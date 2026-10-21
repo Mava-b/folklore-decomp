@@ -1,18 +1,81 @@
 #!/usr/bin/env python3
 """Folklore-specific fixes applied to the lifted PPU code after a relift.
 
-Each patch names the guest address it changes and why. tools/relift.sh runs
-this after ppu_lifter.py; running it twice is harmless (a patch already
-applied is skipped).
+Each patch names the guest function and address it changes, and why, and is
+written as a few small edits to that function: insert our code before or after
+the line that holds a given call (named by its return address) or label, or
+change one operand. The patches carry only the code we add, never a copy of
+the lifted game code, so this file can be shared with the project.
+
+tools/relift.sh runs this after ppu_lifter.py. Running it twice is harmless:
+a function that already carries its FOLKLORE PATCH marker is skipped.
 
   game_patches.py src/recomp
 """
 import pathlib
+import re
 import sys
 
+MOVIE_TABLE_WHY = (
+    "The movie player takes its AU size table (the .dat_ file, 8 bytes per picture) from the "
+    "shared work-area allocator: read the top, advance it. The main thread's loader uses the "
+    "space above that same top as scratch for archive reads without advancing it. On the PS3 "
+    "the logo movie's table is allocated before or after the loader's read; on PC the threads "
+    "overlap, the loader's model.bin_ read lands on the table (seen in a Windows log: both at "
+    "0x45433600), and the movie gets garbage AU sizes -- corrupt video, a stuck logo, or a "
+    "crash in the decoder. The table now goes in a block reserved right after the player "
+    "struct at boot."
+)
+
+
+def movieTableBranch(address):
+    """The table allocation at `address`: take the reserved block when the table fits."""
+    return (
+        "        /* FOLKLORE PATCH 0x%X: the movie's AU size table goes in the block reserved after\n"
+        "         * the player (FOLKLORE PATCH 0x1A3BA4), not at the shared work-area top (tools/game_patches.py) */\n"
+        "        if ((uint32_t)ctx->gpr[0] <= 0x40000u) {\n"
+        "            ctx->gpr[0] = (uint32_t)(vm_read32(vm_read32(ctx->gpr[2] + -0x20C0)) + 0x240u);\n"
+        "            ctx->gpr[4] = (int64_t)(int32_t)(0);\n"
+        "            ctx->gpr[5] = (int64_t)(int32_t)(0);\n"
+        "            vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n"
+        "            ctx->gpr[9] = vm_read32(ctx->gpr[2] + -0x263C);\n"
+        "            ctx->gpr[3] = vm_read32(ctx->gpr[9]);\n"
+        "        } else {\n" % address
+    )
+
+
+PHYSICS_PLAN = (
+    "        {\n"
+    "            const uint32_t simulation = vm_read32((uint32_t)ctx->gpr[31] + 0x8);\n"
+    "            float currentTime;\n"
+    "            float simulatedTime;\n"
+    "            float markerTime;\n"
+    "            float stepSize;\n"
+    "            uint32_t bits = vm_read32(simulation + 0x10);\n"
+    "            memcpy(&currentTime, &bits, 4);\n"
+    "            bits = vm_read32(simulation + 0x14);\n"
+    "            memcpy(&simulatedTime, &bits, 4);\n"
+    "            bits = vm_read32(simulation + 0x1C);\n"
+    "            memcpy(&markerTime, &bits, 4);\n"
+    "            physicsStepLimit = folklore_physics_plan_steps(currentTime, simulatedTime, markerTime,\n"
+    "                                                           (float)ctx->fpr[31], &stepSize);\n"
+    "            if (physicsStepLimit >= 0)\n"
+    "            {\n"
+    "                ctx->fpr[31] = (double)stepSize;\n"
+    "            }\n"
+    "        }\n"
+)
+
+# Edits, applied in order inside the named function:
+#   ("before_function", text)          text goes in front of the function
+#   ("before_line", pattern, text)     text goes in front of the line matching pattern
+#   ("after_line", pattern, text)      text goes after the line matching pattern
+#   ("replace", pattern, replacement)  re.sub of the one match of pattern
+# Every pattern must match exactly once in the function.
 PATCHES = [
     {
         "address": 0x001A48C4,
+        "function": "func_001A4780",
         "why": (
             "MoviePostThread waits for the movie player's 'hold' to be released "
             "with an untimed sys_cond_wait (cond at player+0x8C). The release "
@@ -23,39 +86,48 @@ PATCHES = [
             "A 100 ms timeout lets it re-check; the loop after the wait already "
             "handles a hold that is still set or gone."
         ),
-        "old": (
-            "        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x64);\n"
-            "        ctx->gpr[4] = (int64_t)(int32_t)(0);\n"
-            "        vm_write8(ctx->gpr[30] + 0x68, ctx->gpr[0]);\n"
-            "        ctx->gpr[11] = (int64_t)(int32_t)(0x6B);\n"
-        ),
-        "new": (
-            "        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x64);\n"
-            "        ctx->gpr[4] = 100000; /* FOLKLORE PATCH 0x1A48C4: timed hold wait (tools/game_patches.py) */\n"
-            "        vm_write8(ctx->gpr[30] + 0x68, ctx->gpr[0]);\n"
-            "        ctx->gpr[11] = (int64_t)(int32_t)(0x6B);\n"
-        ),
+        "edits": [
+            # The wait's timeout argument (r4), set right after the cond is loaded from +0x64.
+            ("replace", r"(\+ 0x64\);\n\s*ctx->gpr\[4\] = )\(int64_t\)\(int32_t\)\(0\);",
+             r"\g<1>100000; /* FOLKLORE PATCH 0x1A48C4: timed hold wait (tools/game_patches.py) */"),
+        ],
     },
     {
         "address": 0x001A3124,
-        "why": "The movie player takes its AU size table (the .dat_ file, 8 bytes per picture) from the shared work-area allocator: read the top, advance it. The main thread's loader uses the space above that same top as scratch for archive reads without advancing it. On the PS3 the logo movie's table is allocated before or after the loader's read; on PC the threads overlap, the loader's model.bin_ read lands on the table (seen in a Windows log: both at 0x45433600), and the movie gets garbage AU sizes -- corrupt video, a stuck logo, or a crash in the decoder. The table now goes in a block reserved right after the player struct at boot.",
-        "old": '        ctx->gpr[0] = vm_read32(ctx->gpr[1] + 0xA8);\n        vm_write32(ctx->gpr[31] + 0x4, ctx->gpr[0]);\n        ctx->lr = 0x001A3128; func_00187C7C(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[4] = (int64_t)(int32_t)(0);\n        ctx->gpr[0] = ctx->gpr[3] | ctx->gpr[3];\n        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x4);\n        ctx->gpr[5] = (int64_t)(int32_t)(0);\n        ctx->gpr[3] = ctx->gpr[3] + ctx->gpr[0];\n        vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n        ctx->gpr[3] = ppc_rldicl(ctx->gpr[3], 0, 32);\n        ctx->lr = 0x001A314C; func_00187CEC(ctx); DRAIN_TRAMPOLINE(ctx);\n',
-        "new": "        ctx->gpr[0] = vm_read32(ctx->gpr[1] + 0xA8);\n        vm_write32(ctx->gpr[31] + 0x4, ctx->gpr[0]);\n        /* FOLKLORE PATCH 0x1A3124: the movie's AU size table goes in the block reserved after\n         * the player (FOLKLORE PATCH 0x1A3BA4), not at the shared work-area top (tools/game_patches.py) */\n        if ((uint32_t)ctx->gpr[0] <= 0x40000u) {\n            ctx->gpr[0] = (uint32_t)(vm_read32(vm_read32(ctx->gpr[2] + -0x20C0)) + 0x240u);\n            ctx->gpr[4] = (int64_t)(int32_t)(0);\n            ctx->gpr[5] = (int64_t)(int32_t)(0);\n            vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n            ctx->gpr[9] = vm_read32(ctx->gpr[2] + -0x263C);\n            ctx->gpr[3] = vm_read32(ctx->gpr[9]);\n        } else {\n        ctx->lr = 0x001A3128; func_00187C7C(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[4] = (int64_t)(int32_t)(0);\n        ctx->gpr[0] = ctx->gpr[3] | ctx->gpr[3];\n        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x4);\n        ctx->gpr[5] = (int64_t)(int32_t)(0);\n        ctx->gpr[3] = ctx->gpr[3] + ctx->gpr[0];\n        vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n        ctx->gpr[3] = ppc_rldicl(ctx->gpr[3], 0, 32);\n        ctx->lr = 0x001A314C; func_00187CEC(ctx); DRAIN_TRAMPOLINE(ctx);\n        }\n",
+        "function": "func_001A289C",
+        "why": MOVIE_TABLE_WHY,
+        "edits": [
+            # Around the allocator calls returning to 0x1A3128 .. 0x1A314C.
+            ("before_line", r"ctx->lr = 0x001A3128;", movieTableBranch(0x1A3124)),
+            ("after_line", r"ctx->lr = 0x001A314C;", "        }\n"),
+        ],
     },
     {
         "address": 0x001A33F4,
-        "why": "The movie player takes its AU size table (the .dat_ file, 8 bytes per picture) from the shared work-area allocator: read the top, advance it. The main thread's loader uses the space above that same top as scratch for archive reads without advancing it. On the PS3 the logo movie's table is allocated before or after the loader's read; on PC the threads overlap, the loader's model.bin_ read lands on the table (seen in a Windows log: both at 0x45433600), and the movie gets garbage AU sizes -- corrupt video, a stuck logo, or a crash in the decoder. The table now goes in a block reserved right after the player struct at boot.",
-        "old": '        ctx->gpr[0] = vm_read32(ctx->gpr[1] + 0xA8);\n        vm_write32(ctx->gpr[31] + 0x4, ctx->gpr[0]);\n        ctx->lr = 0x001A33F8; func_00187C7C(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[4] = (int64_t)(int32_t)(0);\n        ctx->gpr[0] = ctx->gpr[3] | ctx->gpr[3];\n        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x4);\n        ctx->gpr[5] = (int64_t)(int32_t)(0);\n        ctx->gpr[3] = ctx->gpr[3] + ctx->gpr[0];\n        vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n        ctx->gpr[3] = ppc_rldicl(ctx->gpr[3], 0, 32);\n        ctx->lr = 0x001A341C; func_00187CEC(ctx); DRAIN_TRAMPOLINE(ctx);\n',
-        "new": "        ctx->gpr[0] = vm_read32(ctx->gpr[1] + 0xA8);\n        vm_write32(ctx->gpr[31] + 0x4, ctx->gpr[0]);\n        /* FOLKLORE PATCH 0x1A33F4: the movie's AU size table goes in the block reserved after\n         * the player (FOLKLORE PATCH 0x1A3BA4), not at the shared work-area top (tools/game_patches.py) */\n        if ((uint32_t)ctx->gpr[0] <= 0x40000u) {\n            ctx->gpr[0] = (uint32_t)(vm_read32(vm_read32(ctx->gpr[2] + -0x20C0)) + 0x240u);\n            ctx->gpr[4] = (int64_t)(int32_t)(0);\n            ctx->gpr[5] = (int64_t)(int32_t)(0);\n            vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n            ctx->gpr[9] = vm_read32(ctx->gpr[2] + -0x263C);\n            ctx->gpr[3] = vm_read32(ctx->gpr[9]);\n        } else {\n        ctx->lr = 0x001A33F8; func_00187C7C(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[4] = (int64_t)(int32_t)(0);\n        ctx->gpr[0] = ctx->gpr[3] | ctx->gpr[3];\n        ctx->gpr[3] = vm_read32(ctx->gpr[31] + 0x4);\n        ctx->gpr[5] = (int64_t)(int32_t)(0);\n        ctx->gpr[3] = ctx->gpr[3] + ctx->gpr[0];\n        vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n        ctx->gpr[3] = ppc_rldicl(ctx->gpr[3], 0, 32);\n        ctx->lr = 0x001A341C; func_00187CEC(ctx); DRAIN_TRAMPOLINE(ctx);\n        }\n",
+        "function": "func_001A289C",
+        "why": MOVIE_TABLE_WHY,
+        "edits": [
+            ("before_line", r"ctx->lr = 0x001A33F8;", movieTableBranch(0x1A33F4)),
+            ("after_line", r"ctx->lr = 0x001A341C;", "        }\n"),
+        ],
     },
     {
         "address": 0x001A3BA4,
-        "why": 'Movie init allocates the player struct (0x240 bytes) once at boot; 256 KB more right after it holds the AU size table of whichever movie is open (see 0x1A3124), up to 32768 pictures.',
-        "old": '        ctx->gpr[30] = vm_read32(ctx->gpr[2] + -0x20C0);\n        ctx->gpr[9] = ctx->gpr[3] | ctx->gpr[3];\n        ctx->gpr[3] = ctx->gpr[3] + (int64_t)(0x240);\n',
-        "new": '        ctx->gpr[30] = vm_read32(ctx->gpr[2] + -0x20C0);\n        ctx->gpr[9] = ctx->gpr[3] | ctx->gpr[3];\n        ctx->gpr[3] = ctx->gpr[3] + (int64_t)(0x240 + 0x40000); /* FOLKLORE PATCH 0x1A3BA4: 256 KB for the AU size table after the player struct (tools/game_patches.py) */\n',
+        "function": "func_001A3B78",
+        "why": (
+            "Movie init allocates the player struct (0x240 bytes) once at boot; 256 KB more right "
+            "after it holds the AU size table of whichever movie is open (see 0x1A3124), up to "
+            "32768 pictures."
+        ),
+        "edits": [
+            # The size passed to the allocator.
+            ("replace", r"(ctx->gpr\[3\] = ctx->gpr\[3\] \+ \(int64_t\)\(0x240)\);",
+             r"\g<1> + 0x40000); /* FOLKLORE PATCH 0x1A3BA4: 256 KB for the AU size table after the player struct (tools/game_patches.py) */"),
+        ],
     },
     {
         "address": 0x003C913C,
+        "function": "func_003C913C",
         "why": (
             "Every Havok world is stepped here: setFrameTimeMarker(frame time), then "
             "stepDeltaTime(1/30) until the simulation reaches the marker. The cloth and "
@@ -66,34 +138,106 @@ PATCHES = [
             "exactly the frame (folklore_physics_plan_steps, engine setting "
             "physics_frame_step); at 30 fps it is the same single 1/30 step."
         ),
-        "old": 'void func_003C913C(ppu_context* ctx) {\n        uint64_t _cs_31 = ctx->gpr[31];\n        vm_write64(ctx->gpr[1] + -0x90, ctx->gpr[1]); ctx->gpr[1] += -0x90;\n        ctx->gpr[0] = ctx->lr;\n        { uint64_t tmp; memcpy(&tmp, &ctx->fpr[31], 8); vm_write64(ctx->gpr[1] + 0x88, tmp); }\n        ctx->fpr[31] = ctx->fpr[2];\n        vm_write64(ctx->gpr[1] + 0x78, ctx->gpr[31]);\n        ctx->gpr[31] = ctx->gpr[3] | ctx->gpr[3];\n        vm_write64(ctx->gpr[1] + 0xA0, ctx->gpr[0]);\n        ctx->lr = 0x003C915C; func_002FECD4(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        ctx->lr = 0x003C9168; func_00301450(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        goto loc_003C9184;\nloc_003C9170:\n        ctx->lr = 0x003C9174; func_003051CC(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        ctx->lr = 0x003C9180; func_002FED28(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\nloc_003C9184:\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        ctx->lr = 0x003C918C; func_002FECFC(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->fpr[1] = ctx->fpr[31];\n        { int64_t a = (int64_t)ctx->gpr[3]; int64_t b = (int64_t)0; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        if (((ctx->cr >> 1) & 1)) goto loc_003C9170;\n        ctx->gpr[0] = vm_read64(ctx->gpr[1] + 0xA0);\n        ctx->gpr[31] = _cs_31;\n        { uint64_t tmp = vm_read64(ctx->gpr[1] + 0x88); memcpy(&ctx->fpr[31], &tmp, 8); }\n        ctx->lr = ctx->gpr[0];\n        ctx->gpr[1] = ctx->gpr[1] + (int64_t)(0x90);\n        return;\n}\n\n',
-        "new": 'extern "C" int folklore_physics_plan_steps(float, float, float, float, float*); /* FOLKLORE PATCH 0x3C913C */\nvoid func_003C913C(ppu_context* ctx) {\n        /* FOLKLORE PATCH 0x3C913C: step Havok by the frame time, not a fixed 1/30 s\n         * (folklore_physics_plan_steps in src/engine/engine_settings.cpp, tools/game_patches.py) */\n        int physicsStepLimit = -1;\n        int physicsStepsTaken = 0;\n        uint64_t _cs_31 = ctx->gpr[31];\n        vm_write64(ctx->gpr[1] + -0x90, ctx->gpr[1]); ctx->gpr[1] += -0x90;\n        ctx->gpr[0] = ctx->lr;\n        { uint64_t tmp; memcpy(&tmp, &ctx->fpr[31], 8); vm_write64(ctx->gpr[1] + 0x88, tmp); }\n        ctx->fpr[31] = ctx->fpr[2];\n        vm_write64(ctx->gpr[1] + 0x78, ctx->gpr[31]);\n        ctx->gpr[31] = ctx->gpr[3] | ctx->gpr[3];\n        vm_write64(ctx->gpr[1] + 0xA0, ctx->gpr[0]);\n        ctx->lr = 0x003C915C; func_002FECD4(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        ctx->lr = 0x003C9168; func_00301450(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        {\n            const uint32_t simulation = vm_read32((uint32_t)ctx->gpr[31] + 0x8);\n            float currentTime;\n            float simulatedTime;\n            float markerTime;\n            float stepSize;\n            uint32_t bits = vm_read32(simulation + 0x10);\n            memcpy(&currentTime, &bits, 4);\n            bits = vm_read32(simulation + 0x14);\n            memcpy(&simulatedTime, &bits, 4);\n            bits = vm_read32(simulation + 0x1C);\n            memcpy(&markerTime, &bits, 4);\n            physicsStepLimit = folklore_physics_plan_steps(currentTime, simulatedTime, markerTime,\n                                                           (float)ctx->fpr[31], &stepSize);\n            if (physicsStepLimit >= 0)\n            {\n                ctx->fpr[31] = (double)stepSize;\n            }\n        }\n        goto loc_003C9184;\nloc_003C9170:\n        ctx->lr = 0x003C9174; func_003051CC(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        ctx->lr = 0x003C9180; func_002FED28(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        physicsStepsTaken++;\nloc_003C9184:\n        if (physicsStepLimit >= 0 && physicsStepsTaken >= physicsStepLimit)\n        {\n            goto loc_003C91A0;\n        }\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        ctx->lr = 0x003C918C; func_002FECFC(ctx); DRAIN_TRAMPOLINE(ctx);\n        /* nop */;\n        ctx->fpr[1] = ctx->fpr[31];\n        { int64_t a = (int64_t)ctx->gpr[3]; int64_t b = (int64_t)0; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }\n        ctx->gpr[3] = ctx->gpr[31] | ctx->gpr[31];\n        if (((ctx->cr >> 1) & 1)) goto loc_003C9170;\nloc_003C91A0:\n        ctx->gpr[0] = vm_read64(ctx->gpr[1] + 0xA0);\n        ctx->gpr[31] = _cs_31;\n        { uint64_t tmp = vm_read64(ctx->gpr[1] + 0x88); memcpy(&ctx->fpr[31], &tmp, 8); }\n        ctx->lr = ctx->gpr[0];\n        ctx->gpr[1] = ctx->gpr[1] + (int64_t)(0x90);\n        return;\n}\n\n',
+        "edits": [
+            ("before_function",
+             'extern "C" int folklore_physics_plan_steps(float, float, float, float, float*); /* FOLKLORE PATCH 0x3C913C */\n'),
+            ("after_line", r"^void func_003C913C\(ppu_context\* ctx\) \{",
+             "        /* FOLKLORE PATCH 0x3C913C: step Havok by the frame time, not a fixed 1/30 s\n"
+             "         * (folklore_physics_plan_steps in src/engine/engine_settings.cpp, tools/game_patches.py) */\n"
+             "        int physicsStepLimit = -1;\n"
+             "        int physicsStepsTaken = 0;\n"),
+            # After setFrameTimeMarker/advanceTime, before the step loop is entered.
+            ("before_line", r"goto loc_003C9184;", PHYSICS_PLAN),
+            # Count each step; stop when the frame is covered.
+            ("before_line", r"^loc_003C9184:", "        physicsStepsTaken++;\n"),
+            ("after_line", r"^loc_003C9184:",
+             "        if (physicsStepLimit >= 0 && physicsStepsTaken >= physicsStepLimit)\n"
+             "        {\n"
+             "            goto loc_003C91A0;\n"
+             "        }\n"),
+            ("after_line", r"goto loc_003C9170;", "loc_003C91A0:\n"),
+        ],
     },
 ]
 
 
+class PatchError(Exception):
+    pass
+
+
+def findLine(body, pattern):
+    """(start, end) of the one line in body matching pattern; end includes the newline."""
+    matches = list(re.finditer(pattern, body, re.MULTILINE))
+    if len(matches) != 1:
+        raise PatchError("pattern %r matches %d times" % (pattern, len(matches)))
+    lineStart = body.rfind("\n", 0, matches[0].start()) + 1
+    lineEnd = body.find("\n", matches[0].end())
+    lineEnd = len(body) if lineEnd < 0 else lineEnd + 1
+    return lineStart, lineEnd
+
+
+def applyEdits(prefix, body, edits):
+    for edit in edits:
+        kind = edit[0]
+        if kind == "before_function":
+            prefix = prefix + edit[1]
+        elif kind == "before_line":
+            lineStart, _ = findLine(body, edit[1])
+            body = body[:lineStart] + edit[2] + body[lineStart:]
+        elif kind == "after_line":
+            _, lineEnd = findLine(body, edit[1])
+            body = body[:lineEnd] + edit[2] + body[lineEnd:]
+        elif kind == "replace":
+            matchCount = len(re.findall(edit[1], body, re.MULTILINE))
+            if matchCount != 1:
+                raise PatchError("pattern %r matches %d times" % (edit[1], matchCount))
+            body = re.sub(edit[1], edit[2], body, count=1, flags=re.MULTILINE)
+        else:
+            raise PatchError("unknown edit %r" % kind)
+    return prefix, body
+
+
+def functionSpan(text, name):
+    """(start, end) of `void name(ppu_context* ctx) { ... }` in text, or None."""
+    header = "void %s(ppu_context* ctx) {" % name
+    start = text.find(header)
+    if start < 0:
+        return None
+    if start > 0 and text[start - 1] != "\n":
+        return None
+    end = text.find("\n}\n", start)
+    if end < 0:
+        return None
+    return start, end + 3
+
+
+def applyPatch(sources, patch):
+    marker = "FOLKLORE PATCH 0x%X" % patch["address"]
+    for source in sources:
+        text = source.read_text()
+        span = functionSpan(text, patch["function"])
+        if span is None:
+            continue
+        start, end = span
+        body = text[start:end]
+        if marker in body:
+            return "already applied", source.name
+        prefix, newBody = applyEdits("", body, patch["edits"])
+        source.write_text(text[:start] + prefix + newBody + text[end:])
+        return "applied", source.name
+    raise PatchError("function %s not found" % patch["function"])
+
+
 def main():
-    recompDir = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "src/recomp")
-    sources = sorted(recompDir.glob("*.cpp"))
+    recompDirectory = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "src/recomp")
+    sources = sorted(recompDirectory.glob("*.cpp"))
     failures = 0
     for patch in PATCHES:
-        applied = False
-        for source in sources:
-            text = source.read_text()
-            if patch["new"] in text:
-                print("already applied: 0x%08X (%s)" % (patch["address"], source.name))
-                applied = True
-                break
-            count = text.count(patch["old"])
-            if count == 1:
-                source.write_text(text.replace(patch["old"], patch["new"]))
-                print("applied: 0x%08X (%s)" % (patch["address"], source.name))
-                applied = True
-                break
-            if count > 1:
-                print("ambiguous: 0x%08X matches %d times in %s" % (patch["address"], count, source.name))
-        if not applied:
-            print("NOT FOUND: 0x%08X" % patch["address"])
+        try:
+            status, sourceName = applyPatch(sources, patch)
+            print("%s: 0x%08X (%s in %s)" % (status, patch["address"], patch["function"], sourceName))
+        except PatchError as error:
+            print("FAILED: 0x%08X (%s): %s" % (patch["address"], patch["function"], error))
             failures += 1
     sys.exit(1 if failures else 0)
 

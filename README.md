@@ -231,6 +231,8 @@ lifted sources and `folklore_settings.ini`.
 
 ## Credits and licences
 
+- **This project** (scripts, port code, patches): MIT licence, see
+  [`LICENSE`](LICENSE).
 - **ps3recomp** © Ned Heller / sp00nznet, MIT licence (`ps3recomp/LICENSE`).
 - **Dear ImGui** © Omar Cornut, MIT licence (`folklore/src/third_party/imgui`).
 - **FFmpeg** (LGPL) is downloaded by setup for the cutscenes; it is not part
