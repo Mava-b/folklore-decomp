@@ -21,6 +21,8 @@
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "../spu/spurs_trace.h" /* SPURS_GOLDEN_TRACE */
+#include <string.h>       /* memcpy */
 #include <stdlib.h>       /* getenv */
 #include <stdint.h>
 #include <stdio.h>
@@ -567,6 +569,13 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                     }
                 }
             }
+            /* SPURS_GOLDEN_TRACE: the call and the memory behind its arguments (spurs_trace.c). */
+            uint64_t spursTraceArguments[11];
+            if (spurs_trace_init())
+            {
+                memcpy(spursTraceArguments, ctx->gpr, sizeof(spursTraceArguments));
+                spurs_trace_api_call(nid, ctx->gpr, (uint32_t)ctx->lr);
+            }
             uint32_t _cap_ts = (nid==0x87630976u) ? (uint32_t)ctx->gpr[4] : 0; /* taskset EA before the call clobbers r4 */
             ctx->gpr[2] = toc;            /* libsre's own TOC */
             ctx->ctr    = code;
@@ -585,6 +594,10 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               if(_ri){ uint64_t _sr1=ctx->gpr[1]; ctx->gpr[1]=(ctx->gpr[1]-0x1000)&~0xFull;
                 ps3_indirect_call(ctx); ctx->gpr[1]=_sr1; }
               else ps3_indirect_call(ctx); }       /* -> registered lifted libsre fn; r3=ret */
+            if (g_spurs_trace_on)
+            {
+                spurs_trace_api_return(nid, spursTraceArguments, (uint32_t)ctx->gpr[3]);
+            }
             /* A real PRX serving this import is a different implementation of it,
              * so it gets its own prefix rather than reading as the HLE stub. */
             ps3_msf("prx:0x%08X", nid);

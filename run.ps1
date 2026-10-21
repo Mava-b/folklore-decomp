@@ -11,6 +11,9 @@
 #   ... run.ps1 -Profile                            record where the CPU time goes
 #                                                   (a report every 10 s in the log)
 #   ... run.ps1 -BlockingWaitFlip                   old frame pacing (A/B comparison)
+#   ... run.ps1 -TraceSpurs                         record everything the real libsre
+#                                                   does to logs\spurs-<date-time>.trace
+#                                                   (for writing our own; large, slower)
 #
 # In game: L3 + R3 together (or F1) opens the engine menu -- frame-rate cap,
 # frame limiter precision, performance overlay. Settings are kept in
@@ -45,6 +48,10 @@ param(
     # Make cellGcmSetWaitFlip block the game thread until the next vblank, as
     # the runtime used to (the hardware call does not block).
     [switch]$BlockingWaitFlip,
+    # SPURS_GOLDEN_TRACE: record every libsre call, SPU DMA, lock-line
+    # atomic and job entry/exit to logs\spurs-<date-time>.trace, the reference
+    # for replacing libsre (ps3recomp runtime/spu/spurs_trace.c).
+    [switch]$TraceSpurs,
     # Render capture is always armed; this only prints a reminder.
     [switch]$Capture,
     [switch]$Verbose
@@ -250,6 +257,20 @@ $env:LD_HLSL_DUMP = $hlslDir
 # shaders an extra time. Set LD_PROBE_PSO here to follow a broken effect.
 Remove-Item Env:LD_PROBE_PSO -ErrorAction SilentlyContinue
 Remove-Item Env:LD_PROBE_AB -ErrorAction SilentlyContinue
+$spursTrace = Join-Path $LogDir "spurs-$stamp.trace"
+if ($TraceSpurs)
+{
+    if ($NoLibsre)
+    {
+        throw '-TraceSpurs records the real libsre; leave out -NoLibsre'
+    }
+    $env:SPURS_GOLDEN_TRACE = $spursTrace
+    Write-Host "Recording SPURS to $spursTrace (the game runs a little slower while it does)." -ForegroundColor Yellow
+}
+else
+{
+    Remove-Item Env:SPURS_GOLDEN_TRACE -ErrorAction SilentlyContinue
+}
 if ($Capture)
 {
     Write-Host "Render capture armed -- press F2 (or the PS button on a DualShock 3), or double-click capture.bat, while the screen looks wrong." -ForegroundColor Yellow

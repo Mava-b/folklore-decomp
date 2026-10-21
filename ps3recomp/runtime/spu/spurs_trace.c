@@ -1,0 +1,545 @@
+/*
+ * spurs_trace.c -- see spurs_trace.h.
+ *
+ * Line format (all numbers hex unless named otherwise):
+ *
+ *   <seconds> <thread> <actor> <event> key=value ...
+ *
+ *   thread   "ppu<tid>" or "spu<n>"
+ *   actor    PPU: "game"; SPU: "krn" (SPURS kernel, LS < 0xA00), "pm<img>"
+ *            (the policy module at LS 0xA00: 41 system service, 42 job-chain
+ *            manager), "job<img>" (a job's placed binary, images 50+)
+ *   event    CALL / RET              a libsre call and its result
+ *            MEM                     memory behind a pointer argument
+ *            GET / PUT               a DMA, after it completed
+ *            GETLLAR / PUTLLC / PUTLLUC   a lock-line atomic, after it ran
+ *            JOB_ENTER / JOB_LEAVE   control entering / leaving a job's code
+ *            REPEAT n=<count>        <count> more events identical to ones among
+ *                                    this thread's previous 8 lines (a polling loop)
+ *
+ *   hash=    64-bit content hash of the bytes moved (or shown)
+ *   data=    the bytes, only the first time this (ea, size, hash) appears,
+ *            and only up to 512 bytes; "seen" when shown before
+ */
+#include "spurs_trace.h"
+#include "spu_context.h"
+#include "spu_dma.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdarg.h>
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#else
+#include <pthread.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/syscall.h>
+#endif
+
+extern uint8_t* vm_base;
+
+volatile int g_spurs_trace_on = 0;
+
+static int s_traceState = -1;          /* -1 unread, 0 off, 1 on */
+static FILE* s_traceFile = NULL;
+static uint64_t s_traceBytes = 0;
+static uint64_t s_traceLimitBytes = 0;
+static int s_traceStopped = 0;
+
+#ifdef _WIN32
+static CRITICAL_SECTION s_traceLock;
+static LARGE_INTEGER s_traceStart;
+static LARGE_INTEGER s_traceFrequency;
+static void traceLock(void) { EnterCriticalSection(&s_traceLock); }
+static void traceUnlock(void) { LeaveCriticalSection(&s_traceLock); }
+#else
+static pthread_mutex_t s_traceLock = PTHREAD_MUTEX_INITIALIZER;
+static struct timespec s_traceStart;
+static void traceLock(void) { pthread_mutex_lock(&s_traceLock); }
+static void traceUnlock(void) { pthread_mutex_unlock(&s_traceLock); }
+#endif
+
+/* ---- content hash and "shown before" set --------------------------------- */
+
+static uint64_t traceHash(const uint8_t* data, uint32_t size)
+{
+    uint64_t hash = 0x9E3779B97F4A7C15ull ^ size;
+    uint32_t offset = 0;
+    for (; offset + 8 <= size; offset += 8)
+    {
+        uint64_t word;
+        memcpy(&word, data + offset, 8);
+        hash ^= word;
+        hash *= 0xFF51AFD7ED558CCDull;
+        hash ^= hash >> 32;
+    }
+    for (; offset < size; offset++)
+    {
+        hash ^= data[offset];
+        hash *= 0x100000001B3ull;
+    }
+    hash ^= hash >> 29;
+    hash *= 0xC4CEB9FE1A85EC53ull;
+    hash ^= hash >> 32;
+    return hash;
+}
+
+#define TRACE_SEEN_BITS 22u
+static uint64_t* s_seenTable = NULL;   /* open addressing, 0 = empty */
+
+static void traceLock(void);
+static void traceUnlock(void);
+
+/* 1 if this key was already in the set (and leaves it there), else adds it. */
+static int traceSeenLocked(uint64_t key);
+static int traceSeen(uint64_t key)
+{
+    traceLock();
+    const int seen = traceSeenLocked(key);
+    traceUnlock();
+    return seen;
+}
+
+static int traceSeenLocked(uint64_t key)
+{
+    if (!s_seenTable)
+    {
+        return 0;
+    }
+    if (key == 0)
+    {
+        key = 1;
+    }
+    const uint64_t mask = (1ull << TRACE_SEEN_BITS) - 1u;
+    uint64_t slot = (key * 0x9E3779B97F4A7C15ull) >> (64u - TRACE_SEEN_BITS);
+    for (uint32_t probe = 0; probe < 64u; probe++)
+    {
+        uint64_t* entry = &s_seenTable[(slot + probe) & mask];
+        if (*entry == key)
+        {
+            return 1;
+        }
+        if (*entry == 0)
+        {
+            *entry = key;
+            return 0;
+        }
+    }
+    return 0;   /* crowded neighbourhood: show the data again */
+}
+
+/* ---- output --------------------------------------------------------------- */
+
+static double traceSeconds(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER now;
+    QueryPerformanceCounter(&now);
+    return (double)(now.QuadPart - s_traceStart.QuadPart) / (double)s_traceFrequency.QuadPart;
+#else
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    return (double)(now.tv_sec - s_traceStart.tv_sec) + (double)(now.tv_nsec - s_traceStart.tv_nsec) * 1e-9;
+#endif
+}
+
+static unsigned long traceThreadId(void)
+{
+#ifdef _WIN32
+    return (unsigned long)GetCurrentThreadId();
+#else
+    return (unsigned long)syscall(SYS_gettid);
+#endif
+}
+
+/* Write one finished line; the caller holds the lock. */
+static void traceWriteLocked(const char* line, size_t length)
+{
+    if (!s_traceFile || s_traceStopped)
+    {
+        return;
+    }
+    if (s_traceBytes + length > s_traceLimitBytes)
+    {
+        const char* note = "TRACE_LIMIT reached -- stopping (SPURS_GOLDEN_TRACE_MB)\n";
+        fwrite(note, 1, strlen(note), s_traceFile);
+        fflush(s_traceFile);
+        s_traceStopped = 1;
+        return;
+    }
+    fwrite(line, 1, length, s_traceFile);
+    s_traceBytes += length;
+    static double lastFlush = 0.0;
+    const double now = traceSeconds();
+    if (now - lastFlush > 1.0)
+    {
+        fflush(s_traceFile);
+        lastFlush = now;
+    }
+}
+
+/* Per-thread collapse of polling loops: an event identical (everything but
+ * the time) to one of this thread's last TRACE_RECENT events is counted, not
+ * written, and the count comes out as one REPEAT line before the next new
+ * event. That folds a GETLLAR / test / PUTLLC idle loop down to its first lap.
+ * Events with signature 0 (calls, job entry and exit) always print and start
+ * a fresh window, so a loop is never folded across one of them. */
+#define TRACE_RECENT 8u
+static SPU_THREAD_LOCAL uint64_t t_recentSignatures[TRACE_RECENT];
+static SPU_THREAD_LOCAL uint32_t t_recentNext = 0;
+static SPU_THREAD_LOCAL uint32_t t_repeatCount = 0;
+static SPU_THREAD_LOCAL char t_lastPrefix[48];
+
+static int traceRecentlySeen(uint64_t signature)
+{
+    for (uint32_t index = 0; index < TRACE_RECENT; index++)
+    {
+        if (t_recentSignatures[index] == signature)
+        {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A line growing in a fixed buffer. */
+typedef struct
+{
+    char text[4096];
+    size_t length;
+} trace_line;
+
+static void lineAppend(trace_line* line, const char* format, ...)
+{
+    if (line->length >= sizeof(line->text) - 2u)
+    {
+        return;
+    }
+    va_list arguments;
+    va_start(arguments, format);
+    const int written = vsnprintf(line->text + line->length, sizeof(line->text) - line->length - 1u,
+                                  format, arguments);
+    va_end(arguments);
+    if (written > 0)
+    {
+        line->length += (size_t)written;
+        if (line->length > sizeof(line->text) - 2u)
+        {
+            line->length = sizeof(line->text) - 2u;
+        }
+    }
+}
+
+static void lineAppendHex(trace_line* line, const uint8_t* data, uint32_t size)
+{
+    static const char digits[] = "0123456789ABCDEF";
+    for (uint32_t index = 0; index < size && line->length + 3u < sizeof(line->text) - 2u; index++)
+    {
+        line->text[line->length++] = digits[data[index] >> 4];
+        line->text[line->length++] = digits[data[index] & 15u];
+    }
+    line->text[line->length] = 0;
+}
+
+/* Hash `size` bytes and append " hash=... data=..." (data only when new);
+ * returns the hash. */
+static uint64_t lineAppendContent(trace_line* line, uint32_t ea, const uint8_t* data, uint32_t size)
+{
+    const uint64_t hash = traceHash(data, size);
+    lineAppend(line, " hash=%016llX", (unsigned long long)hash);
+    if (size > 512u)
+    {
+        return hash;
+    }
+    const uint64_t key = hash ^ ((uint64_t)ea << 20) ^ ((uint64_t)size * 0x9E3779B97F4A7C15ull);
+    if (traceSeen(key))
+    {
+        lineAppend(line, " data=seen");
+        return hash;
+    }
+    lineAppend(line, " data=");
+    lineAppendHex(line, data, size);
+    return hash;
+}
+
+/* Emit a line, collapsing it into a REPEAT count when the same thread just
+ * emitted an identical event (signature covers everything but the time). */
+static void traceEmit(const char* prefix, trace_line* body, uint64_t signature)
+{
+    if (signature && traceRecentlySeen(signature))
+    {
+        t_repeatCount++;
+        return;
+    }
+    traceLock();
+    char head[96];
+    if (t_repeatCount)
+    {
+        const int headLength = snprintf(head, sizeof(head), "%.6f %s REPEAT n=%u\n", traceSeconds(),
+                                        t_lastPrefix, t_repeatCount);
+        traceWriteLocked(head, (size_t)headLength);
+        t_repeatCount = 0;
+    }
+    if (signature)
+    {
+        t_recentSignatures[t_recentNext] = signature;
+        t_recentNext = (t_recentNext + 1u) % TRACE_RECENT;
+    }
+    else
+    {
+        memset(t_recentSignatures, 0, sizeof(t_recentSignatures));
+        t_recentNext = 0;
+    }
+    snprintf(t_lastPrefix, sizeof(t_lastPrefix), "%s", prefix);
+    const int headLength = snprintf(head, sizeof(head), "%.6f %s ", traceSeconds(), prefix);
+    traceWriteLocked(head, (size_t)headLength);
+    body->text[body->length++] = '\n';
+    traceWriteLocked(body->text, body->length);
+    traceUnlock();
+}
+
+int spurs_trace_init(void)
+{
+    if (s_traceState >= 0)
+    {
+        return s_traceState;
+    }
+    const char* path = getenv("SPURS_GOLDEN_TRACE");
+    if (!path || !path[0])
+    {
+        s_traceState = 0;
+        return 0;
+    }
+#ifdef _WIN32
+    InitializeCriticalSection(&s_traceLock);
+    QueryPerformanceFrequency(&s_traceFrequency);
+    QueryPerformanceCounter(&s_traceStart);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &s_traceStart);
+#endif
+    s_traceFile = fopen(path, "wb");
+    if (!s_traceFile)
+    {
+        fprintf(stderr, "[spurs-trace] cannot open %s -- trace off\n", path);
+        s_traceState = 0;
+        return 0;
+    }
+    setvbuf(s_traceFile, NULL, _IOFBF, 8u << 20);
+    s_seenTable = (uint64_t*)calloc((size_t)1u << TRACE_SEEN_BITS, sizeof(uint64_t));
+    const char* limitText = getenv("SPURS_GOLDEN_TRACE_MB");
+    const unsigned long limitMegabytes = limitText && limitText[0] ? strtoul(limitText, NULL, 10) : 4096ul;
+    s_traceLimitBytes = (uint64_t)(limitMegabytes ? limitMegabytes : 4096ul) << 20;
+    fprintf(s_traceFile, "# SPURS golden trace v1 -- see runtime/spu/spurs_trace.c for the format\n");
+    fflush(s_traceFile);
+    fprintf(stderr, "[spurs-trace] recording to %s (limit %lu MB)\n", path,
+            limitMegabytes ? limitMegabytes : 4096ul);
+    s_traceState = 1;
+    g_spurs_trace_on = 1;
+    return 1;
+}
+
+/* ---- PPU: calls into libsre ---------------------------------------------- */
+
+static const char* spursNidName(uint32_t nid)
+{
+    switch (nid)
+    {
+    case 0xACFC8DBCu: return "cellSpursInitialize";
+    case 0xCA4C4600u: return "cellSpursFinalize";
+    case 0xB9BC6207u: return "cellSpursAttachLv2EventQueue";
+    case 0x4E66D483u: return "cellSpursDetachLv2EventQueue";
+    case 0x60EB2DECu: return "cellSpursCreateJobChain";
+    case 0xBFEA60FAu: return "cellSpursKickJobChain";
+    case 0x738E40E6u: return "cellSpursShutdownJobChain";
+    case 0xA7C066DEu: return "cellSpursJoinJobChain";
+    case 0x68AAEBA9u: return "cellSpursJobGuardInitialize";
+    case 0xD5D0B256u: return "cellSpursJobGuardNotify";
+    default:          return "?";
+    }
+}
+
+/* Dump the memory behind each argument that looks like a guest pointer. */
+static void traceArgumentMemory(const char* prefix, int phase, const uint64_t* gpr)
+{
+    for (int registerIndex = 3; registerIndex <= 10; registerIndex++)
+    {
+        const uint32_t address = (uint32_t)gpr[registerIndex];
+        if (address < 0x10000u || address >= 0xD0000000u || !mfc_ea_range_committed(address, 512u))
+        {
+            continue;
+        }
+        trace_line line;
+        line.length = 0;
+        lineAppend(&line, "MEM %s r%d ea=%08X size=200", phase ? "after" : "before", registerIndex, address);
+        lineAppendContent(&line, address, vm_base + address, 512u);
+        traceEmit(prefix, &line, 0);
+    }
+}
+
+void spurs_trace_api_call(uint32_t nid, const uint64_t* gpr, uint32_t lr)
+{
+    if (!g_spurs_trace_on)
+    {
+        return;
+    }
+    char prefix[48];
+    snprintf(prefix, sizeof(prefix), "ppu%lu game", traceThreadId());
+    trace_line line;
+    line.length = 0;
+    lineAppend(&line, "CALL %s nid=%08X lr=%08X", spursNidName(nid), nid, lr);
+    for (int registerIndex = 3; registerIndex <= 10; registerIndex++)
+    {
+        lineAppend(&line, " r%d=%08X", registerIndex, (uint32_t)gpr[registerIndex]);
+    }
+    traceEmit(prefix, &line, 0);
+    traceArgumentMemory(prefix, 0, gpr);
+}
+
+void spurs_trace_api_return(uint32_t nid, const uint64_t* argumentGpr, uint32_t result)
+{
+    if (!g_spurs_trace_on)
+    {
+        return;
+    }
+    char prefix[48];
+    snprintf(prefix, sizeof(prefix), "ppu%lu game", traceThreadId());
+    trace_line line;
+    line.length = 0;
+    lineAppend(&line, "RET %s nid=%08X r3=%08X", spursNidName(nid), nid, result);
+    traceEmit(prefix, &line, 0);
+    traceArgumentMemory(prefix, 1, argumentGpr);
+}
+
+/* ---- SPU ------------------------------------------------------------------ */
+
+static SPU_THREAD_LOCAL int t_jobImage = 0;
+
+static void spuPrefix(spu_context* ctx, char* prefix, size_t capacity)
+{
+    const uint32_t pc = (uint32_t)ctx->pc & SPU_LS_MASK;
+    if (t_jobImage)
+    {
+        snprintf(prefix, capacity, "spu%u job%d", (unsigned)(ctx->spu_id & 0xFFu), t_jobImage);
+    }
+    else if (pc < 0xA00u)
+    {
+        snprintf(prefix, capacity, "spu%u krn", (unsigned)(ctx->spu_id & 0xFFu));
+    }
+    else
+    {
+        const int module = ctx->module_img_a00 ? ctx->module_img_a00 : ctx->image_id;
+        snprintf(prefix, capacity, "spu%u pm%d", (unsigned)(ctx->spu_id & 0xFFu), module);
+    }
+}
+
+void spurs_trace_dma(struct spu_context* ctx, uint32_t cmd, uint32_t lsa, uint32_t ea, uint32_t size)
+{
+    if (!g_spurs_trace_on || !ctx || !size)
+    {
+        return;
+    }
+    const int isGet = (cmd & 0xF0u) == 0x40u;
+    const int isPut = (cmd & 0xF0u) == 0x20u;
+    if (!isGet && !isPut)
+    {
+        return;
+    }
+    char prefix[48];
+    spuPrefix(ctx, prefix, sizeof(prefix));
+    const uint8_t* data = ctx->ls + (lsa & SPU_LS_MASK);
+    trace_line line;
+    line.length = 0;
+    lineAppend(&line, "%s ea=%08X lsa=%05X size=%X pc=%05X", isGet ? "GET" : "PUT", ea, lsa & SPU_LS_MASK, size,
+               (unsigned)(ctx->pc & SPU_LS_MASK));
+    uint64_t signature = traceHash((const uint8_t*)line.text, (uint32_t)line.length);
+    if ((lsa & SPU_LS_MASK) + size <= SPU_LS_SIZE)
+    {
+        signature ^= lineAppendContent(&line, ea, data, size) * 0x9E3779B97F4A7C15ull;
+    }
+    signature |= 1u;
+    traceEmit(prefix, &line, signature);
+}
+
+void spurs_trace_atomic(struct spu_context* ctx, uint32_t cmd, uint32_t ea, uint32_t lsa, uint32_t atomicStat)
+{
+    if (!g_spurs_trace_on || !ctx)
+    {
+        return;
+    }
+    const char* name = cmd == 0xD0u ? "GETLLAR" : cmd == 0xB4u ? "PUTLLC" : "PUTLLUC";
+    char prefix[48];
+    spuPrefix(ctx, prefix, sizeof(prefix));
+    trace_line line;
+    line.length = 0;
+    lineAppend(&line, "%s ea=%08X lsa=%05X stat=%X pc=%05X", name, ea, lsa & SPU_LS_MASK, atomicStat,
+               (unsigned)(ctx->pc & SPU_LS_MASK));
+    uint64_t signature = traceHash((const uint8_t*)line.text, (uint32_t)line.length);
+    if ((lsa & SPU_LS_MASK) + 128u <= SPU_LS_SIZE)
+    {
+        signature ^= lineAppendContent(&line, ea, ctx->ls + (lsa & SPU_LS_MASK), 128u) * 0x9E3779B97F4A7C15ull;
+    }
+    signature |= 1u;
+    traceEmit(prefix, &line, signature);
+}
+
+static void lineAppendLs(trace_line* line, spu_context* ctx, const char* label, uint32_t address, uint32_t size)
+{
+    address &= SPU_LS_MASK;
+    if (address + size > SPU_LS_SIZE)
+    {
+        return;
+    }
+    lineAppend(line, " %s@%05X=", label, address);
+    lineAppendHex(line, ctx->ls + address, size);
+}
+
+void spurs_trace_branch(struct spu_context* ctx, int codeImage)
+{
+    if (!g_spurs_trace_on || !ctx || codeImage == t_jobImage)
+    {
+        return;
+    }
+    trace_line line;
+    line.length = 0;
+    char prefix[48];
+    if (codeImage)
+    {
+        t_jobImage = codeImage;
+        spuPrefix(ctx, prefix, sizeof(prefix));
+        lineAppend(&line, "JOB_ENTER img=%d pc=%05X r0=%05X r3=%05X r4=%05X r5=%08X r6=%08X", codeImage,
+                   (unsigned)(ctx->pc & SPU_LS_MASK), ctx->gpr[0]._u32[0] & SPU_LS_MASK,
+                   ctx->gpr[3]._u32[0] & SPU_LS_MASK, ctx->gpr[4]._u32[0] & SPU_LS_MASK, ctx->gpr[5]._u32[0],
+                   ctx->gpr[6]._u32[0]);
+        /* cellSpursJobMain2(CellSpursJobContext2* context, CellSpursJob256* job):
+         * the context and the descriptor the job manager built in LS. */
+        lineAppendLs(&line, ctx, "context", ctx->gpr[3]._u32[0], 0x80u);
+        lineAppendLs(&line, ctx, "job", ctx->gpr[4]._u32[0], 0x100u);
+    }
+    else
+    {
+        spuPrefix(ctx, prefix, sizeof(prefix));
+        lineAppend(&line, "JOB_LEAVE img=%d to=%05X r3=%08X", t_jobImage, (unsigned)(ctx->pc & SPU_LS_MASK),
+                   ctx->gpr[3]._u32[0]);
+        t_jobImage = 0;
+    }
+    traceEmit(prefix, &line, 0);
+}
+
+void spurs_trace_note(const char* text)
+{
+    if (!g_spurs_trace_on || !text)
+    {
+        return;
+    }
+    trace_line line;
+    line.length = 0;
+    lineAppend(&line, "NOTE %s", text);
+    char prefix[48];
+    snprintf(prefix, sizeof(prefix), "thr%lu -", traceThreadId());
+    traceEmit(prefix, &line, 0);
+}

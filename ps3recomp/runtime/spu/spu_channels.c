@@ -404,7 +404,7 @@ volatile unsigned g_spu_putllc_sync_hit = 0;
 #define SPU_JOB_RETURN_LS   0x3FF00u
 
 /* Returns 1 if `cmd` is an atomic line op and was handled here, else 0. */
-static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+static int spu_mfc_atomic_run(spu_context* ctx, uint32_t cmd)
 {
     /* Classify FIRST. Every MFC_Cmd write lands here, and only the switch at
      * the bottom used to filter -- so the uncommitted-EA guard below reported
@@ -776,6 +776,17 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
     default:
         return 0;
     }
+}
+
+/* spu_mfc_atomic_run, recorded for SPURS_GOLDEN_TRACE (spurs_trace.c). */
+static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+{
+    const int handled = spu_mfc_atomic_run(ctx, cmd);
+    if (handled && g_spurs_trace_on)
+    {
+        spurs_trace_atomic(ctx, cmd, ctx->mfc_eal & ~(uint32_t)(MFC_ATOMIC_LINE - 1), ctx->mfc_lsa, ctx->atomic_stat);
+    }
+    return handled;
 }
 
 static int channel_is_mfc(uint32_t ch)
@@ -2295,6 +2306,11 @@ void spu_indirect_branch(spu_context* ctx)
      * may also be registered (historical junk lifts) and must lose. */
     if (!code_owner && !fn && ctx->resident_ovl) fn = spu_lookup(ctx->pc, ctx->resident_ovl);
     if (!code_owner && !fn) fn = spu_lookup(ctx->pc, ctx->image_id);
+    /* SPURS_GOLDEN_TRACE: control entering or leaving a job's code. */
+    if (g_spurs_trace_on)
+    {
+        spurs_trace_branch(ctx, code_owner);
+    }
     /* The job returned through the link register we planted: it is finished.
      * Its outermost frame ends in `bi $r0`, and r0 was 0 -- so without this the
      * return landed on LS 0, which is the job's OWN entry, and it ran a second

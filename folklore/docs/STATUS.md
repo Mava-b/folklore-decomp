@@ -790,6 +790,22 @@ What 0006 fixes in ps3recomp to make that run:
     with MMCSS "Pro Audio". The log gets a [cellAudio] line every 10 s when
     the device ran dry, the game was late with blocks, or the limiter acted,
     which tells the remaining causes apart.
+58. Replacing libsre, step 1: a golden trace of the real one. Folklore
+    needs Sony's libsre (lifted from the user's firmware) for its SPU work,
+    which is the one thing the repository cannot ship. It uses only ten
+    cellSpurs calls (Initialize/Finalize, Attach/DetachLv2EventQueue, the
+    job-chain Create/Kick/Shutdown/Join, JobGuardInitialize/Notify) and nine
+    job binaries from its own EBOOT, so a native job-chain runner can stand in
+    for libsre. patches/0048 (runtime/spu/spurs_trace.c) records what the real
+    one does, as the reference to write and check that runner against:
+    SPURS_GOLDEN_TRACE=<file> (run.ps1 -TraceSpurs) logs every libsre call
+    with its registers and the 512 bytes behind each pointer argument before
+    and after; every SPU GET/PUT and lock-line atomic with who issued it (the
+    SPURS kernel, the job-chain policy module, or a job), its address, size,
+    a content hash and the bytes the first time each (address, size, content)
+    appears; and every job entry and exit with the job context and descriptor
+    in LS. Polling loops fold into REPEAT lines. Off, each hook is one load
+    and a branch.
 
 `run.ps1 -NoLibsre` goes back to HLE cellSpurs for comparison. Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

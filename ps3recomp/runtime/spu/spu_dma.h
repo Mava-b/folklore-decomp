@@ -17,6 +17,7 @@
 
 #include "spu_context.h"
 #include "spu_coherency.h"
+#include "spurs_trace.h"   /* SPURS_GOLDEN_TRACE */
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
@@ -751,6 +752,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
           } }
     }
 
+    /* SPURS_GOLDEN_TRACE: every completed GET / PUT (spurs_trace.c). */
+    if (g_spurs_trace_on)
+    {
+        spurs_trace_dma(spu, mfc_is_get(cmd) ? 0x40u : (mfc_is_put(cmd) ? 0x20u : 0u), lsa, (uint32_t)ea, size);
+    }
     return 0;
 }
 
