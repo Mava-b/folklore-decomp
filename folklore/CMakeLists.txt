@@ -90,9 +90,11 @@ if(WIN32)
         "${IMGUI_DIR}/backends/imgui_impl_dx12.cpp")
 endif()
 
-# Optional: Sony's real libsre (SPURS), lifted from the USER'S OWN decrypted
-# firmware by tools/lift_firmware.sh into firmware_lle/. Never shipped; the port
-# builds and runs with HLE cellSpurs when the folder is absent.
+# Optional, for comparison runs only (run.ps1 -Libsre): Sony's real libsre
+# (SPURS), lifted from the USER'S OWN decrypted firmware by
+# tools/lift_firmware.sh into firmware_lle/ (setup.ps1 -LibsrePrx). Never
+# shipped. The game runs on the port's own SPURS (src/hle/spurs_native*,
+# docs/SPURS.md) either way.
 set(FIRMWARE_LLE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/firmware_lle")
 set(LIBSRE_SOURCES)
 if(EXISTS "${FIRMWARE_LLE_DIR}/libsre_recomp.cpp" AND EXISTS "${FIRMWARE_LLE_DIR}/libsre_exports.c")
@@ -106,9 +108,9 @@ if(EXISTS "${FIRMWARE_LLE_DIR}/libsre_recomp.cpp" AND EXISTS "${FIRMWARE_LLE_DIR
     # Lifted module code is C++ like the title's own; the export table too, so
     # its extern "C" block links against libsre_load.cpp.
     set_source_files_properties("${FIRMWARE_LLE_DIR}/libsre_exports.c" PROPERTIES LANGUAGE CXX)
-    message(STATUS "Real libsre (firmware LLE): enabled")
+    message(STATUS "SPURS: the port's own, plus Sony's libsre from firmware_lle for run.ps1 -Libsre")
 else()
-    message(STATUS "Real libsre (firmware LLE): not present -- HLE cellSpurs")
+    message(STATUS "SPURS: the port's own (src/hle/spurs_native*); no firmware_lle")
 endif()
 # The game's jobs lifted where the job manager loads them
 # (tools/relift_lle_jobs.sh). Both SPURS implementations run them: Sony's
