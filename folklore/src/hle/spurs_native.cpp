@@ -54,6 +54,7 @@ namespace
     constexpr uint64_t kCellOk = 0;
     constexpr uint32_t kSpursJobErrorNullPointer = 0x80410A11u;   /* CELL_SPURS_JOB_ERROR_NULL_POINTER */
     constexpr uint32_t kSpursJobErrorStat = 0x80410A0Fu;          /* CELL_SPURS_JOB_ERROR_STAT */
+    constexpr uint8_t kFirstDynamicPort = 0x11;
 
     uint32_t readGuest32(uint32_t address)
     {
@@ -128,6 +129,14 @@ namespace
     bool passGuard(JobChain* chain, uint32_t guardEa)
     {
         std::unique_lock<std::mutex> hold(chain->lock);
+        if (readGuest32(guardEa + kGuardCount) != 0)
+        {
+            /* The real manager places the next job as though nothing came
+             * before it once the chain has had to wait (traces: the first job
+             * of a pass almost always gets its working memory right after its
+             * own binary). */
+            folklore_job_runner_idle(chain->runner);
+        }
         while (!chain->shutdownRequested && readGuest32(guardEa + kGuardCount) != 0)
         {
             chain->wake.wait_for(hold, std::chrono::milliseconds(50));
@@ -231,11 +240,27 @@ namespace
     /* cellSpursAttachLv2EventQueue(spurs, queue, port*, isDynamic) */
     void hleAttachLv2EventQueue(ppu_context* context)
     {
-        const int32_t result = cellSpursAttachLv2EventQueue(
-            reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<uint32_t>(context->gpr[3]))),
-            static_cast<uint32_t>(context->gpr[4]),
-            reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(static_cast<uint32_t>(context->gpr[5]))),
-            static_cast<int32_t>(context->gpr[6]));
+        void* spurs = reinterpret_cast<void*>(static_cast<uintptr_t>(static_cast<uint32_t>(context->gpr[3])));
+        const uint32_t queue = static_cast<uint32_t>(context->gpr[4]);
+        const uint32_t portEa = static_cast<uint32_t>(context->gpr[5]);
+        uint8_t* port = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(portEa));
+        const int32_t isDynamic = static_cast<int32_t>(context->gpr[6]);
+        if (isDynamic && portEa)
+        {
+            /* libsre handed out 0x11 for Folklore's dynamic attach in every
+             * trace; ask for that one, so the jobs' events use the same port
+             * as under libsre (and the traces compare). Any free one if it is
+             * taken. */
+            const uint8_t previous = vm_base[portEa];
+            vm_base[portEa] = kFirstDynamicPort;
+            if (cellSpursAttachLv2EventQueue(spurs, queue, port, 0) == 0)
+            {
+                returnValue(context, kCellOk);
+                return;
+            }
+            vm_base[portEa] = previous;
+        }
+        const int32_t result = cellSpursAttachLv2EventQueue(spurs, queue, port, isDynamic);
         returnValue(context, static_cast<uint32_t>(result));
     }
 

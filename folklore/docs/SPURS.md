@@ -236,10 +236,21 @@ libsre one (`-Libsre -TraceSpurs`), so the two compare.
   No other lists, binaries or placements appear. The job setups were
   identical in two separate sessions. One placement detail was confirmed
   this way: a job's working memory starts above the *previous* job's binary
-  when it fits (the 0x1AC00 case for the fifth job).
-- A shape trace of a native run, to compare with the libsre traces job by
-  job. The first native run had no trace: the recorder only started from the
-  libsre call path. That is fixed now.
+  when it fits and the chain has not waited at its guard in between (the
+  0x1AC00 case for the fifth job).
+- Nothing. A native run of Keats' chapter 1 (2026-10-21, shape trace)
+  matches the libsre one of the same chapter. All 19 kinds of job entry are
+  identical: binary, placement, `r1`, context, descriptor header and stack
+  frame. So are the boot runs and the job counts per kind, in proportion.
+  Two differences were found and fixed afterwards:
+  - **The event port.** The native run had 0x10, the runtime's first free
+    dynamic port; libsre gives 0x11. The native attach now asks for 0x11.
+  - **A placement case.** In the two-job load chain, the native runner put
+    the first job's working memory above the second job's binary on every
+    pass. libsre did that only once. The rule was refined: after the chain
+    has waited at its guard, the previous binary no longer counts
+    (`folklore_job_runner_idle`). Jobs do not depend on where their
+    working memory is, so this was cosmetic, but now the traces agree.
 
 ## Recording
 

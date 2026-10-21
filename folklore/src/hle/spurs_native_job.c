@@ -15,7 +15,8 @@
  *   - above the binary comes the job's working memory (the descriptor's u16
  *     at +0x1E, in 16-byte units, rounded up to 1 KB), then a 16 KB stack.
  *     The working memory starts above the previous job's binary when that
- *     still fits below 0x3F000, otherwise right after this job's own binary;
+ *     still fits below 0x3F000 and the chain has not waited in between,
+ *     otherwise right after this job's own binary;
  *   - the job context at LS 0x48F0 is zero but for +0x70 (working memory)
  *     and +0x78 (the descriptor's EA); nothing else in LS is cleared;
  *   - the job is called at its first instruction with r3 = context,
@@ -137,6 +138,11 @@ void folklore_job_runner_reset(folklore_job_runner* runner)
     runner->nextBinaryBase = JOB_FIRST_BINARY_LS;
     runner->previousBinaryEnd = 0;
     runner->descriptorBuffer = 0;
+}
+
+void folklore_job_runner_idle(folklore_job_runner* runner)
+{
+    runner->previousBinaryEnd = 0;
 }
 
 uint64_t folklore_job_runner_count(const folklore_job_runner* runner)

@@ -857,6 +857,15 @@ What 0006 fixes in ps3recomp to make that run:
     - README's requirements are down to the disc and the decrypted EBOOT.
     The native handlers also go through SPURS_GOLDEN_TRACE now, so
     -TraceSpurs records a native run in the same form as a libsre one.
+63. Native SPURS checked against libsre, job by job. Keats' chapter 1 was
+    traced on the native SPURS and compared with the earlier libsre trace of
+    the same chapter. All 19 kinds of job entry match: binary, LS
+    placement, r1, context, descriptor and stack frame. Two cosmetic
+    differences were fixed:
+    - the dynamic event port is now 0x11, as libsre's;
+    - the two-job load chain no longer puts its first job's working memory
+      above the previous job's binary after a wait at the guard, which
+      libsre only did once.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
