@@ -6,11 +6,17 @@
 #                                                   saved in folklore_settings.ini; with
 #                                                   none saved, folklore.exe asks once.
 #   ... run.ps1 -Verbose                            extra runtime logging
-#   ... run.ps1 -NoLibsre                           HLE cellSpurs instead of the
-#                                                   real libsre (A/B comparison)
+#   ... run.ps1 -Libsre                             Sony's libsre instead of the port's own
+#                                                   SPURS, to compare (needs it lifted:
+#                                                   setup.ps1 -LibsrePrx <file>)
 #   ... run.ps1 -Profile                            record where the CPU time goes
 #                                                   (a report every 10 s in the log)
 #   ... run.ps1 -BlockingWaitFlip                   old frame pacing (A/B comparison)
+#   ... run.ps1 -TraceSpurs                         record what SPURS does (add -Libsre for
+#                                                   Sony's) to logs\spurs-<date-time>.trace (each new
+#                                                   kind of event once, then counts; a few
+#                                                   MB an hour). SPURS_GOLDEN_TRACE_MODE=full
+#                                                   records every event (GBs in minutes).
 #
 # In game: L3 + R3 together (or F1) opens the engine menu -- frame-rate cap,
 # frame limiter precision, performance overlay. Settings are kept in
@@ -34,7 +40,11 @@ param(
     # Wipe the port's own hdd0/hdd1 (install data, cache, saves) first, so the
     # game re-runs its first-boot install. Only touches this folder.
     [switch]$ResetInstall,
-    # Use the runtime's HLE cellSpurs even when firmware_lle\ was built in.
+    # Run the SPU jobs on Sony's libsre (folklore\firmware_lle, lifted from
+    # your firmware by setup.ps1 -LibsrePrx) instead of the port's own SPURS.
+    [switch]$Libsre,
+    # Old switches: the port's own SPURS is now the default.
+    [switch]$NativeSpurs,
     [switch]$NoLibsre,
     # Run every lifted SPURS job through the SPU interpreter instead (slower):
     # tells a fault in the lifted job code apart from anything else.
@@ -45,6 +55,10 @@ param(
     # Make cellGcmSetWaitFlip block the game thread until the next vblank, as
     # the runtime used to (the hardware call does not block).
     [switch]$BlockingWaitFlip,
+    # SPURS_GOLDEN_TRACE: record every libsre call, SPU DMA, lock-line
+    # atomic and job entry/exit to logs\spurs-<date-time>.trace, the reference
+    # for replacing libsre (ps3recomp runtime/spu/spurs_trace.c).
+    [switch]$TraceSpurs,
     # Render capture is always armed; this only prints a reminder.
     [switch]$Capture,
     [switch]$Verbose
@@ -168,13 +182,19 @@ $env:PS3_WATCHDOG_DUMP = '0x10A60C00:0x1000'
 # hardware does (patches/0012) -- the game holds the GPU there until SPU jobs
 # have finished writing what it draws. Bounded, and logged as [gcm-sema].
 $env:GCM_SEMA_ACQUIRE = '1'
-if ($NoLibsre)
+Remove-Item Env:PS3_NO_LIBSRE -ErrorAction SilentlyContinue
+if ($Libsre)
 {
-    $env:PS3_NO_LIBSRE = '1'
+    if (-not (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp')))
+    {
+        throw '-Libsre: this build has no libsre -- lift it with setup.ps1 -LibsrePrx <your decrypted libsre.prx>, then build.ps1'
+    }
+    $env:FOLKLORE_SPURS = 'libsre'
+    Write-Host "SPURS: Sony's libsre (-Libsre)." -ForegroundColor Yellow
 }
 else
 {
-    Remove-Item Env:PS3_NO_LIBSRE -ErrorAction SilentlyContinue
+    $env:FOLKLORE_SPURS = 'native'
 }
 if ($InterpJobs)
 {
@@ -250,6 +270,16 @@ $env:LD_HLSL_DUMP = $hlslDir
 # shaders an extra time. Set LD_PROBE_PSO here to follow a broken effect.
 Remove-Item Env:LD_PROBE_PSO -ErrorAction SilentlyContinue
 Remove-Item Env:LD_PROBE_AB -ErrorAction SilentlyContinue
+$spursTrace = Join-Path $LogDir "spurs-$stamp.trace"
+if ($TraceSpurs)
+{
+    $env:SPURS_GOLDEN_TRACE = $spursTrace
+    Write-Host "Recording SPURS to $spursTrace" -ForegroundColor Yellow
+}
+else
+{
+    Remove-Item Env:SPURS_GOLDEN_TRACE -ErrorAction SilentlyContinue
+}
 if ($Capture)
 {
     Write-Host "Render capture armed -- press F2 (or the PS button on a DualShock 3), or double-click capture.bat, while the screen looks wrong." -ForegroundColor Yellow

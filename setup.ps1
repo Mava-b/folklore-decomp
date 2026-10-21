@@ -7,27 +7,33 @@
 # for the game's MPEG-2 cutscenes) and -- only if you have no Visual Studio
 # with clang-cl already -- Visual Studio 2022 Build Tools. Then prepares
 # ps3recomp (the included copy, or a clone with patches\ applied), lifts the
-# game's code and libsre from your own files, and builds the runtime library.
+# game's code from your own dump, and builds the runtime library.
 #
 # Safe to re-run: every step skips itself when its result already exists.
 #
-# From a build kit (package.ps1 -Kind BuildKit) neither the game's code nor
-# Sony's SPURS library is included: setup lifts them from your own dump and
-# your own firmware file. It asks for both at the start (a folder picker and
-# a file picker), or take them on the command line:
-#     setup.ps1 -GameDir D:\Games\BCUS98147 -LibsrePrx D:\Firmware\libsre.prx
+# From a build kit (package.ps1 -Kind BuildKit) the game's code is not
+# included: setup lifts it from your own dump. It asks for the dump folder at
+# the start (a folder picker), or take it on the command line:
+#     setup.ps1 -GameDir D:\Games\BCUS98147
+#
+# Folklore's SPU work runs on the port's own SPURS (folklore/docs/SPURS.md);
+# no firmware file is needed. For comparing against Sony's library, setup can
+# still lift your own decrypted libsre.prx into folklore\firmware_lle:
+#     setup.ps1 -LibsrePrx D:\Firmware\libsre.prx     (or -WithLibsre for a file picker)
+# and run.ps1 -Libsre then uses it.
 
 param(
     # Your Folklore dump: the folder that contains PS3_GAME, with
     # PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf (RPCS3: Utilities >
     # Decrypt PS3 Binaries). Only needed when folklore\src\recomp is empty.
     [string]$GameDir = '',
-    # Your decrypted libsre.prx: dev_flash\sys\external\libsre.sprx from
-    # RPCS3's firmware install, decrypted the same way. Only needed when
-    # folklore\firmware_lle is missing. A dev_flash folder works too.
+    # Optional, for comparison runs (run.ps1 -Libsre): your decrypted
+    # libsre.prx -- dev_flash\sys\external\libsre.sprx from RPCS3's firmware
+    # install, decrypted the same way. A dev_flash folder works too.
     [string]$LibsrePrx = '',
-    # Build without the real libsre (the HLE stand-in, which crashes in the
-    # sound thread): for testing only.
+    # The same, chosen with a file picker.
+    [switch]$WithLibsre,
+    # Accepted for old command lines; libsre is not lifted unless asked for.
     [switch]$SkipLibsre
 )
 
@@ -169,7 +175,7 @@ function Set-SavedSetting([string]$key, [string]$value)
 
 $needGameCode = $null -eq (Get-ChildItem -Path (Join-Path $PortDir 'src\recomp') -Filter '*.cpp' -ErrorAction SilentlyContinue |
                            Select-Object -First 1)
-$needLibsre = (-not $SkipLibsre) -and -not (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp'))
+$needLibsre = ($LibsrePrx -or $WithLibsre) -and -not (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp'))
 $sourceEboot = ''
 if ($needGameCode)
 {
@@ -205,9 +211,8 @@ if ($needGameCode)
 $libsreFile = ''
 if ($needLibsre)
 {
-    Write-Step 'Your PS3 firmware''s libsre'
-    Write-Host '    Folklore needs Sony''s SPURS library (libsre); this build kit does not include it. Needed:'
-    Write-Host '    your decrypted libsre.prx -- dev_flash\sys\external\libsre.sprx from RPCS3''s firmware'
+    Write-Step 'Your PS3 firmware''s libsre (optional, for run.ps1 -Libsre)'
+    Write-Host '    Your decrypted libsre.prx -- dev_flash\sys\external\libsre.sprx from RPCS3''s firmware'
     Write-Host '    install, decrypted with RPCS3 (Utilities > Decrypt PS3 Binaries).'
     while (-not $libsreFile)
     {
@@ -465,7 +470,7 @@ if (-not $haveRecomp)
     }
 }
 
-# ---- Sony's SPURS library, lifted from your own firmware --------------------
+# ---- Optional: Sony's SPURS library, lifted from your own firmware ----------
 $firmwareLle = Join-Path $PortDir 'firmware_lle'
 if (-not (Test-Path (Join-Path $firmwareLle 'libsre_recomp.cpp')))
 {
@@ -489,11 +494,6 @@ if (-not (Test-Path (Join-Path $firmwareLle 'libsre_recomp.cpp')))
         {
             throw 'Lifting libsre failed -- see logs\setup-firmware-lift.log'
         }
-    }
-    else
-    {
-        Write-Host '    -SkipLibsre: no folklore\firmware_lle, so the game uses the HLE SPURS stand-in, which' -ForegroundColor Yellow
-        Write-Host '    crashes in the sound thread. Run setup.ps1 again without it to lift the real one.' -ForegroundColor Yellow
     }
 }
 

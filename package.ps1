@@ -11,11 +11,11 @@
 #
 # What each one contains, and why it matters:
 #
-#   Binaries: folklore.exe, the FFmpeg and Visual C++ runtime DLLs it loads,
-#   and libsre_image.bin when the build uses the real SPURS library. The exe
-#   IS Folklore's own code, translated to C++ and compiled, and (with
-#   firmware_lle) Sony's libsre lifted from your firmware. Giving it to
-#   someone is distributing that code; they still need their own dump to play.
+#   Binaries: folklore.exe and the FFmpeg and Visual C++ runtime DLLs it
+#   loads. The exe IS Folklore's own code, translated to C++ and compiled
+#   (and, in a build that has folklore\firmware_lle, Sony's libsre lifted
+#   from your firmware for comparison runs). Giving it to someone is
+#   distributing that code; they still need their own dump to play.
 #
 #   BuildKit: the scripts, patches, engine code and tools -- none of the
 #   game's code (src\recomp, src\spu_gen, src\spu_gen_lle) and none of the
@@ -146,13 +146,15 @@ if ($Kind -eq 'Binaries')
         Write-Host '    not found -- the other PC needs the Visual C++ 2015-2022 x64 redistributable' -ForegroundColor Yellow
     }
 
-    # The real SPURS library (only in builds made with firmware_lle). Without
-    # it the game falls back to the HLE stand-in, which is not playable.
-    $libsreImage = Join-Path $PortDir 'firmware_lle\libsre_image.bin'
+    # The game runs on the port's own SPURS. Sony's libsre (firmware_lle,
+    # only there after setup.ps1 -LibsrePrx) is for comparison runs and is
+    # not packaged -- but a build that has it compiled it into the exe.
     if (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp'))
     {
-        Write-Step 'libsre_image.bin (from your firmware)'
-        Copy-Item $libsreImage $package
+        Write-Host ''
+        Write-Host 'This build has folklore\firmware_lle, so folklore.exe also contains Sony''s libsre lifted' -ForegroundColor Yellow
+        Write-Host 'from your firmware. For a package without it: delete folklore\firmware_lle, run build.ps1,' -ForegroundColor Yellow
+        Write-Host 'then package.ps1 again.' -ForegroundColor Yellow
     }
 
     $readme = @"
@@ -185,9 +187,9 @@ If something goes wrong, send the newest file in logs\.
     Set-Content -Path (Join-Path $package 'README.txt') -Value $readme -Encoding UTF8
 
     Write-Host ''
-    Write-Host 'Note: folklore.exe contains the game''s own code, translated and compiled (and, with' -ForegroundColor Yellow
-    Write-Host 'firmware_lle, Sony''s libsre). Sharing it distributes that code. package.ps1 -Kind BuildKit' -ForegroundColor Yellow
-    Write-Host 'makes a kit without it that rebuilds the same game from the other person''s own dump.' -ForegroundColor Yellow
+    Write-Host 'Note: folklore.exe contains the game''s own code, translated and compiled. Sharing it' -ForegroundColor Yellow
+    Write-Host 'distributes that code. package.ps1 -Kind BuildKit makes a kit without it that rebuilds the' -ForegroundColor Yellow
+    Write-Host 'same game from the other person''s own dump.' -ForegroundColor Yellow
     Complete-Package $package
 }
 else
@@ -201,7 +203,7 @@ else
 
     Write-Step 'Scripts and patches'
     foreach ($file in @('setup.ps1', 'build.ps1', 'run.ps1', 'common.ps1', 'package.ps1',
-                        'capture.bat', 'capture.ps1', 'README.md'))
+                        'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'README.md', 'LICENSE'))
     {
         $source = Join-Path $Root $file
         if (Test-Path $source)
@@ -231,12 +233,10 @@ else
     $readme = @"
 Folklore (PS3) recompilation -- build kit, $(Get-Date -Format 'yyyy-MM-dd')
 
-This kit has no game code and no firmware in it. You need:
-  - your own Folklore dump: North American disc BCUS98147, v1.00 (a folder that
-    contains PS3_GAME), with PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf
-    (RPCS3: Utilities > Decrypt PS3 Binaries);
-  - your own decrypted libsre.prx: dev_flash\sys\external\libsre.sprx from
-    RPCS3's firmware install, decrypted the same way.
+This kit has no game code and no firmware in it. You need your own Folklore
+dump: North American disc BCUS98147, v1.00 (a folder that contains PS3_GAME),
+with PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf (RPCS3: Utilities >
+Decrypt PS3 Binaries). No PS3 firmware is needed.
 
 Unzip somewhere with ~30 GB free (tools, build, installed game data), then in
 PowerShell from that folder:
@@ -245,14 +245,12 @@ PowerShell from that folder:
   powershell -ExecutionPolicy Bypass -File .\build.ps1
   powershell -ExecutionPolicy Bypass -File .\run.ps1
 
-setup.ps1 first asks for your dump folder and your decrypted libsre.prx (a
-folder picker and a file picker; it checks both and asks again if one is
-wrong), or take them on the command line: -GameDir <dump> -LibsrePrx <file>.
+setup.ps1 first asks for your dump folder (a folder picker; it checks it and
+asks again if it is wrong), or take it on the command line: -GameDir <dump>.
 Then it downloads the tools (Git, CMake, Ninja, Python, FFmpeg and, if you
 have no Visual Studio with clang-cl, the VS 2022 Build Tools), sets up
-ps3recomp with this project's patches, then lifts the game's code from your
-EBOOT and the SPURS library from your libsre.prx. The first build takes 10-30
-minutes. After that, folklore\build\folklore.exe also runs on its own, and
+ps3recomp with this project's patches, and lifts the game's code from your
+EBOOT. The first build takes 10-30 minutes. After that, folklore\build\folklore.exe also runs on its own, and
 package.ps1 makes a self-contained copy of it.
 
 README.md has the details.

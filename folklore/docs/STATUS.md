@@ -790,8 +790,84 @@ What 0006 fixes in ps3recomp to make that run:
     with MMCSS "Pro Audio". The log gets a [cellAudio] line every 10 s when
     the device ran dry, the game was late with blocks, or the limiter acted,
     which tells the remaining causes apart.
+58. Replacing libsre, step 1: a golden trace of the real one. Folklore
+    needs Sony's libsre (lifted from the user's firmware) for its SPU work,
+    which is the one thing the repository cannot ship. It uses only ten
+    cellSpurs calls (Initialize/Finalize, Attach/DetachLv2EventQueue, the
+    job-chain Create/Kick/Shutdown/Join, JobGuardInitialize/Notify) and nine
+    job binaries from its own EBOOT, so a native job-chain runner can stand in
+    for libsre. patches/0048 (runtime/spu/spurs_trace.c) records what the real
+    one does, as the reference to write and check that runner against:
+    SPURS_GOLDEN_TRACE=<file> (run.ps1 -TraceSpurs) logs every libsre call
+    with its registers and the 512 bytes behind each pointer argument before
+    and after; every SPU GET/PUT and lock-line atomic with who issued it (the
+    SPURS kernel, the job-chain policy module, or a job), its address, size,
+    a content hash and the bytes the first time each (address, size, content)
+    appears; and every job entry and exit with the job context and descriptor
+    in LS. Polling loops fold into REPEAT lines. Off, each hook is one load
+    and a branch.
+59. Replacing libsre, step 2: what the trace says. folklore/docs/SPURS.md
+    has the details. Folklore uses one SPU and, after 13 short-lived boot
+    chains in the first 1.2 s, a single job chain for the whole session: a
+    guard, then seven jobs (five binaries) with SYNCs between them, then a
+    jump back. The game releases one pass with cellSpursJobGuardNotify, about
+    190 times a second (~1300 jobs/s). The jobs do all their own DMA; the
+    job manager only fetches the descriptor and the binary (packed in LS from
+    0x4C00 in order of first use, which is where the lifted placements come
+    from) and calls it with the context at 0x48F0 and the descriptor in r4.
+    libsre also serves the game's cellSyncMutex calls. The full trace is far
+    too big for a session (17 MB/s, 4 GB in four minutes), so patches/0049
+    adds a shape mode, now the default: each kind of event is written once
+    in full and then counted once a second. That includes a job run with its
+    entry registers, context, descriptor, stack and LS map, and the manager's
+    and kernel's operations before it. It also records SPU mailbox sends. A
+    session's steady state comes to a few lines a second.
+60. Replacing libsre, step 3: the second trace (shape mode) gave the job
+    environment. Stack: 16 KB above a working-memory area sized by the
+    descriptor's u16 at +0x1E. Nothing is cleared. The jobs throw events to
+    queue 3 on port 0x11; the last job does it once a pass, which is likely
+    how the game learns a pass is done. All in folklore/docs/SPURS.md. It
+    still filled 1 GB in 2.5 minutes because libsre also serves the game's
+    cellSyncMutexLock/Unlock (~260/s), whose argument dumps were not folded.
+    patches/0050 folds every call except the job-chain setup ones into
+    counts, and caps the shape table so a mistake can no longer flood the
+    file.
+61. Replacing libsre, step 4: the port's own SPURS. A shape trace of
+    Keats' first chapter showed nothing new; the job setups were identical
+    across sessions. So src/hle/spurs_native.cpp and spurs_native_job.c now
+    answer Folklore's ten cellSpurs calls:
+    - a host thread per kicked chain walks the command list (GUARD / JOB /
+      SYNC / NEXT);
+    - each job is set up exactly as the traces show jm2 doing it, then the
+      lifted job runs;
+    - thrown events go through the runtime's SPURS port table.
+    run.ps1 -NativeSpurs selects it. Builds without firmware_lle get it
+    automatically, and src/spu_gen_lle (the jobs, lifted from the EBOOT) is
+    now compiled in every build. Untested in play as of this entry.
+62. The port now runs on its own SPURS by default, and needs no firmware.
+    The first native run (entry 61) played through Ellen's chapter 1 at 60
+    fps with no chain errors or dropped events. The main thread's time in
+    library calls went from 4.6 to 0.6 ms per frame, since the lifted libsre
+    PPU code no longer runs. So:
+    - setup.ps1 no longer asks for libsre.prx; -LibsrePrx / -WithLibsre
+      still lift it, for comparison;
+    - libsre_load.cpp loads Sony's library only with FOLKLORE_SPURS=libsre
+      (run.ps1 -Libsre);
+    - package.ps1 no longer copies libsre_image.bin;
+    - README's requirements are down to the disc and the decrypted EBOOT.
+    The native handlers also go through SPURS_GOLDEN_TRACE now, so
+    -TraceSpurs records a native run in the same form as a libsre one.
+63. Native SPURS checked against libsre, job by job. Keats' chapter 1 was
+    traced on the native SPURS and compared with the earlier libsre trace of
+    the same chapter. All 19 kinds of job entry match: binary, LS
+    placement, r1, context, descriptor and stack frame. Two cosmetic
+    differences were fixed:
+    - the dynamic event port is now 0x11, as libsre's;
+    - the two-job load chain no longer puts its first job's working memory
+      above the previous job's binary after a wait at the guard, which
+      libsre only did once.
 
-`run.ps1 -NoLibsre` goes back to HLE cellSpurs for comparison. Locally (stand-in
+`run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
 the logo movie open, which needs the real movie files.
 

@@ -14,7 +14,9 @@
  * builds (see docs/STATUS.md, patches/0005); the real library removes the
  * guesswork for every job at once.
  *
- * PS3_NO_LIBSRE=1 skips loading, falling back to HLE cellSpurs for A/B runs.
+ * Loaded only with FOLKLORE_SPURS=libsre (run.ps1 -Libsre), for comparison:
+ * the game's cellSpurs calls otherwise go to the port's own SPURS
+ * (src/hle/spurs_native.cpp, folklore/docs/SPURS.md).
  */
 #include "prx_loader.h"
 
@@ -57,9 +59,13 @@ namespace
 
 extern "C" void ps3_load_prx_modules(void)
 {
-    if (std::getenv("PS3_NO_LIBSRE"))
+    /* The port's own SPURS is the default; Sony's library is loaded only when
+     * asked for, to compare against (run.ps1 -Libsre). */
+    const char* spursChoice = std::getenv("FOLKLORE_SPURS");
+    if (!spursChoice || std::strcmp(spursChoice, "libsre") != 0 || std::getenv("PS3_NO_LIBSRE"))
     {
-        std::fprintf(stderr, "[libsre] PS3_NO_LIBSRE set -- using HLE cellSpurs\n");
+        std::fprintf(stderr, "[libsre] not loaded -- the port's own SPURS runs the jobs "
+                             "(FOLKLORE_SPURS=libsre loads Sony's)\n");
         return;
     }
 
