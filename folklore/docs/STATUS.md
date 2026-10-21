@@ -822,6 +822,16 @@ What 0006 fixes in ps3recomp to make that run:
     entry registers, context, descriptor, stack and LS map, and the manager's
     and kernel's operations before it. It also records SPU mailbox sends. A
     session's steady state comes to a few lines a second.
+60. Replacing libsre, step 3: the second trace (shape mode) gave the job
+    environment. Stack: 16 KB above a working-memory area sized by the
+    descriptor's u16 at +0x1E. Nothing is cleared. The jobs throw events to
+    queue 3 on port 0x11; the last job does it once a pass, which is likely
+    how the game learns a pass is done. All in folklore/docs/SPURS.md. It
+    still filled 1 GB in 2.5 minutes because libsre also serves the game's
+    cellSyncMutexLock/Unlock (~260/s), whose argument dumps were not folded.
+    patches/0050 folds every call except the job-chain setup ones into
+    counts, and caps the shape table so a mistake can no longer flood the
+    file.
 
 `run.ps1 -NoLibsre` goes back to HLE cellSpurs for comparison. Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

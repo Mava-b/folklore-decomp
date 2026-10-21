@@ -1,0 +1,146 @@
+diff --git a/runtime/spu/spurs_trace.c b/runtime/spu/spurs_trace.c
+index 2c4d43d..34e9df5 100644
+--- a/runtime/spu/spurs_trace.c
++++ b/runtime/spu/spurs_trace.c
+@@ -432,9 +432,23 @@ static void traceShapeEvent(const char* prefix, uint64_t key, trace_line* body,
+     if (!shape)
+     {
+         shape = traceShapeFindLocked(key, 1);
++        if (!shape)
++        {
++            /* The table is full: say so once and drop the rest, rather than
++             * writing every event in full from here on. */
++            static int s_fullNoted = 0;
++            if (!s_fullNoted)
++            {
++                s_fullNoted = 1;
++                const char* note = "SHAPE_TABLE_FULL -- further new kinds of event are not recorded\n";
++                traceWriteLocked(note, strlen(note));
++            }
++            traceUnlock();
++            return;
++        }
+         char head[128];
+         const int headLength = snprintf(head, sizeof(head), "%.6f %s SHAPE id=%u ", traceSeconds(), prefix,
+-                                        shape ? shape->id : 0u);
++                                        shape->id);
+         traceWriteLocked(head, (size_t)headLength);
+         body->text[body->length++] = '\n';
+         traceWriteLocked(body->text, body->length);
+@@ -538,6 +552,9 @@ static const char* spursNidName(uint32_t nid)
+     case 0xA7C066DEu: return "cellSpursJoinJobChain";
+     case 0x68AAEBA9u: return "cellSpursJobGuardInitialize";
+     case 0xD5D0B256u: return "cellSpursJobGuardNotify";
++    case 0xA9072DEEu: return "cellSyncMutexInitialize";
++    case 0x1BB675C2u: return "cellSyncMutexLock";
++    case 0x91F2B7B0u: return "cellSyncMutexUnlock";
+     default:          return "?";
+     }
+ }
+@@ -562,25 +579,58 @@ static void traceArgumentMemory(const char* prefix, int phase, const uint64_t* g
+ 
+ #define TRACE_NID_GUARD_NOTIFY 0xD5D0B256u
+ 
+-/* Shape mode: a cellSpursJobGuardNotify (about 190 a second in Folklore) is
+- * one kind of event per (guard, guard contents, result), so the steady state
+- * folds into a count. */
+-static void traceGuardNotify(const char* prefix, const char* phase, uint32_t guard, uint32_t result)
++/* Shape mode writes these calls in full every time: they set the chain up or
++ * take it down, and happen a few dozen times a session. Every other call
++ * (cellSpursJobGuardNotify ~190/s, the cellSyncMutex calls libsre also
++ * serves ~260/s) is folded into counts. */
++static int traceCallIsRare(uint32_t nid)
++{
++    switch (nid)
++    {
++    case 0xACFC8DBCu:   /* Initialize */
++    case 0xCA4C4600u:   /* Finalize */
++    case 0xB9BC6207u:   /* AttachLv2EventQueue */
++    case 0x4E66D483u:   /* DetachLv2EventQueue */
++    case 0x60EB2DECu:   /* CreateJobChain */
++    case 0xBFEA60FAu:   /* KickJobChain */
++    case 0x738E40E6u:   /* ShutdownJobChain */
++    case 0xA7C066DEu:   /* JoinJobChain */
++    case 0x68AAEBA9u:   /* JobGuardInitialize */
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++static const char* spursNidName(uint32_t nid);
++
++/* One folded call: a kind per (call, caller, object) -- and for the guard,
++ * per guard contents too, which take only two values. The SHAPE line shows
++ * the first 32 bytes of the object (r3). */
++static void traceFoldedCall(const char* prefix, int isReturn, uint32_t nid, uint32_t lr, uint32_t object,
++                            uint32_t result)
+ {
+     trace_line line;
+     line.length = 0;
+-    lineAppend(&line, "%s cellSpursJobGuardNotify r3=%08X", phase, guard);
+-    if (phase[0] == 'R')
++    if (isReturn)
++    {
++        lineAppend(&line, "RET %s nid=%08X r3=%08X result=%08X", spursNidName(nid), nid, object, result);
++    }
++    else
+     {
+-        lineAppend(&line, " result=%08X", result);
++        lineAppend(&line, "CALL %s nid=%08X lr=%08X r3=%08X", spursNidName(nid), nid, lr, object);
+     }
+-    if (guard >= 0x10000u && guard < 0xD0000000u && mfc_ea_range_committed(guard, 32u))
++    uint64_t key = traceHash((const uint8_t*)line.text, (uint32_t)line.length);
++    if (object >= 0x10000u && object < 0xD0000000u && mfc_ea_range_committed(object, 32u))
+     {
+-        lineAppend(&line, " guard=");
+-        lineAppendHex(&line, vm_base + guard, 32u);
++        lineAppend(&line, " object=");
++        lineAppendHex(&line, vm_base + object, 32u);
++        if (nid == TRACE_NID_GUARD_NOTIFY)
++        {
++            key ^= traceHash(vm_base + object, 32u) * 0x9E3779B97F4A7C15ull;
++        }
+     }
+-    const uint64_t key = traceHash((const uint8_t*)line.text, (uint32_t)line.length) ^ 0x6775617264ull;
+-    traceShapeEvent(prefix, key, &line, 0, 0, 0, 0);
++    traceShapeEvent(prefix, key ^ 0x63616C6Cull, &line, 0, 0, 0, 0);
+ }
+ 
+ void spurs_trace_api_call(uint32_t nid, const uint64_t* gpr, uint32_t lr)
+@@ -591,9 +641,9 @@ void spurs_trace_api_call(uint32_t nid, const uint64_t* gpr, uint32_t lr)
+     }
+     char prefix[48];
+     snprintf(prefix, sizeof(prefix), "ppu%lu game", traceThreadId());
+-    if (s_shapeMode && nid == TRACE_NID_GUARD_NOTIFY)
++    if (s_shapeMode && !traceCallIsRare(nid))
+     {
+-        traceGuardNotify(prefix, "CALL", (uint32_t)gpr[3], 0);
++        traceFoldedCall(prefix, 0, nid, lr, (uint32_t)gpr[3], 0);
+         return;
+     }
+     trace_line line;
+@@ -615,9 +665,9 @@ void spurs_trace_api_return(uint32_t nid, const uint64_t* argumentGpr, uint32_t
+     }
+     char prefix[48];
+     snprintf(prefix, sizeof(prefix), "ppu%lu game", traceThreadId());
+-    if (s_shapeMode && nid == TRACE_NID_GUARD_NOTIFY)
++    if (s_shapeMode && !traceCallIsRare(nid))
+     {
+-        traceGuardNotify(prefix, "RET", (uint32_t)argumentGpr[3], result);
++        traceFoldedCall(prefix, 1, nid, 0, (uint32_t)argumentGpr[3], result);
+         return;
+     }
+     trace_line line;
+@@ -819,7 +869,10 @@ static void traceShapeJobEnter(spu_context* ctx, int codeImage)
+     key = key * 31u + stackAddress;
+     key = key * 31u + contextAddress;
+     key = key * 31u + jobAddress;
+-    key = key * 31u + traceHash(ctx->ls + (contextAddress & ~0x7Fu), 0x80u);
++    if (contextAddress + 0x80u <= SPU_LS_SIZE)
++    {
++        key = key * 31u + traceHash(ctx->ls + contextAddress, 0x80u);
++    }
+     key ^= 0x6A6F62ull;
+     lineAppend(line, " r5=%08X r6=%08X events=%X", ctx->gpr[5]._u32[0], ctx->gpr[6]._u32[0], ctx->event_mask);
+     lineAppend(line, " manager(%u ops):%s", record->managerOps, record->managerText.length ? record->managerText.text : " -");

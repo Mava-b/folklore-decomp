@@ -86,7 +86,8 @@ For each JOB command, the job manager:
    - `r3` = the job context at LS `0x48F0`;
    - `r4` = the descriptor in LS;
    - `r0` = the return address in the manager (`0x24B0`);
-   - `r1` = the job stack, kept at LS `0x4890`. The value is not traced yet.
+   - `r1` = the job stack (below);
+   - `r5` = `0xFFFFFFFF`; `r6` is left over from the manager.
 
 The job context is all zero except:
 
@@ -108,14 +109,39 @@ order a chain first uses them, each rounded up to 1 KB. In steady state:
 
 The boot chains run each of the nine binaries alone at `0x4C00` (images 50,
 51, 54, 55, 57, 59, 60, 62, 63), and job `10087000` at `0x12000` (image 52)
-in the two-job chain. The binary is fetched again for every run, presumably
-because a job's working memory past its binary can overwrite whatever is
-loaded above it.
+in the two-job chain. The binary is fetched again for every run, because a
+job's working memory past its binary can overwrite whatever is loaded above it.
+
+**A job's local store**, from its base upward:
+
+| Area | Size |
+|---|---|
+| binary | round-up(sizeBinary × 16, 1 KB); context +0x70 points past it |
+| working memory | round-up(descriptor u16 at +0x1E × 16, 1 KB) |
+| stack | 16 KB; `r1` = its top − 0x30 |
+
+At `r1` the manager leaves four words:
+
+- `r1 + 0x20` (the back chain);
+- `0x4020`;
+- (top − context +0x70) + 0x20;
+- `0x20`.
+
+Nothing is cleared: working memory and stack hold whatever was there before.
+For example:
+
+| Binary | Base | +0x70 | Working memory | Stack top | `r1` |
+|---|---|---|---|---|---|
+| `10079E00` | `04C00` | `12000` | 0x1FD2 → 0x20000 | `36000` | `35FD0` |
+| `10097B80` | `12000` | `18400` | 0xE8C → 0xEC00 | `2B000` | `2AFD0` |
+| `100A2800` | `18400` | `1AC00` | 0x600 → 0x6000 | `24C00` | `24BD0` |
+| `10094500` | `1AC00` | `1E400` | 0x814 → 0x8400 | `2A800` | `2A7D0` |
+| `10087000` | `1E400` | `27400` | 0x10A1 → 0x10C00 | `3C000` | `3BFD0` |
 
 **Descriptors.** These are CellSpursJob128. Header: eaBinary, sizeBinary,
-and nothing else non-zero up to +0x1C. The word at +0x1C is `0x0400xxxx`;
-the low half is per-binary (0 for the boot chains) and its meaning is not
-known yet. User data starts at +0x30:
+and nothing else non-zero up to +0x1C. At +0x1C: `0x04`, then at +0x1E the
+working-memory size in 16-byte units (0 in the boot chains). User data
+starts at +0x30:
 
 | Offset | Contents |
 |---|---|
@@ -132,10 +158,19 @@ there were only 35 distinct descriptors.
 
 - DMA and tag waits;
 - the decrementer;
-- one outbound mailbox / interrupt-mailbox site per binary, possibly an
-  error path (whether it is ever reached is open).
+- **events to the PPU**: `sys_spu_thread_throw_event`, i.e. channel 28 =
+  data1, then channel 30 = `0x51000000 | data0`. That is port 0x11, the
+  dynamic port `cellSpursAttachLv2EventQueue` gave queue 3.
+  - In steady state, job `10087000` (the last in the loop) throws data0 6,
+    data1 0 once a pass, about 188 a second. It is very likely how the game
+    learns that a pass is done.
+  - In boot, every binary throws data0 0 with a size-like data1.
+  - Job `10087000` at `0x12000` throws data0 1.
 
-They never call into the job manager. They return through `r0`.
+The manager itself writes channel 28 = 0 (with no interrupt) about once a
+pass, at LS `0x29B8`.
+
+The jobs never call into the job manager. They return through `r0`.
 
 ## What a replacement needs
 
@@ -145,9 +180,12 @@ They never call into the job manager. They return through `r0`.
    command list:
    - GUARD: wait for a notify, or exit on shutdown;
    - JOB: GET the descriptor, place and GET the binary, set up the context,
-     `r1` and `r0`, and run the lifted job;
+     `r1` (and the frame there) and `r0`, and run the lifted job;
    - SYNC: nothing to wait for on one SPU;
    - NEXT: jump.
+
+   The jobs' thrown events have to reach queue 3 as lv2 SPU-thread user
+   events on port 0x11.
 3. **Checks.** Fail loudly on anything outside this:
    - another opcode;
    - descriptor DMA lists;
@@ -158,13 +196,11 @@ The shape trace (below) is the reference to compare against.
 
 ## Still open
 
-These are answered by the next trace, which uses shape mode:
-
-- `r1` at job entry and the stack frame there;
-- whether the manager clears anything in LS before a job (the `lsmap` field);
-- whether any SPU ever sends an event or mailbox message (`SEND` lines);
-- whether later parts of the game use other chains, lists or binaries
-  (menus, cutscenes, the Netherworld realms).
+- Whether later parts of the game use other chains, lists or binaries
+  (menus, cutscenes, the Netherworld realms). The second trace (shape mode,
+  2026-10-21) answered the stack, LS and event questions above, but filled
+  its 1 GB in 2½ minutes: libsre also serves the game's cellSyncMutex calls,
+  and their memory dumps were not folded. patches/0050 folds them.
 
 ## Recording
 
