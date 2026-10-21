@@ -103,9 +103,6 @@ if(EXISTS "${FIRMWARE_LLE_DIR}/libsre_recomp.cpp" AND EXISTS "${FIRMWARE_LLE_DIR
     # SPU side: the SPURS kernel, system service and job-chain policy module.
     file(GLOB_RECURSE LIBSRE_SPU_SOURCES CONFIGURE_DEPENDS "${FIRMWARE_LLE_DIR}/spu/*.c")
     list(APPEND LIBSRE_SOURCES ${LIBSRE_SPU_SOURCES})
-    # The game's jobs lifted where the real jm2 loads them (tools/relift_lle_jobs.sh).
-    file(GLOB_RECURSE JOBS_LLE_SOURCES CONFIGURE_DEPENDS "src/spu_gen_lle/*.c")
-    list(APPEND LIBSRE_SOURCES ${JOBS_LLE_SOURCES})
     # Lifted module code is C++ like the title's own; the export table too, so
     # its extern "C" block links against libsre_load.cpp.
     set_source_files_properties("${FIRMWARE_LLE_DIR}/libsre_exports.c" PROPERTIES LANGUAGE CXX)
@@ -113,6 +110,12 @@ if(EXISTS "${FIRMWARE_LLE_DIR}/libsre_recomp.cpp" AND EXISTS "${FIRMWARE_LLE_DIR
 else()
     message(STATUS "Real libsre (firmware LLE): not present -- HLE cellSpurs")
 endif()
+# The game's jobs lifted where the job manager loads them
+# (tools/relift_lle_jobs.sh). Both SPURS implementations run them: Sony's
+# libsre above, and the port's own (src/hle/spurs_native*.c*), which is all a
+# build without firmware_lle has.
+file(GLOB_RECURSE JOBS_LLE_SOURCES CONFIGURE_DEPENDS "src/spu_gen_lle/*.c")
+list(APPEND SPU_SOURCES ${JOBS_LLE_SOURCES})
 if(NOT RECOMP_SOURCES)
     message(FATAL_ERROR "src/recomp/ is empty -- run tools/relift.sh first")
 endif()

@@ -6,8 +6,9 @@
 #                                                   saved in folklore_settings.ini; with
 #                                                   none saved, folklore.exe asks once.
 #   ... run.ps1 -Verbose                            extra runtime logging
-#   ... run.ps1 -NoLibsre                           HLE cellSpurs instead of the
-#                                                   real libsre (A/B comparison)
+#   ... run.ps1 -NativeSpurs                        the port's own SPURS instead of
+#                                                   Sony's libsre (folklore/docs/SPURS.md;
+#                                                   -NoLibsre is the same)
 #   ... run.ps1 -Profile                            record where the CPU time goes
 #                                                   (a report every 10 s in the log)
 #   ... run.ps1 -BlockingWaitFlip                   old frame pacing (A/B comparison)
@@ -39,7 +40,9 @@ param(
     # Wipe the port's own hdd0/hdd1 (install data, cache, saves) first, so the
     # game re-runs its first-boot install. Only touches this folder.
     [switch]$ResetInstall,
-    # Use the runtime's HLE cellSpurs even when firmware_lle\ was built in.
+    # Use the port's own SPURS (src/hle/spurs_native.cpp) even when
+    # firmware_lle\ (Sony's libsre) was built in. -NoLibsre is the old name.
+    [switch]$NativeSpurs,
     [switch]$NoLibsre,
     # Run every lifted SPURS job through the SPU interpreter instead (slower):
     # tells a fault in the lifted job code apart from anything else.
@@ -177,13 +180,15 @@ $env:PS3_WATCHDOG_DUMP = '0x10A60C00:0x1000'
 # hardware does (patches/0012) -- the game holds the GPU there until SPU jobs
 # have finished writing what it draws. Bounded, and logged as [gcm-sema].
 $env:GCM_SEMA_ACQUIRE = '1'
-if ($NoLibsre)
+Remove-Item Env:PS3_NO_LIBSRE -ErrorAction SilentlyContinue
+if ($NativeSpurs -or $NoLibsre)
 {
-    $env:PS3_NO_LIBSRE = '1'
+    $env:FOLKLORE_SPURS = 'native'
+    Write-Host "SPURS: the port's own (-NativeSpurs), not libsre." -ForegroundColor Yellow
 }
 else
 {
-    Remove-Item Env:PS3_NO_LIBSRE -ErrorAction SilentlyContinue
+    Remove-Item Env:FOLKLORE_SPURS -ErrorAction SilentlyContinue
 }
 if ($InterpJobs)
 {
@@ -262,10 +267,6 @@ Remove-Item Env:LD_PROBE_AB -ErrorAction SilentlyContinue
 $spursTrace = Join-Path $LogDir "spurs-$stamp.trace"
 if ($TraceSpurs)
 {
-    if ($NoLibsre)
-    {
-        throw '-TraceSpurs records the real libsre; leave out -NoLibsre'
-    }
     $env:SPURS_GOLDEN_TRACE = $spursTrace
     Write-Host "Recording SPURS to $spursTrace" -ForegroundColor Yellow
 }

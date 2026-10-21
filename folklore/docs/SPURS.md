@@ -194,13 +194,44 @@ The jobs never call into the job manager. They return through `r0`.
 
 The shape trace (below) is the reference to compare against.
 
+## The replacement
+
+`folklore/src/hle/spurs_native.cpp` (the PPU calls and the chain walker) and
+`spurs_native_job.c` (one job, set up as above) implement this. It is used:
+
+- with `run.ps1 -NativeSpurs` (`FOLKLORE_SPURS=native`), which stops libsre
+  loading;
+- in any build without `firmware_lle`.
+
+The details:
+
+- **Calls.** The ten cellSpurs calls are handled here.
+  `cellSpursAttachLv2EventQueue` and `cellSpursDetachLv2EventQueue` go
+  through to the runtime's own versions, which keep the SPURS port table
+  that thrown events are delivered through. The cellSyncMutex calls go to the
+  runtime's cellSync.
+- **Chains.** Each kicked chain is a host thread with its own SPU context,
+  walking the command list. Anything outside GUARD / JOB / SYNC / NEXT / END
+  stops the chain with a message.
+- **Jobs.** Descriptors and binaries are fetched through the MFC like the
+  real manager does. The overlay tracker gives each binary's range to the
+  lift for that placement, and the job is entered through
+  `spu_indirect_branch`. It returns to `SPU_JOB_RETURN_LS`.
+
+`run.ps1 -NativeSpurs -TraceSpurs` records the SPU side of a native run in
+the same shape format, to compare against a libsre one. The PPU calls are
+not traced in native mode.
+
 ## Still open
 
-- Whether later parts of the game use other chains, lists or binaries
-  (menus, cutscenes, the Netherworld realms). The second trace (shape mode,
-  2026-10-21) answered the stack, LS and event questions above, but filled
-  its 1 GB in 2½ minutes: libsre also serves the game's cellSyncMutex calls,
-  and their memory dumps were not folded. patches/0050 folds them.
+- Nothing from the traces. A shape trace of Keats' first chapter (six
+  minutes, 0.9 MB) shows the same set as Ellen's. Each area load tears the
+  chain down and builds it again: the two-job form, then the seven-job loop.
+  No other lists, binaries or placements appear. The job setups were
+  identical in two separate sessions. One placement detail was confirmed
+  this way: a job's working memory starts above the *previous* job's binary
+  when it fits (the 0x1AC00 case for the fifth job).
+- Whether the replacement behaves the same in play. That is the next test.
 
 ## Recording
 

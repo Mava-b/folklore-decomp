@@ -832,8 +832,20 @@ What 0006 fixes in ps3recomp to make that run:
     patches/0050 folds every call except the job-chain setup ones into
     counts, and caps the shape table so a mistake can no longer flood the
     file.
+61. Replacing libsre, step 4: the port's own SPURS. A shape trace of
+    Keats' first chapter showed nothing new; the job setups were identical
+    across sessions. So src/hle/spurs_native.cpp and spurs_native_job.c now
+    answer Folklore's ten cellSpurs calls:
+    - a host thread per kicked chain walks the command list (GUARD / JOB /
+      SYNC / NEXT);
+    - each job is set up exactly as the traces show jm2 doing it, then the
+      lifted job runs;
+    - thrown events go through the runtime's SPURS port table.
+    run.ps1 -NativeSpurs selects it. Builds without firmware_lle get it
+    automatically, and src/spu_gen_lle (the jobs, lifted from the EBOOT) is
+    now compiled in every build. Untested in play as of this entry.
 
-`run.ps1 -NoLibsre` goes back to HLE cellSpurs for comparison. Locally (stand-in
+`run.ps1 -NoLibsre` (now the same as -NativeSpurs, entry 61) went back to HLE cellSpurs for comparison. Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
 the logo movie open, which needs the real movie files.
 

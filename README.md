@@ -175,7 +175,7 @@ port 0. XInput mode has no motion data; without a DS3, use *Automatic* or
 .\run.ps1 -ResetInstall                   # wipe hdd0/hdd1 and redo the first-boot install
 .\run.ps1 -Verbose                        # very detailed logging (slow)
 .\run.ps1 -Profile                        # report where the CPU time goes (every 10 s)
-.\run.ps1 -NoLibsre                       # ps3recomp's own SPURS stand-in instead (crashes; testing)
+.\run.ps1 -NativeSpurs                    # the port's own SPURS instead of libsre (testing; folklore/docs/SPURS.md)
 .\run.ps1 -InterpJobs                     # SPU jobs in the interpreter (A/B, slower)
 .\run.ps1 -TraceSpurs                     # record what libsre does (logs\spurs-*.trace; folklore/docs/SPURS.md)
 .\build.ps1 -Clean                        # full rebuild
