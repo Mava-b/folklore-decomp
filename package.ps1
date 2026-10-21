@@ -120,6 +120,20 @@ if ($Kind -eq 'Binaries')
     {
         Copy-Item $licence.FullName (Join-Path $licenceFolder "ffmpeg-$($licence.Name)")
     }
+    # The MIT-licensed code compiled into the exe: this project, ps3recomp
+    # and Dear ImGui.
+    $mitLicences = @{
+        'folklore-decomp-LICENSE.txt' = (Join-Path $Root 'LICENSE')
+        'ps3recomp-LICENSE.txt'       = (Join-Path $Ps3RecompDir 'LICENSE')
+        'imgui-LICENSE.txt'           = (Join-Path $PortDir 'src\third_party\imgui\LICENSE.txt')
+    }
+    foreach ($entry in $mitLicences.GetEnumerator())
+    {
+        if (Test-Path $entry.Value)
+        {
+            Copy-Item $entry.Value (Join-Path $licenceFolder $entry.Key)
+        }
+    }
 
     # The Visual C++ runtime the exe was linked against, deployed beside it
     # (Microsoft allows this app-local copy), so nobody needs the
@@ -160,8 +174,18 @@ if ($Kind -eq 'Binaries')
     $readme = @"
 Folklore (PS3) -- PC port, built $(Get-Date -Format 'yyyy-MM-dd')
 
+Source: https://github.com/Mava-b/folklore-decomp
+
+What this is: folklore.exe is Folklore's own program code, statically translated
+from the PS3 executable to C++ and compiled for Windows, on top of the
+ps3recomp runtime and this project's own engine and SPURS code. It contains no
+game data (models, textures, sound, movies, text) and no Sony system software:
+everything the game shows and plays comes from your own disc dump, and it will
+not start without one. Not affiliated with or endorsed by Sony or Game
+Republic.
+
 You need your own copy of Folklore: the North American disc, BCUS98147, v1.00,
-dumped to a folder. That folder contains PS3_GAME.
+dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
 1. Decrypt the game's EBOOT once with RPCS3: Utilities > Decrypt PS3 Binaries,
    choose <your dump>\PS3_GAME\USRDIR\EBOOT.BIN. RPCS3 writes EBOOT.elf beside it.
@@ -182,7 +206,10 @@ In the game
 Optional: system fonts. Copy a dev_flash folder (RPCS3's, from its firmware
 install) here, or set dev_flash in folklore_settings.ini.
 
-If something goes wrong, send the newest file in logs\.
+If something goes wrong, open an issue at the source link above with the
+newest file in logs\.
+
+Licences of the code compiled into folklore.exe and of FFmpeg are in licences\.
 "@
     Set-Content -Path (Join-Path $package 'README.txt') -Value $readme -Encoding UTF8
 
