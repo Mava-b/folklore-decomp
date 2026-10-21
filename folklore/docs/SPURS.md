@@ -1,10 +1,11 @@
 # What Folklore asks of SPURS
 
-Folklore's SPU work runs on Sony's SPURS library (libsre). It is the one thing
-this project cannot ship, so setup asks every player for their own decrypted
-`libsre.prx`. This file collects what the game actually uses, from traces of
-the real library (`run.ps1 -TraceSpurs`, `ps3recomp/runtime/spu/spurs_trace.c`),
-as the specification for a replacement written here.
+On the PS3, Folklore's SPU work runs on Sony's SPURS library (libsre). Until
+October 2026 this port ran it the same way, which meant every player had to
+supply their own decrypted `libsre.prx`. This file collects what the game
+actually uses, from traces of the real library (`run.ps1 -TraceSpurs`,
+`ps3recomp/runtime/spu/spurs_trace.c`). It was the specification for the
+replacement that the port now runs on (see *The replacement*, below).
 
 Source: the first golden trace, 2026-10-21. It is a full-mode recording of
 boot through the first minutes of play, which hit its 4 GB limit after 242
@@ -197,11 +198,17 @@ The shape trace (below) is the reference to compare against.
 ## The replacement
 
 `folklore/src/hle/spurs_native.cpp` (the PPU calls and the chain walker) and
-`spurs_native_job.c` (one job, set up as above) implement this. It is used:
+`spurs_native_job.c` (one job, set up as above) implement this. It is what
+the game runs on.
 
-- with `run.ps1 -NativeSpurs` (`FOLKLORE_SPURS=native`), which stops libsre
-  loading;
-- in any build without `firmware_lle`.
+Sony's libsre can still be lifted from your own firmware for comparison
+(`setup.ps1 -LibsrePrx`). It is then used only with `run.ps1 -Libsre`
+(`FOLKLORE_SPURS=libsre`).
+
+First test: 2026-10-21, Ellen's chapter 1 played through. It held a steady
+60 fps (as with libsre), with no chain errors or dropped events in the log.
+The main thread's time in library calls fell from 4.6 ms to 0.6 ms per frame:
+the lifted libsre PPU code is gone.
 
 The details:
 
@@ -218,9 +225,8 @@ The details:
   lift for that placement, and the job is entered through
   `spu_indirect_branch`. It returns to `SPU_JOB_RETURN_LS`.
 
-`run.ps1 -NativeSpurs -TraceSpurs` records the SPU side of a native run in
-the same shape format, to compare against a libsre one. The PPU calls are
-not traced in native mode.
+`run.ps1 -TraceSpurs` records a native run in the same shape format as a
+libsre one (`-Libsre -TraceSpurs`), so the two compare.
 
 ## Still open
 
@@ -231,7 +237,9 @@ not traced in native mode.
   identical in two separate sessions. One placement detail was confirmed
   this way: a job's working memory starts above the *previous* job's binary
   when it fits (the 0x1AC00 case for the fifth job).
-- Whether the replacement behaves the same in play. That is the next test.
+- A shape trace of a native run, to compare with the libsre traces job by
+  job. The first native run had no trace: the recorder only started from the
+  libsre call path. That is fixed now.
 
 ## Recording
 

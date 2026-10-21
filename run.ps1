@@ -6,14 +6,14 @@
 #                                                   saved in folklore_settings.ini; with
 #                                                   none saved, folklore.exe asks once.
 #   ... run.ps1 -Verbose                            extra runtime logging
-#   ... run.ps1 -NativeSpurs                        the port's own SPURS instead of
-#                                                   Sony's libsre (folklore/docs/SPURS.md;
-#                                                   -NoLibsre is the same)
+#   ... run.ps1 -Libsre                             Sony's libsre instead of the port's own
+#                                                   SPURS, to compare (needs it lifted:
+#                                                   setup.ps1 -LibsrePrx <file>)
 #   ... run.ps1 -Profile                            record where the CPU time goes
 #                                                   (a report every 10 s in the log)
 #   ... run.ps1 -BlockingWaitFlip                   old frame pacing (A/B comparison)
-#   ... run.ps1 -TraceSpurs                         record what the real libsre does to
-#                                                   logs\spurs-<date-time>.trace (each new
+#   ... run.ps1 -TraceSpurs                         record what SPURS does (add -Libsre for
+#                                                   Sony's) to logs\spurs-<date-time>.trace (each new
 #                                                   kind of event once, then counts; a few
 #                                                   MB an hour). SPURS_GOLDEN_TRACE_MODE=full
 #                                                   records every event (GBs in minutes).
@@ -40,8 +40,10 @@ param(
     # Wipe the port's own hdd0/hdd1 (install data, cache, saves) first, so the
     # game re-runs its first-boot install. Only touches this folder.
     [switch]$ResetInstall,
-    # Use the port's own SPURS (src/hle/spurs_native.cpp) even when
-    # firmware_lle\ (Sony's libsre) was built in. -NoLibsre is the old name.
+    # Run the SPU jobs on Sony's libsre (folklore\firmware_lle, lifted from
+    # your firmware by setup.ps1 -LibsrePrx) instead of the port's own SPURS.
+    [switch]$Libsre,
+    # Old switches: the port's own SPURS is now the default.
     [switch]$NativeSpurs,
     [switch]$NoLibsre,
     # Run every lifted SPURS job through the SPU interpreter instead (slower):
@@ -181,14 +183,18 @@ $env:PS3_WATCHDOG_DUMP = '0x10A60C00:0x1000'
 # have finished writing what it draws. Bounded, and logged as [gcm-sema].
 $env:GCM_SEMA_ACQUIRE = '1'
 Remove-Item Env:PS3_NO_LIBSRE -ErrorAction SilentlyContinue
-if ($NativeSpurs -or $NoLibsre)
+if ($Libsre)
 {
-    $env:FOLKLORE_SPURS = 'native'
-    Write-Host "SPURS: the port's own (-NativeSpurs), not libsre." -ForegroundColor Yellow
+    if (-not (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp')))
+    {
+        throw '-Libsre: this build has no libsre -- lift it with setup.ps1 -LibsrePrx <your decrypted libsre.prx>, then build.ps1'
+    }
+    $env:FOLKLORE_SPURS = 'libsre'
+    Write-Host "SPURS: Sony's libsre (-Libsre)." -ForegroundColor Yellow
 }
 else
 {
-    Remove-Item Env:FOLKLORE_SPURS -ErrorAction SilentlyContinue
+    $env:FOLKLORE_SPURS = 'native'
 }
 if ($InterpJobs)
 {

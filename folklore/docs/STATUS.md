@@ -844,8 +844,21 @@ What 0006 fixes in ps3recomp to make that run:
     run.ps1 -NativeSpurs selects it. Builds without firmware_lle get it
     automatically, and src/spu_gen_lle (the jobs, lifted from the EBOOT) is
     now compiled in every build. Untested in play as of this entry.
+62. The port now runs on its own SPURS by default, and needs no firmware.
+    The first native run (entry 61) played through Ellen's chapter 1 at 60
+    fps with no chain errors or dropped events. The main thread's time in
+    library calls went from 4.6 to 0.6 ms per frame, since the lifted libsre
+    PPU code no longer runs. So:
+    - setup.ps1 no longer asks for libsre.prx; -LibsrePrx / -WithLibsre
+      still lift it, for comparison;
+    - libsre_load.cpp loads Sony's library only with FOLKLORE_SPURS=libsre
+      (run.ps1 -Libsre);
+    - package.ps1 no longer copies libsre_image.bin;
+    - README's requirements are down to the disc and the decrypted EBOOT.
+    The native handlers also go through SPURS_GOLDEN_TRACE now, so
+    -TraceSpurs records a native run in the same form as a libsre one.
 
-`run.ps1 -NoLibsre` (now the same as -NativeSpurs, entry 61) went back to HLE cellSpurs for comparison. Locally (stand-in
+`run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
 the logo movie open, which needs the real movie files.
 

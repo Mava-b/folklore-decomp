@@ -7,8 +7,9 @@ game's PowerPC and SPU code is translated to C++ and runs on a runtime that
 stands in for the PS3's OS, with Direct3D 12 for graphics.
 
 **This repository contains no game code and no Sony code.** You build the game
-yourself from **your own disc** and **your own PS3 firmware file**; setup does
-the translation on your PC.
+yourself from **your own disc**; setup does the translation on your PC. No PS3
+firmware is needed: the SPU job system the game runs on (SPURS) is
+reimplemented here ([`folklore/docs/SPURS.md`](folklore/docs/SPURS.md)).
 
 **Status:** playable on the author's PC (Windows 11, Ryzen 7 7800X3D): it boots,
 does the first-boot install, and plays, including capturing Folks with
@@ -24,8 +25,8 @@ sharpening, borderless fullscreen, save backups.
 
 ## Requirements — read this first
 
-You need **all three** of these. None of them are in this repository and none
-can be downloaded from it.
+You need **both** of these. Neither is in this repository and neither can be
+downloaded from it.
 
 ### 1. Your own Folklore disc, North American release, v1.00
 
@@ -44,17 +45,6 @@ The dumped `PS3_GAME\USRDIR\EBOOT.BIN` is encrypted. Decrypt it with
 `EBOOT.BIN`. RPCS3 writes **`EBOOT.elf`** beside it — leave it there.
 
 The decrypted file must be **6,518,936 bytes**; setup checks this.
-
-### 3. Your libsre.prx (Sony's SPURS library), decrypted
-
-Folklore runs its SPU work through Sony's SPURS library, which lives in the
-PS3 firmware, not in the game. You provide your own copy:
-
-1. Install the PS3 firmware into RPCS3 (**File → Install Firmware**, with the
-   official `PS3UPDAT.PUP` from PlayStation's website).
-2. In RPCS3's folder, find **`dev_flash\sys\external\libsre.sprx`**.
-3. Decrypt it the same way: **Utilities → Decrypt PS3 Binaries** →
-   `libsre.sprx`. That writes **`libsre.prx`** beside it.
 
 ### Also needed
 
@@ -82,18 +72,16 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 ```
 
 1. **setup.ps1** (15–30 minutes, once)
-   - **First it asks for your files**: a folder picker for your dump (the
-     folder that contains `PS3_GAME`), then a file picker for your decrypted
-     `libsre.prx`. Each is checked; if something is wrong (still encrypted,
-     wrong version, wrong file) it says what and asks again. You can also pass
-     them: `.\setup.ps1 -GameDir D:\Games\BCUS98147 -LibsrePrx D:\RPCS3\dev_flash\sys\external\libsre.prx`
+   - **First it asks for your dump**: a folder picker (choose the folder that
+     contains `PS3_GAME`). It is checked; if something is wrong (still
+     encrypted, wrong version) it says what and asks again. You can also pass
+     it: `.\setup.ps1 -GameDir D:\Games\BCUS98147`
    - Then it runs on its own: downloads Git, CMake, Ninja, Python and FFmpeg
      into `tools\`, and — only if you have no Visual Studio with clang-cl —
      Visual Studio 2022 Build Tools (about 6 GB, one UAC prompt; the Visual
      Studio Installer always goes on C:).
    - Translates the game's code from your `EBOOT.elf` into
-     `folklore\src\recomp\` (about a minute) and Sony's SPURS library from your
-     `libsre.prx` into `folklore\firmware_lle\`. Both stay on your PC.
+     `folklore\src\recomp\` (about a minute). It stays on your PC.
    - Builds the ps3recomp runtime library.
 2. **build.ps1** compiles about 1.5 million lines of translated C++: roughly
    10–30 minutes the first time on a modern 8-core CPU, incremental after
@@ -113,9 +101,8 @@ directly (see *Running folklore.exe on its own*).
   Studio Installer* → Modify → Individual components → tick *C++ Clang Compiler
   for Windows* and *MSBuild support for LLVM (clang-cl)*, then run setup.ps1
   again.
-- **"EBOOT.BIN is still encrypted" / "libsre.sprx is still encrypted"**:
-  decrypt it with RPCS3 as described above and choose the `.elf` / `.prx` it
-  writes.
+- **"EBOOT.BIN is still encrypted"**: decrypt it with RPCS3 as described
+  above.
 - **"not the BCUS98147 v1.00 EBOOT"**: your disc is another region or the
   EBOOT is from the 1.10 update. Only the North American v1.00 disc works.
 - setup and build are safe to re-run; each step skips what is already done.
@@ -175,9 +162,9 @@ port 0. XInput mode has no motion data; without a DS3, use *Automatic* or
 .\run.ps1 -ResetInstall                   # wipe hdd0/hdd1 and redo the first-boot install
 .\run.ps1 -Verbose                        # very detailed logging (slow)
 .\run.ps1 -Profile                        # report where the CPU time goes (every 10 s)
-.\run.ps1 -NativeSpurs                    # the port's own SPURS instead of libsre (testing; folklore/docs/SPURS.md)
+.\run.ps1 -Libsre                         # Sony's libsre instead of the port's SPURS, to compare (see below)
 .\run.ps1 -InterpJobs                     # SPU jobs in the interpreter (A/B, slower)
-.\run.ps1 -TraceSpurs                     # record what libsre does (logs\spurs-*.trace; folklore/docs/SPURS.md)
+.\run.ps1 -TraceSpurs                     # record what SPURS does (logs\spurs-*.trace; folklore/docs/SPURS.md)
 .\build.ps1 -Clean                        # full rebuild
 $env:AUDIO_LATENCY_MS = '48'; .\run.ps1   # more audio buffering if sound breaks up (default 32)
 ```
@@ -196,6 +183,22 @@ When something draws wrong, press **F2** (or the PS button on a DualShock 3)
 while it is on screen, or double-click `capture.bat`. The next four seconds of
 draws go to `logs\capture-<date-time>\`.
 
+### Comparing with Sony's libsre
+
+Until October 2026 the port ran the game's SPU jobs on Sony's own SPURS
+library, lifted from each player's firmware. That is still possible, for
+checking the port's version against it:
+
+1. Install the PS3 firmware into RPCS3 (**File → Install Firmware**).
+2. Decrypt `dev_flash\sys\external\libsre.sprx` with **Utilities → Decrypt PS3
+   Binaries**.
+3. Run `.\setup.ps1 -LibsrePrx <the libsre.prx it wrote>` (or
+   `-WithLibsre` for a file picker), then `build.ps1`.
+4. Run `.\run.ps1 -Libsre`.
+
+`-TraceSpurs` records either one, and the two recordings compare
+(`folklore/docs/SPURS.md`).
+
 ---
 
 ## Sharing what you built
@@ -207,9 +210,9 @@ draws go to `logs\capture-<date-time>\`.
 
 The build kit contains nothing from the game or the firmware — the same as
 this repository. The **binaries** package contains your `folklore.exe`, which
-*is* Folklore's code translated and compiled, plus Sony's libsre lifted from
-your firmware: giving that to someone else distributes their code. Point
-people at this repository instead.
+*is* Folklore's code translated and compiled (plus Sony's libsre, if you
+lifted it for comparison): giving that to someone else distributes that code.
+Point people at this repository instead.
 
 ---
 
@@ -222,7 +225,7 @@ people at this repository instead.
 | `common.ps1` | Paths and helpers the scripts share |
 | `folklore/` | The port: CMake project, Folklore-specific HLE, the engine menu and settings (`src/engine`), the lifting scripts (`tools/`) and the engineering log (`docs/STATUS.md`) |
 | `folklore/src/recomp/` | Empty here; setup fills it with the game's code translated from **your** EBOOT |
-| `folklore/firmware_lle/` | Not in the repository; setup creates it from **your** libsre.prx |
+| `folklore/firmware_lle/` | Not in the repository; only made by `setup.ps1 -LibsrePrx`, from **your** libsre.prx, for comparison runs |
 | `ps3recomp/` | The recompiler and runtime: [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp) at commit `39a3629`, with everything in `patches/` already applied |
 | `patches/` | The changes this port made to ps3recomp, one patch per fix, kept as a record (and so they can go upstream) |
 
@@ -241,4 +244,4 @@ lifted sources and `folklore_settings.ini`.
 - Folklore is © Sony Interactive Entertainment / Game Republic. This project
   is not affiliated with or endorsed by Sony or Game Republic, contains none
   of their code or data, and requires your own legally obtained copy of the
-  game and firmware.
+  game.

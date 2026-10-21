@@ -22,11 +22,11 @@
  * fills.
  *
  * These handlers are registered for every build, ahead of the runtime's
- * generic cellSpurs. The real libsre, when it is built in and loaded, still
- * takes precedence (ps3_hle_call asks the PRX export table first), so they
- * answer when there is no libsre: FOLKLORE_SPURS=native (run.ps1 -NativeSpurs)
- * or a build without firmware_lle. The game's cellSyncMutex calls, which
- * libsre also serves, go to the runtime's cellSync then.
+ * generic cellSpurs, and are what the game runs on. Sony's libsre, lifted
+ * from the player's own firmware, is loaded only for comparison
+ * (FOLKLORE_SPURS=libsre, run.ps1 -Libsre); it then takes precedence, since
+ * ps3_hle_call asks the PRX export table first. The game's cellSyncMutex
+ * calls, which libsre also serves, go to the runtime's cellSync otherwise.
  */
 #include "ppu_recomp.h"
 #include "spurs_native_job.h"
@@ -45,6 +45,9 @@ extern "C" uint8_t* vm_base;
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, void (*fn)(ppu_context*));
 extern "C" int32_t cellSpursAttachLv2EventQueue(void* spurs, uint32_t queue, uint8_t* port, int32_t isDynamic);
 extern "C" int32_t cellSpursDetachLv2EventQueue(void* spurs, uint8_t port);
+extern "C" int spurs_trace_init(void);
+extern "C" void spurs_trace_api_call(uint32_t nid, const uint64_t* gpr, uint32_t lr);
+extern "C" void spurs_trace_api_return(uint32_t nid, const uint64_t* argumentGpr, uint32_t result);
 
 namespace
 {
@@ -392,6 +395,23 @@ namespace
         returnValue(context, kCellOk);
     }
 
+    /* Each handler, recorded by SPURS_GOLDEN_TRACE (run.ps1 -TraceSpurs) the
+     * same way the real library's calls are, so the two traces compare. */
+    template <uint32_t Nid, void (*Handler)(ppu_context*)>
+    void traced(ppu_context* context)
+    {
+        if (!spurs_trace_init())
+        {
+            Handler(context);
+            return;
+        }
+        uint64_t arguments[11];
+        std::memcpy(arguments, context->gpr, sizeof(arguments));
+        spurs_trace_api_call(Nid, context->gpr, static_cast<uint32_t>(context->lr));
+        Handler(context);
+        spurs_trace_api_return(Nid, arguments, static_cast<uint32_t>(context->gpr[3]));
+    }
+
     struct HandlerEntry
     {
         uint32_t nid;
@@ -400,16 +420,16 @@ namespace
     };
 
     const HandlerEntry kHandlers[] = {
-        { 0xACFC8DBCu, "cellSpursInitialize",           hleInitialize },
-        { 0xCA4C4600u, "cellSpursFinalize",             hleFinalize },
-        { 0xB9BC6207u, "cellSpursAttachLv2EventQueue",  hleAttachLv2EventQueue },
-        { 0x4E66D483u, "cellSpursDetachLv2EventQueue",  hleDetachLv2EventQueue },
-        { 0x60EB2DECu, "cellSpursCreateJobChain",       hleCreateJobChain },
-        { 0xBFEA60FAu, "cellSpursKickJobChain",         hleKickJobChain },
-        { 0x738E40E6u, "cellSpursShutdownJobChain",     hleShutdownJobChain },
-        { 0xA7C066DEu, "cellSpursJoinJobChain",         hleJoinJobChain },
-        { 0x68AAEBA9u, "cellSpursJobGuardInitialize",   hleJobGuardInitialize },
-        { 0xD5D0B256u, "cellSpursJobGuardNotify",       hleJobGuardNotify },
+        { 0xACFC8DBCu, "cellSpursInitialize",          traced<0xACFC8DBCu, hleInitialize> },
+        { 0xCA4C4600u, "cellSpursFinalize",            traced<0xCA4C4600u, hleFinalize> },
+        { 0xB9BC6207u, "cellSpursAttachLv2EventQueue", traced<0xB9BC6207u, hleAttachLv2EventQueue> },
+        { 0x4E66D483u, "cellSpursDetachLv2EventQueue", traced<0x4E66D483u, hleDetachLv2EventQueue> },
+        { 0x60EB2DECu, "cellSpursCreateJobChain",      traced<0x60EB2DECu, hleCreateJobChain> },
+        { 0xBFEA60FAu, "cellSpursKickJobChain",        traced<0xBFEA60FAu, hleKickJobChain> },
+        { 0x738E40E6u, "cellSpursShutdownJobChain",    traced<0x738E40E6u, hleShutdownJobChain> },
+        { 0xA7C066DEu, "cellSpursJoinJobChain",        traced<0xA7C066DEu, hleJoinJobChain> },
+        { 0x68AAEBA9u, "cellSpursJobGuardInitialize",  traced<0x68AAEBA9u, hleJobGuardInitialize> },
+        { 0xD5D0B256u, "cellSpursJobGuardNotify",      traced<0xD5D0B256u, hleJobGuardNotify> },
     };
 
     struct Registrar
