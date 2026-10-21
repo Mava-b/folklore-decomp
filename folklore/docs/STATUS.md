@@ -806,6 +806,22 @@ What 0006 fixes in ps3recomp to make that run:
     appears; and every job entry and exit with the job context and descriptor
     in LS. Polling loops fold into REPEAT lines. Off, each hook is one load
     and a branch.
+59. Replacing libsre, step 2: what the trace says. folklore/docs/SPURS.md
+    has the details. Folklore uses one SPU and, after 13 short-lived boot
+    chains in the first 1.2 s, a single job chain for the whole session: a
+    guard, then seven jobs (five binaries) with SYNCs between them, then a
+    jump back. The game releases one pass with cellSpursJobGuardNotify, about
+    190 times a second (~1300 jobs/s). The jobs do all their own DMA; the
+    job manager only fetches the descriptor and the binary (packed in LS from
+    0x4C00 in order of first use, which is where the lifted placements come
+    from) and calls it with the context at 0x48F0 and the descriptor in r4.
+    libsre also serves the game's cellSyncMutex calls. The full trace is far
+    too big for a session (17 MB/s, 4 GB in four minutes), so patches/0049
+    adds a shape mode, now the default: each kind of event is written once
+    in full and then counted once a second. That includes a job run with its
+    entry registers, context, descriptor, stack and LS map, and the manager's
+    and kernel's operations before it. It also records SPU mailbox sends. A
+    session's steady state comes to a few lines a second.
 
 `run.ps1 -NoLibsre` goes back to HLE cellSpurs for comparison. Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

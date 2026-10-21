@@ -11,9 +11,11 @@
 #   ... run.ps1 -Profile                            record where the CPU time goes
 #                                                   (a report every 10 s in the log)
 #   ... run.ps1 -BlockingWaitFlip                   old frame pacing (A/B comparison)
-#   ... run.ps1 -TraceSpurs                         record everything the real libsre
-#                                                   does to logs\spurs-<date-time>.trace
-#                                                   (for writing our own; large, slower)
+#   ... run.ps1 -TraceSpurs                         record what the real libsre does to
+#                                                   logs\spurs-<date-time>.trace (each new
+#                                                   kind of event once, then counts; a few
+#                                                   MB an hour). SPURS_GOLDEN_TRACE_MODE=full
+#                                                   records every event (GBs in minutes).
 #
 # In game: L3 + R3 together (or F1) opens the engine menu -- frame-rate cap,
 # frame limiter precision, performance overlay. Settings are kept in
@@ -265,7 +267,7 @@ if ($TraceSpurs)
         throw '-TraceSpurs records the real libsre; leave out -NoLibsre'
     }
     $env:SPURS_GOLDEN_TRACE = $spursTrace
-    Write-Host "Recording SPURS to $spursTrace (the game runs a little slower while it does)." -ForegroundColor Yellow
+    Write-Host "Recording SPURS to $spursTrace" -ForegroundColor Yellow
 }
 else
 {

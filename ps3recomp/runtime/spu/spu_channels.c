@@ -843,6 +843,11 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
 
     switch (channel) {
     case SPU_WrOutMbox:
+        /* SPURS_GOLDEN_TRACE: an event or message from an SPU to the PPU. */
+        if (g_spurs_trace_on)
+        {
+            spurs_trace_channel(ctx, channel, v);
+        }
         /* A raw SPU's outbound mailbox is one entry deep and wrch stalls while
          * it is full. Buffering instead let two replies queue up, and a PPU
          * that tests bit 0 of the count -- Tornado Outbreak's boot handshake,
@@ -872,6 +877,11 @@ void spu_wrch(spu_context* ctx, uint32_t channel, u128 value)
         /* Plain mailbox data is consumed by the following interrupt request. */
         break;
     case SPU_WrOutIntrMbox:
+        /* SPURS_GOLDEN_TRACE: an event or message from an SPU to the PPU. */
+        if (g_spurs_trace_on)
+        {
+            spurs_trace_channel(ctx, channel, v);
+        }
         { static int s_t = -1; if (s_t < 0) s_t = getenv("SPU_MBOXTRACE") ? 1 : 0;
           if (s_t) fprintf(stderr, "[spu-mbox] INTR grp=0x%X spu=0x%X val=0x%08X\n",
                            ctx->spu_group_id, ctx->spu_id, v); }

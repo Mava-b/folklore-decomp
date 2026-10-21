@@ -13,9 +13,11 @@
  *   - every entry into and exit from a job's code, with its registers and the
  *     job context and descriptor it was handed.
  *
- * Repeats of an identical event on the same thread (an SPU polling a lock
- * line) collapse into one line with a count. Off, the cost is one load and a
- * branch per hook. SPURS_GOLDEN_TRACE_MB caps the file (default 4096 MB).
+ * SPURS_GOLDEN_TRACE_MODE=shape (the default) writes each distinct kind of
+ * event once and counts the rest, small enough for a whole play session;
+ * =full writes every event (minutes of play fill gigabytes). Off, the cost is
+ * one load and a branch per hook. SPURS_GOLDEN_TRACE_MB caps the file
+ * (default 1024 MB in shape mode, 4096 MB in full).
  */
 #ifndef PS3RECOMP_SPURS_TRACE_H
 #define PS3RECOMP_SPURS_TRACE_H
@@ -51,6 +53,10 @@ void spurs_trace_atomic(struct spu_context* ctx, uint32_t cmd, uint32_t ea, uint
 /* SPU: an indirect branch resolved to code owned by `codeImage` (a job's
  * placed binary; 0 = anything else). Records job entry and exit. */
 void spurs_trace_branch(struct spu_context* ctx, int codeImage);
+
+/* SPU: a write to the outbound mailbox (channel 28) or the outbound
+ * interrupt mailbox (30) -- how an SPU sends an event or message to the PPU. */
+void spurs_trace_channel(struct spu_context* ctx, uint32_t channel, uint32_t value);
 
 /* Anything else worth a line (free text, already formatted). */
 void spurs_trace_note(const char* text);

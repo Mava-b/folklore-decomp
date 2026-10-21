@@ -177,7 +177,7 @@ port 0. XInput mode has no motion data; without a DS3, use *Automatic* or
 .\run.ps1 -Profile                        # report where the CPU time goes (every 10 s)
 .\run.ps1 -NoLibsre                       # ps3recomp's own SPURS stand-in instead (crashes; testing)
 .\run.ps1 -InterpJobs                     # SPU jobs in the interpreter (A/B, slower)
-.\run.ps1 -TraceSpurs                     # record what libsre does (logs\spurs-*.trace; for replacing it)
+.\run.ps1 -TraceSpurs                     # record what libsre does (logs\spurs-*.trace; folklore/docs/SPURS.md)
 .\build.ps1 -Clean                        # full rebuild
 $env:AUDIO_LATENCY_MS = '48'; .\run.ps1   # more audio buffering if sound breaks up (default 32)
 ```
