@@ -1,0 +1,231 @@
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 6611749..2de5c21 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1601,6 +1601,78 @@ int rsx_fp_apply_convolution(char* hlsl, u32 hlsl_size, u32 convolution_mask,
+     return patched;
+ }
+ 
++/* A depth buffer read through a colour format.
++ *
++ * Soft particles and other depth-faded effects bind their zeta's address as
++ * an A8R8G8B8 texture and rebuild the depth from its bytes (Folklore's soul
++ * and capture-tether effects: dot(tex.wxy, weights)). An RSX Z24S8 word holds
++ * the depth in its upper 24 bits and the stencil in the lower 8, so read as
++ * ARGB the depth's high byte is A, its middle byte R, its low byte G and the
++ * stencil B. The host keeps that depth in a float snapshot, so each Sample()
++ * on a unit in `alias_mask` is rewritten to rebuild those bytes from it. */
++int rsx_fp_apply_zeta_alias(char* hlsl, u32 hlsl_size, u32 alias_mask, u32 cube_mask)
++{
++    if (!hlsl || !alias_mask)
++    {
++        return 0;
++    }
++    static const char helpers[] =
++        "float4 _rsx_zeta_argb(Texture2D depthTexture, SamplerState depthSampler, float2 coordinate) {\n"
++        "    float depth = saturate(depthTexture.SampleLevel(depthSampler, coordinate, 0).x);\n"
++        "    uint depthBits = (uint)round(depth * 16777215.0);\n"
++        "    return float4((float)((depthBits >> 8) & 255u), (float)(depthBits & 255u), 0.0,\n"
++        "                  (float)((depthBits >> 16) & 255u)) / 255.0;\n"
++        "}\n";
++    int patched = 0;
++    for (u32 unit = 0; unit < 16; unit++)
++    {
++        if (!((alias_mask >> unit) & 1u) || ((cube_mask >> unit) & 1u))
++        {
++            continue;
++        }
++        char needles[2][48];
++        char replacements[2][64];
++        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample(rsx_samp[%u],", unit, unit);
++        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample(rsx_samp[%u],", unit, unit);
++        snprintf(replacements[0], sizeof replacements[0], "_rsx_zeta_argb(rsx_tex[%u], rsx_samp[%u],", unit, unit);
++        snprintf(replacements[1], sizeof replacements[1], "_rsx_zeta_argb(rsx_tex%u, rsx_samp[%u],", unit, unit);
++        for (int spelling = 0; spelling < 2; spelling++)
++        {
++            const u32 needleLength = (u32)strlen(needles[spelling]);
++            const u32 replacementLength = (u32)strlen(replacements[spelling]);
++            for (;;)
++            {
++                char* site = strstr(hlsl, needles[spelling]);
++                if (!site)
++                {
++                    break;
++                }
++                const u32 used = (u32)strlen(hlsl);
++                if (used - needleLength + replacementLength + 1 > hlsl_size)
++                {
++                    return -1;
++                }
++                memmove(site + replacementLength, site + needleLength,
++                        used - (u32)(site - hlsl) - needleLength + 1);
++                memcpy(site, replacements[spelling], replacementLength);
++                patched++;
++            }
++        }
++    }
++    if (patched)
++    {
++        const u32 used = (u32)strlen(hlsl);
++        const u32 helperLength = (u32)strlen(helpers);
++        if (used + helperLength + 1 > hlsl_size)
++        {
++            return -1;
++        }
++        memmove(hlsl + helperLength, hlsl, used + 1);
++        memcpy(hlsl, helpers, helperLength);
++    }
++    return patched;
++}
++
+ /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
+  * 32-bit exports bypass the integer framebuffer's RGB transfer function. */
+ int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format)
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index d1cbef4..ee36265 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -101,6 +101,13 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+ int rsx_fp_apply_convolution(char* hlsl, u32 hlsl_size, u32 convolution_mask,
+                              const u8 kernels[16], u32 cube_mask);
+ 
++/* A zeta sampled through an A8R8G8B8 texture: rewrite each 2D Sample() on a
++ * unit in `alias_mask` to rebuild the Z24S8 bytes (A = depth high byte,
++ * R = middle, G = low, B = stencil) from the float depth snapshot bound
++ * there. Returns the number of call sites rewritten, or -1 when the buffer is
++ * too small. */
++int rsx_fp_apply_zeta_alias(char* hlsl, u32 hlsl_size, u32 alias_mask, u32 cube_mask);
++
+ /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
+  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
+  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 96e65a6..fa56c36 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -5160,6 +5160,42 @@ static int ld_scale_wpos(char* hlsl, u32 capacity, u32 drawScale, float drawScal
+  * depth test, 2 without the alpha test, 3 with texture unit 0 white. A
+  * capture's flip images then show which change makes the draw appear.
+  * -----------------------------------------------------------------------*/
++/* A texture that reads a depth buffer through A8R8G8B8 -- the zeta's own
++ * address, a colour format, and a zeta the host has drawn into. Returns that
++ * zeta's index in g.zdepths, or -1. The host depth never reaches guest VRAM,
++ * so such a read must take the depth snapshot, rebuilt into the Z24S8 bytes
++ * by rsx_fp_apply_zeta_alias; from guest VRAM it read stale bytes, which
++ * depth-faded effects turned into speckle or faded out entirely.
++ * LD_NO_ZETA_ALIAS=1 restores the old guest-VRAM read. */
++static int ld_zeta_alias_index(const rsx_dsp_texture* texture)
++{
++    static int disabled = -1;
++    if (disabled < 0)
++    {
++        const char* text = getenv("LD_NO_ZETA_ALIAS");
++        disabled = text && text[0] && text[0] != '0' ? 1 : 0;
++    }
++    if (disabled || !texture->enabled)
++    {
++        return -1;
++    }
++    const u32 baseFormat = texture->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    if (baseFormat != TEX_FMT_A8R8G8B8 || texture->remap != 0x0000AAE4u)
++    {
++        return -1;
++    }
++    for (u32 zetaIndex = 0; zetaIndex < g.n_zdepths; zetaIndex++)
++    {
++        const zdepth_t* zeta = &g.zdepths[zetaIndex];
++        if (zeta->location == texture->location && zeta->offset == texture->offset &&
++            (zeta->had_write || zeta->snapshot_valid))
++        {
++            return (int)zetaIndex;
++        }
++    }
++    return -1;
++}
++
+ static u64 g_ld_probe_keys[8];
+ static u32 g_ld_probe_key_count = 0;
+ static int g_ld_probe_ab_prim = -1;
+@@ -5636,6 +5672,26 @@ static ID3D12PipelineState* get_pso(
+     {
+         convolution_mask = 0;
+     }
++    /* Units that read a zeta through A8R8G8B8 (ld_zeta_alias_index): their
++     * Sample() calls are rewritten, so the set is part of the identity. */
++    u32 zetaAliasMask = 0;
++    for (u32 aliasUnit = 0; aliasUnit < 16; aliasUnit++)
++    {
++        rsx_dsp_texture aliasTexture;
++        rsx_dsp_get_texture(&g.rsx, aliasUnit, &aliasTexture);
++        if (ld_zeta_alias_index(&aliasTexture) >= 0)
++        {
++            zetaAliasMask |= 1u << aliasUnit;
++        }
++    }
++    zetaAliasMask &= ~cube_mask;
++    convolution_mask &= ~zetaAliasMask;
++    if (zetaAliasMask)
++    {
++        static const u32 zetaAliasTag = 0x415A4C41u; /* "ALZA" */
++        key = fnv1a(&zetaAliasTag, sizeof(zetaAliasTag), key);
++        key = fnv1a(&zetaAliasMask, sizeof(zetaAliasMask), key);
++    }
+     if (masked_layout) {
+         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+         const u32 payload_stride =
+@@ -5766,6 +5822,24 @@ static ID3D12PipelineState* get_pso(
+                 convolution_kernels, cube_mask) < 0)
+             fi = -1;
+     }
++    if (fi > 0 && zetaAliasMask)
++    {
++        const int aliasSites = rsx_fp_apply_zeta_alias(ps_hlsl, sizeof(ps_hlsl), zetaAliasMask, cube_mask);
++        if (aliasSites < 0)
++        {
++            fi = -1;
++        }
++        else
++        {
++            static int aliasLogged = 0;
++            if (aliasSites > 0 && aliasLogged < 8)
++            {
++                aliasLogged++;
++                fprintf(stderr, "[zeta-alias] pso %016llx reads its depth through ARGB8 on units 0x%X (%d sites)\n",
++                        (unsigned long long)live_legacy_pso_key(), zetaAliasMask, aliasSites);
++            }
++        }
++    }
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+         (u64)(ld_profile_qpc() - decompile_begin);
+@@ -8651,8 +8725,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     if (g_ld_probe_key_count)
+     {
+         const u64 probeKey = live_legacy_pso_key();
+-        ld_probe_draw(probeKey, prim);
+         g_ld_probe_variant = ld_probe_choose_variant(probeKey, prim);
++        ld_probe_draw(probeKey, prim);
+     }
+     ID3D12PipelineState* pso = get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+@@ -8920,6 +8994,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+          * depth read: try the zeta first. Before, the colour surface at the
+          * same address was taken (zeros). */
+         int zeta_pref = 0;
++        const int zetaAliasIndex = ((g_ld_current_pso.cube_mask >> u) & 1u) ? -1 : ld_zeta_alias_index(&t);
++        if (zetaAliasIndex >= 0)
++        {
++            zeta_pref = 1;
++        }
+         if ((t.format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM) == TEX_FMT_DEPTH24_D8)
+             for (u32 i = 0; i < g.n_zdepths; i++)
+                 if (g.zdepths[i].location == t.location &&
+@@ -9064,7 +9143,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             /* Mirror the replay-proven depth-RT contract: address and format
+              * must match, and the pass must have executed a depth-writing draw.
+              * Clear-only zetas intentionally fall through to guest VRAM. */
+-            if (texture_base_fmt == TEX_FMT_DEPTH24_D8)
++            if (texture_base_fmt == TEX_FMT_DEPTH24_D8 || zetaAliasIndex >= 0)
+                 for (u32 i = 0; i < g.n_zdepths; i++)
+                     if (g.zdepths[i].location == t.location &&
+                         g.zdepths[i].offset == t.offset &&

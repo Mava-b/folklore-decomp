@@ -1,0 +1,98 @@
+From: Folklore port <noreply@localhost>
+Subject: [PATCH 0009] Eight resident SPU code regions; log failing video AUs
+
+1. spu_context.resident_code grows from 4 to 8 slots
+   (SPU_RESIDENT_CODE_SLOTS). With its sound running, Folklore's jm2 keeps
+   five job binaries in local store at once (0x4C00, 0x12000, 0x18400,
+   0x1AC00, 0x1E400).
+2. cellVdec: an AU the decoder rejects is logged with its address, size,
+   FNV-1a hash and first bytes, to tell corrupted input from a decoder that
+   rejects good input.
+
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index e129ed2..34614a6 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -297,9 +297,24 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
+         v->auCount++;
+         v->aus[v->auCount % VDEC_AU_RING] = au;
+         v->newPics = 0;
+-        if (au.size)   /* an empty packet would mean end of stream to FFmpeg */
+-            vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
+-                           vdec_on_picture, v);
++        if (au.size) { /* an empty packet would mean end of stream to FFmpeg */
++            int rc = vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
++                                    vdec_on_picture, v);
++            /* Say what the failing AU held, so it can be checked against the
++             * file: corrupted input and a decoder that rejects good input
++             * need different fixes. */
++            if (rc < 0) {
++                static int s_n;
++                if (s_n++ < 12) {
++                    const u8* p = vm_ptr8(au.startAddr);
++                    u64 hash = 1469598103934665603ull;
++                    for (u32 i = 0; i < au.size; i++) { hash ^= p[i]; hash *= 1099511628211ull; }
++                    fprintf(stderr, "[cellVdec]   AU %u at 0x%08X size %u fnv=%016llX head=%02X%02X%02X%02X %02X%02X%02X%02X\n",
++                            v->auCount, au.startAddr, au.size, (unsigned long long)hash,
++                            p[0], p[1], p[2], p[3], p[4], p[5], p[6], p[7]);
++                }
++            }
++        }
+         vdec_notify(handle, CELL_VDEC_MSG_TYPE_AUDONE, CELL_OK);
+         vdec_notify_new_pics(handle);
+         return CELL_OK;
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 02c5f64..a8ecc1c 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -1674,7 +1674,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+ {
+     uint32_t lsa = (uint32_t)(ls - ctx->ls);
+     spu_ovl_dump(ctx, ea, lsa, ls, size);
+-    for (unsigned slot = 0; slot < 4; ++slot) {
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+         if (!ctx->resident_code[slot].image_id) continue;
+         uint32_t base = ctx->resident_code[slot].lsa;
+         uint32_t end = base + ctx->resident_code[slot].size;
+@@ -1703,7 +1703,7 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+                               "resident at LS 0x%05X\n", o->image_id, ea, o->span, lsa);
+                   } }
+                 if (lsa + o->span > SPU_LS_SIZE) return;
+-                for (unsigned slot = 0; slot < 4; ++slot) {
++                for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+                         continue;
+                     ctx->resident_code[slot].lsa = lsa;
+@@ -2278,7 +2278,7 @@ void spu_indirect_branch(spu_context* ctx)
+      * is 0 outside the region, so this only ever fires for genuine task code.) */
+     spu_fn fn = NULL;
+     int code_owner = 0;
+-    for (unsigned slot = 0; slot < 4; ++slot) {
++    for (unsigned slot = 0; slot < SPU_RESIDENT_CODE_SLOTS; ++slot) {
+         if (ctx->resident_code[slot].image_id && ctx->pc >= ctx->resident_code[slot].lsa &&
+             ctx->pc - ctx->resident_code[slot].lsa < ctx->resident_code[slot].size) {
+             code_owner = ctx->resident_code[slot].image_id;
+diff --git a/runtime/spu/spu_context.h b/runtime/spu/spu_context.h
+index fa88c3f..600a31b 100644
+--- a/runtime/spu/spu_context.h
++++ b/runtime/spu/spu_context.h
+@@ -168,6 +168,10 @@ typedef struct spu_channel {
+ /* ---------------------------------------------------------------------------
+  * SPU execution context
+  * -----------------------------------------------------------------------*/
++/* Code images resident in one local store at once (a job manager's binary
++ * cache can hold five or more; Folklore's jm2 does). */
++#define SPU_RESIDENT_CODE_SLOTS 8
++
+ typedef struct spu_context {
+     /* 128 general-purpose 128-bit registers */
+     SPU_ALIGN16 u128 gpr[128];
+@@ -288,7 +292,7 @@ typedef struct spu_context {
+     struct {
+         uint32_t lsa, size, source_ea;
+         int image_id;
+-    } resident_code[4];
++    } resident_code[SPU_RESIDENT_CODE_SLOTS];
+ 
+     /* Resident SPURS-taskset TASK image id (0 = none) retires the id-0 wildcard
+      * for co-resident tasks. A taskset may hold several tasks that all lift at the

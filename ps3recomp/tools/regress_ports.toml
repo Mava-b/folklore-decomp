@@ -1,0 +1,189 @@
+# Ports the regression gate runs. See tools/regress.py.
+#
+# Build commands use placeholders rather than a fixed toolchain: {cc} / {cxx} /
+# {generator} are filled per platform (clang-cl + Ninja on Windows, because the
+# runtime needs GCC/Clang builtins cl does not have; the system compiler
+# elsewhere), and {toolkit} is this repo's root. Executables are named without
+# .exe -- regress.py tries both -- so one registry serves every platform.
+#
+# Paths are relative to the ps3recomp repo root, and assume the sibling layout
+# every port already uses (ps3recomp and the game trees next to each other).
+# A port that is not on this machine is SKIPPED, not failed -- nobody owns all
+# seven titles, and the gate has to be useful to someone who owns two.
+#
+# The default run does NOT set RSX_LIVE_DRAW: the draw milestone is recorded in
+# rsx_commands.c before the backend call, so draws are captured with the null
+# backend too. That keeps a gate run headless, faster, and identical on Linux
+# and macOS, where there is no D3D12 at all.
+#
+# It also means the default run cannot tell you whether a title still RENDERS,
+# only whether it still submits draw methods -- and for VF5, whose draws exist
+# only on the live-draw path, not even that. `regress.py --shots` covers the
+# gap: see `render_env` below.
+#
+# `expect = "timeout"` is the normal case: a title that reaches its frame loop
+# never exits, so being killed on the timeout is what success looks like. The
+# milestone stream is flushed as each key is first seen so the kill still leaves
+# a complete record.
+#
+# `build` is how a golden stays reproducible. The gate builds the toolkit, then
+# builds each port against THAT toolkit into build-gate/ -- kept separate from
+# the developer's own build/ so a gate run cannot be fooled by a stale binary.
+# `{toolkit}` expands to the repo root; regress.py also exports PS3RECOMP_DIR and,
+# on Windows, the MSVC environment clang-cl needs (see tools/msvc_env.py), so the
+# commands below are the same ones a person would type.
+#
+# Regenerating the NID table is part of the build, not a nicety: building vf5
+# against master failed outright until its src/gen/ppu_hle_nids.cpp was
+# regenerated, because the table in its tree came from the ports' own toolkit
+# branch (ydkj-live-draw) and referenced three sysPrxForUser handlers master does
+# not have. That is the "no port pins a toolkit version" problem, and generating
+# the table from the toolkit under test is what fixes it.
+#
+# Ports without a `build` line are still the operator's job to build; they SKIP
+# cleanly until then.
+#
+# Rubber Ducky is deliberately absent, for the same class of reason as flOw.
+#
+# It is a Sony SDK sample recompiled from a DEBUG fSELF -- unencrypted and
+# unstripped, with its symbol map exposed. Nothing else in the gate is built that
+# way and no retail title ever will be, so it was never a fair conformance
+# subject: it exercises a pipeline that had names to work from. It is valuable as
+# ground truth for the lifter and worthless as a statement about whether a change
+# is safe for real games.
+#
+# It did render once (a correct bathroom scene, 2026-08-26, docs/images/ducky.png
+# in its repo) and does not now. That is worth reconciling one day -- what was
+# hand-rolled to get there, and which of it should be general -- but it is not
+# worth holding the gate red for. Its golden is preserved in git history at the
+# commit that removed it.
+
+# flOw is deliberately absent. Its lifted tree is git-ignored and cannot be
+# regenerated, so a golden recorded from it could never be reproduced or
+# explained. It stays a manual title until it is relifted from scratch.
+
+# The toolkit itself, built once per gate run before any port touches it.
+[toolkit]
+build = """cmake -S . -B build-gate -G "{generator}"   -DCMAKE_C_COMPILER={cc} -DCMAKE_CXX_COMPILER={cxx}   -DCMAKE_BUILD_TYPE=Release && cmake --build build-gate"""
+
+# Default build for every port: regenerate the NID table from the toolkit under
+# test, configure against it, build. Ports override with their own `build` only
+# if they differ.
+#
+# Note the side effect: this rewrites the port's src/gen/ppu_hle_nids.cpp in
+# place, so a gate run leaves that generated file regenerated. It is git-ignored
+# output that the port's own relift.sh regenerates too, but a developer's build/
+# will pick it up on their next rebuild.
+port_build = """python "{toolkit}/tools/gen_hle_nids.py" --all --out src/gen/ppu_hle_nids.cpp && cmake -S . -B build-gate -G "{generator}"   -DCMAKE_C_COMPILER={cc} -DCMAKE_CXX_COMPILER={cxx}   -DCMAKE_BUILD_TYPE=Release   -DPS3RECOMP_DIR="{toolkit}"   -DPS3RECOMP_RUNTIME_LIB="{toolkit}/build-gate/{runtime_lib}" && cmake --build build-gate"""
+
+# `render_env` is how each port is run when `regress.py --shots` is passed: the
+# configuration its own README documents, which is what produced its known-good
+# screenshots. Every rendering port needs RSX_LIVE_DRAW=1 for caner's live
+# NV4097 engine; Rubber Ducky renders through the plain D3D12 backend instead
+# and wants its texture/display knobs. This is deliberately NOT the default --
+# the headless run stays the CI gate, because it needs no GPU and behaves the
+# same on Linux and macOS. But headless means the gate has no opinion on whether
+# a title still renders, and for VF5, whose draws exist only on the live path,
+# headless looks identical to drawing nothing at all.
+
+# `render_gold` is the port's OWN reference screenshot, tracked in its repo --
+# the picture someone kept because the title looked right that day. It is the
+# only statement anywhere of what a port is supposed to look like, and the
+# goldens in tools/regress/ cannot serve that purpose: they were all recorded
+# after the regressions they were meant to catch. --shots writes a side-by-side
+# <port>-vs-gold.png when one exists. No pixel diff -- the references carry
+# window chrome at assorted sizes and attract modes animate, so a strict
+# comparison would only cry wolf. twistedmetal and youdontknowjack have none
+# tracked yet; capturing one, next time either renders, is worth doing.
+
+# PS3_VFS_ROOT is the directory the guest's /dev_bdvd maps to, and the guest path
+# is appended WHOLE. A title asking for /dev_bdvd/PS3_GAME/USRDIR/rom/x under a
+# root of "vfs/PS3_GAME/USRDIR" resolves to
+# vfs/PS3_GAME/USRDIR/PS3_GAME/USRDIR/rom/x, which exists nowhere -- so the root
+# is the PARENT, "vfs".
+#
+# This registry had the doubled form for vf5 and simpsons, and it is why both
+# looked dead. VF5 spun on 686,996 failed opens and never left cellFsOpen, which
+# read as "stuck at 46 milestone keys"; Simpsons opened zero files and drew 9,391
+# groups of nothing, which read as "presents a flat frame". Neither was a
+# regression. With the root corrected VF5 executes 13,569 draw groups with zero
+# drops and shows the AM2 screen, and Simpsons shows its Fox Television intro.
+#
+# Their goldens were recorded under the broken root, so they describe titles that
+# could not load an asset. Re-record both.
+
+# --- showcase titles -------------------------------------------------------
+
+[[port]]
+name    = "vf5"
+dir     = "../ps3games/vf5"
+cmd     = ["build-gate/vf5", "game/EBOOT.elf"]
+timeout = 60
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "vfs" }
+render_env = { RSX_LIVE_DRAW = "1" }
+render_timeout = 150
+render_gold = "docs/now_loading.png"
+
+[[port]]
+name    = "tokyojungle"
+dir     = "../ps3games/tokyojungle"
+cmd     = ["build-gate/tokyojungle", "input/EBOOT.elf"]
+timeout = 90
+# TJ has two terminal states and picks one per run. In the first it gives up
+# after cellSailPlayerSetSoundAdapter and tears down -- cellHttpEnd,
+# netFinalizeNetwork, sceNpTrophyTerm -- then exits 0, or 0xC0000005 in the
+# teardown, a coin flip of its own. In the second it gets further, boots the
+# Sail movie player (cellSailPlayerBoot) and never exits. The golden records
+# the second, which is what it does today and what it did on unmodified master;
+# the split is a real race and wants fixing on its own. Until then the exit
+# code is not asserted -- the run is.
+expect  = "any"
+env     = { PS3_VFS_ROOT = "input" }
+render_env = { RSX_LIVE_DRAW = "1" }
+render_timeout = 150
+
+# --- regression subjects: not being worked on, which is exactly why they are
+#     here. These are the ports a shared-runtime change breaks silently. ------
+
+[[port]]
+name    = "twistedmetal"
+dir     = "../ps3games/twistedmetal"
+cmd     = ["build-gate/twistedmetal", "input/EBOOT.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "input" }
+render_env = { RSX_LIVE_DRAW = "1" }
+
+[[port]]
+name    = "simpsons"
+dir     = "../ps3games/simpsons"
+clean   = ["gamedata/dev_hdd0/home/00000001/savedata"]   # golden starts with no save
+cmd     = ["build-gate/simpsons", "vfs/PS3_GAME/USRDIR/EBOOT.elf"]
+timeout = 90
+expect  = "timeout"
+env     = { PS3_VFS_ROOT = "vfs" }
+render_env = { RSX_LIVE_DRAW = "1" }
+render_gold = "docs/media/02-attract-canyon.png"
+
+[[port]]
+name    = "youdontknowjack"
+dir     = "../ps3games/youdontknowjack/project"
+cmd     = ["build-gate/ydkj_boot", "input/EBOOT.elf"]
+timeout = 90
+# expect = "any" for the same reason Tokyo Jungle has it: the terminal state is a
+# coin flip while the RUN is stable. This title reaches 118 milestone keys ending
+# at rsx:draw_arrays whether it survives to the timeout or exits 0xC0000005 --
+# identical streams either way. It boots fully and starts drawing, then hits a
+# late race maybe half the time.
+#
+# The race only appears at full speed: with stdout/stderr on DEVNULL it exits
+# 0xC0000005 in roughly one run of two, and with them redirected to a FILE it
+# survived five for five. Writing the log is enough to hide it -- the inverse of
+# the usual problem, where logging hides bugs by slowing the guest down.
+#
+# So the crash is real and worth fixing, but asserting the exit code here only
+# tests which side of the coin landed. The milestones are what carry the signal.
+expect  = "any"
+env     = { PS3_VFS_ROOT = "input" }
+render_env = { RSX_LIVE_DRAW = "1" }

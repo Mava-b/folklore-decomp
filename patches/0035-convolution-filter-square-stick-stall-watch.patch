@@ -1,0 +1,220 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index cb8fc7b..5e5c13c 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -97,21 +97,58 @@ static int s_sdl_inited = 0;
+ #define PAD_STICK_DEADZONE  7849
+ #define PAD_TRIGGER_THRESHOLD 30
+ 
+-static u8 pad_xinput_stick_to_u8(short raw, short deadzone)
++/* One stick, both axes together.
++ *
++ * Done per axis (above), an XInput stick's round gate never reaches the
++ * corners: pushed fully to a diagonal it reads about 0.62 on each axis after
++ * the per-axis deadzone, where a DualShock 3 -- whose gate is close to
++ * square -- reads nearly full on both. Folklore decides walk or run from the
++ * stick's deflection, so Keats walked whenever the stick was in a corner.
++ *
++ * Here the deadzone is radial (the stick's distance from centre), the rest of
++ * the travel is rescaled to 0..1, and the round gate is stretched onto a
++ * square one: the direction is kept and the larger axis reaches full
++ * deflection at the edge of the gate. Up is 0 on the PS3, so Y is flipped.
++ * Centre stays exactly 128 on both axes. */
++static u8 pad_axis_to_u8(float value)
+ {
+-    float normalized;
+-    if (raw > deadzone)
+-        normalized = (float)(raw - deadzone) / (float)(32767 - deadzone);
+-    else if (raw < -deadzone)
+-        normalized = (float)(raw + deadzone) / (float)(32767 - deadzone);
+-    else
+-        normalized = 0.0f;
++    int converted = value < 0.0f ? 128 + (int)lroundf(value * 128.0f)
++                                 : 128 + (int)lroundf(value * 127.0f);
++    if (converted < 0)
++    {
++        converted = 0;
++    }
++    if (converted > 255)
++    {
++        converted = 255;
++    }
++    return (u8)converted;
++}
+ 
+-    /* Map -1.0..1.0 to 0..255 with center at 128 */
+-    int val = (int)(normalized * 127.0f) + 128;
+-    if (val < 0) val = 0;
+-    if (val > 255) val = 255;
+-    return (u8)val;
++static void pad_xinput_stick_pair(short rawX, short rawY, short deadzone, u8* outX, u8* outY)
++{
++    const float stickX = (float)rawX / 32767.0f;
++    const float stickY = (float)rawY / 32767.0f;
++    const float magnitude = sqrtf(stickX * stickX + stickY * stickY);
++    const float deadzoneFraction = (float)deadzone / 32767.0f;
++    if (magnitude <= deadzoneFraction)
++    {
++        *outX = 128;
++        *outY = 128;
++        return;
++    }
++    float deflection = (magnitude - deadzoneFraction) / (1.0f - deadzoneFraction);
++    if (deflection > 1.0f)
++    {
++        deflection = 1.0f;
++    }
++    const float directionX = stickX / magnitude;
++    const float directionY = stickY / magnitude;
++    const float largerAxis = fabsf(directionX) > fabsf(directionY) ? fabsf(directionX) : fabsf(directionY);
++    const float squareX = directionX / largerAxis * deflection;
++    const float squareY = directionY / largerAxis * deflection;
++    *outX = pad_axis_to_u8(squareX);
++    *outY = pad_axis_to_u8(-squareY);
+ }
+ 
+ /* Keyboard fallback for port 0.
+@@ -228,10 +265,10 @@ static void pad_poll_xinput(void)
+          * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
+          * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
+          * (via sagemono, PR #42) */
+-        s_host_state[i].analog_lx = pad_xinput_stick_to_u8(gp->sThumbLX, PAD_STICK_DEADZONE);
+-        s_host_state[i].analog_ly = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbLY, PAD_STICK_DEADZONE));
+-        s_host_state[i].analog_rx = pad_xinput_stick_to_u8(gp->sThumbRX, PAD_STICK_DEADZONE);
+-        s_host_state[i].analog_ry = (u8)(256 - pad_xinput_stick_to_u8(gp->sThumbRY, PAD_STICK_DEADZONE));
++        pad_xinput_stick_pair(gp->sThumbLX, gp->sThumbLY, PAD_STICK_DEADZONE,
++                              &s_host_state[i].analog_lx, &s_host_state[i].analog_ly);
++        pad_xinput_stick_pair(gp->sThumbRX, gp->sThumbRY, PAD_STICK_DEADZONE,
++                              &s_host_state[i].analog_rx, &s_host_state[i].analog_ry);
+ 
+         /* Triggers */
+         s_host_state[i].trigger_l2 = gp->bLeftTrigger;
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 9f8206c..469e1a6 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1740,11 +1740,17 @@ void cellGcm_ref_on_poll(void)
+         SetEvent(s_gcm_kick_ev);       /* dry: ask the present thread to walk */
+ }
+ 
++/* Completed drain passes. The ring back-pressure uses it to tell a drain
++ * that is busy (a pass still running -- a shader being compiled, a long
++ * frame) from one that keeps running and cannot get past something. */
++static volatile u32 s_drain_passes = 0;
++
+ void cellGcm_rsx_process_fifo(void)
+ {
+     AcquireSRWLockExclusive(&s_gcm_fifo_lock);
+     gcm_rsx_process_fifo_unlocked();
+     ReleaseSRWLockExclusive(&s_gcm_fifo_lock);
++    s_drain_passes++;
+ }
+ 
+ static void gcm_rsx_process_fifo_unlocked(void)
+@@ -2740,11 +2746,15 @@ static u32 s_ring_frame_peak = 0;
+ /* How far short of the drain the guest is stopped. */
+ #define GCM_RING_GUARD 0x100u
+ /* How long the guest may be held before it is let go regardless... */
+-#define GCM_RING_WAIT_CAP_MS 500
+-/* ...and how long the drain may sit still meanwhile: it can be parked on a
+- * label the guest only writes later. Longer than the present thread's
+- * slowest frame, during which the drain does not move either. */
++#define GCM_RING_WAIT_CAP_MS 5000
++/* ...and how long the drain may sit still meanwhile, running pass after pass
++ * without getting anywhere: it can be parked on a label the guest only
++ * writes later. A drain that is simply busy -- the present thread compiling
++ * a shader, which took over 150 ms twice on the way to the underworld --
++ * does not count: letting the guest go then overwrote commands the drain had
++ * not read. */
+ #define GCM_RING_STALL_MS 150
++#define GCM_RING_STALL_PASSES 8
+ 
+ /* The runtime's ring, unchanged since setup, still with the runtime's
+  * buffer-full callback. */
+@@ -2854,6 +2864,7 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
+     int waitedMs = 0;
+     int stillMs = 0;
+     u32 lastDrainedEa = g_gcm_fifo_drained_ea;
++    u32 passesWhileStill = s_drain_passes;
+     while (gcm_ring_soft_end(current) < current + requiredBytes)
+     {
+         const u32 drainedEa = g_gcm_fifo_drained_ea;
+@@ -2861,8 +2872,11 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
+         {
+             lastDrainedEa = drainedEa;
+             stillMs = 0;
++            passesWhileStill = s_drain_passes;
+         }
+-        if (waitedMs >= GCM_RING_WAIT_CAP_MS || stillMs >= GCM_RING_STALL_MS)
++        const int drainStuck = stillMs >= GCM_RING_STALL_MS &&
++                               (u32)(s_drain_passes - passesWhileStill) >= GCM_RING_STALL_PASSES;
++        if (waitedMs >= GCM_RING_WAIT_CAP_MS || drainStuck)
+         {
+             static int reports = 0;
+             if (reports < 8)
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index d18d16d..c258902 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1546,8 +1546,21 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
+     D3D12_SAMPLER_DESC sd = {0};
+     const u32 minf = (t->filter >> 16) & 0x7;
+     const u32 magf = (t->filter >> 24) & 0x7;
+-    const int min_linear = (minf == 2 || minf == 4 || minf == 6);
+-    const int mag_linear = (magf == 2);
++    /* 7 (CONVOLUTION_MIN) and mag 4 (CONVOLUTION_MAG) are the RSX's
++     * convolution filters: a quincunx or Gaussian kernel over neighbouring
++     * texels, used to resolve the 2x-wide AA surfaces and to soften
++     * upscaled blur buffers. Read as POINT they were the hardest filter
++     * there is -- Folklore's bloom came out as blocks and its resolved
++     * frame stippled. Bilinear is the nearest D3D12 sampler state (the same
++     * choice RPCS3 makes). */
++    const int min_linear = (minf == 2 || minf == 4 || minf == 6 || minf == 7);
++    const int mag_linear = (magf == 2 || magf == 4);
++    { static unsigned reported = 0;
++      if ((minf == 7 || magf == 4) && reported < 4) {
++          reported++;
++          fprintf(stderr, "[live-draw] convolution filter on a %ux%u texture (min %u, mag %u, kernel %u): sampled bilinear\n",
++                  t->width, t->height, minf, magf, (t->filter >> 13) & 0x7);
++      } }
+     const int mip_linear = (minf == 5 || minf == 6);
+     const int mip_present = (minf >= 3);
+     D3D12_FILTER_TYPE mnf = min_linear ? D3D12_FILTER_TYPE_LINEAR : D3D12_FILTER_TYPE_POINT;
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index acd9558..6fcc847 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -1115,6 +1115,33 @@ static DWORD WINAPI hang_watchdog(LPVOID)
+     snprintf(lbl, sizeof lbl, "%ds sample", t1); dump_threads(lbl, self);
+     Sleep((DWORD)(t2 - t1) * 1000);
+     snprintf(lbl, sizeof lbl, "%ds sample", t2); dump_threads(lbl, self);
++
++    /* Then keep watching: a game that stops presenting frames after it has
++     * started (Folklore at the underworld portal: sound on, picture and game
++     * frozen, nothing in the log) gets the same dump 5 s and 20 s into the
++     * stall, so the log says which thread is waiting on what. A few reports
++     * per run at most; a long movie can trip it harmlessly. */
++    { LONG lastFrames = g_frames_presented;
++      int stalledSeconds = 0;
++      int reports = 0;
++      while (reports < 6)
++      {
++          Sleep(1000);
++          const LONG frames = g_frames_presented;
++          if (frames != lastFrames || frames == 0)
++          {
++              lastFrames = frames;
++              stalledSeconds = 0;
++              continue;
++          }
++          stalledSeconds++;
++          if (stalledSeconds == 5 || stalledSeconds == 20)
++          {
++              reports++;
++              snprintf(lbl, sizeof lbl, "no frame presented for %d s", stalledSeconds);
++              dump_threads(lbl, self);
++          }
++      } }
+     return 0;
+ }
+ #endif

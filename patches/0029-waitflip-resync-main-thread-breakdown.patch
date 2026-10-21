@@ -1,0 +1,173 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 1530159..2366f43 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -75,6 +75,12 @@ volatile u64 g_gcm_perf_waitflip_ns = 0;
+ volatile u64 g_gcm_perf_present_idle_ns = 0;
+ volatile u64 g_gcm_perf_gpu_wait_ns = 0;
+ volatile u64 g_gcm_perf_swap_ns = 0;
++/* The guest main thread (thread id 1) inside sys_timer_usleep, inside any
++ * other lv2 syscall, and inside HLE library calls (cellGcmSetWaitFlip
++ * included, and any guest callback an HLE call runs). */
++volatile u64 g_gcm_perf_main_usleep_ns = 0;
++volatile u64 g_gcm_perf_main_syscall_ns = 0;
++volatile u64 g_gcm_perf_main_hle_ns = 0;
+ u64 gcm_perf_now_ns(void)
+ {
+     return get_timestamp_ns();
+@@ -100,6 +106,13 @@ static volatile u32 s_flip_request_count = 0;
+  * vblank, at most one per vblank (cellGcmTickFlip). */
+ static volatile u32 s_flips_issued = 0;
+ static volatile u32 s_flips_shown = 0;
++/* The flip-request count at the last flip cellGcmTickFlip retired. A flip is
++ * on screen once the drain has produced a new request since then; comparing
++ * the two absolute counters instead stuck for good once any flip went
++ * missing between them (a resync over a marker, a flip that never reached
++ * the drain): shown could never pass the request count again, every frame's
++ * wait ran into its 100 ms cap, and Folklore's beach fell to 4 fps. */
++static volatile u32 s_flips_request_seen = 0;
+ 
+ u32 cellGcm_flip_request_count(void)
+ {
+@@ -675,11 +688,29 @@ void cellGcmSetWaitFlip(void)
+           if ((int)(s_flips_issued - s_flips_shown) > depth)
+           {
+               const u64 waitBegin = gcm_perf_now_ns();
+-              for (int waited = 0; waited < 100 && (int)(s_flips_issued - s_flips_shown) > depth; waited++)
++              int waited = 0;
++              while (waited < 100 && (int)(s_flips_issued - s_flips_shown) > depth)
+               {
+                   Sleep(1);
++                  waited++;
+               }
+               g_gcm_perf_waitflip_ns += gcm_perf_now_ns() - waitBegin;
++              /* 100 ms with no flip reaching the screen: the counters have
++               * drifted apart (or the drain is stalled, where waiting longer
++               * would not help either). Resynchronize instead of paying the
++               * full cap again on every following frame. */
++              if ((int)(s_flips_issued - s_flips_shown) > depth)
++              {
++                  static int resyncReports = 0;
++                  if (resyncReports < 8)
++                  {
++                      resyncReports++;
++                      fprintf(stderr, "[gcm] WaitFlip: no flip shown in %d ms (issued=%u shown=%u requests=%u); resynchronizing\n",
++                              waited, s_flips_issued, s_flips_shown, s_flip_request_count);
++                  }
++                  s_flips_shown = s_flips_issued - (u32)depth;
++                  s_flips_request_seen = s_flip_request_count;
++              }
+           }
+           return;
+       } }
+@@ -839,8 +870,10 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+ void cellGcmTickFlip(void)
+ {
+     /* One flip reaches the screen per vblank, once the drain has reached it. */
+-    if (s_flips_shown < s_flips_issued && s_flips_shown < s_flip_request_count)
++    if ((s32)(s_flips_issued - s_flips_shown) > 0 &&
++        (s32)(s_flip_request_count - s_flips_request_seen) > 0)
+     {
++        s_flips_request_seen++;
+         s_flips_shown++;
+     }
+     if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 85606ea..5ed4656 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1745,6 +1745,9 @@ extern volatile u64 g_gcm_perf_gpu_wait_ns;   /* [fps] breakdown, cellGcmSys.c *
+ extern volatile u64 g_gcm_perf_swap_ns;
+ extern volatile u64 g_gcm_perf_waitflip_ns;
+ extern volatile u64 g_gcm_perf_present_idle_ns;
++extern volatile u64 g_gcm_perf_main_usleep_ns;
++extern volatile u64 g_gcm_perf_main_syscall_ns;
++extern volatile u64 g_gcm_perf_main_hle_ns;
+ extern u64 gcm_perf_now_ns(void);
+ static void ld_flush(ld_flush_reason reason)
+ {
+@@ -10116,7 +10119,16 @@ void rsx_live_draw_present(u32 buffer_id)
+                     (double)(idleNs - lastIdle) / 1e6 / frameCount,
+                     (double)(gpuNs - lastGpu) / 1e6 / frameCount,
+                     (double)(swapNs - lastSwap) / 1e6 / frameCount);
+-            lastWaitFlip = waitFlipNs; lastIdle = idleNs; lastGpu = gpuNs; lastSwap = swapNs; }
++            lastWaitFlip = waitFlipNs; lastIdle = idleNs; lastGpu = gpuNs; lastSwap = swapNs;
++            { static u64 lastUsleep = 0, lastSyscall = 0, lastHle = 0;
++              const u64 usleepNs = g_gcm_perf_main_usleep_ns;
++              const u64 syscallNs = g_gcm_perf_main_syscall_ns;
++              const u64 hleNs = g_gcm_perf_main_hle_ns;
++              fprintf(stderr, "[fps]   main thread per frame: usleep %.1f ms, other syscalls %.1f ms, HLE calls %.1f ms (waitflip included)\n",
++                      (double)(usleepNs - lastUsleep) / 1e6 / frameCount,
++                      (double)(syscallNs - lastSyscall) / 1e6 / frameCount,
++                      (double)(hleNs - lastHle) / 1e6 / frameCount);
++              lastUsleep = usleepNs; lastSyscall = syscallNs; lastHle = hleNs; } }
+           fps_t0 = now; fps_f0 = g_ld_frames;
+       } }
+     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index 0ab497f..db91993 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -181,8 +181,21 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
+ 
+ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+ extern "C" uint32_t ppu_prof_resolve_host(void* ra);
++extern "C" uint64_t gcm_perf_now_ns(void);            /* cellGcmSys.c */
++extern "C" volatile uint64_t g_gcm_perf_main_hle_ns;
+ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
+ {
++    /* [fps] breakdown: the main thread's time inside HLE library calls. */
++    struct MainHleTimer {
++        uint64_t begin;
++        ~MainHleTimer()
++        {
++            if (begin)
++            {
++                g_gcm_perf_main_hle_ns += gcm_perf_now_ns() - begin;
++            }
++        }
++    } mainHleTimer{ (ctx && ctx->thread_id == 1) ? gcm_perf_now_ns() : 0 };
+     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
+      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
+      * event queue, which misses a thread that stops looping while it is BUSY --
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 355cd86..096fdcb 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3296,6 +3296,9 @@ extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+ #define PS3_SC_INFLIGHT_MAX 64
+ extern "C" uint32_t g_sc_inflight[PS3_SC_INFLIGHT_MAX] = { 0 };
+ 
++extern "C" uint64_t gcm_perf_now_ns(void);            /* cellGcmSys.c */
++extern "C" volatile uint64_t g_gcm_perf_main_usleep_ns;
++extern "C" volatile uint64_t g_gcm_perf_main_syscall_ns;
+ extern "C" void lv2_syscall(ppu_context* ctx)
+ {
+     /* One-shot: PPU_GUARD_EA=<hex> arms the page guard on that address without
+@@ -3318,9 +3321,24 @@ extern "C" void lv2_syscall(ppu_context* ctx)
+      * just "somewhere in ntdll". Cleared on every exit path by the guard. */
+     struct _ScGuard {
+         ppu_context* c;
++        uint64_t number;
++        uint64_t begin;
+         ~_ScGuard() { unsigned t = (unsigned)c->thread_id;
+-                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0; }
+-    } _sg{ ctx };
++                      if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = 0;
++                      /* [fps] breakdown: where the main thread waits. */
++                      if (begin)
++                      {
++                          const uint64_t spent = gcm_perf_now_ns() - begin;
++                          if (number == 141)
++                          {
++                              g_gcm_perf_main_usleep_ns += spent;
++                          }
++                          else
++                          {
++                              g_gcm_perf_main_syscall_ns += spent;
++                          }
++                      } }
++    } _sg{ ctx, num, ctx->thread_id == 1 ? gcm_perf_now_ns() : 0 };
+     { unsigned t = (unsigned)ctx->thread_id;
+       if (t < PS3_SC_INFLIGHT_MAX) g_sc_inflight[t] = (uint32_t)num; }
+     /* Guest-PC breadcrumb for the sampling profiler: record the syscall

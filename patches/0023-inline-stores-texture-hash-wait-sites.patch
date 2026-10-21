@@ -1,0 +1,342 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index aff7597..4125cd7 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -2146,20 +2146,35 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
+           tsn++;
+       } }
+ 
+-    /* One hash per cached texture per presented frame.  Word-at-a-time FNV is
+-     * deliberately cheap; this is a mutation detector, not a content ID. */
+-    u64 hash = 1469598103934665603ull;
+-    u32 i = 0;
+-    for (; i + 8 <= span; i += 8) {
+-        u64 word;
+-        memcpy(&word, src + i, sizeof(word));
+-        hash ^= word;
+-        hash *= 1099511628211ull;
+-    }
+-    for (; i < span; i++) {
+-        hash ^= src[i];
+-        hash *= 1099511628211ull;
++    /* One hash per cached texture per presented frame -- a mutation detector,
++     * not a content ID. Every bound texture is re-read in full each frame, so
++     * this is a hot loop (a busy scene binds tens of megabytes of texels): four
++     * independent FNV-style lanes over 32-byte blocks let the multiplies
++     * overlap instead of forming one serial chain, about four times the
++     * throughput of the single-lane version for the same detection. */
++    u64 laneA = 1469598103934665603ull;
++    u64 laneB = 0x9E3779B97F4A7C15ull;
++    u64 laneC = 0xC2B2AE3D27D4EB4Full;
++    u64 laneD = 0x165667B19E3779F9ull;
++    const u64 prime = 1099511628211ull;
++    u32 position = 0;
++    for (; position + 32 <= span; position += 32)
++    {
++        u64 words[4];
++        memcpy(words, src + position, sizeof(words));
++        laneA = (laneA ^ words[0]) * prime;
++        laneB = (laneB ^ words[1]) * prime;
++        laneC = (laneC ^ words[2]) * prime;
++        laneD = (laneD ^ words[3]) * prime;
++    }
++    u64 hash = laneA ^ (laneB * 31u) ^ (laneC * 961u) ^ (laneD * 29791u);
++    for (; position < span; position++)
++    {
++        hash ^= src[position];
++        hash *= prime;
+     }
++    hash ^= span;
++    hash *= prime;
+     *readable = 1;
+     return hash;
+ }
+diff --git a/runtime/ppu/ppu_hle.cpp b/runtime/ppu/ppu_hle.cpp
+index d9ce0c3..0ab497f 100644
+--- a/runtime/ppu/ppu_hle.cpp
++++ b/runtime/ppu/ppu_hle.cpp
+@@ -17,6 +17,7 @@
+  * Compiled as C++ (matches the lifted output). Game-agnostic.
+  */
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
++#define PPU_NO_INLINE_STORES  /* and the out-of-line vm_write* */
+ #include "ppu_recomp.h"   /* ppu_context */
+ #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
+ #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index e0aa6fb..5d9e552 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -33,6 +33,7 @@
+ 
+ #include "ppu_tls.h"   /* PPU_THREAD_LOCAL, without a second ppu_context */
+ #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
++#define PPU_NO_INLINE_STORES  /* and the out-of-line vm_write* */
+ #include "ppu_recomp.h"
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
+ #include <atomic>
+@@ -552,6 +553,71 @@ static void samp_rva_hit(uintptr_t rip)
+     }
+ }
+ 
++/* Where a guest thread is when it is NOT running lifted code: the nearest
++ * lifted function on its stack, split by whether the RIP is in ntdll (it is
++ * waiting -- a lock, an event, a sleep) or in other host code (the runtime is
++ * doing work on its behalf: a store helper, an HLE, the renderer). The thread
++ * table says a thread is 30% idle; this says idle in WHICH guest call, which
++ * is what tells a frame-pacing wait from a lock convoy. */
++#define SAMP_SITES 1024
++static uint32_t s_site_tid[SAMP_SITES];
++static uint32_t s_site_fn[SAMP_SITES];
++static uint8_t  s_site_wait[SAMP_SITES];
++static uint64_t s_site_ct[SAMP_SITES];
++
++static void samp_site_hit(uint32_t tid, uint32_t guestFunction, int waiting)
++{
++    const uint32_t key = (guestFunction >> 2) ^ (tid * 2654435761u) ^ (uint32_t)waiting;
++    for (uint32_t probe = 0; probe < SAMP_SITES; probe++)
++    {
++        const uint32_t slot = (key + probe) % SAMP_SITES;
++        if (s_site_ct[slot] == 0)
++        {
++            s_site_tid[slot] = tid;
++            s_site_fn[slot] = guestFunction;
++            s_site_wait[slot] = (uint8_t)waiting;
++            s_site_ct[slot] = 1;
++            return;
++        }
++        if (s_site_tid[slot] == tid && s_site_fn[slot] == guestFunction &&
++            s_site_wait[slot] == (uint8_t)waiting)
++        {
++            s_site_ct[slot]++;
++            return;
++        }
++    }
++}
++
++static void samp_site_report(void)
++{
++    for (int pass = 0; pass < 2; pass++)
++    {
++        for (int rank = 0; rank < 16; rank++)
++        {
++            uint64_t best = 0;
++            int bestSlot = -1;
++            for (int slot = 0; slot < SAMP_SITES; slot++)
++            {
++                if (s_site_wait[slot] == (uint8_t)(pass == 0) && s_site_ct[slot] > best)
++                {
++                    best = s_site_ct[slot];
++                    bestSlot = slot;
++                }
++            }
++            if (bestSlot < 0 || !best)
++            {
++                break;
++            }
++            fprintf(stderr, "[samp] %s tid %-6u under %s%08X  (%llu)\n",
++                    pass == 0 ? "wait" : "host", s_site_tid[bestSlot],
++                    (s_site_fn[bestSlot] & 0x80000000u) ? "spu_LS_" : "func_",
++                    s_site_fn[bestSlot] & 0x7FFFFFFFu, (unsigned long long)best);
++            s_site_ct[bestSlot] = 0;
++        }
++    }
++    memset(s_site_ct, 0, sizeof s_site_ct);
++}
++
+ static void samp_report(void)
+ {
+     fprintf(stderr, "[samp] %llu samples, %llu in guest code (%.1f%%)\n",
+@@ -595,7 +661,7 @@ static void samp_report(void)
+                 s_t2_id[k], (unsigned long long)s_t2_guest[k],
+                 (unsigned long long)s_t2_ntdll[k], (unsigned long long)s_t2_other[k]);
+     }
+-    for (int rank = 0; rank < 25; rank++) {
++    for (int rank = 0; rank < 40; rank++) {
+         uint64_t best = 0; int bi = -1;
+         for (int k = 0; k < SAMP_RVAS; k++)
+             if (s_rva_ct[k] > best) { best = s_rva_ct[k]; bi = k; }
+@@ -605,6 +671,7 @@ static void samp_report(void)
+                 (unsigned long long)best);
+         s_rva_ct[bi] = 0;
+     }
++    samp_site_report();
+     memset(s_rva_key, 0, sizeof s_rva_key); memset(s_rva_ct, 0, sizeof s_rva_ct);
+     memset(s_t2_id, 0, sizeof s_t2_id); memset(s_t2_guest, 0, sizeof s_t2_guest);
+     memset(s_t2_ntdll, 0, sizeof s_t2_ntdll); memset(s_t2_other, 0, sizeof s_t2_other);
+@@ -666,7 +733,12 @@ static DWORD WINAPI samp_thread(LPVOID p)
+                                  samp_tid2(te.th32ThreadID, 1, 0); }
+                         else { int nt = samp_mod_hit((uintptr_t)c.Rip);
+                                if (!nt) samp_rva_hit((uintptr_t)c.Rip);
+-                               samp_tid2(te.th32ThreadID, 0, nt); }
++                               samp_tid2(te.th32ThreadID, 0, nt);
++                               const uint32_t under = samp_stack_guest(h, &c);
++                               if (under)
++                               {
++                                   samp_site_hit(te.th32ThreadID, under, nt);
++                               } }
+                     }
+                     ResumeThread(h);
+                 }
+@@ -1550,6 +1622,8 @@ static inline void ppu_null_read_report(uint32_t a, int width, void* ra)
+ /* ppu_recomp.h's inline loads (vm_read*_inl) skip the out-of-line accessors'
+  * probes, so they run only while no read diagnostic is armed. */
+ extern "C" int vm_inline_ok = 0;
++/* ppu_recomp.h's inline stores, likewise: set while no store diagnostic is armed. */
++extern "C" int vm_store_inline_ok = 0;
+ static struct VmInlineInit {
+     VmInlineInit() {
+         static const char* const vars[] = {
+@@ -1558,6 +1632,20 @@ static struct VmInlineInit {
+         int d = 0;
+         for (int i = 0; vars[i]; i++) if (getenv(vars[i])) d = 1;
+         vm_inline_ok = !d;
++        /* The inline stores (vm_write*_inl) skip barrier_watch_hit and the
++         * null-page sweep, so they run only while none of the store
++         * diagnostics those implement is armed. */
++        static const char* const storeVars[] = {
++            "PPU_WWATCH", "PPU_WVAL", "PT", "PS3_NULL_SWEEP", "SPU_ATOM_EA", 0 };
++        int storeDiagnostic = 0;
++        for (int i = 0; storeVars[i]; i++)
++        {
++            if (getenv(storeVars[i]))
++            {
++                storeDiagnostic = 1;
++            }
++        }
++        vm_store_inline_ok = !storeDiagnostic && !getenv("PPU_NO_INLINE_STORES");
+     }
+ } s_vm_inline_init;
+ 
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index db9ea00..a85b99a 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -11,6 +11,7 @@
+  * without hand-written NID literals.
+  */
+ #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
++#define PPU_NO_INLINE_STORES  /* and the out-of-line vm_write* */
+ #include "ppu_recomp.h"     /* ppu_context */
+ #include "ps3emu/nid.h"     /* ps3_compute_nid */
+ #include <stdint.h>
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 923d8bd..812f3c7 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -73,6 +73,10 @@ void spu_lockline_unlock(void) { atomic_flag_clear_explicit(&g_lockline, memory_
+ #define SPU_COH_BITMAP_SZ   (SPU_COH_LINES / 8)                 /* 4 MiB */
+ 
+ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
++/* Read-only view for the lifted code's inline stores (ppu_recomp.h): a store
++ * whose line has its bit set takes the out-of-line path, which serializes with
++ * the SPU and raises the lock-line event. */
++const unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
+ 
+ /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
+  * bitmap entirely for a title that runs no SPU code, and keeps every existing
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 0681074..7089aa4 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -215,6 +215,100 @@ static inline uint64_t vm_read64_inl(uint64_t a)
+ #define vm_read64(a) vm_read64_inl(a)
+ #endif
+ 
++/* Inline guest-store fast paths, the store side of the loads above. The
++ * out-of-line vm_write* run the store diagnostics (PPU_WWATCH, PPU_WVAL, ...),
++ * the null-page and end-of-mapping checks, the raw-SPU register side effects
++ * and the PPU<->SPU lock-line coherence -- for every store, through a call.
++ * In Folklore that was a quarter of the main thread at the beach. The runtime
++ * sets vm_store_inline_ok once it knows no store diagnostic is armed; a store
++ * to a line an SPU holds a reservation on still goes out of line, which
++ * serializes it with the SPU and raises the lock-line event, so the result is
++ * the same. PPU_NO_INLINE_STORES=1 (at run time) turns this off. */
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern int vm_store_inline_ok;
++extern const unsigned char* const g_spu_coh_bitmap;
++#ifdef __cplusplus
++}
++#endif
++static inline int vm_store_inl_ok(uint32_t ea, uint32_t n)
++{
++    return __builtin_expect(vm_store_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
++           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size) &&
++           !((g_spu_coh_bitmap[ea >> 10] >> ((ea >> 7) & 7u)) & 1u);
++}
++static inline void vm_write8_inl(uint64_t a, uint8_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_store_inl_ok(ea, 1))
++    {
++        __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED);
++        return;
++    }
++    vm_write8(a, v);
++}
++static inline void vm_write16_inl(uint64_t a, uint16_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_store_inl_ok(ea, 2))
++    {
++        const uint16_t raw = __builtin_bswap16(v);
++        if (!(ea & 1u))
++        {
++            __atomic_store_n((uint16_t*)(vm_base + ea), raw, __ATOMIC_RELAXED);
++        }
++        else
++        {
++            memcpy(vm_base + ea, &raw, 2);
++        }
++        return;
++    }
++    vm_write16(a, v);
++}
++static inline void vm_write32_inl(uint64_t a, uint32_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_store_inl_ok(ea, 4))
++    {
++        const uint32_t raw = __builtin_bswap32(v);
++        if (!(ea & 3u))
++        {
++            __atomic_store_n((uint32_t*)(vm_base + ea), raw, __ATOMIC_RELAXED);
++        }
++        else
++        {
++            memcpy(vm_base + ea, &raw, 4);
++        }
++        return;
++    }
++    vm_write32(a, v);
++}
++static inline void vm_write64_inl(uint64_t a, uint64_t v)
++{
++    const uint32_t ea = (uint32_t)a;
++    if (vm_store_inl_ok(ea, 8))
++    {
++        const uint64_t raw = __builtin_bswap64(v);
++        if (!(ea & 7u))
++        {
++            __atomic_store_n((uint64_t*)(vm_base + ea), raw, __ATOMIC_RELAXED);
++        }
++        else
++        {
++            memcpy(vm_base + ea, &raw, 8);
++        }
++        return;
++    }
++    vm_write64(a, v);
++}
++#ifndef PPU_NO_INLINE_STORES
++#define vm_write8(a, v)  vm_write8_inl(a, v)
++#define vm_write16(a, v) vm_write16_inl(a, v)
++#define vm_write32(a, v) vm_write32_inl(a, v)
++#define vm_write64(a, v) vm_write64_inl(a, v)
++#endif
++
+ /* Syscall handler */
+ #ifdef __cplusplus
+ extern "C"

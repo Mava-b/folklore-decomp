@@ -1,0 +1,287 @@
+From: Folklore port <noreply@localhost>
+Subject: [PATCH 0008] Per-thread guest callback stacks; AIO latency; diagnostics
+
+1. ppu_guest_call / ppu_guest_call_ct: each host thread gets its own 64 KB
+   callback stack from the PPU stack region (on first use), instead of one
+   scratch stack at 0xCFFE0000 shared by every host thread -- a callback on a
+   game thread (cellVdec PICOUT) and one on the vblank ticker (GCM flip
+   handler) could run on the same guest stack at once. Callbacks also inherit
+   the calling thread's TLS (r13). PS3_CB_SCRATCH_STACK=1 restores the old
+   stack.
+2. cellFsAioRead completions arrive after 25 ms (PS3_FS_AIO_LATENCY_MS), like
+   a disc read; PS3_FS_AIO_SUBMIT_DELAY_MS (default 0) for experiments.
+3. Diagnostics: PS3_CONDLOG=1 logs sys_cond_wait calls, PS3_CONDLOG_SIGNAL=<id>
+   the signals of one cond; cellVdec logs the callback's return value (first
+   three per message type, and every non-zero one).
+
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index 4f3f3ce..e129ed2 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -78,8 +78,20 @@ static void vdec_notify(CellVdecHandle handle, u32 msg_type, s32 msg_data)
+     if (handle >= MAX_VDEC || !s_vdec[handle].in_use) return;
+     const VdecSlot* v = &s_vdec[handle];
+     if (!v->cbFunc || !g_ps3_guest_caller) return;
+-    g_ps3_guest_caller(v->cbFunc, (u64)handle, (u64)msg_type,
+-                       (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
++    /* The callback's return value says whether the title accepted the
++     * message; log the first few of each type and every non-zero one. */
++    extern u64 ppu_guest_call(u32 opd, u64 a0, u64 a1, u64 a2, u64 a3,
++                              u64 a4, u64 a5, u64 a6, u64 a7);
++    u64 rc = ppu_guest_call(v->cbFunc, (u64)handle, (u64)msg_type,
++                            (u64)(s64)msg_data, (u64)v->cbArg, 0, 0, 0, 0);
++    { static u32 s_seen[4]; static u32 s_bad;
++      u32 slot = msg_type < 4 ? msg_type : 3;
++      if (s_seen[slot] < 3 || (rc && s_bad < 16)) {
++          if (rc) s_bad++;
++          s_seen[slot]++;
++          fprintf(stderr, "[cellVdec] callback(msg=%u data=0x%X) -> 0x%llX\n",
++                  msg_type, (u32)msg_data, (unsigned long long)rc);
++      } }
+ }
+ 
+ /* ---------------------------------------------------------------------------
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 3fd258f..6b20639 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -21,6 +21,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <atomic>
++#include <chrono>
+ #include <condition_variable>
+ #include <deque>
+ #include <mutex>
+@@ -924,9 +925,7 @@ static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+  *
+  * The worker reads through its own host handle, opened from the path, so the
+  * guest's fd position and stdio buffer are untouched (AIO reads are absolute).
+- * It calls the guest back on a guest stack of its own (ppu_guest_call_set_stack). */
+-extern "C" void ppu_guest_call_set_stack(uint32_t top);
+-extern "C" uint32_t sys_ppu_thread_alloc_host_stack(uint32_t stack_size);
++ * It calls the guest back on a guest stack of its own (see ppu_callback_stack). */
+ 
+ struct FsAioRequest
+ {
+@@ -969,9 +968,8 @@ static size_t fs_aio_perform(const FsAioRequest& request, int32_t* error)
+     return bytesRead;
+ }
+ 
+-static void fs_aio_worker(uint32_t stackTop)
++static void fs_aio_worker()
+ {
+-    ppu_guest_call_set_stack(stackTop);
+     for (;;)
+     {
+         FsAioRequest request;
+@@ -981,6 +979,25 @@ static void fs_aio_worker(uint32_t stackTop)
+             request = std::move(s_aioQueue.front());
+             s_aioQueue.pop_front();
+         }
++        /* Disc latency. Completing in microseconds exposes a race in
++         * Folklore's movie player: MovieOpen clears its "hold" flag and
++         * signals the presentation thread when the first read lands, and that
++         * thread only notices the hold on a 10 ms poll -- if the signal comes
++         * first it is lost and the movie never shows a frame. A Blu-ray read
++         * takes tens of milliseconds, which is the ordering the title was
++         * written against. PS3_FS_AIO_LATENCY_MS overrides (0 = none). */
++        {
++            static int s_latencyMs = -1;
++            if (s_latencyMs < 0)
++            {
++                const char* text = getenv("PS3_FS_AIO_LATENCY_MS");
++                s_latencyMs = text ? atoi(text) : 25;
++            }
++            if (s_latencyMs > 0)
++            {
++                std::this_thread::sleep_for(std::chrono::milliseconds(s_latencyMs));
++            }
++        }
+         int32_t error = CELL_OK;
+         size_t bytesRead = fs_aio_perform(request, &error);
+         if (getenv("PS3_FSLOG"))
+@@ -1015,6 +1032,28 @@ static void cellFsAioRead(ppu_context* ctx)
+         request.hostPath = g_fd_host_path[request.fd];
+     }
+ 
++    /* PS3_FS_AIO_SUBMIT_DELAY_MS: time the SUBMIT takes. On a Blu-ray drive
++     * the work around a read -- opening the file, the seek -- costs tens of
++     * milliseconds, and some titles are only correct with that much time
++     * between steps. Folklore's movie player: MovieOpen submits the first read
++     * and then MovieStart clears the "hold" flag its two movie threads check
++     * on a 10 ms poll; if one thread sees the hold and the other does not,
++     * the one waiting in the hold handshake is never released. (Folklore now
++     * fixes that in its own lifted code, tools/game_patches.py; this stays as
++     * a knob for experiments.) Default 0. */
++    {
++        static int s_submitDelayMs = -1;
++        if (s_submitDelayMs < 0)
++        {
++            const char* text = getenv("PS3_FS_AIO_SUBMIT_DELAY_MS");
++            s_submitDelayMs = text ? atoi(text) : 0;
++        }
++        if (s_submitDelayMs > 0)
++        {
++            std::this_thread::sleep_for(std::chrono::milliseconds(s_submitDelayMs));
++        }
++    }
++
+     static std::atomic<int32_t> s_nextId(1);
+     request.id = s_nextId++;
+     if (id_ptr) vm_write32(id_ptr, (uint32_t)request.id);
+@@ -1039,8 +1078,7 @@ static void cellFsAioRead(ppu_context* ctx)
+     if (!s_aioStarted)
+     {
+         /* 64 KB of guest stack for the callbacks, from the PPU stack region. */
+-        uint32_t stackTop = sys_ppu_thread_alloc_host_stack(0x10000u);
+-        std::thread(fs_aio_worker, stackTop).detach();
++        std::thread(fs_aio_worker).detach();
+         s_aioStarted = true;
+     }
+     s_aioQueue.push_back(std::move(request));
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 52353b0..30c7981 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -35,6 +35,7 @@
+ #define PPU_NO_INLINE_LOADS   /* this file defines the out-of-line accessors */
+ #include "ppu_recomp.h"
+ #include "ps3emu/milestone.h"   /* ps3_ms / ps3_msf -- boot milestone log */     /* ppu_context, func decls, ppu_recomp_register */
++#include <atomic>
+ #include "../memory/vm.h"   /* vm_commit -- sys_mmapper_search_and_map maps for real */
+ #include "../platform/win32_compat.h"      /* Win32 types, interlocked ops, Sleep/QPC on POSIX */
+ #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+@@ -3653,6 +3654,42 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
+ static PPU_THREAD_LOCAL uint32_t s_host_cb_stack_top = 0;
+ extern "C" void ppu_guest_call_set_stack(uint32_t top) { s_host_cb_stack_top = top & ~0xFu; }
+ 
++/* Where a callback's frames go.
++ *
++ * Every host thread -- each guest PPU thread, the vblank ticker, HLE workers --
++ * gets a callback stack of its own, 64 KB from the PPU stack region,
++ * allocated on its first callback. It used to be one scratch stack at
++ * 0xCFFE0000 shared by every host thread, so a callback on a game thread
++ * (cellVdec's PICOUT on Folklore's movie thread) and one on the vblank ticker
++ * (the GCM flip handler) could run on the same guest stack at the same time.
++ * (Firmware runs such callbacks on its own threads -- libvdec's decoder
++ * thread, for one -- so the calling thread's own stack is not the answer
++ * either: Folklore's movie threads have 16 KB stacks.)
++ * A callback made from inside a callback continues below the outer one.
++ * PS3_CB_SCRATCH_STACK=1 restores the shared scratch stack. */
++extern "C" uint32_t sys_ppu_thread_alloc_host_stack(uint32_t stack_size);
++static uint32_t ppu_callback_stack(const ppu_context* caller, uint32_t* hostStack)
++{
++    const uint32_t kCallbackStackSize = 0x10000u;
++    static int s_scratch = -1;
++    if (s_scratch < 0) s_scratch = getenv("PS3_CB_SCRATCH_STACK") ? 1 : 0;
++    if (!*hostStack) {
++        if (s_host_cb_stack_top) {
++            *hostStack = s_host_cb_stack_top;
++        } else if (s_scratch) {
++            *hostStack = 0xCFFE0000u;
++        } else {
++            uint32_t top = sys_ppu_thread_alloc_host_stack(kCallbackStackSize);
++            *hostStack = top ? (top & ~0xFu) : 0xCFFE0000u;
++        }
++    }
++    /* Nested: the caller is already running on this callback stack. */
++    if (caller && caller->gpr[1] < *hostStack &&
++        caller->gpr[1] > *hostStack - kCallbackStackSize + 0x1000u)
++        return ((uint32_t)caller->gpr[1] - 0x400u) & ~0xFu;
++    return *hostStack;
++}
++
+ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+@@ -3680,15 +3717,15 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+     /* Private scratch stack high in the guest stack region, distinct from the
+      * main + ppu_thread stacks. One callback at a time per caller thread. */
+     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
+-    if (!s_cb_sp) s_cb_sp = s_host_cb_stack_top ? s_host_cb_stack_top : 0xCFFE0000u;
+ 
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof(ctx));
+-    ctx.gpr[1]  = s_cb_sp;
++    ctx.gpr[1]  = ppu_callback_stack(g_active_ctx, &s_cb_sp);
+     ctx.gpr[2]  = toc;
+     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
+-    ctx.gpr[13] = PPU_TLS_TP;
++    /* The caller's TLS, when there is a calling guest thread. */
++    ctx.gpr[13] = (g_active_ctx && g_active_ctx->gpr[13]) ? g_active_ctx->gpr[13] : PPU_TLS_TP;
+     ctx.cia     = code;
+     /* Save/restore g_active_ctx: this scratch ctx lives on the stack, so leaving
+      * g_active_ctx pointing at it after we return leaves a DANGLING pointer once the
+@@ -3725,15 +3762,15 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
+ 
+     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
+-    if (!s_cb_sp) s_cb_sp = s_host_cb_stack_top ? s_host_cb_stack_top : 0xCFFE0000u;
+ 
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof(ctx));
+-    ctx.gpr[1]  = s_cb_sp;
++    ctx.gpr[1]  = ppu_callback_stack(g_active_ctx, &s_cb_sp);
+     ctx.gpr[2]  = toc;
+     ctx.gpr[3]  = a0; ctx.gpr[4] = a1; ctx.gpr[5] = a2; ctx.gpr[6] = a3;
+     ctx.gpr[7]  = a4; ctx.gpr[8] = a5; ctx.gpr[9] = a6; ctx.gpr[10] = a7;
+-    ctx.gpr[13] = PPU_TLS_TP;
++    /* The caller's TLS, when there is a calling guest thread. */
++    ctx.gpr[13] = (g_active_ctx && g_active_ctx->gpr[13]) ? g_active_ctx->gpr[13] : PPU_TLS_TP;
+     ctx.cia     = code;
+     /* Save/restore g_active_ctx (see ppu_guest_call): the scratch ctx is stack-local,
+      * so a dangling g_active_ctx after return corrupts the crash handler / diagnostics. */
+diff --git a/runtime/syscalls/sys_cond.c b/runtime/syscalls/sys_cond.c
+index 45235ea..c4012cd 100644
+--- a/runtime/syscalls/sys_cond.c
++++ b/runtime/syscalls/sys_cond.c
+@@ -138,6 +138,15 @@ int64_t sys_cond_wait(ppu_context* ctx)
+     long probe_ms = spurious ? atol(spurious) : 0;
+     if (probe_ms > 0 && !timeout) timeout = (uint64_t)probe_ms * 1000;
+ #endif
++    if (getenv("PS3_CONDLOG")) {
++        static int s_n;
++        if (s_n++ < 400)
++            fprintf(stderr, "[condlog] tid=%llu cond=%u timeout=%llu r25=0x%llX r26=0x%llX r29=0x%llX r31=0x%llX\n",
++                    (unsigned long long)ctx->thread_id, LV2_ARG_U32(ctx, 0),
++                    (unsigned long long)timeout, (unsigned long long)ctx->gpr[25],
++                    (unsigned long long)ctx->gpr[26], (unsigned long long)ctx->gpr[29],
++                    (unsigned long long)ctx->gpr[31]);
++    }
+     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
+     if (!c) return (int32_t)CELL_ESRCH;
+@@ -212,6 +221,13 @@ static int64_t signal_cond(uint32_t id, int all)
+         selected = 1;
+         if (!all) break;
+     }
++    { static const char* s_want = (const char*)-1;
++      if (s_want == (const char*)-1) s_want = getenv("PS3_CONDLOG_SIGNAL");
++      if (s_want && (uint32_t)atoi(s_want) == id) {
++          static int s_n;
++          if (s_n++ < 200)
++              fprintf(stderr, "[condlog] signal cond=%u all=%d woke=%d\n", id, all, selected);
++      } }
+     /* Broadcast the host CV: only selected records return to the guest.
+      * Waking an arbitrary host waiter could leave the selected one asleep. */
+     if (selected) cond_wake(c);
+@@ -219,7 +235,16 @@ static int64_t signal_cond(uint32_t id, int all)
+     return CELL_OK;
+ }
+ 
+-int64_t sys_cond_signal(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 0); }
++int64_t sys_cond_signal(ppu_context* ctx)
++{
++    { static const char* s_want = (const char*)-1;
++      if (s_want == (const char*)-1) s_want = getenv("PS3_CONDLOG_SIGNAL");
++      if (s_want && (uint32_t)atoi(s_want) == LV2_ARG_U32(ctx, 0))
++          fprintf(stderr, "[condlog] signal by tid=%llu lr=0x%08llX r29=0x%llX r30=0x%llX\n",
++                  (unsigned long long)ctx->thread_id, (unsigned long long)ctx->lr,
++                  (unsigned long long)ctx->gpr[29], (unsigned long long)ctx->gpr[30]); }
++    return signal_cond(LV2_ARG_U32(ctx, 0), 0);
++}
+ int64_t sys_cond_signal_all(ppu_context* ctx) { return signal_cond(LV2_ARG_U32(ctx, 0), 1); }
+ 
+ /* Preserve upstream's current broadcast fallback for signal_to. */

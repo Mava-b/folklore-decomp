@@ -1,0 +1,425 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index f2b4c11..cb8fc7b 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -421,6 +421,11 @@ static unsigned long long pad_now_ms(void)
+ #endif
+ }
+ 
++/* Set by a port's in-game menu while it is open: the game then sees every
++ * port connected but idle, so navigating the menu does not also move the
++ * character. */
++volatile int g_cellpad_block_guest_input = 0;
++
+ static void pad_poll_backend(void)
+ {
+     /* Benign race: two threads may poll in the same tick. That costs one extra
+@@ -442,6 +447,19 @@ static void pad_poll_backend(void)
+ #ifdef _WIN32
+     if (!s_host_state[0].connected) pad_poll_keyboard();
+ #endif
++    if (g_cellpad_block_guest_input)
++    {
++        for (int port = 0; port < PAD_MAX_HOST_PORTS; port++)
++        {
++            const int connected = s_host_state[port].connected;
++            memset(&s_host_state[port], 0, sizeof(s_host_state[port]));
++            s_host_state[port].connected = connected;
++            s_host_state[port].analog_lx = 128;
++            s_host_state[port].analog_ly = 128;
++            s_host_state[port].analog_rx = 128;
++            s_host_state[port].analog_ry = 128;
++        }
++    }
+ }
+ 
+ /* ---------------------------------------------------------------------------
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 5ed4656..1fea5e6 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -51,6 +51,7 @@ void rsx_live_draw_flush(void) {}
+ void rsx_live_draw_present(u32 b) { (void)b; }
+ void rsx_live_draw_set_movie_mode(int on) { (void)on; }
+ void rsx_live_draw_present_rgba(const uint8_t* r, u32 w, u32 h) { (void)r; (void)w; (void)h; }
++void rsx_live_draw_set_overlay(rsx_live_overlay_fn fn) { (void)fn; }
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+ void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
+ u32  rsx_live_draw_get_last_draws(void) { return 0; }
+@@ -1836,6 +1837,37 @@ void rsx_live_draw_flush(void)
+     if (g.ready) ld_flush(LD_FLUSH_GUEST_REFERENCE);
+ }
+ 
++/* Port overlay (rsx_live_draw.h). */
++static rsx_live_overlay_fn s_ld_overlay = NULL;
++void rsx_live_draw_set_overlay(rsx_live_overlay_fn fn)
++{
++    s_ld_overlay = fn;
++}
++
++/* The backbuffer `bb` (index `index`) has just been written by a copy and is
++ * in COPY_DEST: run the overlay over it, if one is set, and leave it in
++ * PRESENT either way. */
++static void ld_overlay_then_present_state(ID3D12Resource* bb, u32 index)
++{
++    D3D12_RESOURCE_BARRIER barrier = {0};
++    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
++    barrier.Transition.pResource = bb;
++    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
++    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
++    if (s_ld_overlay)
++    {
++        barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
++        g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
++        const D3D12_CPU_DESCRIPTOR_HANDLE target = rtv_handle(index);
++        g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &target, FALSE, NULL);
++        s_ld_overlay(g.dev, g.queue, g.list, (unsigned long long)target.ptr,
++                     (unsigned)DXGI_FORMAT_R8G8B8A8_UNORM, g.width, g.height);
++        barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
++    }
++    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
++}
++
+ static void retire_texture(ID3D12Resource* tex)
+ {
+     if (!tex) return;
+@@ -5060,14 +5092,11 @@ static void fetch_batches_hoisted(
+             dc.fetch_ok = 0;
+             return;
+         }
+-        for (u32 i = 0; i < dc.n_refs; i++) {
+-            u8* destination = layout->stride
+-                ? dc.compact_verts + (u64)i * layout->stride : NULL;
+-            if (!rsx_vertex_fetch_one(
+-                    &dc.fetch_plan, &dc.refs[i], destination)) {
+-                dc.fetch_ok = 0;
+-                return;
+-            }
++        if (!rsx_vertex_fetch_many(
++                &dc.fetch_plan, dc.refs, dc.n_refs,
++                layout->stride ? dc.compact_verts : NULL, layout->stride)) {
++            dc.fetch_ok = 0;
++            return;
+         }
+     } else {
+         /*
+@@ -5087,13 +5116,12 @@ static void fetch_batches_hoisted(
+             dc.fetch_ok = 0;
+             return;
+         }
+-        for (u32 i = 0; i < dc.n_refs; i++) {
+-            if (!rsx_vertex_fetch_one(
+-                    &dc.fetch_plan, &dc.refs[i],
+-                    (u8*)&dc.verts[i])) {
+-                dc.fetch_ok = 0;
+-                return;
+-            }
++        if (dc.n_refs &&
++            !rsx_vertex_fetch_many(
++                &dc.fetch_plan, dc.refs, dc.n_refs,
++                (u8*)&dc.verts[0], (u32)sizeof(dc.verts[0]))) {
++            dc.fetch_ok = 0;
++            return;
+         }
+     }
+     dc.n_verts = dc.n_refs;
+@@ -8796,9 +8824,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+     src.PlacedFootprint.Footprint.RowPitch = pitch;
+     g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
+ 
+-    b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+-    b.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
++    ld_overlay_then_present_state(bb, bbi);
+ 
+     ld_flush(LD_FLUSH_MOVIE_PRESENT);
+     {
+@@ -9366,9 +9392,8 @@ void rsx_live_draw_present(u32 buffer_id)
+ 
+     bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+     bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+-    bar[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+-    bar[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+-    g.list->lpVtbl->ResourceBarrier(g.list, 2, bar);
++    g.list->lpVtbl->ResourceBarrier(g.list, 1, bar);
++    ld_overlay_then_present_state(bb, bbi);
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+     {
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index 1c3fd72..c4f01bf 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -109,6 +109,20 @@ void rsx_live_draw_set_movie_mode(int on);
+  * swap-chain backbuffer. Call from one thread with movie mode on. */
+ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h);
+ 
++/* Overlay hook: called on the present thread for every presented frame,
++ * after the frame has been copied into the swap-chain backbuffer and before
++ * the Present. The backbuffer is in RENDER_TARGET state and bound as the only
++ * render target; `device` is the ID3D12Device, `queue` the ID3D12CommandQueue,
++ * `list` the open ID3D12GraphicsCommandList, `rtv` the backbuffer's RTV CPU
++ * handle (D3D12_CPU_DESCRIPTOR_HANDLE.ptr), `format` its DXGI_FORMAT. The
++ * list is submitted and reset right after, so the hook may change any list
++ * state (root signature, heaps, viewport). A port's in-game menu draws here.
++ * NULL (the default) skips it. */
++typedef void (*rsx_live_overlay_fn)(void* device, void* queue, void* list,
++                                    unsigned long long rtv, unsigned format,
++                                    u32 width, u32 height);
++void rsx_live_draw_set_overlay(rsx_live_overlay_fn fn);
++
+ /* Count of REAL game frames the live-draw engine has presented (the game's own
+  * 0xE944 flips carrying accumulated draws) -- distinct from the null backend's
+  * per-vblank "flips" present count, which keeps ticking even when t1 has stalled
+diff --git a/libs/video/rsx_vertex_compact.c b/libs/video/rsx_vertex_compact.c
+index 4334f16..adc6aee 100644
+--- a/libs/video/rsx_vertex_compact.c
++++ b/libs/video/rsx_vertex_compact.c
+@@ -6,7 +6,7 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
+-static float rsx_compact_be_f32(const u8* p)
++static inline float rsx_compact_be_f32(const u8* p)
+ {
+     const u32 w = ((u32)p[0] << 24) | ((u32)p[1] << 16) |
+                   ((u32)p[2] << 8) | (u32)p[3];
+@@ -15,7 +15,7 @@ static float rsx_compact_be_f32(const u8* p)
+     return f;
+ }
+ 
+-static float rsx_compact_be_f16(const u8* p)
++static inline float rsx_compact_be_f16(const u8* p)
+ {
+     const u16 h = (u16)((p[0] << 8) | p[1]);
+     const u32 sign = (u32)(h >> 15) << 31;
+@@ -292,6 +292,185 @@ int rsx_vertex_fetch_one(
+     return 1;
+ }
+ 
++/* One attribute of rsx_vertex_fetch_one, for a single vertex: the source the
++ * per-vertex path would pick, decoded, or the default. Returns 0 where that
++ * path would fail the vertex (ATTR0 unusable). */
++static int rsx_vertex_fetch_attr_one(
++    const rsx_vertex_fetch_plan* plan, u32 attr, const rsx_vertex_ref* ref,
++    float* value)
++{
++    const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
++    const u32 element = rsx_vertex_element_index(
++        ref->vertex_id, ref->base_index, fetch->desc.frequency,
++        (plan->divider_mask >> attr) & 1u);
++    const u8* source = NULL;
++    if (fetch->stable_base &&
++        element >= fetch->stable_first && element <= fetch->stable_last) {
++        source = fetch->stable_base +
++            (u64)(element - fetch->stable_first) * fetch->stride;
++    } else if (plan->inline_data) {
++        source = NULL;
++    } else if (plan->guest_ptr) {
++        const u32 offset =
++            plan->base_offset + fetch->desc.offset +
++            element * fetch->stride;
++        source = plan->guest_ptr(
++            plan->guest_user, fetch->desc.location, offset,
++            fetch->elem_size);
++    }
++    if (source && rsx_vertex_decode_element(
++            fetch->desc.type, fetch->desc.size, source, value))
++        return 1;
++    if (attr == 0)
++        return 0;
++    memcpy(value, fetch->default_value, 16);
++    return 1;
++}
++
++static inline u32 rsx_compact_load_be32(const u8* p)
++{
++    u32 word;
++    memcpy(&word, p, 4);
++    return __builtin_bswap32(word);
++}
++
++static inline u16 rsx_compact_load_be16(const u8* p)
++{
++    u16 half;
++    memcpy(&half, p, 2);
++    return (u16)__builtin_bswap16(half);
++}
++
++static int rsx_vertex_fetch_block(
++    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
++    u8* out, u32 out_stride)
++{
++    for (u32 slot = 0; slot < plan->layout.count; slot++) {
++        const u32 attr = plan->layout.attrs[slot];
++        const rsx_vertex_fetch_attr* fetch = &plan->attr[attr];
++        u8* base = out + slot * 16u;
++        if (!fetch->desc.type || !fetch->desc.size) {
++            for (u32 vertex = 0; vertex < count; vertex++)
++                memcpy(base + (u64)vertex * out_stride, fetch->default_value, 16);
++            continue;
++        }
++        const u32 type = fetch->desc.type;
++        const u32 components = fetch->desc.size < 4u ? fetch->desc.size : 4u;
++        const int simple_index = fetch->desc.frequency <= 1;
++        const int fast_type =
++            type == RSX_VTX_TYPE_FLOAT || type == RSX_VTX_TYPE_HALF ||
++            type == RSX_VTX_TYPE_UNORM8 || type == RSX_VTX_TYPE_UINT8 ||
++            type == RSX_VTX_TYPE_SNORM16 || type == RSX_VTX_TYPE_SINT16 ||
++            type == RSX_VTX_TYPE_CMP32;
++        if (!fetch->stable_base || !simple_index || !fast_type) {
++            for (u32 vertex = 0; vertex < count; vertex++) {
++                float* value = (float*)(base + (u64)vertex * out_stride);
++                if (!rsx_vertex_fetch_attr_one(plan, attr, &refs[vertex], value))
++                    return 0;
++            }
++            continue;
++        }
++        const u8* stable = fetch->stable_base;
++        const u32 first = fetch->stable_first;
++        const u32 last = fetch->stable_last;
++        const u32 stride = fetch->stride;
++        /* One loop per (format, component count): the decode is fixed for
++         * the whole attribute, so nothing but the vertex index varies. */
++#define RSX_FETCH_LOOP(COMPONENTS, DECODE)                                        \
++        for (u32 vertex = 0; vertex < count; vertex++) {                          \
++            float* value = (float*)(base + (u64)vertex * out_stride);             \
++            const u32 element =                                                    \
++                (refs[vertex].vertex_id + refs[vertex].base_index) & 0x000FFFFFu;  \
++            if (element < first || element > last) {                              \
++                if (!rsx_vertex_fetch_attr_one(plan, attr, &refs[vertex], value))  \
++                    return 0;                                                       \
++                continue;                                                           \
++            }                                                                       \
++            const u8* source = stable + (u64)(element - first) * stride;           \
++            float result[4] = { 0.0f, 0.0f, 0.0f, 1.0f };                          \
++            for (u32 component = 0; component < (COMPONENTS); component++)         \
++                result[component] = DECODE;                                         \
++            memcpy(value, result, 16);                                              \
++        }
++#define RSX_FETCH_BY_SIZE(DECODE)                                                  \
++        switch (components) {                                                      \
++        case 1: RSX_FETCH_LOOP(1, DECODE) break;                                   \
++        case 2: RSX_FETCH_LOOP(2, DECODE) break;                                   \
++        case 3: RSX_FETCH_LOOP(3, DECODE) break;                                   \
++        default: RSX_FETCH_LOOP(4, DECODE) break;                                  \
++        }
++        switch (type) {
++        case RSX_VTX_TYPE_FLOAT:
++            RSX_FETCH_BY_SIZE(rsx_compact_be_f32(source + component * 4u))
++            break;
++        case RSX_VTX_TYPE_HALF:
++            RSX_FETCH_BY_SIZE(rsx_compact_be_f16(source + component * 2u))
++            break;
++        case RSX_VTX_TYPE_UNORM8:
++            RSX_FETCH_BY_SIZE(source[component] / 255.0f)
++            break;
++        case RSX_VTX_TYPE_UINT8:
++            RSX_FETCH_BY_SIZE((float)source[component])
++            break;
++        case RSX_VTX_TYPE_SNORM16:
++            RSX_FETCH_BY_SIZE((s16)rsx_compact_load_be16(source + component * 2u) / 32767.0f)
++            break;
++        case RSX_VTX_TYPE_SINT16:
++            RSX_FETCH_BY_SIZE((float)(s16)rsx_compact_load_be16(source + component * 2u))
++            break;
++        case RSX_VTX_TYPE_CMP32:
++        default:
++            for (u32 vertex = 0; vertex < count; vertex++) {
++                float* value = (float*)(base + (u64)vertex * out_stride);
++                const u32 element =
++                    (refs[vertex].vertex_id + refs[vertex].base_index) & 0x000FFFFFu;
++                if (element < first || element > last) {
++                    if (!rsx_vertex_fetch_attr_one(plan, attr, &refs[vertex], value))
++                        return 0;
++                    continue;
++                }
++                const u32 word = rsx_compact_load_be32(stable + (u64)(element - first) * stride);
++                s32 x = (s32)(word & 0x7FF);
++                s32 y = (s32)((word >> 11) & 0x7FF);
++                s32 z = (s32)((word >> 22) & 0x3FF);
++                if (x & 0x400) x -= 0x800;
++                if (y & 0x400) y -= 0x800;
++                if (z & 0x200) z -= 0x400;
++                const float result[4] = { (float)x / 1023.0f, (float)y / 1023.0f, (float)z / 511.0f, 1.0f };
++                memcpy(value, result, 16);
++            }
++            break;
++        }
++#undef RSX_FETCH_BY_SIZE
++#undef RSX_FETCH_LOOP
++    }
++    return 1;
++}
++
++int rsx_vertex_fetch_many(
++    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
++    u8* out, u32 out_stride)
++{
++    if (!plan || (!refs && count))
++        return 0;
++    if (!plan->layout.stride || !out) {
++        for (u32 vertex = 0; vertex < count; vertex++)
++            if (!rsx_vertex_fetch_one(plan, &refs[vertex], NULL))
++                return 0;
++        return 1;
++    }
++    /* Blocks small enough that a block's output stays in L1 while every
++     * attribute pass writes into it. */
++    const u32 block = 128;
++    for (u32 begin = 0; begin < count; begin += block) {
++        const u32 length = count - begin < block ? count - begin : block;
++        if (!rsx_vertex_fetch_block(plan, refs + begin, length,
++                                    out + (u64)begin * out_stride, out_stride))
++            return 0;
++    }
++    return 1;
++}
++
+ static u64 rsx_vertex_remap_hash(u64 value)
+ {
+     value ^= value >> 33;
+diff --git a/libs/video/rsx_vertex_compact.h b/libs/video/rsx_vertex_compact.h
+index ad21361..6e12e2c 100644
+--- a/libs/video/rsx_vertex_compact.h
++++ b/libs/video/rsx_vertex_compact.h
+@@ -116,6 +116,15 @@ void rsx_vertex_fetch_plan_prepare(
+ int rsx_vertex_fetch_one(
+     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
+ 
++/* rsx_vertex_fetch_one for refs[0..count), vertex i written at
++ * out + i * out_stride, with byte-identical results. Works attribute by
++ * attribute with the format switch hoisted out of the vertex loop, which is
++ * where the live renderer spent most of its time. Returns 0 exactly when
++ * rsx_vertex_fetch_one would for some vertex (an unusable ATTR0). */
++int rsx_vertex_fetch_many(
++    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
++    u8* out, u32 out_stride);
++
+ /* Collapse repeated (vertex_id, base_index) references in first-use order.
+  * refs is rewritten in place with the unique prefix.  The occurrence map
+  * remains valid until the next call using the same remap object. */
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 6a1ede0..0ba3493 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -115,6 +115,9 @@ static void write_be64(uint32_t addr, uint64_t val)
+  * frame whose work takes 29 ms sleeps until 39 ms. Polling the same condition
+  * every 1 ms ends the frame at 30 ms, and the loop's own exit test is
+  * unchanged. Up to 8 sites. */
++/* A port's settings can turn the clamp off and on at run time. */
++volatile int g_usleep_clamp_enabled = 1;
++
+ static uint64_t usleep_clamp(uint32_t lr, uint64_t usec)
+ {
+     static int parsed = 0;
+@@ -148,7 +151,7 @@ static uint64_t usleep_clamp(uint32_t lr, uint64_t usec)
+             fprintf(stderr, "[usleep] clamping %d call site(s) (PS3_USLEEP_CLAMP)\n", siteCount);
+         }
+     }
+-    for (int site = 0; site < siteCount; site++)
++    for (int site = 0; site < siteCount && g_usleep_clamp_enabled; site++)
+     {
+         if (siteLr[site] == lr && usec > siteMax[site])
+         {

@@ -1,0 +1,65 @@
+diff --git a/runtime/syscalls/sys_timer.c b/runtime/syscalls/sys_timer.c
+index 78b3e38..6a1ede0 100644
+--- a/runtime/syscalls/sys_timer.c
++++ b/runtime/syscalls/sys_timer.c
+@@ -108,9 +108,59 @@ static void write_be64(uint32_t addr, uint64_t val)
+  *
+  * r3 = microseconds
+  * -----------------------------------------------------------------------*/
++/* PS3_USLEEP_CLAMP=<lr>:<max us>[,<lr>:<max us>...]: cap the sleep a guest
++ * asks for at the named call sites (keyed on ctx->lr, as PS3_POLLTOP prints
++ * them). For a title's frame limiter that polls the clock in coarse steps:
++ * Folklore's main loop runs `while (elapsed < 30 ms) usleep(10 ms)`, so a
++ * frame whose work takes 29 ms sleeps until 39 ms. Polling the same condition
++ * every 1 ms ends the frame at 30 ms, and the loop's own exit test is
++ * unchanged. Up to 8 sites. */
++static uint64_t usleep_clamp(uint32_t lr, uint64_t usec)
++{
++    static int parsed = 0;
++    static int siteCount = 0;
++    static uint32_t siteLr[8];
++    static uint64_t siteMax[8];
++    if (!parsed)
++    {
++        parsed = 1;
++        const char* text = getenv("PS3_USLEEP_CLAMP");
++        while (text && *text && siteCount < 8)
++        {
++            char* end = NULL;
++            const unsigned long lrValue = strtoul(text, &end, 0);
++            if (!end || *end != ':')
++            {
++                break;
++            }
++            const unsigned long long maxValue = strtoull(end + 1, &end, 0);
++            siteLr[siteCount] = (uint32_t)lrValue;
++            siteMax[siteCount] = (uint64_t)maxValue;
++            siteCount++;
++            if (!end || *end != ',')
++            {
++                break;
++            }
++            text = end + 1;
++        }
++        if (siteCount)
++        {
++            fprintf(stderr, "[usleep] clamping %d call site(s) (PS3_USLEEP_CLAMP)\n", siteCount);
++        }
++    }
++    for (int site = 0; site < siteCount; site++)
++    {
++        if (siteLr[site] == lr && usec > siteMax[site])
++        {
++            return siteMax[site];
++        }
++    }
++    return usec;
++}
++
+ int64_t sys_timer_usleep(ppu_context* ctx)
+ {
+-    uint64_t usec = LV2_ARG_U64(ctx, 0);
++    uint64_t usec = usleep_clamp((uint32_t)ctx->lr, LV2_ARG_U64(ctx, 0));
+     { extern unsigned long long ps3_qpc_us(void);
+       static int n=0; if (n++ < 60)
+         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),

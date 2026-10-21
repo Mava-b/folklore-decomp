@@ -1,0 +1,334 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index d359f52..1530159 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -65,6 +65,21 @@ static u64 get_timestamp_ns(void)
+ }
+ #endif
+ 
++
++/* Frame-time breakdown printed with the [fps] heartbeat (rsx_live_draw.c):
++ * nanoseconds summed since start by each place a frame can be held up.
++ * A delta per heartbeat divided by its frame count says where the frame went
++ * without the sampler: the guest blocked on the flip queue, the present
++ * thread with nothing to do, the CPU waiting for the GPU, or DXGI Present. */
++volatile u64 g_gcm_perf_waitflip_ns = 0;
++volatile u64 g_gcm_perf_present_idle_ns = 0;
++volatile u64 g_gcm_perf_gpu_wait_ns = 0;
++volatile u64 g_gcm_perf_swap_ns = 0;
++u64 gcm_perf_now_ns(void)
++{
++    return get_timestamp_ns();
++}
++
+ /* ---------------------------------------------------------------------------
+  * Internal state
+  * -----------------------------------------------------------------------*/
+@@ -657,9 +672,14 @@ void cellGcmSetWaitFlip(void)
+       }
+       if (depth > 0)
+       {
+-          for (int waited = 0; waited < 100 && (int)(s_flips_issued - s_flips_shown) > depth; waited++)
++          if ((int)(s_flips_issued - s_flips_shown) > depth)
+           {
+-              Sleep(1);
++              const u64 waitBegin = gcm_perf_now_ns();
++              for (int waited = 0; waited < 100 && (int)(s_flips_issued - s_flips_shown) > depth; waited++)
++              {
++                  Sleep(1);
++              }
++              g_gcm_perf_waitflip_ns += gcm_perf_now_ns() - waitBegin;
+           }
+           return;
+       } }
+@@ -667,8 +687,12 @@ void cellGcmSetWaitFlip(void)
+      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
+      * to vsync; without it the guest loops unthrottled and many frames batch
+      * into a single host present -> the console text stacks/duplicates. */
+-    for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+-        Sleep(1);
++    {
++        const u64 waitBegin = gcm_perf_now_ns();
++        for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
++            Sleep(1);
++        g_gcm_perf_waitflip_ns += gcm_perf_now_ns() - waitBegin;
++    }
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+ }
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 4125cd7..85606ea 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1741,6 +1741,11 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
+ /* ---------------------------------------------------------------------------
+  * command list submit/wait (simple synchronous model, like the harness)
+  * -----------------------------------------------------------------------*/
++extern volatile u64 g_gcm_perf_gpu_wait_ns;   /* [fps] breakdown, cellGcmSys.c */
++extern volatile u64 g_gcm_perf_swap_ns;
++extern volatile u64 g_gcm_perf_waitflip_ns;
++extern volatile u64 g_gcm_perf_present_idle_ns;
++extern u64 gcm_perf_now_ns(void);
+ static void ld_flush(ld_flush_reason reason)
+ {
+ #if defined(YZ_PERF_PROFILE)
+@@ -1788,7 +1793,11 @@ static void ld_flush(ld_flush_reason reason)
+             g.ready = 0;
+             return;
+         }
+-        WaitForSingleObject(g.fence_event, INFINITE);
++        {
++            const u64 gpuWaitBegin = gcm_perf_now_ns();
++            WaitForSingleObject(g.fence_event, INFINITE);
++            g_gcm_perf_gpu_wait_ns += gcm_perf_now_ns() - gpuWaitBegin;
++        }
+ #if defined(YZ_PERF_PROFILE)
+         const u64 wait_ticks = (u64)(ld_profile_qpc() - wait_begin);
+         g_ld_profile.total.fence_wait_qpc += wait_ticks;
+@@ -9360,7 +9369,9 @@ void rsx_live_draw_present(u32 buffer_id)
+ 
+     ld_flush(LD_FLUSH_PRESENT);
+     {
++        const u64 swapBegin = gcm_perf_now_ns();
+         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);
++        g_gcm_perf_swap_ns += gcm_perf_now_ns() - swapBegin;
+         if (SUCCEEDED(present_hr))
+             ld_present_measure_record(g_ld_frames + 1u);
+         else {
+@@ -10090,6 +10101,22 @@ void rsx_live_draw_present(u32 buffer_id)
+           fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
+                   (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
+                   fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
++          /* Where each frame went, averaged over the same window: the guest
++           * blocked in cellGcmSetWaitFlip, the present thread idle (no FIFO
++           * work), the CPU waiting on the GPU fence, and DXGI Present. */
++          { static u64 lastWaitFlip = 0, lastIdle = 0, lastGpu = 0, lastSwap = 0;
++            const u64 waitFlipNs = g_gcm_perf_waitflip_ns;
++            const u64 idleNs = g_gcm_perf_present_idle_ns;
++            const u64 gpuNs = g_gcm_perf_gpu_wait_ns;
++            const u64 swapNs = g_gcm_perf_swap_ns;
++            const double frameCount = (g_ld_frames > fps_f0) ? (double)(g_ld_frames - fps_f0) : 1.0;
++            fprintf(stderr, "[fps]   per frame: %.1f ms; guest waitflip %.1f ms, present thread idle %.1f ms, gpu wait %.1f ms, swap %.1f ms\n",
++                    (double)(now - fps_t0) / frameCount,
++                    (double)(waitFlipNs - lastWaitFlip) / 1e6 / frameCount,
++                    (double)(idleNs - lastIdle) / 1e6 / frameCount,
++                    (double)(gpuNs - lastGpu) / 1e6 / frameCount,
++                    (double)(swapNs - lastSwap) / 1e6 / frameCount);
++            lastWaitFlip = waitFlipNs; lastIdle = idleNs; lastGpu = gpuNs; lastSwap = swapNs; }
+           fps_t0 = now; fps_f0 = g_ld_frames;
+       } }
+     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 5aa68f9..355cd86 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -980,6 +980,10 @@ extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
+  * the PPU store-conditional cannot interleave. PPU_RESV_LINE_OFF=1 restores
+  * the old word-only behaviour for A/B runs. */
+ extern "C" void (*g_spu_break_ppu_resv_hook)(uint32_t line);
++extern "C" void vm_slow_lines_refresh(void);
++extern "C" void vm_slow_lines_mark(uint64_t lo, uint64_t hi, unsigned bits);
++extern "C" uint32_t ppu_hle_inject_base;
++extern "C" uint32_t ppu_vm_size;
+ static void ppu_resv_break_line(uint32_t line)
+ {
+     long contextCount = g_resv_ctx_n;
+@@ -1000,6 +1004,7 @@ static void ppu_resv_break_line(uint32_t line)
+ extern "C" void ppu_resv_register(ppu_context* c)
+ {
+     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
++    vm_slow_lines_refresh();
+     if (!g_spu_break_ppu_resv_hook && !getenv("PPU_RESV_LINE_OFF"))
+     {
+         g_spu_break_ppu_resv_hook = ppu_resv_break_line;
+@@ -1771,9 +1776,48 @@ static struct VmInlineInit {
+             }
+         }
+         vm_store_inline_ok = !storeDiagnostic && !getenv("PPU_NO_INLINE_STORES");
++        vm_slow_lines_refresh();
+     }
+ } s_vm_inline_init;
+ 
++/* Keep ppu_recomp.h's one-byte fast-path table in step with everything the
++ * old per-access compares checked: a diagnostic armed (whole table), the null
++ * page, the raw-SPU windows and everything above 0xE0000000, the end of the
++ * mapping and the gcm ref-poll word. Called once at static init and again as
++ * each guest thread registers, so a port that moves ppu_hle_inject_base or
++ * sets ppu_vm_size before running guest code is picked up. */
++extern "C" void vm_slow_lines_refresh(void)
++{
++    static int marked = 0;
++    static uint32_t markedVmSize = 0;
++    static uint32_t markedInjectBase = 0;
++    if (!marked)
++    {
++        marked = 1;
++        if (!vm_inline_ok)
++        {
++            vm_slow_lines_mark(0, 0x100000000ull, 1u);
++        }
++        if (!vm_store_inline_ok)
++        {
++            vm_slow_lines_mark(0, 0x100000000ull, 2u);
++        }
++        vm_slow_lines_mark(0, 0x10000u, 3u);
++        vm_slow_lines_mark(0xE0000000u, 0x100000000ull, 3u);
++    }
++    if (ppu_vm_size && ppu_vm_size != markedVmSize)
++    {
++        markedVmSize = ppu_vm_size;
++        vm_slow_lines_mark(ppu_vm_size, 0xE0000000u, 3u);
++    }
++    if (ppu_hle_inject_base != markedInjectBase)
++    {
++        markedInjectBase = ppu_hle_inject_base;
++        vm_slow_lines_mark((uint64_t)ppu_hle_inject_base + 0x2008u,
++                           (uint64_t)ppu_hle_inject_base + 0x200Cu, 1u);
++    }
++}
++
+ uint8_t  vm_read8 (uint64_t a) { if (vm_oob((uint32_t)a,1)) return 0; vm_hotmap((uint32_t)a,1);
+     if ((uint32_t)a < 0x10000u) ppu_null_read_report((uint32_t)a, 1, __builtin_return_address(0));
+ #ifdef VM_SAMPLE_READS
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 7bfefe4..64fd9d6 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -325,6 +325,8 @@ extern "C" int  rsx_null_backend_pump_messages(void);
+ #endif
+ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->put */
+ extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
++extern "C" volatile uint64_t g_gcm_perf_present_idle_ns;   /* [fps] breakdown, cellGcmSys.c */
++extern "C" uint64_t gcm_perf_now_ns(void);
+ extern "C" unsigned cellGcm_flip_request_count(void);
+ extern "C" unsigned cellGcmGetCurrentDisplayBufferId(void);
+ extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
+@@ -526,7 +528,11 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+          * fence still paid the whole tick. Waiting on it keeps the same 4 ms
+          * ceiling when nothing kicks, and drains on demand when something
+          * does. */
+-        cellGcm_fifo_kick_wait(4);
++        {
++            const uint64_t idleBegin = gcm_perf_now_ns();
++            cellGcm_fifo_kick_wait(4);
++            g_gcm_perf_present_idle_ns += gcm_perf_now_ns() - idleBegin;
++        }
+         ULONGLONG now = GetTickCount64();
+         const TickClock::time_point tickNow = TickClock::now();
+         int fired = 0;
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 8f099b9..6b682ad 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -78,6 +78,36 @@ static unsigned char s_coh_bitmap[SPU_COH_BITMAP_SZ];
+  * the SPU and raises the lock-line event. */
+ const unsigned char* const g_spu_coh_bitmap = s_coh_bitmap;
+ 
++/* The lifted code's single fast-path test (ppu_recomp.h, vm_inl_ok and
++ * vm_store_inl_ok): one byte per 128-byte line, bit 0 = loads go out of line,
++ * bit 1 = stores do. 32 MiB of zeroed BSS; only the pages around marked
++ * ranges are ever touched. Lines are marked and never cleared, like the
++ * reservation bitmap above. */
++unsigned char g_vm_slow_lines[1u << (32 - SPU_COH_LINE_SHIFT)];
++
++/* Mark every line overlapping [lo, hi) and the line in front of it. */
++void vm_slow_lines_mark(uint64_t lo, uint64_t hi, unsigned bits)
++{
++    if (hi <= lo)
++    {
++        return;
++    }
++    if (hi > 0x100000000ull)
++    {
++        hi = 0x100000000ull;
++    }
++    uint64_t firstLine = lo >> SPU_COH_LINE_SHIFT;
++    const uint64_t lastLine = (hi - 1) >> SPU_COH_LINE_SHIFT;
++    if (firstLine)
++    {
++        firstLine--;
++    }
++    for (uint64_t line = firstLine; line <= lastLine; line++)
++    {
++        g_vm_slow_lines[line] |= (unsigned char)bits;
++    }
++}
++
+ /* Zero until the first GETLLAR anywhere. Keeps the PPU fast path off the
+  * bitmap entirely for a title that runs no SPU code, and keeps every existing
+  * test that stores through vm_write* paying one compare against a hot global.
+@@ -103,6 +133,13 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+ {
+     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+     s_coh_bitmap[line >> 3] |= (unsigned char)(1u << (line & 7));
++    /* PPU stores to this line (or running into it from the one before) must
++     * now take the serialized out-of-line path. */
++    g_vm_slow_lines[line] |= 2u;
++    if (line)
++    {
++        g_vm_slow_lines[line - 1] |= 2u;
++    }
+     s_coh_armed = 1;
+ 
+     if (!ctx) return;
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index 4931809..7f3485e 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -55,6 +55,13 @@ void spu_coh_reserve(spu_context* ctx, uint32_t ea);
+  * lookup guarded by a global that is zero until the first GETLLAR. */
+ int spu_coh_is_reserved(uint32_t addr);
+ 
++/* Fast-path table for the lifted code's inline loads and stores (see
++ * ppu_recomp.h): one byte per 128-byte line, bit 0 = loads take the
++ * out-of-line accessor, bit 1 = stores do. vm_slow_lines_mark marks every
++ * line overlapping [lo, hi) plus the line in front of it. */
++extern unsigned char g_vm_slow_lines[];
++void vm_slow_lines_mark(uint64_t lo, uint64_t hi, unsigned bits);
++
+ /* A store by the PPU landed on `ea`'s line. Raise SPU_EVENT_LR on every SPU
+  * whose live reservation covers it, drop that reservation, and wake the host
+  * thread in case it is parked in `rdch SPU_RdEventStat`.
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 8ffd271..e4ebb65 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -163,14 +163,23 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
+ extern int      vm_inline_ok;
+ extern uint32_t ppu_vm_size;
+ extern uint32_t ppu_hle_inject_base;
++/* One byte per 128-byte guest line (runtime/spu/spu_coherency.c). Bit 0 sends
++ * a load on that line out of line, bit 1 a store. The runtime marks
++ * everything the out-of-line accessors treat specially -- the null page, the
++ * raw-SPU register windows at 0xE0000000 and up, the gcm ref-poll word, the
++ * end of the mapping, every line an SPU has reserved (stores), the whole table
++ * while a memory diagnostic is armed -- and the line in front of each of
++ * those, so an access that starts one line early and runs into it is caught
++ * too. That folds four compares and three global loads per access into one
++ * byte test. */
++extern unsigned char g_vm_slow_lines[];
+ #ifdef __cplusplus
+ }
+ #endif
+ static inline int vm_inl_ok(uint32_t ea, uint32_t n)
+ {
+-    return __builtin_expect(vm_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
+-           ea != ppu_hle_inject_base + 0x2008u &&
+-           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size);
++    (void)n;
++    return __builtin_expect(!(g_vm_slow_lines[ea >> 7] & 1u), 1);
+ }
+ static inline uint8_t vm_read8_inl(uint64_t a)
+ {
+@@ -234,9 +243,8 @@ extern const unsigned char* const g_spu_coh_bitmap;
+ #endif
+ static inline int vm_store_inl_ok(uint32_t ea, uint32_t n)
+ {
+-    return __builtin_expect(vm_store_inline_ok, 1) && ea >= 0x10000u && ea < 0xE0000000u &&
+-           (ppu_vm_size == 0 || (uint64_t)ea + n <= ppu_vm_size) &&
+-           !((g_spu_coh_bitmap[ea >> 10] >> ((ea >> 7) & 7u)) & 1u);
++    (void)n;
++    return __builtin_expect(!(g_vm_slow_lines[ea >> 7] & 2u), 1);
+ }
+ static inline void vm_write8_inl(uint64_t a, uint8_t v)
+ {

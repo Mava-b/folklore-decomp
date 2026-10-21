@@ -1,0 +1,7 @@
+# Metal window close signal
+
+`rsx_metal_backend_pump_messages()` returns -1 for an actual close of its owned window and 0 otherwise. An owned `NSWindowWillCloseNotification` observer replaces the visibility inference: ordering a window out, hiding the application or minimizing it does not end the session. The close latch is atomic because the callback and a host pump can run on different threads. The observer is removed before shutdown closes the window, and window UI teardown executes on the main queue. Starting a replacement window removes the old observer and resets the latch. The later readiness transition preserves a close received during initialization. Headless and not-ready backends return 0 even when an earlier window was closed.
+
+The backend reports the event; the host chooses its session policy. A host with blocked guest threads may end the whole process promptly without running concurrent teardown. This change does not claim graceful guest/SPU/audio worker termination, or change rendering/present timing.
+
+On macOS with an available WindowServer, run `python3 tools/check_metal_window_close.py`. The test compiles actual production observer and pump bodies and exercises AppKit hide/order-out/minimize, foreign and old-window events, actual owned close, sticky state, observer removal, and headless/not-ready controls. It creates only synthetic owned windows; no guest program or game runtime is needed. The standalone `check_` runner is outside the cross-platform `tools/test_*.py` CI glob because it requires AppKit and an available WindowServer.

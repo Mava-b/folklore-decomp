@@ -1,0 +1,2 @@
+# Link the real cellSync LFQueue HLE module for the bring-up rung-3 round-trip.
+EXTRA="-I $REPO/libs/sync -I $REPO/include $REPO/libs/sync/cellSync.c"

@@ -1,0 +1,117 @@
+# Build directories
+build/
+build-*/
+cmake-build-*/
+out/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.cmake
+!CMakeLists.txt
+!cmake/PS3RecompSPU.cmake
+
+# Compiled objects and libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exp
+*.pdb
+
+# Executables
+*.exe
+*.out
+*.app
+
+# Precompiled headers
+*.gch
+*.pch
+
+# IDE / Editor files
+.vs/
+.vscode/
+*.suo
+*.user
+*.sln
+*.vcxproj*
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+*.egg
+.venv/
+venv/
+env/
+
+# Recompiled output (generated, not tracked)
+recompiled/
+
+# Game files (never commit these)
+*.elf
+*.ELF
+*.self
+*.SELF
+*.bin
+*.BIN
+*.pkg
+*.PKG
+*.sfo
+*.SFO
+*.sprx
+*.SPRX
+
+# Decryption keys
+*.keys
+*.rap
+
+# OS files
+.DS_Store
+Desktop.ini
+Thumbs.db
+ehthumbs.db
+
+# Logs
+*.log
+
+# Harness batch-run outputs (per-title JSON, work dirs, REPORT.md)
+_harness/
+.pr_review/
+_drill/
+
+# Local Claude Code settings
+.claude/
+
+# macOS packaging output
+*.dmg
+
+# Gate builds: a port (or the toolkit) built against the toolkit under test,
+# kept separate from the developer's own build/ so a gate run cannot be fooled
+# by a stale binary. See tools/regress.py.
+build-gate/
+
+# Scratch space for generated test drivers and their output (test_ppu_lift.py,
+# test_milestone.py).
+scratch/
+
+# Firmware and anything lifted from it stay local (docs/FIRMWARE_LLE.md)
+fw_spu/
+*.prx
+*.PRX
+
+# SPU differential test build products (runtime/spu/tests/build_diff_test.sh)
+runtime/spu/tests/build_diff/

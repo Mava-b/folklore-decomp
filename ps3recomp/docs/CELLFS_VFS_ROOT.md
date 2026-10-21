@@ -1,0 +1,11 @@
+# CellFs disc-root consistency
+
+The public host-string `cellfs_translate_path` API is also used by media libraries. Its default `/dev_bdvd/` mapping previously remained `gamedata/dev_bdvd/` even when the runtime's other file paths used `PS3_VFS_ROOT`. A configured disc tree could therefore load through PPU file calls while a media-library open looked in the wrong directory.
+
+When the default mappings are first initialized, a nonempty `PS3_VFS_ROOT` now supplies the default disc mapping. It names the host disc directory containing `PS3_GAME`, consistent with the existing boot configuration. Explicit mappings registered by a port still override defaults. Environment configuration must precede the first mapping operation; changing the environment afterward does not replace registered mappings. Other device defaults are unchanged.
+
+Absolute host mappings bypass the relative mapping base. Relative host mappings retain `cellfs_set_root_path` as their base. Mapping targets may have or omit their final separator. POSIX absolute paths and Windows rooted/drive-absolute paths are recognized; Windows execution remains unverified locally.
+
+The translator builds the complete path in its existing maximum path capacity, applies the real shared `PS3_GAME` layout fallback, then checks the caller's output capacity. An oversized result returns failure rather than a successful truncated path, including when fallback adds a directory component. Existing void configuration setters and their fixed mapping storage retain their historical overlong-input behavior; this change does not redesign those configuration APIs or mount synchronization.
+
+`python3 tools/test_cellfs_vfs_root.py` compiles the real CellFs implementation and real shared fallback. No file-I/O or path-translation mocks are used. The test creates temporary disc files and reads their known bytes through the resulting host paths. Its five process-isolated modes cover absent environment/defaults, configured disc root, trailing separators, explicit absolute override, relative mapping with a configured base, unmapped prefixes, output bounds and canaries, and fallback expansion. All 66 checks pass on macOS. The original source fails every mode: the configured and absolute paths point elsewhere, and undersized outputs incorrectly report success. The POSIX compiler fixture skips Windows.

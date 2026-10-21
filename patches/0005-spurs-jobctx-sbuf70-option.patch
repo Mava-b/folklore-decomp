@@ -1,0 +1,31 @@
+diff --git a/runtime/spu/spurs_job.c b/runtime/spu/spurs_job.c
+index 5e5b7e1..53c7d50 100644
+--- a/runtime/spu/spurs_job.c
++++ b/runtime/spu/spurs_job.c
+@@ -234,6 +234,18 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+      * LS 0, so the top of LS is the equivalent free space. */
+     uint32_t desc_ls = SPU_LS_SIZE - 0x400;     /* descriptors are <= 1024 B */
+     uint32_t ctx_ls  = desc_ls - 0x40;          /* CellSpursJobContext2, 48 B */
++    /* PS3_SPURS_JOBCTX_SBUF70=1: some titles' jobs (Folklore BCUS98147, a 2007
++     * SDK) read the scratch-buffer base from jobContext+0x70, not the 48-byte
++     * CellSpursJobContext2's sBuffer (+0x20). With the context directly below
++     * the descriptor, +0x70 is the descriptor's userData[0] -- 0xFFFFFFFF in
++     * one of Folklore's audio jobs, which then DMAs 84 KB to LS -1. Leave room
++     * for the larger context and put the scratch base there too. Evidence: the
++     * job GETs exactly sizeScratch bytes to that address, and with it set every
++     * dispatch sees 0xD400 (= s_ls) and the malformed transfers stop.
++     * Unverified against Sony's jm2 -- opt-in until it is. */
++    static int s_sbuf70 = -1;
++    if (s_sbuf70 < 0) s_sbuf70 = getenv("PS3_SPURS_JOBCTX_SBUF70") ? 1 : 0;
++    if (s_sbuf70) ctx_ls = desc_ls - 0x100;
+     uint32_t dsz     = job_desc_size ? job_desc_size : 256u;
+     if (dsz > 0x400) dsz = 0x400;
+     if (p > ctx_ls)
+@@ -252,6 +264,7 @@ int spu_run_spurs_job(spu_lifted_entry_fn entry, int image_id,
+     ls16(ls, ctx_ls + JC_NUM_CACHE_BUFFER, (uint16_t)n_cache);
+     ls32(ls, ctx_ls + JC_O_BUFFER, out_ls);
+     ls32(ls, ctx_ls + JC_S_BUFFER, s_ls);
++    if (s_sbuf70) ls32(ls, ctx_ls + 0x70, s_ls);
+     ls32(ls, ctx_ls + JC_DMA_TAG,  JOB_DMA_TAG);
+     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR,     0);
+     ls32(ls, ctx_ls + JC_EA_JOB_DESCRIPTOR + 4, job_ea);

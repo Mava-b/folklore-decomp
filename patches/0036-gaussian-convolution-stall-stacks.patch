@@ -1,0 +1,258 @@
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+index 4e175d2..6611749 100644
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1512,6 +1512,95 @@ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+     return patched;
+ }
+ 
++/* Convolution filtering.
++ *
++ * The RSX texture unit can filter through a kernel instead of plain
++ * bilinear: NV4097_SET_TEXTURE_FILTER min 7 (CONVOLUTION_MIN) / mag 4
++ * (CONVOLUTION_MAG), kernel 1 quincunx, 2 Gaussian, 3 quincunx-alternate.
++ * Folklore magnifies its bloom buffer through the Gaussian kernel, and that
++ * is what makes the glow soft. D3D12 has no such sampler state; bilinear
++ * alone shows the low-resolution buffer's texel grid as a pattern of
++ * squares around every light.
++ *
++ * Gaussian: four bilinear taps half a texel out on the diagonals, which is
++ * exactly the 3x3 [1 2 1] x [1 2 1] / 16 kernel over the texel grid, then
++ * interpolated -- a smooth (B-spline-like) reconstruction. Quincunx: the
++ * centre at 1/2 and the four diagonal neighbours one texel out at 1/8 each,
++ * as the hardware resolves its 2x anti-aliased surfaces. Same post-pass
++ * style as rsx_fp_apply_unnorm_scale; the call's own arguments are kept. */
++int rsx_fp_apply_convolution(char* hlsl, u32 hlsl_size, u32 convolution_mask,
++                             const u8 kernels[16], u32 cube_mask)
++{
++    if (!hlsl || !convolution_mask || !kernels)
++    {
++        return 0;
++    }
++    static const char helpers[] =
++        "float4 _rsx_conv_gauss(Texture2D t, SamplerState s, float2 uv) {\n"
++        "    uint w, h; t.GetDimensions(w, h);\n"
++        "    float2 d = 0.5 / float2(max(w, 1u), max(h, 1u));\n"
++        "    return 0.25 * (t.Sample(s, uv + float2(-d.x, -d.y)) + t.Sample(s, uv + float2(d.x, -d.y)) +\n"
++        "                   t.Sample(s, uv + float2(-d.x, d.y)) + t.Sample(s, uv + float2(d.x, d.y)));\n"
++        "}\n"
++        "float4 _rsx_conv_quincunx(Texture2D t, SamplerState s, float2 uv) {\n"
++        "    uint w, h; t.GetDimensions(w, h);\n"
++        "    float2 d = 1.0 / float2(max(w, 1u), max(h, 1u));\n"
++        "    return 0.5 * t.Sample(s, uv) + 0.125 * (t.Sample(s, uv + float2(-d.x, -d.y)) + t.Sample(s, uv + float2(d.x, -d.y)) +\n"
++        "                                         t.Sample(s, uv + float2(-d.x, d.y)) + t.Sample(s, uv + float2(d.x, d.y)));\n"
++        "}\n";
++    int patched = 0;
++    for (u32 unit = 0; unit < 16; unit++)
++    {
++        if (!((convolution_mask >> unit) & 1u) || ((cube_mask >> unit) & 1u))
++        {
++            continue;
++        }
++        const char* helperName = kernels[unit] == 2 ? "_rsx_conv_gauss" : "_rsx_conv_quincunx";
++        /* Both spellings the emitter produces for a 2D unit, and the call
++         * that replaces each. */
++        char needles[2][48];
++        char replacements[2][64];
++        snprintf(needles[0], sizeof needles[0], "rsx_tex[%u].Sample(rsx_samp[%u],", unit, unit);
++        snprintf(needles[1], sizeof needles[1], "rsx_tex%u.Sample(rsx_samp[%u],", unit, unit);
++        snprintf(replacements[0], sizeof replacements[0], "%s(rsx_tex[%u], rsx_samp[%u],", helperName, unit, unit);
++        snprintf(replacements[1], sizeof replacements[1], "%s(rsx_tex%u, rsx_samp[%u],", helperName, unit, unit);
++        for (int spelling = 0; spelling < 2; spelling++)
++        {
++            const u32 needleLength = (u32)strlen(needles[spelling]);
++            const u32 replacementLength = (u32)strlen(replacements[spelling]);
++            for (;;)
++            {
++                char* site = strstr(hlsl, needles[spelling]);
++                if (!site)
++                {
++                    break;
++                }
++                const u32 used = (u32)strlen(hlsl);
++                if (used - needleLength + replacementLength + 1 > hlsl_size)
++                {
++                    return -1;
++                }
++                memmove(site + replacementLength, site + needleLength,
++                        used - (u32)(site - hlsl) - needleLength + 1);
++                memcpy(site, replacements[spelling], replacementLength);
++                patched++;
++            }
++        }
++    }
++    if (patched)
++    {
++        const u32 used = (u32)strlen(hlsl);
++        const u32 helperLength = (u32)strlen(helpers);
++        if (used + helperLength + 1 > hlsl_size)
++        {
++            return -1;
++        }
++        memmove(hlsl + helperLength, hlsl, used + 1);
++        memcpy(hlsl, helpers, helperLength);
++    }
++    return patched;
++}
++
+ /* NV4097_SET_SHADER_PACKER accepts any nonzero value. Floating surfaces and
+  * 32-bit exports bypass the integer framebuffer's RGB transfer function. */
+ int rsx_fp_srgb_output_enabled(u32 packer, u32 ctrl, u32 color_format)
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+index e012255..d1cbef4 100644
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -92,6 +92,15 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+ int rsx_fp_apply_unnorm_scale(char* hlsl, u32 hlsl_size, u32 unnorm_mask,
+                               const u32 dim[][2], u32 cube_mask);
+ 
++/* The RSX texture unit's convolution filters (NV4097_SET_TEXTURE_FILTER min 7
++ * / mag 4, kernel in bits 13-15): rewrite each 2D Sample() on a unit in
++ * `convolution_mask` into a call that applies the kernel -- Gaussian for
++ * kernel 2, quincunx otherwise -- over the texels around the sample point.
++ * Run after rsx_fp_apply_unnorm_scale. Returns the number of call sites
++ * rewritten, or -1 when the buffer is too small. */
++int rsx_fp_apply_convolution(char* hlsl, u32 hlsl_size, u32 convolution_mask,
++                             const u8 kernels[16], u32 cube_mask);
++
+ /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
+  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
+  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index c258902..66157f5 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1541,6 +1541,19 @@ static D3D12_TEXTURE_ADDRESS_MODE gcm_wrap(u32 w)
+     }
+ }
+ 
++/* LD_CONVOLUTION=0: plain bilinear for the RSX convolution filters, without
++ * the kernel in the shader (rsx_fp_apply_convolution). For comparison. */
++static int ld_convolution_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char* text = getenv("LD_CONVOLUTION");
++        enabled = (text && *text == '0') ? 0 : 1;
++    }
++    return enabled;
++}
++
+ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
+ {
+     D3D12_SAMPLER_DESC sd = {0};
+@@ -4501,6 +4514,32 @@ static ID3D12PipelineState* get_pso(
+     }
+     key = fnv1a(&unnorm_mask, sizeof(unnorm_mask), key);
+     if (unnorm_mask) key = fnv1a(unnorm_dim, sizeof(unnorm_dim), key);
++    /* Units filtered through the RSX's convolution kernel
++     * (rsx_fp_apply_convolution): the kernel is applied in the shader, so
++     * which units and which kernel are part of the PSO identity. */
++    u32 convolution_mask = 0;
++    u8 convolution_kernels[16] = {0};
++    for (u32 cu = 0; cu < 16; cu++)
++    {
++        rsx_dsp_texture ct; rsx_dsp_get_texture(&g.rsx, cu, &ct);
++        const u32 minFilter = (ct.filter >> 16) & 0x7u;
++        const u32 magFilter = (ct.filter >> 24) & 0x7u;
++        if (!ct.enabled || (minFilter != 7u && magFilter != 4u))
++        {
++            continue;
++        }
++        convolution_mask |= 1u << cu;
++        convolution_kernels[cu] = (u8)((ct.filter >> 13) & 0x7u);
++    }
++    if (ld_convolution_enabled())
++    {
++        key = fnv1a(&convolution_mask, sizeof(convolution_mask), key);
++        if (convolution_mask) key = fnv1a(convolution_kernels, sizeof(convolution_kernels), key);
++    }
++    else
++    {
++        convolution_mask = 0;
++    }
+     if (masked_layout) {
+         static const u32 masked_layout_tag = 0x314B534Du; /* "MSK1" */
+         const u32 payload_stride =
+@@ -4605,6 +4644,10 @@ static ID3D12PipelineState* get_pso(
+                           unnorm_dim[0][1], np); }
+             if (np < 0) fi = -1;
+         }
++        if (fi > 0 && rsx_fp_apply_convolution(
++                ps_hlsl, sizeof(ps_hlsl), convolution_mask,
++                convolution_kernels, cube_mask) < 0)
++            fi = -1;
+     } else {
+         fi = rsx_fp_decompile_ex(
+             fp_uc, fp_size, fp_ctrl, cube_mask,
+@@ -4618,6 +4661,10 @@ static ID3D12PipelineState* get_pso(
+                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
+                 unnorm_dim, cube_mask) < 0)
+             fi = -1;
++        if (fi > 0 && rsx_fp_apply_convolution(
++                ps_hlsl, sizeof(ps_hlsl), convolution_mask,
++                convolution_kernels, cube_mask) < 0)
++            fi = -1;
+     }
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 096fdcb..6096118 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1058,6 +1058,31 @@ extern "C" void ppu_report_guest_lrs(void)
+     fflush(stderr);
+ }
+ 
++/* Every guest thread's call chain (ppu_dump_guest_stack), for the stall
++ * watchdog: the lr above is one frame, and in a freeze the question is what
++ * each waiting thread was waiting FOR, which is several frames up. */
++extern "C" void ppu_dump_guest_stack(ppu_context*, const char*);
++extern "C" void ppu_report_guest_stacks(void)
++{
++    long count = g_resv_ctx_n;
++    if (count > PPU_RESV_MAX)
++    {
++        count = PPU_RESV_MAX;
++    }
++    for (long index = 0; index < count; index++)
++    {
++        ppu_context* context = g_resv_ctxs[index];
++        if (!context)
++        {
++            continue;
++        }
++        char tag[32];
++        snprintf(tag, sizeof tag, "stall tid %u", (unsigned)context->thread_id);
++        ppu_dump_guest_stack(context, tag);
++    }
++    fflush(stderr);
++}
++
+ /* Break every reservation on ea's word (real-PPC granule semantics on a store).
+  * Best-effort/unlocked: the break is a single word write; a concurrent stwcx
+  * recheck reads reserve_addr under its slot lock and the value-CAS backstops the
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 6fcc847..49cadc7 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -666,6 +666,7 @@ static __declspec(thread) size_t s_dbg_capn = 0;
+ 
+ extern "C" const char* g_hle_inflight[];   /* ppu_hle.cpp; 64 entries */
+ extern "C" void ppu_report_guest_lrs(void); /* ppu_loader.cpp */
++extern "C" void ppu_report_guest_stacks(void); /* ppu_loader.cpp */
+ 
+ static void dump_threads(const char* label, HMODULE self)
+ {
+@@ -1140,6 +1141,10 @@ static DWORD WINAPI hang_watchdog(LPVOID)
+               reports++;
+               snprintf(lbl, sizeof lbl, "no frame presented for %d s", stalledSeconds);
+               dump_threads(lbl, self);
++              if (stalledSeconds == 5)
++              {
++                  ppu_report_guest_stacks();
++              }
+           }
+       } }
+     return 0;

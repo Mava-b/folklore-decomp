@@ -1,0 +1,17 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 5a742f1..fb789d2 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6178,8 +6178,11 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+                 rs.eq_rgb, rs.eq_a);
+     fprintf(file, "at=%u/0x%X/0x%X ", rs.alpha_test_enable, rs.alpha_func, rs.alpha_ref_raw);
+     fprintf(file, "sc=%08X/%08X ", rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL), rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL));
+-    if (rs.stencil_enable)
++    if (rs.stencil_enable) {
+         fprintf(file, "st=%X/%X/%X/%X/%X/%X ref=%X ", rs.s_func, rs.s_func_mask, rs.s_write_mask, rs.s_fail, rs.s_zfail, rs.s_zpass, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC + 4));
++        /* Two-sided stencil: back-face func/ops (shadow volumes need them). */
++        fprintf(file, "bst=%u/%X/%X/%X/%X ", rs.stencil_two_sided, rs.bs_func, rs.bs_fail, rs.bs_zfail, rs.bs_zpass);
++    }
+     /* Inline draws (HUD sprites): the largest vertex-colour alpha byte, attr 3
+      * as UB4 -- an element faded to 0 is drawn but invisible. */
+     if (dc.inl && dc.inl_stride) {

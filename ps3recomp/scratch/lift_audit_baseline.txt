@@ -1,0 +1,7 @@
+# lift_audit.py baseline -- generated file, do not hand-edit.
+# key<TAB>count, one per line, sorted by key.
+fallthrough_hazards_total	0
+gap_targets_total	871
+midfunc_targets_total	16750
+todo_mnemonic:.word	6021
+unresolved_targets_total	0

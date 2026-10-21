@@ -1,0 +1,1443 @@
+RSXFIFOCommands
+Cross-reference: 
+https://github.com/AlexAltea/nucleus/blob/master/docs/technical/ps3/gpu.md
+Method fields description
+Method subchannel identifiers
+Method registers
+NV40_CHANNEL_DMA
+NV40_CURIE_PRIMITIVE
+NV03_MEMORY_TO_MEMORY_FORMAT
+NV30_CONTEXT_SURFACES_2D (NV3062)
+NV30_CONTEXT_SURFACE_SWIZZLED
+NV30_IMAGE_FROM_CPU (NV308A)
+NV30_SCALED_IMAGE_FROM_MEMORY
+SCE DRIVER
+Commands
+NOP (0x00000100)
+CALL (0x00000002)
+RET (0x00020000)
+JMP (0x20000000)
+COLOR MASK (0x00040324)
+COLOR MASK MRT (0x00040370)
+CLEAR COLOR (0x00041D90)
+FRONT POLYGON MODE (0x00041828)
+SET REF (0x00040050)
+SEMAPHORE DMA CONTEXT (0x00040060)
+SEMAPHORE OFFSET (0x00040064)
+SEMAPHORE ACQUIRE (0x00040068)
+SEMAPHORE RELEASE (0x0004006C)
+libgcm Functions
+cellGcmGetControlRegister
+cellGcmFlush
+cellGcmFinish
+cellGcmGetFlipStatus
+cellGcmResetFlipStatus
+libgcm Commands
+Contents
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+1 of 27
+10/07/2026, 06:23
+SetNopCommand
+SetReferenceCommand
+SetJumpCommand
+SetCallCommand
+SetReturnCommand
+SetLogicOp
+SetLogicOpEnable
+SetColorMask
+SetColorMaskMrt
+SetClearColor
+SetClearDepthStencil
+SetClearSurface
+SetFrontPolygonMode
+SetFrontFace
+SetAlphaTestEnable
+SetAlphaFunc
+SetDepthTestEnable
+SetDepthFunc
+SetDepthBounds
+SetBlendEnable
+SetBlendFunc
+SetBlendColor
+SetBlendEquation
+SetClipMinMax
+SetZcullEnable
+SetPointSize
+SetWriteCommandLabel
+SetWaitLabel
+SetWriteBackEndLabel
+SetWriteBackEndLabelForConditional
+SetWaitForIdle
+SetWaitFlip
+SetReportLocation
+SetReport
+SetTimeStamp
+SetClearReport
+SetCullFace
+SetCullFaceEnable
+SetViewport
+SetLineWidth
+SetLineSmoothEnable
+SetTextureAddress
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+2 of 27
+10/07/2026, 06:23
+SetTextureControl
+SetTextureFilter
+SetFogMode
+SetNotifyIndex
+SetNotify
+SetTransferDataMode
+SetTransferDataOffset
+SetTransferDataFormat
+SetTransferLocation
+SetTransferData
+SetSurfaceWindow
+SetVertexTextureAddress
+SetVertexDataArray
+libgcm System Semaphores
+Semaphores
+Small Test
+Reports Area
+Method fields description
+What is considered as rsx fifo commands is really combination of few fields describing so called
+"method". Single method description is 32 bit, and contain flags, addresses, and count of
+parameters.
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+3 of 27
+10/07/2026, 06:23
+Bits
+View (MSB:LSB)
+Description
+01:01
+0X000000 00000000 00000000 
+00000000
+Flag: Non-increment
+02:02
+00X00000 00000000 00000000 
+00000000
+Flag: Jump
+14:14
+00000000 000000X0 00000000 
+00000000
+Flag: Return
+30:30
+00000000 00000000 00000000 
+000000X0
+Flag: Call
+03:13
+000XXXXX XXXXXX00 00000000 
+00000000
+Method count, since count is left shifted by 2 you can consider count
+as byte count & 0x1FFC
+16:29
+00000000 00000000 AAABBBBB 
+BBBBBB00
+Method register (2 bits right-shifted)
+03:31
+000XXXXX XXXXXXXX XXXXXXXX 
+XXXXXXXX
+Jump offset
+00:29
+XXXXXXXX XXXXXXXX XXXXXXXX 
+XXXXXX00
+Call offset (2 bits right-shifted)
+Note: It seems to be possible to write continuous registers using single write with multi param
+count. Eg. gcmInit write 0x00080384 to setup NV4097_SET_DEPTH_BOUNDS_MIN and
+NV4097_SET_DEPTH_BOUNDS_MAX using one command with two 4 bytes params.
+Method subchannel identifiers
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+4 of 27
+10/07/2026, 06:23
+Bits
+View (MSB:LSB)
+Description
+16:18
+00000000 00000000 00000000 
+00000000
+NV40_CURIE_PRIMITIVE (NV4097) and NV40_CHANNEL_DMA
+(NV406E)
+16:18
+00000000 00000000 00100000 
+00000000
+NV03_MEMORY_TO_MEMORY_FORMAT (NV0039)
+16:18
+00000000 00000000 01000000 
+00000000
+Unused?
+16:18
+00000000 00000000 01100000 
+00000000
+NV30_CONTEXT_SURFACES_2D (NV3062)
+16:18
+00000000 00000000 10000000 
+00000000
+NV30_CONTEXT_SURFACE_SWIZZLED (NV309E)
+16:18
+00000000 00000000 10100000 
+00000000
+NV30_IMAGE_FROM_CPU (NV308A)
+16:18
+00000000 00000000 11000000 
+00000000
+NV30_SCALED_IMAGE_FROM_MEMORY (NV3089)
+16:18
+00000000 00000000 11100000 
+00000000
+SCE DRIVER These methods are executed by the LV1, not by the
+RSX.
+Method registers
+The method register field consists of two fields: A 3-bit long subchannel identifier and a 11-bit long
+offset in that channel. At driver user-level, the whole 14-bit field can be considered as nothing but a
+2-bit-rightshifted address where data goes in, optionally triggering an event.
+These methods are executed by the PFIFO puller itself, instead of being forwared to an engine.
+NV40_CHANNEL_DMA
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+5 of 27
+10/07/2026, 06:23
+Register (whole
+14 bit)
+Name
+Description
+0x0050
+NV406E_SET_REFERENCE
+Modify DMA control's reference register
+0x0060
+NV406E_SET_CONTEXT_DMA_SEMAPHORE
+DMA context object
+0x0064
+NV406E_SEMAPHORE_OFFSET
+Offset has to be smaller than 0x1000 and
+4-aligned.
+0x0068
+NV406E_SEMAPHORE_ACQUIRE
+Make the PFIFO puller wait until offset
+contains the parameter.
+0x006C
+NV406E_SEMAPHORE_RELEASE
+Write parameter to the specified offset.
+NV40_CURIE_PRIMITIVE
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+6 of 27
+10/07/2026, 06:23
+Register
+(whole
+14 bit)
+Name
+Description
+0x0000
+NV4097_SET_OBJECT
+0x0100
+NV4097_NO_OPERATION
+0x0104
+NV4097_NOTIFY
+0x0110
+NV4097_WAIT_FOR_IDLE
+0x0140
+NV4097_PM_TRIGGER
+0x0180
+NV4097_SET_CONTEXT_DMA_NOTIFIES
+0x0184
+NV4097_SET_CONTEXT_DMA_A
+0x0188
+NV4097_SET_CONTEXT_DMA_B
+0x018C
+NV4097_SET_CONTEXT_DMA_COLOR_B
+0x0190
+NV4097_SET_CONTEXT_DMA_STATE
+0x0194
+NV4097_SET_CONTEXT_DMA_COLOR_A
+0x0198
+NV4097_SET_CONTEXT_DMA_ZETA
+0x019C
+NV4097_SET_CONTEXT_DMA_VERTEX_A
+0x01A0
+NV4097_SET_CONTEXT_DMA_VERTEX_B
+0x01A4
+NV4097_SET_CONTEXT_DMA_SEMAPHORE
+0x01A8
+NV4097_SET_CONTEXT_DMA_REPORT
+0x01AC
+NV4097_SET_CONTEXT_DMA_CLIP_ID
+0x01B0
+NV4097_SET_CONTEXT_DMA_CULL_DATA
+0x01B4
+NV4097_SET_CONTEXT_DMA_COLOR_C
+0x01B8
+NV4097_SET_CONTEXT_DMA_COLOR_D
+0x0200
+NV4097_SET_SURFACE_CLIP_HORIZONTAL
+0x0204
+NV4097_SET_SURFACE_CLIP_VERTICAL
+0x0208
+NV4097_SET_SURFACE_FORMAT
+0x020C
+NV4097_SET_SURFACE_PITCH_A
+0x0210
+NV4097_SET_SURFACE_COLOR_AOFFSET
+0x0214
+NV4097_SET_SURFACE_ZETA_OFFSET
+0x0218
+NV4097_SET_SURFACE_COLOR_BOFFSET
+0x021C
+NV4097_SET_SURFACE_PITCH_B
+0x0220
+NV4097_SET_SURFACE_COLOR_TARGET
+0x022C
+NV4097_SET_SURFACE_PITCH_Z
+0x0234
+NV4097_INVALIDATE_ZCULL
+0x0238
+NV4097_SET_CYLINDRICAL_WRAP
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+7 of 27
+10/07/2026, 06:23
+0x023C
+NV4097_SET_CYLINDRICAL_WRAP1
+0x0280
+NV4097_SET_SURFACE_PITCH_C
+0x0284
+NV4097_SET_SURFACE_PITCH_D
+0x0288
+NV4097_SET_SURFACE_COLOR_COFFSET
+0x028C
+NV4097_SET_SURFACE_COLOR_DOFFSET
+0x02B8
+NV4097_SET_WINDOW_OFFSET
+0x02BC
+NV4097_SET_WINDOW_CLIP_TYPE
+0x02C0
+NV4097_SET_WINDOW_CLIP_HORIZONTAL
+0x02C4
+NV4097_SET_WINDOW_CLIP_VERTICAL
+0x0300
+NV4097_SET_DITHER_ENABLE
+0x0304
+NV4097_SET_ALPHA_TEST_ENABLE
+0x0308
+NV4097_SET_ALPHA_FUNC
+0x030C
+NV4097_SET_ALPHA_REF
+0x0310
+NV4097_SET_BLEND_ENABLE
+0x0314
+NV4097_SET_BLEND_FUNC_SFACTOR
+0x0318
+NV4097_SET_BLEND_FUNC_DFACTOR
+0x031C
+NV4097_SET_BLEND_COLOR
+0x0320
+NV4097_SET_BLEND_EQUATION
+0x0324
+NV4097_SET_COLOR_MASK
+0x0328
+NV4097_SET_STENCIL_TEST_ENABLE
+0x032C
+NV4097_SET_STENCIL_MASK
+0x0330
+NV4097_SET_STENCIL_FUNC
+0x0334
+NV4097_SET_STENCIL_FUNC_REF
+0x0338
+NV4097_SET_STENCIL_FUNC_MASK
+0x033C
+NV4097_SET_STENCIL_OP_FAIL
+0x0340
+NV4097_SET_STENCIL_OP_ZFAIL
+0x0344
+NV4097_SET_STENCIL_OP_ZPASS
+0x0348
+NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE
+0x034C
+NV4097_SET_BACK_STENCIL_MASK
+0x0350
+NV4097_SET_BACK_STENCIL_FUNC
+0x0354
+NV4097_SET_BACK_STENCIL_FUNC_REF
+0x0358
+NV4097_SET_BACK_STENCIL_FUNC_MASK
+0x035C
+NV4097_SET_BACK_STENCIL_OP_FAIL
+0x0360
+NV4097_SET_BACK_STENCIL_OP_ZFAIL
+0x0364
+NV4097_SET_BACK_STENCIL_OP_ZPASS
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+8 of 27
+10/07/2026, 06:23
+0x0368
+NV4097_SET_SHADE_MODE
+0x036C
+NV4097_SET_BLEND_ENABLE_MRT
+0x0370
+NV4097_SET_COLOR_MASK_MRT
+0x0374
+NV4097_SET_LOGIC_OP_ENABLE
+0x0378
+NV4097_SET_LOGIC_OP
+0x037C
+NV4097_SET_BLEND_COLOR2
+0x0380
+NV4097_SET_DEPTH_BOUNDS_TEST_ENABLE
+0x0384
+NV4097_SET_DEPTH_BOUNDS_MIN
+When writing 2 params, second param
+will be used to setup
+NV4097_SET_DEPTH_BOUNDS_MAX
+0x0388
+NV4097_SET_DEPTH_BOUNDS_MAX
+0x0394
+NV4097_SET_CLIP_MIN
+0x0398
+NV4097_SET_CLIP_MAX
+0x03B0
+NV4097_SET_CONTROL0
+0x03B8
+NV4097_SET_LINE_WIDTH
+0x03BC
+NV4097_SET_LINE_SMOOTH_ENABLE
+0x03C0
+NV4097_SET_ANISO_SPREAD
+0x08C0
+NV4097_SET_SCISSOR_HORIZONTAL
+0x08C4
+NV4097_SET_SCISSOR_VERTICAL
+0x08CC
+NV4097_SET_FOG_MODE
+0x08D0
+NV4097_SET_FOG_PARAMS
+0x08E4
+NV4097_SET_SHADER_PROGRAM
+0x0900
+NV4097_SET_VERTEX_TEXTURE_OFFSET
+0x0904
+NV4097_SET_VERTEX_TEXTURE_FORMAT
+0x0908
+NV4097_SET_VERTEX_TEXTURE_ADDRESS
+0x090C
+NV4097_SET_VERTEX_TEXTURE_CONTROL0
+0x0910
+NV4097_SET_VERTEX_TEXTURE_CONTROL3
+0x0914
+NV4097_SET_VERTEX_TEXTURE_FILTER
+0x0918
+NV4097_SET_VERTEX_TEXTURE_IMAGE_RECT
+0x091C
+NV4097_SET_VERTEX_TEXTURE_BORDER_COLOR
+0x0A00
+NV4097_SET_VIEWPORT_HORIZONTAL
+0x0A04
+NV4097_SET_VIEWPORT_VERTICAL
+0x0A0C
+NV4097_SET_POINT_CENTER_MODE
+0x0A1C
+NV4097_ZCULL_SYNC
+0x0A20
+NV4097_SET_VIEWPORT_OFFSET
+0x0A30
+NV4097_SET_VIEWPORT_SCALE
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+9 of 27
+10/07/2026, 06:23
+0x0A60
+NV4097_SET_POLY_OFFSET_POINT_ENABLE
+0x0A64
+NV4097_SET_POLY_OFFSET_LINE_ENABLE
+0x0A68
+NV4097_SET_POLY_OFFSET_FILL_ENABLE
+0x0A6C
+NV4097_SET_DEPTH_FUNC
+0x0A70
+NV4097_SET_DEPTH_MASK
+0x0A74
+NV4097_SET_DEPTH_TEST_ENABLE
+0x0A78
+NV4097_SET_POLYGON_OFFSET_SCALE_FACTOR
+0x0A7C
+NV4097_SET_POLYGON_OFFSET_BIAS
+0x0A80
+NV4097_SET_VERTEX_DATA_SCALED4S_M
+0x0B00
+NV4097_SET_TEXTURE_CONTROL2
+0x0B40
+NV4097_SET_TEX_COORD_CONTROL
+0x0B80
+NV4097_SET_TRANSFORM_PROGRAM
+Copy 128-bit data to PGRAPH's VPE
+instruction buffer at the LOAD offset by
+collecting 32-bit chunks.
+0x1428
+NV4097_SET_SPECULAR_ENABLE
+0x142C
+NV4097_SET_TWO_SIDE_LIGHT_EN
+0x1438
+NV4097_CLEAR_ZCULL_SURFACE
+0x1450
+NV4097_SET_PERFORMANCE_PARAMS
+0x1454
+NV4097_SET_FLAT_SHADE_OP
+0x145C
+NV4097_SET_EDGE_FLAG
+0x1478
+NV4097_SET_USER_CLIP_PLANE_CONTROL
+0x147C
+NV4097_SET_POLYGON_STIPPLE
+0x1480
+NV4097_SET_POLYGON_STIPPLE_PATTERN
+0x1500
+NV4097_SET_VERTEX_DATA3F_M
+0x1680
+NV4097_SET_VERTEX_DATA_ARRAY_OFFSET
+0x1710
+NV4097_INVALIDATE_VERTEX_CACHE_FILE
+0x1714
+NV4097_INVALIDATE_VERTEX_FILE
+0x1718
+NV4097_PIPE_NOP
+0x1738
+NV4097_SET_VERTEX_DATA_BASE_OFFSET
+0x173C
+NV4097_SET_VERTEX_DATA_BASE_INDEX
+0x1740
+NV4097_SET_VERTEX_DATA_ARRAY_FORMAT
+0x17C8
+NV4097_CLEAR_REPORT_VALUE
+0x17CC
+NV4097_SET_ZPASS_PIXEL_COUNT_ENABLE
+0x1800
+NV4097_GET_REPORT
+0x1804
+NV4097_SET_ZCULL_STATS_ENABLE
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+10 of 27
+10/07/2026, 06:23
+0x1808
+NV4097_SET_BEGIN_END
+Locks or unlocks PGRAPH state while
+submitting vertex/index/inlined data to
+draw
+0x180C
+NV4097_ARRAY_ELEMENT16
+0x1810
+NV4097_ARRAY_ELEMENT32
+0x1814
+NV4097_DRAW_ARRAYS
+0x1818
+NV4097_INLINE_ARRAY
+0x181C
+NV4097_SET_INDEX_ARRAY_ADDRESS
+0x1820
+NV4097_SET_INDEX_ARRAY_DMA
+0x1824
+NV4097_DRAW_INDEX_ARRAY
+0x1828
+NV4097_SET_FRONT_POLYGON_MODE
+0x182C
+NV4097_SET_BACK_POLYGON_MODE
+0x1830
+NV4097_SET_CULL_FACE
+0x1834
+NV4097_SET_FRONT_FACE
+0x1838
+NV4097_SET_POLY_SMOOTH_ENABLE
+0x183C
+NV4097_SET_CULL_FACE_ENABLE
+0x1840
+NV4097_SET_TEXTURE_CONTROL3
+0x1880
+NV4097_SET_VERTEX_DATA2F_M
+0x1900
+NV4097_SET_VERTEX_DATA2S_M
+0x1940
+NV4097_SET_VERTEX_DATA4UB_M
+0x1980
+NV4097_SET_VERTEX_DATA4S_M
+0x1A00
+NV4097_SET_TEXTURE_OFFSET
+0x1A04
+NV4097_SET_TEXTURE_FORMAT
+0x1A08
+NV4097_SET_TEXTURE_ADDRESS
+0x1A0C
+NV4097_SET_TEXTURE_CONTROL0
+0x1A10
+NV4097_SET_TEXTURE_CONTROL1
+0x1A14
+NV4097_SET_TEXTURE_FILTER
+0x1A18
+NV4097_SET_TEXTURE_IMAGE_RECT
+0x1A1C
+NV4097_SET_TEXTURE_BORDER_COLOR
+0x1C00
+NV4097_SET_VERTEX_DATA4F_M
+0x1D00
+NV4097_SET_COLOR_KEY_COLOR
+0x1D60
+NV4097_SET_SHADER_CONTROL
+0x1D64
+NV4097_SET_INDEXED_CONSTANT_READ_LIMITS
+0x1D6C
+NV4097_SET_SEMAPHORE_OFFSET
+0x1D70
+NV4097_BACK_END_WRITE_SEMAPHORE_RELEASE
+0x1D74
+NV4097_TEXTURE_READ_SEMAPHORE_RELEASE
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+11 of 27
+10/07/2026, 06:23
+0x1D78
+NV4097_SET_ZMIN_MAX_CONTROL
+0x1D7C
+NV4097_SET_ANTI_ALIASING_CONTROL
+0x1D80
+NV4097_SET_SURFACE_COMPRESSION
+0x1D84
+NV4097_SET_ZCULL_EN
+0x1D88
+NV4097_SET_SHADER_WINDOW
+0x1D8C
+NV4097_SET_ZSTENCIL_CLEAR_VALUE
+0x1D90
+NV4097_SET_COLOR_CLEAR_VALUE
+0x1D94
+NV4097_CLEAR_SURFACE
+0x1D98
+NV4097_SET_CLEAR_RECT_HORIZONTAL
+0x1D9C
+NV4097_SET_CLEAR_RECT_VERTICAL
+0x1DA4
+NV4097_SET_CLIP_ID_TEST_ENABLE
+0x1DAC
+NV4097_SET_RESTART_INDEX_ENABLE
+0x1DB0
+NV4097_SET_RESTART_INDEX
+0x1DB4
+NV4097_SET_LINE_STIPPLE
+0x1DB8
+NV4097_SET_LINE_STIPPLE_PATTERN
+0x1E40
+NV4097_SET_VERTEX_DATA1F_M
+0x1E94
+NV4097_SET_TRANSFORM_EXECUTION_MODE
+0x1E98
+NV4097_SET_RENDER_ENABLE
+0x1E9C
+NV4097_SET_TRANSFORM_PROGRAM_LOAD
+Set PGRAPH's VPE LOAD register, which
+specifies the offset where new instructions
+are copied.
+0x1EA0
+NV4097_SET_TRANSFORM_PROGRAM_START
+Set PGRAPH's VPE START register.
+0x1EA4
+NV4097_SET_ZCULL_CONTROL0
+0x1EA8
+NV4097_SET_ZCULL_CONTROL1
+0x1EAC
+NV4097_SET_SCULL_CONTROL
+0x1EE0
+NV4097_SET_POINT_SIZE
+0x1EE4
+NV4097_SET_POINT_PARAMS_ENABLE
+0x1EE8
+NV4097_SET_POINT_SPRITE_CONTROL
+0x1EF8
+NV4097_SET_TRANSFORM_TIMEOUT
+0x1EFC
+NV4097_SET_TRANSFORM_CONSTANT_LOAD
+0x1F00
+NV4097_SET_TRANSFORM_CONSTANT
+0x1FC0
+NV4097_SET_FREQUENCY_DIVIDER_OPERATION
+0x1FC4
+NV4097_SET_ATTRIB_COLOR
+0x1FC8
+NV4097_SET_ATTRIB_TEX_COORD
+0x1FCC
+NV4097_SET_ATTRIB_TEX_COORD_EX
+0x1FD0
+NV4097_SET_ATTRIB_UCLIP0
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+12 of 27
+10/07/2026, 06:23
+0x1FD4
+NV4097_SET_ATTRIB_UCLIP1
+0x1FD8
+NV4097_INVALIDATE_L2
+0x1FE0
+NV4097_SET_REDUCE_DST_COLOR
+0x1FE8
+NV4097_SET_NO_PARANOID_TEXTURE_FETCHES
+0x1FEC
+NV4097_SET_SHADER_PACKER
+0x1FF0
+NV4097_SET_VERTEX_ATTRIB_INPUT_MASK
+0x1FF4
+NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK
+0x1FF8
+NV4097_SET_TRANSFORM_BRANCH_BITS
+Register (whole 14 bit)
+Name
+Description
+0x2000
+NV0039_SET_OBJECT
+0x2180
+NV0039_SET_CONTEXT_DMA_NOTIFIES
+0x2184
+NV0039_SET_CONTEXT_DMA_BUFFER_IN
+0x2188
+NV0039_SET_CONTEXT_DMA_BUFFER_OUT
+0x230C
+NV0039_OFFSET_IN
+0x2310
+NV0039_OFFSET_OUT
+0x2314
+NV0039_PITCH_IN
+0x2318
+NV0039_PITCH_OUT
+0x231C
+NV0039_LINE_LENGTH_IN
+0x2320
+NV0039_LINE_COUNT
+0x2324
+NV0039_FORMAT
+0x2328
+NV0039_BUFFER_NOTIFY
+Register (whole 14 bit)
+Name
+Description
+0x6000
+NV3062_SET_OBJECT
+0x6180
+NV3062_SET_CONTEXT_DMA_NOTIFIES
+0x6184
+NV3062_SET_CONTEXT_DMA_IMAGE_SOURCE
+0x6188
+NV3062_SET_CONTEXT_DMA_IMAGE_DESTIN
+0x6300
+NV3062_SET_COLOR_FORMAT
+0x6304
+NV3062_SET_PITCH
+0x6308
+NV3062_SET_OFFSET_SOURCE
+0x630C
+NV3062_SET_OFFSET_DESTIN
+NV03_MEMORY_TO_MEMORY_FORMAT
+NV30_CONTEXT_SURFACES_2D (NV3062)
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+13 of 27
+10/07/2026, 06:23
+Register (whole 14 bit)
+Name
+Description
+0x8000
+NV309E_SET_OBJECT
+0x8180
+NV309E_SET_CONTEXT_DMA_NOTIFIES
+0x8184
+NV309E_SET_CONTEXT_DMA_IMAGE
+0x8300
+NV309E_SET_FORMAT
+0x8304
+NV309E_SET_OFFSET
+Register (whole 14 bit)
+Name
+Description
+0xA000
+NV308A_SET_OBJECT
+0xA180
+NV308A_SET_CONTEXT_DMA_NOTIFIES
+0xA184
+NV308A_SET_CONTEXT_COLOR_KEY
+0xA188
+NV308A_SET_CONTEXT_CLIP_RECTANGLE
+0xA18C
+NV308A_SET_CONTEXT_PATTERN
+0xA190
+NV308A_SET_CONTEXT_ROP
+0xA194
+NV308A_SET_CONTEXT_BETA1
+0xA198
+NV308A_SET_CONTEXT_BETA4
+0xA19C
+NV308A_SET_CONTEXT_SURFACE
+0xA2F8
+NV308A_SET_COLOR_CONVERSION
+0xA2FC
+NV308A_SET_OPERATION
+0xA300
+NV308A_SET_COLOR_FORMAT
+0xA304
+NV308A_POINT
+0xA308
+NV308A_SIZE_OUT
+0xA30C
+NV308A_SIZE_IN
+0xA400
+NV308A_COLOR
+NV30_CONTEXT_SURFACE_SWIZZLED
+NV30_IMAGE_FROM_CPU (NV308A)
+NV30_SCALED_IMAGE_FROM_MEMORY
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+14 of 27
+10/07/2026, 06:23
+Register (whole 14 bit)
+Name
+Description
+0xC000
+NV3089_SET_OBJECT
+0xC180
+NV3089_SET_CONTEXT_DMA_NOTIFIES
+0xC184
+NV3089_SET_CONTEXT_DMA_IMAGE
+0xC188
+NV3089_SET_CONTEXT_PATTERN
+0xC18C
+NV3089_SET_CONTEXT_ROP
+0xC190
+NV3089_SET_CONTEXT_BETA1
+0xC194
+NV3089_SET_CONTEXT_BETA4
+0xC198
+NV3089_SET_CONTEXT_SURFACE
+0xC2FC
+NV3089_SET_COLOR_CONVERSION
+0xC300
+NV3089_SET_COLOR_FORMAT
+0xC304
+NV3089_SET_OPERATION
+0xC308
+NV3089_CLIP_POINT
+0xC30C
+NV3089_CLIP_SIZE
+0xC310
+NV3089_IMAGE_OUT_POINT
+0xC314
+NV3089_IMAGE_OUT_SIZE
+0xC318
+NV3089_DS_DX
+0xC31C
+NV3089_DT_DY
+0xC400
+NV3089_IMAGE_IN_SIZE
+0xC404
+NV3089_IMAGE_IN_FORMAT
+0xC408
+NV3089_IMAGE_IN_OFFSET
+0xC40C
+NV3089_IMAGE_IN
+These methods are executed by the LV1, not by the RSX.
+Register (whole 14
+bit)
+Name
+Description
+0xE000
+SCE_DRIVER_SET_OBJECT
+0xE920
+SCE_DRIVER_FLIP
+Head is specified by the 2 possible indices
+[0xE920:0E924]
+0xE940
+SCE_DRIVER_QUEUE
+Head is specified by the 8 possible indices
+[0xE940:0E95C]
+0xEB00
+SCE_DRIVER_INTERRUPT
+Commands
+SCE DRIVER
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+15 of 27
+10/07/2026, 06:23
+▪ 
+Nop
+0x00000100
+▪ 
+Calls a function at the specified offset.
+▪ 
+Command size is 
+0
+.
+▪ 
+The parameter is offset in FIFO buffer.
+<offset> | 0x00000002
+▪ 
+Returns from a function.
+▪ 
+Command size is 
+0
+.
+0x00020000
+▪ 
+Jumps to the specified offset.
+▪ 
+Command size is 
+0
+.
+▪ 
+The parameter is offset in FIFO buffer.
+0x20000000 | <offset>
+▪ 
+Sets color mask.
+▪ 
+Command size is 
+1
+.
+▪ 
+The parameter is color mask.
+0x00040324
+<color mask>
+0x00040370
+<color mask>
+NOP (0x00000100)
+CALL (0x00000002)
+RET (0x00020000)
+JMP (0x20000000)
+COLOR MASK (0x00040324)
+COLOR MASK MRT (0x00040370)
+CLEAR COLOR (0x00041D90)
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+16 of 27
+10/07/2026, 06:23
+0x00041D90
+<value>
+▪ 
+Sets front polygon mode.
+▪ 
+Command size is 
+1
+.
+▪ 
+The parameter is front polygon mode.
+0x00041828
+<front polygon mode>
+▪ 
+Sets value of REF control register
+0x00040050
+<value>
+▪ 
+Sets semaphore DMA context
+0x00040060
+<value>
+▪ 
+Sets semaphore offset
+0x00040064
+<value>
+▪ 
+Acquires semaphore
+0x00040068
+<value>
+▪ 
+Releases semaphore
+0x0004006C
+<value>
+FRONT POLYGON MODE (0x00041828)
+SET REF (0x00040050)
+SEMAPHORE DMA CONTEXT (0x00040060)
+SEMAPHORE OFFSET (0x00040064)
+SEMAPHORE ACQUIRE (0x00040068)
+SEMAPHORE RELEASE (0x0004006C)
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+17 of 27
+10/07/2026, 06:23
+libgcm Functions
+▪ 
+Returns EA of FIFO registers: PUT, GET and REF
+▪ 
+Kicks FIFO command processing by moving PUT register
+▪ 
+This function adds FIFO command for setting REF register to value 0xFFFFFFFF, kicks FIFO
+and then loops and checks REF register until it is set to value 0xFFFFFFFF.
+▪ 
+It just waits until all FIFO commands are processed by GPU.
+▪ 
+Returns flip status.
+▪ 
+Checks bit 31 in word at offset 0x10C0 + 0x1 * 0x40 of reports area returned by
+lv1_gpu_context_allocate.
+▪ 
+Flip status = ((word at 0x10C0 + 0x1 * 0x40) >> 31) ^ 0x1.
+▪ 
+Flip status: 0 - flip done, 1 - flip waiting
+▪ 
+Resets flip status.
+▪ 
+Sets flip status to 
+flip waiting
+.
+▪ 
+Sets bit 31 to 0 in word at offset 0x10C0 + 0x1 * 0x40 of reports area returned by
+lv1_gpu_context_allocate.
+Equivalent to:
+lv1_gpu_context_attribute(context handle, 0x10a, 0x1 /* id */, 0x7fffffff /* mask */, 0x0 /* value */, 
+0x0)
+libgcm Commands
+0x00000000
+cellGcmGetControlRegister
+cellGcmFlush
+cellGcmFinish
+cellGcmGetFlipStatus
+cellGcmResetFlipStatus
+SetNopCommand
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+18 of 27
+10/07/2026, 06:23
+0x00040050
+<param>
+0x20000000 | <param>
+0x00000002 | <param>
+0x00002000
+▪ 
+Sets pixel logical operation
+0x00040378
+<param>
+▪ 
+Enables/Disables pixel logical operation
+0x00040374
+<param>
+0x00040324
+<param>
+0x00040370
+<param>
+0x00041D90
+SetReferenceCommand
+SetJumpCommand
+SetCallCommand
+SetReturnCommand
+SetLogicOp
+SetLogicOpEnable
+SetColorMask
+SetColorMaskMrt
+SetClearColor
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+19 of 27
+10/07/2026, 06:23
+<param>
+0x00041D8C
+<param>
+0x00041D94
+<param>
+0x00040100
+<param>
+0x00041828
+<param>
+0x00041834
+<param>
+0x00040304
+<param>
+0x00080308
+<param1>
+<param2>
+0x00040A74
+<param>
+0x00040A6C
+<param>
+SetClearDepthStencil
+SetClearSurface
+SetFrontPolygonMode
+SetFrontFace
+SetAlphaTestEnable
+SetAlphaFunc
+SetDepthTestEnable
+SetDepthFunc
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+20 of 27
+10/07/2026, 06:23
+0x00080384
+<param1>
+<param2>
+0x00040310
+<param>
+0x00080314
+<param1>
+<param2>
+0x0004031C
+<param>
+0x0004037C
+<param>
+0x00040320
+<param>
+▪ 
+Sets Z clipping values
+0x00080394
+<param1>
+<param2>
+▪ 
+Enables/Disables Zcull/Scull
+0x00041D84
+<param>
+SetDepthBounds
+SetBlendEnable
+SetBlendFunc
+SetBlendColor
+SetBlendEquation
+SetClipMinMax
+SetZcullEnable
+SetPointSize
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+21 of 27
+10/07/2026, 06:23
+0x00041EE0
+<param>
+▪ 
+Releases semaphore.
+0x00040064
+<param>
+0x0004006C
+<param>
+▪ 
+Acquires semaphore.
+0x00040064
+<param>
+0x00040068
+<param>
+0x00041D6C
+<param>
+0x00041D70
+<param>
+0x00041D6C
+<param>
+0x00041D70
+<param>
+0x00040110
+0x00000000
+0x00040110
+0x00000000
+▪ 
+SetWaitFlip is nothing more than acquiring semaphore.
+▪ 
+This command is equal to SetWaitLabel with 
+index=0x00000001
+ and 
+value=0x00000000
+.
+SetWriteCommandLabel
+SetWaitLabel
+SetWriteBackEndLabel
+SetWriteBackEndLabelForConditional
+SetWaitForIdle
+SetWaitFlip
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+22 of 27
+10/07/2026, 06:23
+0x00040064
+0x00000010       # semaphore offset = index * 16
+0x00040068
+0x00000000
+0x000401A8
+<param>
+0x00041800
+<param>
+0x00041800
+<param>
+0x000417c8
+<param>
+▪ 
+Specifies culling face (front or back)
+0x00041830
+<param>
+▪ 
+Enables/Disables face culling
+0x0004183C
+<param>
+0x00080A00
+<param1>
+<param2>
+0x00080394
+<param1>
+<param2>
+0x200A20
+<param1>
+SetReportLocation
+SetReport
+SetTimeStamp
+SetClearReport
+SetCullFace
+SetCullFaceEnable
+SetViewport
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+23 of 27
+10/07/2026, 06:23
+<param2>
+<param3>
+<param4>
+<param5>
+<param6>
+<param7>
+<param8>
+0x200A20
+<param1>
+<param2>
+<param3>
+<param4>
+<param5>
+<param6>
+<param7>
+<param8>
+0x000403B8
+<param>
+0x000403BC
+<param>
+0x00041A08 + (param1 << 5)
+<param2>
+0x00041A0C + (param1 << 5)
+<param2>
+0x00041A14 + (param1 << 5)
+<param2>
+0x000408CC
+<param>
+0x00040180
+SetLineWidth
+SetLineSmoothEnable
+SetTextureAddress
+SetTextureControl
+SetTextureFilter
+SetFogMode
+SetNotifyIndex
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+24 of 27
+10/07/2026, 06:23
+0x6660420F - <param>
+0x00040104
+0x00000000
+0x00040100
+0x00000000
+0x00082184
+<source>            # 0xFEED0000 - local memory, 0xFEED0001 - system memory
+<destination>       # 0xFEED0000 - local memory, 0xFEED0001 - system memory
+0x0004230C
+<source address>
+0x00042310
+<destination address>
+0x00042328
+0x00000000
+0x00142314
+<source pitch>
+<destination pitch>
+<line length>
+<line count>
+<destination increment> << 8 | <source increment>
+0x00046188
+<destination>            # 0xFEED0000 - local memory, 0xFEED0001 - system memory
+0x00082184
+<source>                 # 0xFEED0000 - local memory, 0xFEED0001 - system memory
+<destination>            # 0xFEED0000 - local memory, 0xFEED0001 - system memory
+for (each row)
+{
+    0x0020230C
+    <source address>
+    <destination address>
+    0x00000000
+    0x00000000
+    <number of bytes to transfer>    # max 0x3FFFFF bytes
+SetNotify
+SetTransferDataMode
+SetTransferDataOffset
+SetTransferDataFormat
+SetTransferLocation
+SetTransferData
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+25 of 27
+10/07/2026, 06:23
+    0x00000001
+    0x00000101
+    0x00000000
+}
+0x00040194
+<param>
+0x0004018C
+<param>
+0x000801B4
+<param1>
+<param2>
+0x00040198
+<param>
+TODO
+0x00040908 + (index * 0x20)
+(wrapt << 8) | wraps
+0x00041740 + (index * 0x4)
+param
+0x00041680 + (index * 0x4)
+param
+libgcm System Semaphores
+Offset
+Value
+Description
+0x00000010
+0x00000000
+Flip done semaphore (used by cellGcmWaitFlip)
+Semaphores
+Here is a FIFO program i executed on Linux:
+0x00040060     # set semaphore DMA context method
+0x66616661     # DMA object handle
+0x00040064     # set semaphore offset method
+0x00000400     # semaphore offset
+0x0004006C     # semaphore release method
+0xf00dbeef     # semaphore value
+And here is dump of reports area:
+SetSurfaceWindow
+SetVertexTextureAddress
+SetVertexDataArray
+Small Test
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+26 of 27
+10/07/2026, 06:23
+v
+ ·
+e
+ (
+https://www.psdevwiki.com/ps3/edit/Template:Development
+)
+000003f8: 0x1337beef
+000003fc: 0x1337f001
+00000400: 0xf00dbeef   # semaphore value
+00000404: 0x1337babe
+00000408: 0x1337beef
+0000040c: 0x1337f001
+▪ 
+As you see releasing semaphore writes 0xf00dbeef to reports area at offset 0x400.
+Reports Area
+▪ 
+PS3:HvReverseEngineering:RSXFIFOCommands:ReportsAreaDump
+Development
+SDK
+Cell Programming IBM
+·
+PSL1GHT
+·
+PSDK3v2
+·
+SCEI PS3 SDK
+VSH
+VSH Exports
+·
+VSH Imports
+·
+DIVXDRM Exports
+·
+PAF WEB Exports
+IDs + labels
+Category ID
+·
+Category ID Label
+·
+Chassis ID
+·
+Console ID
+·
+Client ID
+·
+Client Secret
+·
+Content ID
+·
+Entitlement ID
+·
+Entitlement Label
+·
+IDPS
+·
+NID
+·
+NP Communication ID
+·
+NP Communication Signature
+·
+NP OnlineID
+·
+NP Passphrase
+·
+NP Service Label
+·
+NP Title ID
+·
+NP Title Secret
+·
+OpenPSID
+·
+Platform ID
+·
+Product Code
+·
+Product Sub Code
+·
+Product ID
+·
+Product Label
+·
+Service Entitlement ID
+·
+Service Entitlement Label
+·
+Publisher ID
+·
+Service ID
+·
+SKU ID
+·
+SKU Label
+·
+Slot ID
+·
+TITLE_ID
+·
+Serial Database
+Reference
+Program Authority ID
+·
+Program Vender Id
+·
+Dev Tools
+·
+DeviceID
+·
+Devices
+·
+HV Syscall Reference
+·
+HV Syscalls
+·
+Iso module
+·
+Loaders
+·
+LV2 Functions and Syscalls
+·
+LV2 Handling
+·
+PS3 Payload Development
+·
+RSXFIFOCommands
+·
+Synergistic Processing Unit (SPU)
+·
+Documented SPU Channels
+·
+Undocumented SPU Channels
+·
+Gitbrew
+·
+Gitorious
+·
+OpenCLit
+·
+PS3-Documents
+Others
+Multimedia Formats and Tools
+·
+Game Engines
+·
+Game Modding
+·
+Unreal Development Kit 3
+·
+Codenames
+Retrieved from "
+https://www.psdevwiki.com/ps3/index.php?title=RSXFIFOCommands&oldid=74893
+"
+This page was last edited on 18 January 2025, at 04:51.
+Content is available under 
+GNU Free Documentation License 1.2
+ unless otherwise noted.
+RSXFIFOCommands - PS3 Developer wiki https://www.psdevwiki.com/ps3/RSXFIFOCommands
+27 of 27
+10/07/2026, 06:23

@@ -1,0 +1,67 @@
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 0d7abe4..4e79e05 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -8,6 +8,7 @@
+ 
+ #include "rsx_null_backend.h"
+ #include <stdio.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include "../../runtime/ps3_log.h"
+ 
+@@ -192,9 +193,20 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+     }
+ 
+     case WM_KEYDOWN:
++        /* Escape quits only when PS3_ESCAPE_QUITS is set: games use it
++         * themselves (Folklore's engine menu closes on it), and quitting the
++         * whole game on it lost progress. The window's close button and
++         * Alt+F4 still quit. */
+         if (wp == VK_ESCAPE) {
+-            s_state.window_closed = 1;
+-            DestroyWindow(hwnd);
++            static int escapeQuits = -1;
++            if (escapeQuits < 0) {
++                const char* setting = getenv("PS3_ESCAPE_QUITS");
++                escapeQuits = setting && setting[0] && setting[0] != '0';
++            }
++            if (escapeQuits) {
++                s_state.window_closed = 1;
++                DestroyWindow(hwnd);
++            }
+         }
+         return 0;
+     }
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 49cadc7..23bf530 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -1207,6 +1207,10 @@ static LONG WINAPI vm_commit_veh(EXCEPTION_POINTERS* ep)
+ }
+ #endif
+ 
++#ifdef PS3_HAVE_HOST_BOOTSTRAP
++extern "C" const char* ps3_host_bootstrap(const char* elf_from_command_line);
++#endif
++
+ int main(int argc, char** argv)
+ {
+     /* <PPU ELF> [--username NAME] [--psnr host[:port]], flags in any order. */
+@@ -1222,6 +1226,16 @@ int main(int argc, char** argv)
+         if (eq) *flag = eq + 1;
+         else if (i + 1 < argc) *flag = argv[++i];
+     }
++#ifdef PS3_HAVE_HOST_BOOTSTRAP
++    /* A title's own start-up hook (defined in its port, enabled with
++     * -DPS3_HAVE_HOST_BOOTSTRAP): fills in default environment, redirects the
++     * log, and supplies the ELF when none was given on the command line --
++     * e.g. from a saved game folder or a folder picker. NULL quits quietly. */
++    elf = ps3_host_bootstrap(elf);
++    if (!elf) {
++        return 2;
++    }
++#endif
+     if (!elf) {
+         printf("usage: %s <PPU ELF> [--username NAME] [--psnr host[:port]]\n", argv[0]);
+         return 2;

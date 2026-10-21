@@ -1,0 +1,36 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index be960e1..a5228ef 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -2507,12 +2507,27 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+     return 1;
+ }
+ 
+-/* cellGcmSetFlip(context, buffer_id) — immediate flip request. PSL1GHT's
+- * gcmSetFlip import (NID 0xDC09357E) lands here; without it vkcube's flip was
+- * a no-op, GetFlipStatus never cleared, and init timed out into exit(-1). */
++/* cellGcmSetFlip(context, buffer_id). PSL1GHT's gcmSetFlip import (NID
++ * 0xDC09357E) lands here; without it vkcube's flip was a no-op, GetFlipStatus
++ * never cleared, and init timed out into exit(-1).
++ *
++ * The real one appends the flip to the context's command buffer (RPCS3:
++ * gcmSetPrepareFlip), so the RSX flips after everything queued before it.
++ * Flipping at call time presented whatever the drain had reached: Folklore
++ * calls it every frame, and its presents showed the previous frame again,
++ * frames without their last HUD draws, and frames the next one had already
++ * started drawing over -- camera judder and stray geometry. Queue it in the
++ * FIFO like _cellGcmSetFlipCommand; immediate only when the context is not a
++ * mapped command buffer (or with PS3_GCM_SETFLIP_IMMEDIATE=1). */
+ s32 cellGcmSetFlip(void* context, u32 bufferId)
+ {
+-    (void)context;   /* command context — flip is immediate in HLE */
++    static int immediate = -1;
++    if (immediate < 0) {
++        immediate = getenv("PS3_GCM_SETFLIP_IMMEDIATE") ? 1 : 0;
++    }
++    if (!immediate && gcm_flip_into_fifo((u32)(uintptr_t)context, bufferId)) {
++        return gcm_flip_request(bufferId, 1);
++    }
+     return cellGcmSetFlipCommand(bufferId);
+ }
+ 

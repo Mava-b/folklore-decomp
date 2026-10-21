@@ -1,0 +1,34 @@
+# Made by setup.ps1 / build.ps1 / run.ps1 -- never committed.
+/tools/
+/logs/
+/dist/
+/hdd0/
+/hdd1/
+/gamedata/
+/scratch/
+/save_snapshots/
+/folklore_settings.ini
+/ps3recomp/build/
+/folklore/build/
+
+# Lifted from YOUR copy of the game and YOUR firmware by setup.ps1.
+# Derived from Sony's and the game's code: keep them out of the repository.
+/folklore/src/recomp/*.cpp
+/folklore/src/recomp/*.h
+/folklore/src/spu_gen/
+/folklore/src/spu_gen_lle/
+/folklore/analysis/
+/folklore/firmware_lle/
+
+# Game files, if someone drops them in here.
+*.elf
+*.self
+*.sprx
+*.prx
+EBOOT.BIN
+PARAM.SFO
+*.pup
+*.PUP
+
+__pycache__/
+*.pyc

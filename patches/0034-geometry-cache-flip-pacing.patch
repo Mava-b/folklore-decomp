@@ -1,0 +1,855 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index d2ebce6..9f8206c 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -908,13 +908,33 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+  * and its handler runs code that puts the status back to WAITING, so the
+  * poll never saw DONE and the game never rendered another frame. On hardware
+  * the callback IS the flip interrupt -- no flip, no callback. */
+-/* The present thread has just executed and presented a frame: every flip
+- * the drain has reached is now on screen. Retiring them here instead of at
+- * the next vblank tick takes the wait for that tick (up to 16.7 ms, plus the
+- * present thread's idle wait) out of the chain from one frame to the next:
+- * the game waits in cellGcmSetWaitFlip for exactly this. The vblank tick
+- * still retires flips on its own (GCM_FLIP_SHOWN_AT_PRESENT=0 leaves it to
+- * the tick alone). */
++/* Vblank ticks, and the tick in which a flip was last retired: a flip is
++ * shown at most once per vblank, as on the PS3. Retiring every drained flip
++ * at present time (0033 as first shipped) let a title that paces itself by
++ * flips -- Folklore's logo movies and its opening cinematic -- run as fast
++ * as frames could be presented. Both counters live on the present thread. */
++static u32 s_vblank_ticks = 0;
++static u32 s_tick_of_last_retire = 0xFFFFFFFFu;
++
++static void gcm_retire_one_flip(u64 now)
++{
++    s_flips_shown++;
++    s_tick_of_last_retire = s_vblank_ticks;
++    const u64 drainedAt = s_flip_drain_ns[s_flips_shown & 31u];
++    if (drainedAt && now > drainedAt)
++    {
++        g_gcm_perf_flip_show_lat_ns += now - drainedAt;
++        g_gcm_perf_flips_shown++;
++    }
++}
++
++/* The present thread has just executed and presented a frame. If no flip
++ * has been retired in this vblank yet, retire the next drained one now
++ * instead of at the next vblank tick: that takes the wait for the tick (up
++ * to 16.7 ms, plus the present thread's idle wait) out of the chain from one
++ * frame to the next -- the game waits in cellGcmSetWaitFlip for exactly
++ * this. Still one flip per vblank. GCM_FLIP_SHOWN_AT_PRESENT=0 leaves it to
++ * the tick alone. */
+ void cellGcm_note_frame_presented(void)
+ {
+     static int enabled = -1;
+@@ -927,33 +947,25 @@ void cellGcm_note_frame_presented(void)
+     {
+         return;
+     }
+-    const u64 now = gcm_perf_now_ns();
+-    while ((s32)(s_flips_issued - s_flips_shown) > 0 &&
+-           (s32)(s_flips_drained - s_flips_shown) > 0)
++    if (s_tick_of_last_retire == s_vblank_ticks)
+     {
+-        s_flips_shown++;
+-        const u64 drainedAt = s_flip_drain_ns[s_flips_shown & 31u];
+-        if (drainedAt && now > drainedAt)
+-        {
+-            g_gcm_perf_flip_show_lat_ns += now - drainedAt;
+-            g_gcm_perf_flips_shown++;
+-        }
++        return;
++    }
++    if ((s32)(s_flips_issued - s_flips_shown) > 0 &&
++        (s32)(s_flips_drained - s_flips_shown) > 0)
++    {
++        gcm_retire_one_flip(gcm_perf_now_ns());
+     }
+ }
+ 
+ void cellGcmTickFlip(void)
+ {
+     /* One flip reaches the screen per vblank, once the drain has reached it. */
++    s_vblank_ticks++;
+     if ((s32)(s_flips_issued - s_flips_shown) > 0 &&
+         (s32)(s_flips_drained - s_flips_shown) > 0)
+     {
+-        s_flips_shown++;
+-        const u64 drainedAt = s_flip_drain_ns[s_flips_shown & 31u];
+-        if (drainedAt)
+-        {
+-            g_gcm_perf_flip_show_lat_ns += gcm_perf_now_ns() - drainedAt;
+-            g_gcm_perf_flips_shown++;
+-        }
++        gcm_retire_one_flip(gcm_perf_now_ns());
+     }
+     if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+         GCM_PENDING_SET(2);
+diff --git a/libs/video/rsx_geometry_cache.c b/libs/video/rsx_geometry_cache.c
+new file mode 100644
+index 0000000..76a8f35
+--- /dev/null
++++ b/libs/video/rsx_geometry_cache.c
+@@ -0,0 +1,317 @@
++/*
++ * rsx_geometry_cache.c -- see rsx_geometry_cache.h.
++ *
++ * A set-associative table (4 ways) of converted draws. Only the present
++ * thread uses it, so there is no locking.
++ */
++#include "rsx_geometry_cache.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++
++#define GEOM_SETS 4096u
++#define GEOM_WAYS 4u
++/* An entry not used for this many frames is freed (~10 s at 60 fps). */
++#define GEOM_MAX_AGE_FRAMES 600u
++/* A single draw larger than this is not worth keeping. */
++#define GEOM_MAX_ENTRY_BYTES (32u << 20)
++
++static const u64 kPrime1 = 0x9E3779B185EBCA87ull;
++static const u64 kPrime2 = 0xC2B2AE3D27D4EB4Full;
++static const u64 kPrime3 = 0x165667B19E3779F9ull;
++static const u64 kPrime4 = 0x85EBCA77C2B2AE63ull;
++static const u64 kPrime5 = 0x27D4EB2F165667C5ull;
++
++static rsx_geom_entry s_table[GEOM_SETS][GEOM_WAYS];
++static size_t s_bytes = 0;
++static u32 s_entries = 0;
++static size_t s_budget = 0;
++
++static inline u64 rotateLeft(u64 value, unsigned amount)
++{
++    return (value << amount) | (value >> (64u - amount));
++}
++
++static inline u64 loadU64(const u8* bytes)
++{
++    u64 value;
++    memcpy(&value, bytes, 8);
++    return value;
++}
++
++static inline u64 hashRound(u64 accumulator, u64 input)
++{
++    accumulator += input * kPrime2;
++    accumulator = rotateLeft(accumulator, 31);
++    return accumulator * kPrime1;
++}
++
++static inline u64 hashMerge(u64 hash, u64 accumulator)
++{
++    hash ^= hashRound(0, accumulator);
++    return hash * kPrime1 + kPrime4;
++}
++
++static inline u64 hashAvalanche(u64 hash)
++{
++    hash ^= hash >> 33;
++    hash *= kPrime2;
++    hash ^= hash >> 29;
++    hash *= kPrime3;
++    hash ^= hash >> 32;
++    return hash;
++}
++
++u64 rsx_geom_hash(const void* data, size_t bytes, u64 seed)
++{
++    const u8* cursor = (const u8*)data;
++    const size_t length = bytes;
++    u64 hash;
++    if (bytes >= 32)
++    {
++        u64 laneA = seed + kPrime1 + kPrime2;
++        u64 laneB = seed + kPrime2;
++        u64 laneC = seed;
++        u64 laneD = seed - kPrime1;
++        while (bytes >= 32)
++        {
++            laneA = hashRound(laneA, loadU64(cursor));
++            laneB = hashRound(laneB, loadU64(cursor + 8));
++            laneC = hashRound(laneC, loadU64(cursor + 16));
++            laneD = hashRound(laneD, loadU64(cursor + 24));
++            cursor += 32;
++            bytes -= 32;
++        }
++        hash = rotateLeft(laneA, 1) + rotateLeft(laneB, 7) +
++               rotateLeft(laneC, 12) + rotateLeft(laneD, 18);
++        hash = hashMerge(hash, laneA);
++        hash = hashMerge(hash, laneB);
++        hash = hashMerge(hash, laneC);
++        hash = hashMerge(hash, laneD);
++    }
++    else
++    {
++        hash = seed + kPrime5;
++    }
++    hash += (u64)length;
++    while (bytes >= 8)
++    {
++        hash ^= hashRound(0, loadU64(cursor));
++        hash = rotateLeft(hash, 27) * kPrime1 + kPrime4;
++        cursor += 8;
++        bytes -= 8;
++    }
++    while (bytes > 0)
++    {
++        hash ^= (u64)(*cursor) * kPrime5;
++        hash = rotateLeft(hash, 11) * kPrime1;
++        cursor++;
++        bytes--;
++    }
++    return hashAvalanche(hash);
++}
++
++u64 rsx_geom_hash_u64(u64 hash, u64 value)
++{
++    return hashAvalanche(hash ^ hashRound(kPrime3, value)) + kPrime4;
++}
++
++static size_t geom_budget(void)
++{
++    if (!s_budget)
++    {
++        const char* text = getenv("LD_GEOM_CACHE_MB");
++        const long megabytes = text ? strtol(text, NULL, 0) : 384;
++        s_budget = (size_t)(megabytes > 16 ? megabytes : 16) << 20;
++    }
++    return s_budget;
++}
++
++static void geom_free(rsx_geom_entry* entry)
++{
++    if (!entry->bytes)
++    {
++        return;
++    }
++    free(entry->refs);
++    free(entry->occurrence);
++    free(entry->cuts);
++    free(entry->vertices);
++    s_bytes -= entry->bytes;
++    s_entries--;
++    memset(entry, 0, sizeof(*entry));
++}
++
++rsx_geom_entry* rsx_geom_cache_find(u64 key, u64 check, u32 frame)
++{
++    rsx_geom_entry* set = s_table[key & (GEOM_SETS - 1u)];
++    for (u32 way = 0; way < GEOM_WAYS; way++)
++    {
++        rsx_geom_entry* entry = &set[way];
++        if (entry->bytes && entry->key == key && entry->check == check)
++        {
++            entry->last_frame = frame;
++            return entry;
++        }
++    }
++    return NULL;
++}
++
++void rsx_geom_cache_drop(rsx_geom_entry* entry)
++{
++    if (entry)
++    {
++        geom_free(entry);
++    }
++}
++
++static void* geom_copy(const void* source, size_t bytes)
++{
++    if (!bytes)
++    {
++        return NULL;
++    }
++    void* copy = malloc(bytes);
++    if (copy)
++    {
++        memcpy(copy, source, bytes);
++    }
++    return copy;
++}
++
++int rsx_geom_cache_store(u64 key, u64 check, u32 frame,
++                         const rsx_geom_span* spans, u32 n_spans,
++                         const rsx_vertex_ref* refs, u32 n_refs,
++                         u32 n_source_refs, int refs_remapped,
++                         const u32* occurrence,
++                         const u32* cuts, u32 n_cuts,
++                         const u8* vertices, u32 stride)
++{
++    if (n_spans > RSX_GEOM_MAX_SPANS || !n_refs || !stride)
++    {
++        return 0;
++    }
++    const size_t refBytes = (size_t)n_refs * sizeof(rsx_vertex_ref);
++    const size_t occurrenceBytes = refs_remapped ? (size_t)n_source_refs * sizeof(u32) : 0;
++    const size_t cutBytes = (size_t)n_cuts * sizeof(u32);
++    const size_t vertexBytes = (size_t)n_refs * stride;
++    const size_t total = refBytes + occurrenceBytes + cutBytes + vertexBytes;
++    if (total > GEOM_MAX_ENTRY_BYTES || (refs_remapped && !occurrence))
++    {
++        return 0;
++    }
++
++    /* The way: this key's own entry, else an empty one, else the least
++     * recently used. */
++    rsx_geom_entry* set = s_table[key & (GEOM_SETS - 1u)];
++    rsx_geom_entry* target = NULL;
++    for (u32 way = 0; way < GEOM_WAYS && !target; way++)
++    {
++        if (set[way].bytes && set[way].key == key)
++        {
++            target = &set[way];
++        }
++    }
++    for (u32 way = 0; way < GEOM_WAYS && !target; way++)
++    {
++        if (!set[way].bytes)
++        {
++            target = &set[way];
++        }
++    }
++    if (!target)
++    {
++        target = &set[0];
++        for (u32 way = 1; way < GEOM_WAYS; way++)
++        {
++            if ((s32)(set[way].last_frame - target->last_frame) < 0)
++            {
++                target = &set[way];
++            }
++        }
++    }
++    geom_free(target);
++
++    rsx_geom_entry entry;
++    memset(&entry, 0, sizeof(entry));
++    entry.refs = (rsx_vertex_ref*)geom_copy(refs, refBytes);
++    entry.occurrence = occurrenceBytes ? (u32*)geom_copy(occurrence, occurrenceBytes) : NULL;
++    entry.cuts = cutBytes ? (u32*)geom_copy(cuts, cutBytes) : NULL;
++    entry.vertices = (u8*)geom_copy(vertices, vertexBytes);
++    if (!entry.refs || !entry.vertices ||
++        (occurrenceBytes && !entry.occurrence) || (cutBytes && !entry.cuts))
++    {
++        free(entry.refs);
++        free(entry.occurrence);
++        free(entry.cuts);
++        free(entry.vertices);
++        return 0;
++    }
++    entry.key = key;
++    entry.check = check;
++    entry.last_frame = frame;
++    entry.n_spans = n_spans;
++    memcpy(entry.spans, spans, (size_t)n_spans * sizeof(*spans));
++    entry.n_refs = n_refs;
++    entry.n_source_refs = n_source_refs;
++    entry.n_cuts = n_cuts;
++    entry.stride = stride;
++    entry.refs_remapped = refs_remapped;
++    entry.bytes = total;
++    *target = entry;
++    s_bytes += total;
++    s_entries++;
++    return 1;
++}
++
++void rsx_geom_cache_end_frame(u32 frame)
++{
++    const size_t budget = geom_budget();
++    /* Sweep every 64 frames, or at once when over budget. */
++    if ((frame & 63u) != 0 && s_bytes <= budget)
++    {
++        return;
++    }
++    u32 maxAge = GEOM_MAX_AGE_FRAMES;
++    for (;;)
++    {
++        for (u32 setIndex = 0; setIndex < GEOM_SETS; setIndex++)
++        {
++            for (u32 way = 0; way < GEOM_WAYS; way++)
++            {
++                rsx_geom_entry* entry = &s_table[setIndex][way];
++                if (entry->bytes && frame - entry->last_frame > maxAge)
++                {
++                    geom_free(entry);
++                }
++            }
++        }
++        if (s_bytes <= budget || maxAge == 0)
++        {
++            break;
++        }
++        maxAge /= 2u;
++    }
++}
++
++size_t rsx_geom_cache_bytes(void)
++{
++    return s_bytes;
++}
++
++u32 rsx_geom_cache_entries(void)
++{
++    return s_entries;
++}
++
++void rsx_geom_cache_clear(void)
++{
++    for (u32 setIndex = 0; setIndex < GEOM_SETS; setIndex++)
++    {
++        for (u32 way = 0; way < GEOM_WAYS; way++)
++        {
++            geom_free(&s_table[setIndex][way]);
++        }
++    }
++}
+diff --git a/libs/video/rsx_geometry_cache.h b/libs/video/rsx_geometry_cache.h
+new file mode 100644
+index 0000000..7d67998
+--- /dev/null
++++ b/libs/video/rsx_geometry_cache.h
+@@ -0,0 +1,89 @@
++/*
++ * rsx_geometry_cache.h -- converted vertex payloads kept across frames.
++ *
++ * The live renderer turns each draw's guest vertex arrays into its own
++ * compact float layout on the CPU: read the indices, de-duplicate them, then
++ * decode every referenced vertex. Most of a frame's geometry is the same from
++ * one frame to the next (Folklore skins its characters on the GPU, so even
++ * those meshes do not change), and at the pub that conversion was the
++ * largest part of the 22 ms the present thread spent on each frame.
++ *
++ * An entry is found by a key over everything that decides the draw's
++ * output except the vertex bytes themselves -- the layout, every attribute's
++ * format and address, the index buffer's address, format and contents, the
++ * draw ranges -- and is only used if the vertex bytes it was built from
++ * still hash the same. A changed buffer is a miss, never stale geometry.
++ */
++#pragma once
++
++#include "rsx_vertex_compact.h"
++
++#include <stddef.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++/* A 64-bit hash, ~8 bytes per cycle on x86-64. Not cryptographic. */
++u64 rsx_geom_hash(const void* data, size_t bytes, u64 seed);
++/* Fold one 64-bit value into a running hash. */
++u64 rsx_geom_hash_u64(u64 hash, u64 value);
++
++#define RSX_GEOM_MAX_SPANS 16u
++
++/* A guest byte range the entry's vertices were decoded from. */
++typedef struct rsx_geom_span {
++    u32 location;
++    u32 offset;
++    u32 bytes;
++    u64 hash;
++} rsx_geom_span;
++
++typedef struct rsx_geom_entry {
++    u64 key;
++    u64 check;                /* second hash of the same inputs */
++    u32 last_frame;
++    u32 n_spans;
++    rsx_geom_span spans[RSX_GEOM_MAX_SPANS];
++    u32 n_refs;               /* unique vertices */
++    u32 n_source_refs;        /* vertex references before de-duplication */
++    u32 n_cuts;               /* primitive-restart cuts */
++    u32 stride;               /* bytes per converted vertex */
++    int refs_remapped;
++    rsx_vertex_ref* refs;     /* n_refs */
++    u32* occurrence;          /* n_source_refs, when refs_remapped */
++    u32* cuts;                /* n_cuts */
++    u8* vertices;             /* n_refs * stride */
++    size_t bytes;             /* everything above that was allocated */
++} rsx_geom_entry;
++
++/* The entry for (key, check), or NULL. Marks it used in `frame`. */
++rsx_geom_entry* rsx_geom_cache_find(u64 key, u64 check, u32 frame);
++
++/* Store a converted draw, replacing any entry with the same key. Copies
++ * every array. Returns 0 when it does not fit (too large, or allocation
++ * failed); the draw is simply not cached. */
++int rsx_geom_cache_store(u64 key, u64 check, u32 frame,
++                         const rsx_geom_span* spans, u32 n_spans,
++                         const rsx_vertex_ref* refs, u32 n_refs,
++                         u32 n_source_refs, int refs_remapped,
++                         const u32* occurrence,
++                         const u32* cuts, u32 n_cuts,
++                         const u8* vertices, u32 stride);
++
++/* Drop an entry found stale. */
++void rsx_geom_cache_drop(rsx_geom_entry* entry);
++
++/* Once a frame: free entries not used for a while, and enough of the oldest
++ * ones to stay inside the memory budget. */
++void rsx_geom_cache_end_frame(u32 frame);
++
++/* Bytes held, and entries held. */
++size_t rsx_geom_cache_bytes(void);
++u32 rsx_geom_cache_entries(void);
++
++void rsx_geom_cache_clear(void);
++
++#ifdef __cplusplus
++}
++#endif
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index a3e4c4d..d18d16d 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -79,6 +79,7 @@ static unsigned long long g_ld_bind_white = 0, g_ld_bind_real = 0, g_ld_bind_sur
+ static volatile long g_ld_ps1_vram_ready = 0;
+ #include "rsx_restart_cuts.h"
+ #include "rsx_vertex_compact.h"
++#include "rsx_geometry_cache.h"
+ #include "rsx_vp_decompiler.h"
+ 
+ #include <ctype.h>
+@@ -5010,9 +5011,299 @@ static void fetch_batches(void)
+         }
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Geometry cache (rsx_geometry_cache.h): converted draws kept across frames.
++ *
++ * fetch_batches_hoisted reads a draw's indices, de-duplicates them and
++ * decodes every referenced vertex -- for every draw, every frame. At the pub
++ * that was most of the present thread's 22 ms a frame. The cache key covers
++ * what decides the output apart from the vertex bytes (layout, attribute
++ * formats and addresses, defaults, draw ranges, index format, address and
++ * contents); an entry is used only if the vertex bytes it was decoded from
++ * still hash the same. LD_GEOM_CACHE=0 turns it off.
++ * -----------------------------------------------------------------------*/
++static u64 g_ld_geom_hits = 0, g_ld_geom_misses = 0, g_ld_geom_stale = 0, g_ld_geom_uncacheable = 0;
++#define LD_GEOM_KEY_SEED 0x6765306D2D6B6579ull
++#define LD_GEOM_CHECK_SEED 0x636865636B2D3033ull
++#define LD_GEOM_SPAN_SEED 0x7370616E2D686173ull
++
++static int ld_geom_cache_enabled(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char* text = getenv("LD_GEOM_CACHE");
++        enabled = (text && *text == '0') ? 0 : 1;
++    }
++    return enabled;
++}
++
++static u64 ld_geom_mix(u64 hash, u64 value)
++{
++    return rsx_geom_hash_u64(hash, value);
++}
++
++/* The draw's key and check hash. 0 when it cannot be cached: an inline
++ * draw, or an index range that is not one readable span. */
++static int ld_geom_key(const rsx_vertex_layout_plan* layout, u64* outKey, u64* outCheck)
++{
++    if (dc.inl || !layout->stride || !g.guest_ptr)
++    {
++        return 0;
++    }
++    rsx_vertex_fetch_plan plan;
++    rsx_vertex_fetch_plan_init(&plan, &g.rsx, layout,
++                               (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user);
++    u64 describe = LD_GEOM_KEY_SEED;
++    describe = ld_geom_mix(describe, ((u64)layout->mask << 32) | layout->stride);
++    describe = ld_geom_mix(describe, layout->count);
++    describe = ld_geom_mix(describe, ((u64)plan.base_offset << 32) | plan.divider_mask);
++    describe = ld_geom_mix(describe, rsx_dsp_vertex_data_base_index(&g.rsx));
++    for (u32 slot = 0; slot < layout->count; slot++)
++    {
++        const u32 attr = layout->attrs[slot];
++        const rsx_dsp_vertex_attr* desc = &plan.attr[attr].desc;
++        describe = ld_geom_mix(describe, ((u64)attr << 48) | ((u64)desc->type << 32) |
++                                         ((u64)desc->size << 16) | desc->frequency);
++        describe = ld_geom_mix(describe, ((u64)desc->stride << 32) | desc->location);
++        describe = ld_geom_mix(describe, desc->offset);
++        if (!desc->type || !desc->size)
++        {
++            u64 defaults[2];
++            memcpy(defaults, plan.attr[attr].default_value, 16);
++            describe = ld_geom_mix(describe, defaults[0]);
++            describe = ld_geom_mix(describe, defaults[1]);
++        }
++    }
++    describe = ld_geom_mix(describe, ((u64)dc.n_arr << 32) | dc.n_idx);
++    for (u32 batch = 0; batch < dc.n_arr; batch++)
++    {
++        describe = ld_geom_mix(describe, ((u64)dc.arr[batch].first << 32) | dc.arr[batch].count);
++    }
++    u64 contents = 0;
++    if (dc.n_idx)
++    {
++        rsx_dsp_index_array index_array;
++        rsx_dsp_get_index_array(&g.rsx, &index_array);
++        const u32 element_size = index_array.is_u32 ? 4u : 2u;
++        static int no_restart = -1;
++        if (no_restart < 0)
++        {
++            no_restart = getenv("RSX_NO_RESTART") ? 1 : 0;
++        }
++        const int restart_enabled =
++            !no_restart && rsx_dsp_restart_index_enabled(&g.rsx, index_array.is_u32);
++        describe = ld_geom_mix(describe, ((u64)index_array.offset << 32) |
++                                         ((u64)index_array.location << 8) | index_array.is_u32);
++        describe = ld_geom_mix(describe, ((u64)restart_enabled << 32) | rsx_dsp_restart_index(&g.rsx));
++        for (u32 batch = 0; batch < dc.n_idx; batch++)
++        {
++            const u32 first = dc.idx[batch].first;
++            const u32 count = dc.idx[batch].count;
++            describe = ld_geom_mix(describe, ((u64)first << 32) | count);
++            if (!count)
++            {
++                continue;
++            }
++            const u64 start = (u64)index_array.offset + (u64)first * element_size;
++            const u64 bytes = (u64)count * element_size;
++            if (start + bytes > 0x100000000ull)
++            {
++                return 0;
++            }
++            const u8* indices = g.guest_ptr(g.guest_user, index_array.location, (u32)start, (u32)bytes);
++            if (!indices)
++            {
++                return 0;
++            }
++            contents = rsx_geom_hash(indices, (size_t)bytes, contents ^ LD_GEOM_KEY_SEED);
++        }
++    }
++    *outKey = ld_geom_mix(describe, contents);
++    *outCheck = ld_geom_mix(ld_geom_mix(LD_GEOM_CHECK_SEED, describe ^ 0x5A5A5A5A5A5A5A5Aull), contents);
++    return 1;
++}
++
++/* Restore a cached draw into dc. 1 on a hit. */
++static int ld_geom_restore(const rsx_vertex_layout_plan* layout, u64 key, u64 check)
++{
++    rsx_geom_entry* entry = rsx_geom_cache_find(key, check, g_ld_frames);
++    if (!entry)
++    {
++        return 0;
++    }
++    if (entry->stride != layout->stride)
++    {
++        rsx_geom_cache_drop(entry);
++        return 0;
++    }
++    for (u32 span = 0; span < entry->n_spans; span++)
++    {
++        const rsx_geom_span* source = &entry->spans[span];
++        const u8* bytes = g.guest_ptr(g.guest_user, source->location, source->offset, source->bytes);
++        if (!bytes || rsx_geom_hash(bytes, source->bytes, LD_GEOM_SPAN_SEED) != source->hash)
++        {
++            g_ld_geom_stale++;
++            rsx_geom_cache_drop(entry);
++            return 0;
++        }
++    }
++
++    if (entry->n_refs > dc.cap_refs)
++    {
++        rsx_vertex_ref* refs = (rsx_vertex_ref*)realloc(dc.refs, (size_t)entry->n_refs * sizeof(*refs));
++        if (!refs)
++        {
++            return 0;
++        }
++        dc.refs = refs;
++        dc.cap_refs = entry->n_refs;
++    }
++    if (entry->refs_remapped && entry->n_source_refs > dc.ref_remap.occurrence_capacity)
++    {
++        u32* occurrences = (u32*)realloc(dc.ref_remap.occurrence_to_unique,
++                                         (size_t)entry->n_source_refs * sizeof(u32));
++        if (!occurrences)
++        {
++            return 0;
++        }
++        dc.ref_remap.occurrence_to_unique = occurrences;
++        dc.ref_remap.occurrence_capacity = entry->n_source_refs;
++    }
++    if (entry->n_cuts > dc.cap_cuts)
++    {
++        u32* cuts = (u32*)realloc(dc.cuts, (size_t)entry->n_cuts * sizeof(u32));
++        if (!cuts)
++        {
++            return 0;
++        }
++        dc.cuts = cuts;
++        dc.cap_cuts = entry->n_cuts;
++    }
++    if (!reserve_compact_vertices((u64)entry->n_refs * entry->stride))
++    {
++        return 0;
++    }
++
++    memcpy(dc.refs, entry->refs, (size_t)entry->n_refs * sizeof(*dc.refs));
++    dc.n_refs = entry->n_refs;
++    dc.n_source_refs = entry->n_source_refs;
++    dc.refs_remapped = entry->refs_remapped;
++    if (entry->refs_remapped)
++    {
++        memcpy(dc.ref_remap.occurrence_to_unique, entry->occurrence,
++               (size_t)entry->n_source_refs * sizeof(u32));
++    }
++    if (entry->n_cuts)
++    {
++        memcpy(dc.cuts, entry->cuts, (size_t)entry->n_cuts * sizeof(u32));
++    }
++    dc.n_cuts = entry->n_cuts;
++    memcpy(dc.compact_verts, entry->vertices, (size_t)entry->n_refs * entry->stride);
++    dc.layout = *layout;
++    rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout,
++                               (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user);
++    dc.n_verts = dc.n_refs;
++    return 1;
++}
++
++/* After a successful conversion: remember it, with the vertex spans it was
++ * decoded from. */
++static void ld_geom_store(const rsx_vertex_layout_plan* layout, u64 key, u64 check)
++{
++    rsx_geom_span spans[RSX_GEOM_MAX_SPANS];
++    u32 n_spans = 0;
++    for (u32 slot = 0; slot < layout->count; slot++)
++    {
++        const u32 attr = layout->attrs[slot];
++        const rsx_vertex_fetch_attr* fetch = &dc.fetch_plan.attr[attr];
++        if (!fetch->desc.type || !fetch->desc.size || !fetch->elem_size)
++        {
++            continue;
++        }
++        if (!fetch->stable_base)
++        {
++            /* Read vertex by vertex: no single span to check. */
++            g_ld_geom_uncacheable++;
++            return;
++        }
++        const u64 start = (u64)dc.fetch_plan.base_offset + fetch->desc.offset +
++                          (u64)fetch->stable_first * fetch->stride;
++        const u64 end = (u64)dc.fetch_plan.base_offset + fetch->desc.offset +
++                        (u64)fetch->stable_last * fetch->stride + fetch->elem_size;
++        if (end <= start || end > 0x100000000ull)
++        {
++            g_ld_geom_uncacheable++;
++            return;
++        }
++        /* Interleaved attributes share one buffer: merge overlapping or
++         * touching ranges in the same location. */
++        int merged = 0;
++        for (u32 index = 0; index < n_spans && !merged; index++)
++        {
++            rsx_geom_span* span = &spans[index];
++            const u64 spanStart = span->offset;
++            const u64 spanEnd = spanStart + span->bytes;
++            if (span->location == fetch->desc.location && start <= spanEnd && end >= spanStart)
++            {
++                const u64 unionStart = start < spanStart ? start : spanStart;
++                const u64 unionEnd = end > spanEnd ? end : spanEnd;
++                span->offset = (u32)unionStart;
++                span->bytes = (u32)(unionEnd - unionStart);
++                merged = 1;
++            }
++        }
++        if (!merged)
++        {
++            if (n_spans >= RSX_GEOM_MAX_SPANS)
++            {
++                g_ld_geom_uncacheable++;
++                return;
++            }
++            spans[n_spans].location = fetch->desc.location;
++            spans[n_spans].offset = (u32)start;
++            spans[n_spans].bytes = (u32)(end - start);
++            n_spans++;
++        }
++    }
++    for (u32 index = 0; index < n_spans; index++)
++    {
++        const u8* bytes = g.guest_ptr(g.guest_user, spans[index].location, spans[index].offset, spans[index].bytes);
++        if (!bytes)
++        {
++            g_ld_geom_uncacheable++;
++            return;
++        }
++        spans[index].hash = rsx_geom_hash(bytes, spans[index].bytes, LD_GEOM_SPAN_SEED);
++    }
++    rsx_geom_cache_store(key, check, g_ld_frames, spans, n_spans,
++                         dc.refs, dc.n_refs, dc.n_source_refs, dc.refs_remapped,
++                         dc.ref_remap.occurrence_to_unique, dc.cuts, dc.n_cuts,
++                         dc.compact_verts, layout->stride);
++}
++
+ static void fetch_batches_hoisted(
+     const rsx_vertex_layout_plan* layout, int packed_payload)
+ {
++    u64 geomKey = 0, geomCheck = 0;
++    int geomKeyed = 0;
++    if (packed_payload && ld_geom_cache_enabled())
++    {
++        geomKeyed = ld_geom_key(layout, &geomKey, &geomCheck);
++        if (!geomKeyed)
++        {
++            g_ld_geom_uncacheable++;
++        }
++        else if (ld_geom_restore(layout, geomKey, geomCheck))
++        {
++            g_ld_geom_hits++;
++            return;
++        }
++        else
++        {
++            g_ld_geom_misses++;
++        }
++    }
+     for (u32 batch = 0; batch < dc.n_arr && dc.fetch_ok; batch++)
+         for (u32 i = 0; i < dc.arr[batch].count && dc.fetch_ok; i++)
+             push_compact_ref(dc.arr[batch].first + i, 0);
+@@ -5134,6 +5425,10 @@ static void fetch_batches_hoisted(
+         }
+     }
+     dc.n_verts = dc.n_refs;
++    if (geomKeyed && dc.fetch_ok && dc.n_refs)
++    {
++        ld_geom_store(layout, geomKey, geomCheck);
++    }
+ }
+ 
+ static const float* dc_vertex_attr(
+@@ -9457,6 +9752,7 @@ void rsx_live_draw_present(u32 buffer_id)
+       g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
+       packets_at_last_frame = g_ld_stats.packets_seen; }
+     g_ld_frames++;
++    rsx_geom_cache_end_frame(g_ld_frames);
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_present(g_ld_frames);
+ #endif
+@@ -10191,7 +10487,16 @@ void rsx_live_draw_present(u32 buffer_id)
+                       (double)(showLatNs - lastShowLat) / 1e6 / shownCount,
+                       timeouts - lastTimeouts);
+               lastDrain = drainNs; lastPresent = presentNs; lastDrainLat = drainLatNs;
+-              lastShowLat = showLatNs; lastShown = shown; lastTimeouts = timeouts; } }
++              lastShowLat = showLatNs; lastShown = shown; lastTimeouts = timeouts; }
++            { static u64 lastHits = 0, lastMisses = 0, lastStale = 0, lastUncacheable = 0;
++              fprintf(stderr, "[fps]   geometry cache per frame: %.0f hits, %.0f misses (%.0f changed), %.0f not cacheable; %u draws held, %.0f MB\n",
++                      (double)(g_ld_geom_hits - lastHits) / frameCount,
++                      (double)(g_ld_geom_misses - lastMisses) / frameCount,
++                      (double)(g_ld_geom_stale - lastStale) / frameCount,
++                      (double)(g_ld_geom_uncacheable - lastUncacheable) / frameCount,
++                      rsx_geom_cache_entries(), (double)rsx_geom_cache_bytes() / (1024.0 * 1024.0));
++              lastHits = g_ld_geom_hits; lastMisses = g_ld_geom_misses;
++              lastStale = g_ld_geom_stale; lastUncacheable = g_ld_geom_uncacheable; } }
+           fps_t0 = now; fps_f0 = g_ld_frames;
+       } }
+     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --

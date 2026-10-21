@@ -1,0 +1,89 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index da009b4..be960e1 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -29,6 +29,7 @@ static u32 s_gcm_context_ea = 0;
+ #include <windows.h>
+ #else
+ #include <time.h>
++#include <sched.h>
+ #endif
+ 
+ /* ---------------------------------------------------------------------------
+@@ -1845,14 +1846,69 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                         fprintf(stderr, "[SEMA] m=0x%02X v=0x%08X off=0x%X\n", m, v, s_sema_offset); }
+                     if (m == 0x64u)      s_sema_offset = v;
+                     else if (m == 0x6Cu) vm_write32(la, v);
+-                    else if (m == 0x68u && vm_read32(la) != v) {
+-            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually block, which is what
+-             * the hardware does. Off by default: a title whose label nothing
+-             * ever writes would wedge the drain permanently, and RELEASE on
+-             * its own is the half that unblocks a waiting guest. */
++                    else if (m == 0x68u) {
++            /* GCM_SEMA_ACQUIRE=1 makes ACQUIRE actually wait, which is what
++             * the hardware does: the RSX stops until the label holds the
++             * value. Titles use it to hold the GPU until SPU jobs have written
++             * the vertex data or command segments it is about to read;
++             * reading them early draws last frame's (or half-written) data --
++             * stray polygons and a camera that jumps between frames.
++             *
++             * Off by default: a title whose label nothing ever writes would
++             * wedge the drain. So the wait is bounded: spin up to 2 ms here,
++             * then end the drain pass and retry on the next one; after
++             * GCM_SEMA_ACQUIRE_TIMEOUT_MS (default 250) on one ACQUIRE, log it
++             * and go on as before. */
+             static int blk = -1;
+-            if (blk < 0) { const char* e = getenv("GCM_SEMA_ACQUIRE"); blk = e ? atoi(e) : 0; }
+-            if (blk) { sem_blocked = 1; break; }
++            static unsigned long long s_acquireTimeoutMs = 0;
++            static unsigned long long s_acquireStats[3];   /* seen, waited, timed out */
++            static unsigned long long s_blockedSince = 0;
++            static u32 s_blockedGet = ~0u;
++            if (blk < 0) {
++                const char* e = getenv("GCM_SEMA_ACQUIRE");
++                blk = e ? atoi(e) : 0;
++                const char* t = getenv("GCM_SEMA_ACQUIRE_TIMEOUT_MS");
++                s_acquireTimeoutMs = t ? strtoull(t, NULL, 0) : 250ull;
++            }
++            if (vm_read32(la) != v) {
++                extern unsigned long long ps3_ms_now(void);
++                const unsigned long long spinStart = ps3_ms_now();
++                if (blk) {
++                    while (vm_read32(la) != v && ps3_ms_now() - spinStart < 2ull) {
++#ifdef _WIN32
++                        SwitchToThread();
++#else
++                        sched_yield();
++#endif
++                    }
++                }
++                if (vm_read32(la) != v && blk) {
++                    const unsigned long long now = ps3_ms_now();
++                    if (s_blockedGet != s_fifo_getoff) {
++                        s_blockedGet = s_fifo_getoff;
++                        s_blockedSince = now;
++                        s_acquireStats[1]++;
++                    }
++                    if (now - s_blockedSince < s_acquireTimeoutMs) {
++                        sem_blocked = 1;
++                        break;
++                    }
++                    s_acquireStats[2]++;
++                    if (s_acquireStats[2] <= 8u) {
++                        fprintf(stderr, "[gcm-sema] ACQUIRE label 0x%08X = 0x%08X, waiting for 0x%08X for %llu ms -- going on\n",
++                                la, vm_read32(la), v, now - s_blockedSince);
++                    }
++                } else if (blk && s_blockedGet != s_fifo_getoff) {
++                    s_acquireStats[1]++;
++                }
++            }
++            s_blockedGet = ~0u;
++            s_acquireStats[0]++;
++            if ((s_acquireStats[0] & (s_acquireStats[0] - 1)) == 0 && s_acquireStats[0] >= 16) {
++                fprintf(stderr, "[gcm-sema] ACQUIRE seen=%llu waited=%llu timed-out=%llu (%s)\n",
++                        s_acquireStats[0], s_acquireStats[1], s_acquireStats[2],
++                        blk ? "waiting" : "not waiting: GCM_SEMA_ACQUIRE=1 to wait");
++            }
+         }
+                 }
+                 if (sem_blocked) break;

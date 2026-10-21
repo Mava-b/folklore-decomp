@@ -1,0 +1,5 @@
+# Store every file exactly as it is (no line-ending conversion), so the
+# included ps3recomp stays byte-identical to upstream plus patches\.
+* -text
+# The lift scripts run in Git Bash: always LF, even if an editor adds CRLF.
+*.sh text eol=lf

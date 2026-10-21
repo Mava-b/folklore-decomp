@@ -1,0 +1,264 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 1d3f3c5..3715680 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -228,6 +228,7 @@ typedef struct {
+     ID3D12Resource* tex;
+     u32 w, h;
+     DXGI_FORMAT fmt;
++    u32 scale;                /* host pixels per guest pixel (ld_surface_scale_for) */
+     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+@@ -462,6 +463,50 @@ static u32 ld_scaled(u32 guestPixels)
+     return guestPixels * (g.scale ? g.scale : 1u);
+ }
+ 
++/* The render scale a colour surface of this guest size gets. Only surfaces
++ * at least as large as the guest canvas (the scene, its 2x-wide AA buffer,
++ * the display buffers, a 2048x2048 shadow map) are rendered at the render
++ * scale. Smaller ones are the post-effect chain -- Folklore's bloom blurs a
++ * 640x480 buffer, its luminance pass works at 256x256 -- and stay at the
++ * PS3's own size: their shaders step their taps by fixed guest-texel offsets,
++ * so at 3-4x the same taps covered a third or a quarter of the footprint and
++ * the blur fell apart into stripes. They are soft images anyway, so keeping
++ * them small loses nothing (and saves fill). LD_SCALE_ALL_SURFACES=1 scales
++ * every surface again. */
++static u32 ld_surface_scale_for(u32 guestWidth, u32 guestHeight)
++{
++    static int scaleAll = -1;
++    if (scaleAll < 0)
++    {
++        const char* text = getenv("LD_SCALE_ALL_SURFACES");
++        scaleAll = (text && *text == '1') ? 1 : 0;
++    }
++    const u32 renderScale = g.scale ? g.scale : 1u;
++    if (renderScale <= 1u || scaleAll)
++    {
++        return renderScale;
++    }
++    if (!guestWidth)
++    {
++        guestWidth = g.width;
++    }
++    if (!guestHeight)
++    {
++        guestHeight = g.height;
++    }
++    if (guestWidth < g.width || guestHeight < g.height)
++    {
++        return 1u;
++    }
++    return renderScale;
++}
++
++/* A guest-pixel length in a surface's host pixels. */
++static u32 ld_surface_scaled(const surface_t* surface, u32 guestPixels)
++{
++    return guestPixels * (surface->scale ? surface->scale : 1u);
++}
++
+ /* Bounds of the open bank in each transient ring (absolute offsets). */
+ static u32 ld_upload_base(void) { return g.bank * UPLOAD_BANK_SIZE; }
+ static u32 ld_upload_end(void) { return ld_upload_base() + UPLOAD_BANK_SIZE; }
+@@ -1479,6 +1524,9 @@ typedef struct {
+     /* POLY_OFFSET_FILL_ENABLE and the factor / units it applies (float
+      * bits, zero while disabled). Depth bias is rasterizer state: keyed. */
+     u32 poly_offset_fill, poly_offset_scale, poly_offset_bias;
++    /* Render scale of the colour target (ld_surface_scale_for): WPOS and the
++     * slope bias are baked per scale, so it is keyed. */
++    u32 draw_scale;
+ } render_state_t;
+ 
+ static void decode_render_state(render_state_t* rs)
+@@ -1490,6 +1538,7 @@ static void decode_render_state(render_state_t* rs)
+     rsx_dsp_surface alpha_surface;
+     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
+     rs->alpha_ref_format = alpha_surface.color_format;
++    rs->draw_scale = ld_surface_scale_for(alpha_surface.clip_w, alpha_surface.clip_h);
+     /* Alpha to coverage (ANTI_ALIASING_CONTROL: bit 0 enable, bit 4
+      * alpha-to-coverage). Foliage and wire fences are drawn with it and no
+      * alpha test, so without it their cut-out texels come out solid. It only
+@@ -1637,7 +1686,7 @@ static void apply_render_state(D3D12_GRAPHICS_PIPELINE_STATE_DESC* pd,
+         }
+         if (slopeFactor == slopeFactor && slopeFactor > -1.0e6f && slopeFactor < 1.0e6f)
+         {
+-            pd->RasterizerState.SlopeScaledDepthBias = slopeFactor * (float)(g.scale ? g.scale : 1u);
++            pd->RasterizerState.SlopeScaledDepthBias = slopeFactor * (float)(rs->draw_scale ? rs->draw_scale : 1u);
+         }
+         pd->RasterizerState.DepthBiasClamp = 0.0f;
+     }
+@@ -3394,7 +3443,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    rd.Width = ld_scaled(want_w); rd.Height = ld_scaled(want_h); rd.DepthOrArraySize = 1;
++    const u32 surfaceScale = ld_surface_scale_for(want_w, want_h);
++    rd.Width = want_w * surfaceScale; rd.Height = want_h * surfaceScale; rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1; rd.Format = want_fmt; rd.SampleDesc.Count = 1;
+     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+     D3D12_CLEAR_VALUE cv = {0}; cv.Format = rd.Format;
+@@ -3430,6 +3480,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+     s->tex = replacement;
+     s->location = location; s->offset = offset; s->w = want_w; s->h = want_h;
+     s->fmt = want_fmt;
++    s->scale = surfaceScale;
+ #if !defined(YZ_PERF_CLEAN)
+     s->resource_serial = ++g_ld_surface_resource_serial;
+ #endif
+@@ -3619,8 +3670,14 @@ int rsx_live_draw_resolve_blit(u32 src_loc, u32 src_abs, u32 src_pitch, u32 ds,
+     D3D12_TEXTURE_COPY_LOCATION sl = {0}, dl = {0};
+     sl.pResource = s;        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+     dl.pResource = dst->tex; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+-    D3D12_BOX box = { ld_scaled(sx), ld_scaled(sy), 0, ld_scaled(sx + w), ld_scaled(sy + h), 1 };
+-    g.list->lpVtbl->CopyTextureRegion(g.list, &dl, ld_scaled(dx), ld_scaled(dy), 0, &sl, &box);
++    /* Both at one render scale (a resolve into a display buffer is between
++     * canvas-sized surfaces); anything else would need a scaled draw. */
++    const surface_t* resolveSource = &g.surfaces[si];
++    if (resolveSource->scale != dst->scale) return 0;
++    D3D12_BOX box = { ld_surface_scaled(resolveSource, sx), ld_surface_scaled(resolveSource, sy), 0,
++                      ld_surface_scaled(resolveSource, sx + w), ld_surface_scaled(resolveSource, sy + h), 1 };
++    g.list->lpVtbl->CopyTextureRegion(g.list, &dl, ld_surface_scaled(dst, dx), ld_surface_scaled(dst, dy),
++                                      0, &sl, &box);
+     for (int q = 0; q < 2; q++) {
+         b[q].Transition.StateBefore = b[q].Transition.StateAfter;
+         b[q].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -3671,6 +3728,16 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
+     }
+     if (di == si) return -4;
+     if (g.surfaces[di].fmt != g.surfaces[si].fmt) return -5;
++    if (g.surfaces[di].scale != g.surfaces[si].scale) {
++        static u32 scale_mismatch_logs = 0;
++        if (scale_mismatch_logs++ < 8)
++            fprintf(stderr, "[live-draw] blit between surfaces at %ux and %ux render scale "
++                            "(0x%X %ux%u -> 0x%X %ux%u) not copied\n",
++                    g.surfaces[si].scale, g.surfaces[di].scale,
++                    g.surfaces[si].offset, g.surfaces[si].w, g.surfaces[si].h,
++                    g.surfaces[di].offset, g.surfaces[di].w, g.surfaces[di].h);
++        return -6;
++    }
+     ID3D12Resource* src = g.surfaces[si].tex;
+     ID3D12Resource* dst = g.surfaces[di].tex;
+     D3D12_RESOURCE_BARRIER b[2] = {0};
+@@ -3685,8 +3752,11 @@ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
+     D3D12_TEXTURE_COPY_LOCATION s = {0}, d = {0};
+     s.pResource = src; s.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+     d.pResource = dst; d.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+-    D3D12_BOX box = { ld_scaled(sx), ld_scaled(sy), 0, ld_scaled(sx + w), ld_scaled(sy + h), 1 };
+-    g.list->lpVtbl->CopyTextureRegion(g.list, &d, ld_scaled(dx), ld_scaled(dy), 0, &s, &box);
++    const surface_t* blitSurface = &g.surfaces[si];
++    D3D12_BOX box = { ld_surface_scaled(blitSurface, sx), ld_surface_scaled(blitSurface, sy), 0,
++                      ld_surface_scaled(blitSurface, sx + w), ld_surface_scaled(blitSurface, sy + h), 1 };
++    g.list->lpVtbl->CopyTextureRegion(g.list, &d, ld_surface_scaled(blitSurface, dx),
++                                      ld_surface_scaled(blitSurface, dy), 0, &s, &box);
+     for (int k = 0; k < 2; k++) {
+         b[k].Transition.StateBefore = b[k].Transition.StateAfter;
+         b[k].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+@@ -4971,15 +5041,15 @@ static void ld_pso_jobs_wait(void)
+ /* WPOS is the fragment's window position; at a render scale above 1 the
+  * host pixel grid is finer than the guest's, so bring it back to guest
+  * pixels before a shader uses it (screen-space effects, texel lookups). */
+-static int ld_scale_wpos(char* hlsl, u32 capacity)
++static int ld_scale_wpos(char* hlsl, u32 capacity, u32 drawScale)
+ {
+-    if (g.scale <= 1u)
++    if (drawScale <= 1u)
+     {
+         return 0;
+     }
+     static const char needle[] = "input.position";
+     char replacement[96];
+-    const float inverseScale = 1.0f / (float)g.scale;
++    const float inverseScale = 1.0f / (float)drawScale;
+     snprintf(replacement, sizeof replacement,
+              "(input.position * float4(%.9f, %.9f, 1.0, 1.0))", inverseScale, inverseScale);
+     const size_t needleLength = sizeof(needle) - 1u;
+@@ -5210,6 +5280,7 @@ static ID3D12PipelineState* get_pso(
+         key = ld_hash_structural_render_state(&rs, key);
+     else
+         key = fnv1a(&rs, sizeof(rs), key);
++    key = fnv1a(&rs.draw_scale, sizeof(rs.draw_scale), key);
+ #if defined(YZ_PERF_PROFILE)
+     ld_profile_note_fp_variants(
+         fp_uc, fp_size, fp_ctrl_key, cube_mask, &rs);
+@@ -5378,7 +5449,7 @@ static ID3D12PipelineState* get_pso(
+         snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
+         f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
+       } }
+-    if (fi > 0 && ld_scale_wpos(ps_hlsl, sizeof(ps_hlsl)) < 0)
++    if (fi > 0 && ld_scale_wpos(ps_hlsl, sizeof(ps_hlsl), rs.draw_scale) < 0)
+         fi = -1;
+     const u32 entryIndex = g.n_psos;
+     g.psos[entryIndex].key = key;
+@@ -6883,6 +6954,11 @@ static void ld_movie_capture_overlay(void)
+         g.movie_overlay_valid = 0;
+         return;
+     }
++    if (g.surfaces[target].scale != (g.scale ? g.scale : 1u)) {
++        /* A post-effect-sized target (kept at 1x): not a subtitle overlay. */
++        g.movie_overlay_valid = 0;
++        return;
++    }
+     ID3D12Resource* rt = g.surfaces[target].tex;
+     D3D12_RESOURCE_BARRIER b = {0};
+     b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -8770,7 +8846,21 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     g.cb_used += CB_BLOCK_ALIGNED;
+ 
+     /* Guest pixels; scaled to the host surface just before they are set. */
+-    const float renderScale = (float)(g.scale ? g.scale : 1u);
++    const surface_t* drawSurface = &g.surfaces[target];
++    const float renderScale = (float)(drawSurface->scale ? drawSurface->scale : 1u);
++    /* A 1x post-effect target with a canvas-sized (scaled) zeta bound: fine
++     * while the pass ignores depth, which is what such passes do. Say so if
++     * one does not -- its depth test would read the wrong part of the zeta. */
++    if (current_zslot && drawSurface->scale != (g.scale ? g.scale : 1u) &&
++        ((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) || (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u)))
++    {
++        static u32 depthScaleLogs = 0;
++        if (depthScaleLogs++ < 8)
++        {
++            fprintf(stderr, "[live-draw] depth-tested draw into 1x surface 0x%X %ux%u with a %ux zeta\n",
++                    drawSurface->offset, drawSurface->w, drawSurface->h, g.scale);
++        }
++    }
+     D3D12_VIEWPORT dvp = {0, 0, W * renderScale, H * renderScale, 0.0f, 1.0f};
+     D3D12_RECT sc = {
+         0, 0,
+@@ -8802,10 +8892,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+             if (sc.bottom < sc.top)      sc.bottom = sc.top;
+         }
+     }
+-    sc.left = (LONG)ld_scaled((u32)sc.left);
+-    sc.top = (LONG)ld_scaled((u32)sc.top);
+-    sc.right = (LONG)ld_scaled((u32)sc.right);
+-    sc.bottom = (LONG)ld_scaled((u32)sc.bottom);
++    sc.left = (LONG)ld_surface_scaled(drawSurface, (u32)sc.left);
++    sc.top = (LONG)ld_surface_scaled(drawSurface, (u32)sc.top);
++    sc.right = (LONG)ld_surface_scaled(drawSurface, (u32)sc.right);
++    sc.bottom = (LONG)ld_surface_scaled(drawSurface, (u32)sc.bottom);
+     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
+     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
+     /* Dynamic stencil reference (kept out of the PSO key on purpose). */
+@@ -10509,8 +10599,8 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
+ {
+     ID3D12Resource* rt = surface ? surface->tex : NULL;
+     if (!rt) return UINT64_MAX;
+-    const u32 width = ld_scaled(surface->w);     /* the host resource */
+-    const u32 height = ld_scaled(surface->h);
++    const u32 width = ld_surface_scaled(surface, surface->w);     /* the host resource */
++    const u32 height = ld_surface_scaled(surface, surface->h);
+     if (!width || !height) return UINT64_MAX;
+     const int fp16 = surface->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+     const u32 texel = fp16 ? 8u : 4u;
+@@ -11006,8 +11096,8 @@ void rsx_live_draw_present(u32 buffer_id)
+     if (!g.ready) return;
+     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
+     ID3D12Resource* bb = g.backbuf[bbi];
+-    const u32 sourceWidth = ld_scaled(presented_surface->w);
+-    const u32 sourceHeight = ld_scaled(presented_surface->h);
++    const u32 sourceWidth = ld_surface_scaled(presented_surface, presented_surface->w);
++    const u32 sourceHeight = ld_surface_scaled(presented_surface, presented_surface->h);
+ 
+     D3D12_RESOURCE_BARRIER bar[2] = {0};
+     bar[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;

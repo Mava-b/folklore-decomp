@@ -1,0 +1,495 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 6096118..74137ad 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -1009,6 +1009,22 @@ extern "C" void ppu_resv_register(ppu_context* c)
+     {
+         g_spu_break_ppu_resv_hook = ppu_resv_break_line;
+     }
++    /* Thread slots are reused now (sys_ppu_thread.c frees the slot of a
++     * thread nobody joins), and a reused slot brings the same context back:
++     * list each context once, or the list fills with repeats and a context
++     * seen for the first time after that is never listed. */
++    long listed = g_resv_ctx_n;
++    if (listed > PPU_RESV_MAX)
++    {
++        listed = PPU_RESV_MAX;
++    }
++    for (long listIndex = 0; listIndex < listed; listIndex++)
++    {
++        if (g_resv_ctxs[listIndex] == c)
++        {
++            return;
++        }
++    }
+     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
+     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+ }
+@@ -3870,9 +3886,70 @@ extern "C" void (*g_ppu_thread_entry_trampoline)(ppu_context*);
+  * exits, but the 1 MB window holds about 250 page-sized blocks (for a small
+  * TLS image) and titles create their threads at boot and keep them. Reuse a
+  * free list if a title ever churns threads. */
++/* TLS blocks of threads that have gone (ppu_tls_release_block), handed to
++ * the next threads before the window is bumped any further. The window holds
++ * a few hundred blocks, and a title that starts a thread for every load and
++ * music change -- Folklore -- would otherwise fill it within a session, after
++ * which every new thread shares the main thread's TLS. */
++#define PPU_TLS_FREE_MAX 256
++static uint32_t s_tlsFreeBlocks[PPU_TLS_FREE_MAX];
++static int s_tlsFreeCount = 0;
++static std::atomic_flag s_tlsFreeLock = ATOMIC_FLAG_INIT;
++
++static void ppu_tls_free_lock(void)
++{
++    while (s_tlsFreeLock.test_and_set(std::memory_order_acquire))
++    {
++    }
++}
++
++static void ppu_tls_free_unlock(void)
++{
++    s_tlsFreeLock.clear(std::memory_order_release);
++}
++
++/* A thread's TLS block is free again (threadPointer is its r13). The main
++ * block is shared by threads that found the window full, so it never is. */
++extern "C" void ppu_tls_release_block(uint32_t threadPointer)
++{
++    if (!g_tls_memsz || threadPointer == 0 || threadPointer == PPU_TLS_TP)
++    {
++        return;
++    }
++    if (threadPointer < PPU_TLS_IMG + 0x7000u || threadPointer >= 0x11000000u + 0x7000u)
++    {
++        return;                                  /* not a block from this window */
++    }
++    ppu_tls_free_lock();
++    if (s_tlsFreeCount < PPU_TLS_FREE_MAX)
++    {
++        s_tlsFreeBlocks[s_tlsFreeCount] = threadPointer;
++        s_tlsFreeCount++;
++    }
++    ppu_tls_free_unlock();
++}
++
+ static uint32_t ppu_tls_new_block(void)
+ {
+     if (!g_tls_memsz) return 0;                 /* no PT_TLS: nothing to copy */
++    uint32_t reusedPointer = 0;
++    ppu_tls_free_lock();
++    if (s_tlsFreeCount > 0)
++    {
++        s_tlsFreeCount--;
++        reusedPointer = s_tlsFreeBlocks[s_tlsFreeCount];
++    }
++    ppu_tls_free_unlock();
++    if (reusedPointer)
++    {
++        uint32_t reusedBase = reusedPointer - 0x7000u;
++        if (g_tls_filesz) memcpy(vm_base + reusedBase, vm_base + g_tls_vaddr, g_tls_filesz);
++        if (g_tls_memsz > g_tls_filesz)
++        {
++            memset(vm_base + reusedBase + g_tls_filesz, 0, g_tls_memsz - g_tls_filesz);
++        }
++        return reusedPointer;
++    }
+     /* A block holds the TLS image only. r13 = base + 0x7000 is the ABI's bias
+      * (the guest addresses TLS as r13 - 0x7000 + off with off < memsz), not
+      * storage: counting the 0x7000 in the size made every block 0x8000, so the
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index 9d801fa..831b454 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -87,15 +87,135 @@ static int find_free_slot(void)
+     return -1;
+ }
+ 
+-/* Find thread by ID. The ID is the index + 1 (0 is invalid). */
++/* Thread IDs. The low byte is the slot index + 1 (0 is invalid); the bits
++ * above it count how many times that slot has been reused. lv2 never hands
++ * out an exited thread's ID again, so a lock owner or a join target that
++ * names a dead thread must not suddenly match the slot's next occupant. A
++ * slot's first thread keeps the plain index + 1, as before. */
++#define PPU_THREAD_ID_SLOT_BITS 8u
++#define PPU_THREAD_ID_SLOT_MASK ((1u << PPU_THREAD_ID_SLOT_BITS) - 1u)
++static uint32_t s_slotGeneration[PPU_THREAD_MAX];
++/* Set once a joinable thread's host procedure is done with its slot. */
++static int s_slotEpilogueDone[PPU_THREAD_MAX];
++
++static int ppu_thread_slot_of(uint64_t threadId)
++{
++    uint64_t slotNumber = threadId & PPU_THREAD_ID_SLOT_MASK;
++    if (slotNumber == 0 || slotNumber > PPU_THREAD_MAX)
++    {
++        return -1;
++    }
++    return (int)slotNumber - 1;
++}
++
++/* Find thread by ID (see above). */
+ static ppu_thread_info* find_thread(uint64_t thread_id)
+ {
+-    if (thread_id == 0 || thread_id > PPU_THREAD_MAX) return NULL;
+-    ppu_thread_info* t = &g_ppu_threads[thread_id - 1];
++    int slotIndex = ppu_thread_slot_of(thread_id);
++    if (slotIndex < 0)
++    {
++        return NULL;
++    }
++    ppu_thread_info* t = &g_ppu_threads[slotIndex];
+     if (t->state == PPU_THREAD_STATE_FREE) return NULL;
++    if (t->ctx.thread_id != thread_id)
++    {
++        return NULL;                    /* an earlier thread in this slot */
++    }
+     return t;
+ }
+ 
++/* Guest stacks of threads that have gone. The stack region is a bump
++ * allocator that never takes anything back, so without this every thread a
++ * title ever creates costs its stack for good: Folklore starts a 256 KB
++ * stream thread for every music and ambience change. Called under the table
++ * lock. */
++typedef struct ppu_free_stack {
++    uint32_t base;
++    uint32_t size;
++} ppu_free_stack;
++static ppu_free_stack s_freeStacks[PPU_THREAD_MAX];
++static int s_freeStackCount;
++static uint32_t s_slotStackBlock[PPU_THREAD_MAX];   /* block size behind each slot's stack */
++
++static void ppu_stack_release(uint32_t stackBase, uint32_t blockSize)
++{
++    if (stackBase == 0 || blockSize == 0)
++    {
++        return;
++    }
++    if (s_freeStackCount < PPU_THREAD_MAX)
++    {
++        s_freeStacks[s_freeStackCount].base = stackBase;
++        s_freeStacks[s_freeStackCount].size = blockSize;
++        s_freeStackCount++;
++    }
++}
++
++/* The smallest free stack that fits, or a new one. Returns the base and the
++ * size of the block behind it. */
++static uint32_t ppu_stack_take(uint32_t stackSize, uint32_t* blockSizeOut)
++{
++    int bestIndex = -1;
++    for (int freeIndex = 0; freeIndex < s_freeStackCount; freeIndex++)
++    {
++        if (s_freeStacks[freeIndex].size < stackSize)
++        {
++            continue;
++        }
++        if (bestIndex < 0 || s_freeStacks[freeIndex].size < s_freeStacks[bestIndex].size)
++        {
++            bestIndex = freeIndex;
++        }
++    }
++    if (bestIndex >= 0)
++    {
++        uint32_t stackBase = s_freeStacks[bestIndex].base;
++        *blockSizeOut = s_freeStacks[bestIndex].size;
++        s_freeStackCount--;
++        s_freeStacks[bestIndex] = s_freeStacks[s_freeStackCount];
++        /* A new thread's stack starts out zeroed, as a fresh one would. */
++        memset(vm_to_host(stackBase), 0, *blockSizeOut);
++        return stackBase;
++    }
++    uint32_t pageSize = vm_host_page_size();
++    *blockSizeOut = VM_ALIGN_UP(stackSize, pageSize);
++    return vm_stack_allocate(&g_vm_stack_alloc, stackSize);
++}
++
++/* Give a thread's slot back: host handles, join objects and guest stack.
++ * Called under the table lock, once nothing will touch the slot again. */
++static void ppu_thread_release_slot(ppu_thread_info* threadInfo)
++{
++    int slotIndex = (int)(threadInfo - g_ppu_threads);
++#ifdef _WIN32
++    if (threadInfo->host_thread)
++    {
++        CloseHandle(threadInfo->host_thread);
++        threadInfo->host_thread = NULL;
++    }
++    if (threadInfo->finish_event)
++    {
++        CloseHandle(threadInfo->finish_event);
++        threadInfo->finish_event = NULL;
++    }
++#else
++    pthread_mutex_destroy(&threadInfo->finish_mutex);
++    pthread_cond_destroy(&threadInfo->finish_cond);
++#endif
++    if (slotIndex > 0 && slotIndex < PPU_THREAD_MAX)
++    {
++        ppu_stack_release(threadInfo->stack_addr, s_slotStackBlock[slotIndex]);
++        s_slotStackBlock[slotIndex] = 0;
++        /* Its TLS block too (ppu_loader.cpp gives each thread its own). */
++        extern void ppu_tls_release_block(uint32_t threadPointer);
++        ppu_tls_release_block((uint32_t)threadInfo->ctx.gpr[13]);
++        threadInfo->ctx.gpr[13] = 0;
++    }
++    threadInfo->stack_addr = 0;
++    threadInfo->state = PPU_THREAD_STATE_FREE;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Host thread entry point
+  * -----------------------------------------------------------------------*/
+@@ -167,23 +287,37 @@ static void* ppu_host_thread_proc(void* param)
+     table_lock();
+     info->exit_status = (int64_t)info->ctx.gpr[3];
+ 
+-    if (info->state == PPU_THREAD_STATE_DETACHED) {
+-        /* Detached threads self-clean */
+-        info->state = PPU_THREAD_STATE_FREE;
+-    } else {
+-        info->state = PPU_THREAD_STATE_FINISHED;
++    if (!info->joinable || info->state == PPU_THREAD_STATE_DETACHED) {
++        /* Nobody will join it: the slot is free again now. This is the last
++         * thing the thread does with `info`, which is why the slot is given
++         * back here and not in sys_ppu_thread_exit, where the thread is still
++         * running and a new thread could take its slot from under it. */
++        ppu_thread_release_slot(info);
++        table_unlock();
++#ifdef _WIN32
++        return 0;
++#else
++        return NULL;
++#endif
+     }
+-    table_unlock();
++    info->state = PPU_THREAD_STATE_FINISHED;
+ 
+-    /* Signal anyone waiting for join */
++    /* Signal anyone waiting for join -- still under the table lock, so that
++     * once the lock is dropped this thread never touches the slot again and a
++     * detach that comes later may free it at once. */
+ #ifdef _WIN32
+     SetEvent(info->finish_event);
+-    return 0;
+ #else
+     pthread_mutex_lock(&info->finish_mutex);
+     info->finished = 1;
+     pthread_cond_signal(&info->finish_cond);
+     pthread_mutex_unlock(&info->finish_mutex);
++#endif
++    s_slotEpilogueDone[info - g_ppu_threads] = 1;
++    table_unlock();
++#ifdef _WIN32
++    return 0;
++#else
+     return NULL;
+ #endif
+ }
+@@ -264,11 +398,18 @@ uint64_t ppu_thread_register_main(void)
+ unsigned long long ppu_thread_cpu_us(unsigned tid)
+ {
+ #ifdef _WIN32
+-    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;   /* main (tid 1) not in table */
+-    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+-    if (t->state == PPU_THREAD_STATE_FREE || !t->host_thread) return 0;
++    if (tid < 2) return 0;                           /* main (tid 1) not in table */
+     FILETIME c, e, k, u;
+-    if (!GetThreadTimes(t->host_thread, &c, &e, &k, &u)) return 0;
++    /* Under the table lock: a thread nobody joins closes its own handle on
++     * the way out. */
++    table_lock();
++    ppu_thread_info* t = find_thread(tid);
++    int haveTimes = t && t->host_thread && GetThreadTimes(t->host_thread, &c, &e, &k, &u);
++    table_unlock();
++    if (!haveTimes)
++    {
++        return 0;
++    }
+     ULARGE_INTEGER ku, uu;
+     ku.LowPart = k.dwLowDateTime; ku.HighPart = k.dwHighDateTime;
+     uu.LowPart = u.dwLowDateTime; uu.HighPart = u.dwHighDateTime;
+@@ -280,9 +421,9 @@ unsigned long long ppu_thread_cpu_us(unsigned tid)
+ /* Last syscall/HLE callsite of guest thread `tid` (see prof_pc). */
+ unsigned ppu_thread_prof_pc(unsigned tid)
+ {
+-    if (tid < 2 || tid > PPU_THREAD_MAX) return 0;
+-    ppu_thread_info* t = &g_ppu_threads[tid - 1];
+-    if (t->state == PPU_THREAD_STATE_FREE) return 0;
++    if (tid < 2) return 0;
++    ppu_thread_info* t = find_thread(tid);
++    if (!t) return 0;
+     return t->prof_pc;
+ }
+ 
+@@ -330,9 +471,23 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+     uint64_t arg          = LV2_ARG_U64(ctx, 2);
+     int32_t  priority     = LV2_ARG_S32(ctx, 3);
+     uint32_t stack_size   = LV2_ARG_U32(ctx, 4);
+-    /* uint64_t flags     = LV2_ARG_U64(ctx, 5); */
++    uint64_t flags        = LV2_ARG_U64(ctx, 5);
+     uint32_t name_addr    = LV2_ARG_PTR(ctx, 6);
+ 
++    /* SYS_PPU_THREAD_CREATE_JOINABLE (bit 0). A thread created without it
++     * is gone the moment it exits; every thread used to be kept until a join
++     * that never came, so the 64-entry table filled up for good. Folklore
++     * creates a thread for every load, fade and music change and none of
++     * them joinable: an hour in, thread 64 was the last one it ever got, and
++     * the next cutscene waited forever for a music stream whose thread could
++     * not be created. PS3_THREAD_ALL_JOINABLE=1 restores the old behaviour. */
++    static int s_allJoinable = -1;
++    if (s_allJoinable < 0)
++    {
++        s_allJoinable = getenv("PS3_THREAD_ALL_JOINABLE") ? 1 : 0;
++    }
++    int joinable = (s_allJoinable || (flags & 1u)) ? 1 : 0;
++
+     if (stack_size == 0) stack_size = VM_PPU_STACK_SIZE;
+     if (stack_size < 0x4000) stack_size = 0x4000; /* 16 KB minimum */
+ 
+@@ -341,18 +496,28 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+     int slot = find_free_slot();
+     if (slot < 0) {
+         table_unlock();
++        static int s_fullReports = 0;
++        if (s_fullReports < 8)
++        {
++            s_fullReports++;
++            fprintf(stderr, "[SYS] sys_ppu_thread_create: all %d thread slots are taken -- EAGAIN\n",
++                    PPU_THREAD_MAX);
++        }
+         return (int64_t)(int32_t)CELL_EAGAIN;
+     }
+ 
+     ppu_thread_info* t = &g_ppu_threads[slot];
+     memset(t, 0, sizeof(*t));
+ 
+-    /* Allocate guest stack */
+-    uint32_t stack_addr = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
++    /* Allocate guest stack (a freed one when one fits) */
++    uint32_t stackBlockSize = 0;
++    uint32_t stack_addr = ppu_stack_take(stack_size, &stackBlockSize);
+     if (stack_addr == 0) {
+         table_unlock();
+         return (int64_t)(int32_t)CELL_ENOMEM;
+     }
++    s_slotStackBlock[slot] = stackBlockSize;
++    s_slotEpilogueDone[slot] = 0;
+ 
+     /* Set up the PPU context for the new thread */
+     ppu_context_init(&t->ctx);
+@@ -362,12 +527,15 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+     /* Copy TOC from creating thread */
+     t->ctx.gpr[2] = ctx->gpr[2];
+ 
+-    uint64_t thread_id = (uint64_t)(slot + 1);
++    uint64_t thread_id = (uint64_t)(slot + 1) |
++                         ((uint64_t)s_slotGeneration[slot] << PPU_THREAD_ID_SLOT_BITS);
++    /* Below 0x7FFFFF00: 0x7FFFFFFE is the never-a-thread owner sentinel. */
++    s_slotGeneration[slot] = (s_slotGeneration[slot] + 1u) & 0x007FFFFFu;
+     t->ctx.thread_id = thread_id;
+ 
+     t->state      = PPU_THREAD_STATE_RUNNING;
+     t->priority   = priority;
+-    t->joinable   = 1;
++    t->joinable   = joinable;
+     t->stack_addr = stack_addr;
+     t->stack_size = stack_size;
+     t->entry_addr = entry;
+@@ -447,8 +615,7 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+                                   (unsigned (__stdcall*)(void*))ppu_host_thread_proc, t,
+                                   _initflag, (unsigned*)&t->host_tid);
+     if (t->host_thread == NULL) {
+-        t->state = PPU_THREAD_STATE_FREE;
+-        CloseHandle(t->finish_event);
++        ppu_thread_release_slot(t);
+         table_unlock();
+         return (int64_t)(int32_t)CELL_EAGAIN;
+     }
+@@ -492,12 +659,14 @@ int64_t sys_ppu_thread_create(ppu_context* ctx)
+         }
+     }
+     if (rc != 0) {
+-        t->state = PPU_THREAD_STATE_FREE;
+-        pthread_mutex_destroy(&t->finish_mutex);
+-        pthread_cond_destroy(&t->finish_cond);
++        ppu_thread_release_slot(t);
+         table_unlock();
+         return (int64_t)(int32_t)CELL_EAGAIN;
+     }
++    if (!t->joinable)
++    {
++        pthread_detach(t->host_thread);   /* nobody will pthread_join it */
++    }
+ #endif
+ 
+     table_unlock();
+@@ -520,9 +689,11 @@ int64_t sys_ppu_thread_exit(ppu_context* ctx)
+     ppu_thread_info* t = find_thread(tid);
+     if (t) {
+         t->exit_status = (int64_t)status;
+-        if (t->state == PPU_THREAD_STATE_DETACHED) {
+-            t->state = PPU_THREAD_STATE_FREE;
+-        } else {
++        /* A thread nobody joins keeps its slot until ppu_host_thread_proc
++         * has finished with it; freeing it here let a new thread take the
++         * slot while this one was still unwinding through it. */
++        if (t->joinable && t->state != PPU_THREAD_STATE_DETACHED)
++        {
+             t->state = PPU_THREAD_STATE_FINISHED;
+         }
+ 
+@@ -604,11 +775,12 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
+ 
+     /* Clean up */
+ #ifdef _WIN32
++    /* finish_event is set by sys_ppu_thread_exit, before the thread has
++     * unwound out of its body, so wait for the host thread itself: freeing
++     * the slot earlier would let a new thread take it while this one still
++     * runs through it. */
++    WaitForSingleObject(t->host_thread, INFINITE);
+     table_lock();
+-    CloseHandle(t->host_thread);
+-    CloseHandle(t->finish_event);
+-    t->host_thread = NULL;
+-    t->finish_event = NULL;
+ #else
+     /* Reap the host thread with the table lock RELEASED.
+      *
+@@ -628,10 +800,8 @@ int64_t sys_ppu_thread_join(ppu_context* ctx)
+      * FINISHED rather than FREE until the line below. */
+     pthread_join(t->host_thread, NULL);
+     table_lock();
+-    pthread_mutex_destroy(&t->finish_mutex);
+-    pthread_cond_destroy(&t->finish_cond);
+ #endif
+-    t->state = PPU_THREAD_STATE_FREE;
++    ppu_thread_release_slot(t);
+     table_unlock();
+ 
+     return CELL_OK;
+@@ -653,17 +823,16 @@ int64_t sys_ppu_thread_detach(ppu_context* ctx)
+         return (int64_t)(int32_t)CELL_ESRCH;
+     }
+ 
+-    if (t->state == PPU_THREAD_STATE_FINISHED) {
+-        /* Already finished, free it */
+-#ifdef _WIN32
+-        CloseHandle(t->host_thread);
+-        CloseHandle(t->finish_event);
+-#else
++    int slotIndex = (int)(t - g_ppu_threads);
++    if (t->state == PPU_THREAD_STATE_FINISHED && s_slotEpilogueDone[slotIndex]) {
++        /* Already finished and its host thread is done with the slot: free
++         * it. FINISHED alone is not enough -- sys_ppu_thread_exit sets it
++         * while the thread is still unwinding, and then the host procedure
++         * frees the slot itself once it sees the thread is detached. */
++#ifndef _WIN32
+         pthread_detach(t->host_thread);
+-        pthread_mutex_destroy(&t->finish_mutex);
+-        pthread_cond_destroy(&t->finish_cond);
+ #endif
+-        t->state = PPU_THREAD_STATE_FREE;
++        ppu_thread_release_slot(t);
+     } else {
+         t->state = PPU_THREAD_STATE_DETACHED;
+         t->joinable = 0;

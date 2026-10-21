@@ -1,0 +1,128 @@
+[ppu] PT_TLS template vaddr=0x00572378 filesz=0x4 memsz=0x1BC
+[ppu] loaded 4 PT_LOAD segments, entry OPD 0x0054D820
+[boot-dbg] before ppu_recomp_register
+[boot-dbg] after ppu_recomp_register; before ps3_load_prx_modules
+[boot-dbg] after prx; before ppu_hle_init
+[boot-dbg] before lv2_init_syscalls
+[boot-dbg] after lv2_init_syscalls
+[rsx] backend init OK -- window open
+[boot] VFS root: /home/claude/folklore/vfs
+[cellGame] title id from PARAM.SFO ('/home/claude/folklore/vfs/PS3_GAME/PARAM.SFO'): 'BCUS98147'
+[RSX null] headless software backend 1280x720 (Folklore™)
+
+[boot] dispatching entry OPD 0x0054D820 (stack top 0x0FF00000)
+
+[ppu] TLS image 0x10F00000 (r13/TP=0x10F07000)
+[ppu] argv[0] @0x0FEFFFC0 = "/dev_bdvd/PS3_GAME/USRDIR/EBOOT.BIN"
+[ppu] argc=1 argv=0x0FEFFFA0
+[ppu] run: code 0x0001022C, toc 0x0056EB00, sp 0x0FEFFF20
+[crt] sys_initialize_tls: block 0x0E000000, r13=0x0E007000 (seg 0x572378+4, mem 444)
+[sys_memory] allocate(size=0x100000, flags=0x400)
+[sys_memory] allocate -> 0x40000000
+[cellSysmodule] LoadModule(id=0x0024 'UNKNOWN')
+[cellSysmodule] LoadModule(id=0x0010 'CELL_SYSMODULE_GCM_SYS')
+[cellSysmodule] LoadModule(id=0x000D 'CELL_SYSMODULE_SYNC')
+[cellSysmodule] LoadModule(id=0x0011 'CELL_SYSMODULE_AUDIO')
+[cellSysmodule] LoadModule(id=0x0017 'CELL_SYSMODULE_IO')
+[cellSysmodule] LoadModule(id=0x001C 'CELL_SYSMODULE_USBD')
+[cellSysmodule] LoadModule(id=0x000A 'CELL_SYSMODULE_SPURS')
+[cellSysmodule] LoadModule(id=0x000E 'CELL_SYSMODULE_FS')
+[cellSysmodule] LoadModule(id=0x001E 'CELL_SYSMODULE_L10N')
+[cellSysutil] RegisterCallback(slot=0, func=0x005561E8)
+[sys_memory] mmapper_allocate_memory size=0x4800000 -> 0x40100000
+[sys_memory] allocate_from_container(cid=0x40100000, size=0x4800000) -> 0x40100000
+[sys_memory] mmapper_allocate_memory size=0x2700000 -> 0x44900000
+[sys_memory] allocate_from_container(cid=0x44900000, size=0x2700000) -> 0x44900000
+[sys_memory] mmapper_allocate_memory size=0x800000 -> 0x47000000
+[sys_memory] allocate_from_container(cid=0x47000000, size=0x800000) -> 0x47000000
+[sys_memory] mmapper_allocate_memory size=0x3000000 -> 0x47800000
+[sys_memory] allocate_from_container(cid=0x47800000, size=0x1300000) -> 0x47800000
+[sys_memory] allocate_from_container(cid=0x47800000, size=0x400000) -> 0x48B00000
+[sys_memory] allocate_from_container(cid=0x47800000, size=0x1900000) -> 0x48F00000
+[cellPad] Init(max_connect=2)
+[HLE] _cellGcmInitBody(ctx_out=0x10A5B6F0, cmdSize=0x1FF000, ioSize=0x200000, ioAddr=0x44900000)
+[cellGcmSys] Init(cmdSize=0x1FF000, ioSize=0x200000, ioAddr=0x44900000)
+[cellVideoOut] GetState(videoOut=0, deviceIndex=0)
+[cellVideoOut] GetResolution(id=2) -> 1280x720
+[cellGcmSys] GetTiledPitchSize(0x1400) -> 0x1400
+[cellGcmSys] GetTiledPitchSize(0x1400) -> 0x1400
+[cellVideoOut] Configure(videoOut=0)
+[cellVideoOut] Configure: resId=2, format=0, aspect=0, pitch=5120
+[cellGcmSys] SetFlipMode(mode=2)
+[cellGcmSys] SetFlipHandler(opd=0x00555280)
+[cellGcmSys] MapMainMemory(ea=0x47800000, size=0x3000000)
+[cellGcmSys] GetTiledPitchSize(0x1400) -> 0x1400
+[cellGcmSys] SetDisplayBuffer(id=0, offset=0x0, pitch=5120, 1280x720)
+[hle-trace] cellGcmSetTile lr=0x001D74E4 cia=0x00000000 r3..r8=00000000 00000000 00000000 003C0000 00001400 00000000
+[cellGcmSys] SetTile(index=0, loc=0, offset=0x0, size=0x3C0000, pitch=5120)
+[cellGcmSys] GetTiledPitchSize(0x1400) -> 0x1400
+[cellGcmSys] SetDisplayBuffer(id=1, offset=0x3C0000, pitch=5120, 1280x720)
+[hle-trace] cellGcmSetTile lr=0x001D74E4 cia=0x00000000 r3..r8=00000001 00000000 003C0000 003C0000 00001400 00000000
+[cellGcmSys] SetTile(index=1, loc=0, offset=0x3C0000, size=0x3C0000, pitch=5120)
+[hle-trace] cellGcmSetTile lr=0x001D75FC cia=0x00000000 r3..r8=00000002 00000000 00780000 003C0000 00001400 0000000C
+[cellGcmSys] SetTile(index=2, loc=0, offset=0x780000, size=0x3C0000, pitch=5120)
+[cellGcmSys] SetZcull(index=2, offset=0x780000, 1280x768)
+[SYS] sys_ppu_thread_create tid=2 name="FlipThreadMain" entry=0x00554E18 arg=0x109062D0 stack=0x4000 prio=-1
+[cellSysutil] DiscGameRegisterDiscChangeCallback()
+[cellSysutil] DiscGameGetBootDiscInfo(param=0x0FEFFCA0)
+[cellSysutil]   -> disc boot, titleId='BCUS98147'
+[cellSysutil] SysCacheMount(id='BCUS98147')
+[cellSysutil] SysCacheClear()
+[THREAD 2] host thread started, entry=0x00554E18 hosttid=2494
+[hle-trace] cellGcmSetFlip lr=0x001D9514 cia=0x00554E18 r3..r8=0F800000 00000000 00000000 00000000 00000000 00000000
+[fs] open FAIL '/dev_hdd1/cache/BCUS98147/model.bin_' -> '/home/claude/folklore/hdd1/cache/BCUS98147/model.bin_'
+[fs] open FAIL '/USRDIR/bin/model.bin_' -> '/home/claude/folklore/vfs/USRDIR/bin/model.bin_'
+[fs] open FAIL '/dev_bdvd/PS3_GAME/USRDIR/bin/model.bin_' -> '/home/claude/folklore/vfs/PS3_GAME/USRDIR/bin/model.bin_'
+[fs] open FAIL '/app_home/model.bin_' -> '/home/claude/folklore/vfs/model.bin_'
+[fs] open FAIL '/dev_hdd1/cache/BCUS98147/mt.bin_' -> '/home/claude/folklore/hdd1/cache/BCUS98147/mt.bin_'
+[fs] open FAIL '/USRDIR/bin/mt.bin_' -> '/home/claude/folklore/vfs/USRDIR/bin/mt.bin_'
+[fs] open FAIL '/dev_bdvd/PS3_GAME/USRDIR/bin/mt.bin_' -> '/home/claude/folklore/vfs/PS3_GAME/USRDIR/bin/mt.bin_'
+[fs] open FAIL '/app_home/mt.bin_' -> '/home/claude/folklore/vfs/mt.bin_'
+[fs] open FAIL '/dev_hdd1/cache/BCUS98147/etc.bin_' -> '/home/claude/folklore/hdd1/cache/BCUS98147/etc.bin_'
+[fs] open FAIL '/USRDIR/bin/etc.bin_' -> '/home/claude/folklore/vfs/USRDIR/bin/etc.bin_'
+[fs] open FAIL '/dev_bdvd/PS3_GAME/USRDIR/bin/etc.bin_' -> '/home/claude/folklore/vfs/PS3_GAME/USRDIR/bin/etc.bin_'
+[fs] open FAIL '/app_home/etc.bin_' -> '/home/claude/folklore/vfs/etc.bin_'
+[SYS] sys_ppu_thread_create tid=3 name="thread_sys_cache" entry=0x005538B0 arg=0x0 stack=0x4000 prio=1
+[cellGame] DataCheckCreate2(version=0 dir='BCUS98147' funcStat=0x00553AD0)
+[THREAD 3] host thread started, entry=0x005538B0 hosttid=2495
+[cellGame] DataCheckCreate2: funcStat returned result=1
+[sys_memory] allocate_from_container(cid=0x47000000, size=0x800000) -> 0x47000000
+[cellSysutil] CheckCallback: the title pumps sysutil
+[cellMsgDialog] Open2(type=0x00000001, msg='Game data is about to be saved to the HDD.
+During saving the HDD access indicator will blink.
+Do not turn off the PLAYSTATION®3 system during saving.')
+========================================
+[DIALOG] Game data is about to be saved to the HDD.
+During saving the HDD access indicator will blink.
+Do not turn off the PLAYSTATION®3 system during saving.
+========================================
+[cellMsgDialog] Auto-responding: NONE (no buttons)
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[hle-trace] cellGcmSetFlip lr=0x001D9514 cia=0x00554E18 r3..r8=0F800000 00000001 00556280 00000000 44900264 44900274
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[hle-trace] cellGcmSetFlip lr=0x001D9514 cia=0x00554E18 r3..r8=0F800000 00000000 00000000 00000500 449003D4 449003E4
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[cellGame] DataCheckCreate2(version=0 dir='BCUS98147' funcStat=0x00553AD0)
+[cellGame] DataCheckCreate2: funcStat returned result=1
+[sys_memory] allocate_from_container(cid=0x47000000, size=0x800000) -> 0x47000000
+[fs] open FAIL '/dev_hdd0/game/BCUS98147/USRDIR/bin/TMP_HDD_COPY.DAT' -> '/home/claude/folklore/hdd0/game/BCUS98147/USRDIR/bin/TMP_HDD_COPY.DAT'
+[cellMsgDialog] Abort()
+[hle-trace] cellGcmSetFlip lr=0x001D9514 cia=0x00554E18 r3..r8=0F800000 00000001 00000000 00000500 44900544 44900554
+[folklore-hle] cellMsgDialogOpenErrorCode(0x80010006) -> auto OK
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[hle-trace] cellGcmSetFlip lr=0x001D9514 cia=0x00554E18 r3..r8=0F800000 00000000 00000000 00000000 449006B4 449006C4
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[cellMsgDialog] Open2(type=0x00000080, msg='An HDD access error occurred.
+End the game, delete Folklore game data, then try again.')
+========================================
+[DIALOG] An HDD access error occurred.
+End the game, delete Folklore game data, then try again.
+========================================
+[cellMsgDialog] Auto-responding: NONE (no buttons)
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000
+[RSX] CLEAR_SURFACE mask=0xF1 color=0xFF000000

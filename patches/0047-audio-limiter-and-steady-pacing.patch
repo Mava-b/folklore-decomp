@@ -1,0 +1,292 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+index b51fb7c..5afe494 100644
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -156,6 +156,15 @@ static mutex_t       s_audio_mutex;
+ /* Output mix buffer (stereo, one block worth) */
+ static float s_mix_buffer[CELL_AUDIO_BLOCK_SAMPLES * 2];
+ 
++/* What went wrong with the sound since the last [cellAudio] report: blocks
++ * where the device had played everything we gave it (a gap the listener
++ * hears), blocks the game had not written in time (a port that was playing
++ * sound handed us an empty block), and blocks the limiter turned down. */
++static volatile unsigned s_audio_device_dry = 0;
++static volatile unsigned s_audio_game_late = 0;
++static volatile unsigned s_audio_limited_blocks = 0;
++static float s_audio_deepest_gain = 1.0f;
++
+ /* ---------------------------------------------------------------------------
+  * Host audio output backend
+  * -----------------------------------------------------------------------*/
+@@ -278,8 +287,11 @@ static int audio_backend_init(void)
+     wfx.nAvgBytesPerSec = wfx.nSamplesPerSec * wfx.nBlockAlign;
+     wfx.cbSize          = 0;
+ 
+-    /* Request event-driven mode with a ~20ms buffer */
+-    REFERENCE_TIME buf_duration = 200000; /* 20ms in 100ns units */
++    /* Event-driven, with a 100 ms buffer. The mixer keeps only ~32 ms of it
++     * filled (audio_mix_thread_func), so the latency stays low; the rest is
++     * room for the mixing thread to be late under a heavy frame without the
++     * device running dry. (It was 20 ms: one late wake-up was a gap.) */
++    REFERENCE_TIME buf_duration = 1000000; /* 100 ms in 100 ns units */
+     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 
+     hr = s_wasapi_client->lpVtbl->Initialize(
+@@ -408,6 +420,86 @@ static inline float ld_be_f32(const float* p)
+     return f;
+ }
+ 
++/* Peak limiter for the final stereo mix.
++ *
++ * The ports are summed (and a 7.1 port folded down to stereo) in float, so
++ * loud moments -- two captures at once, a boss -- go past full scale. Those
++ * samples used to be clipped flat at +-1.0, which is the "crunchy" sound.
++ * This turns the whole mix down just enough instead: 1 ms look-ahead, a
++ * fast attack and an 80 ms release, so peaks are caught before they arrive
++ * and the gain comes back smoothly. Below the threshold the gain is exactly
++ * 1 and the mix passes through unchanged (one millisecond later). A final
++ * clamp catches the little the attack can leave over. AUDIO_NO_LIMITER=1
++ * restores the plain clip. */
++#define AUDIO_LIMIT_LOOKAHEAD 48
++#define AUDIO_LIMIT_THRESHOLD 0.97f
++static void audio_limit_block(float* stereo)
++{
++    static int disabled = -1;
++    static float delayLine[AUDIO_LIMIT_LOOKAHEAD][2];
++    static float needLine[AUDIO_LIMIT_LOOKAHEAD];
++    static u32 position = 0;
++    static float gain = 1.0f;
++    static float attackCoefficient = 0.0f;
++    static float releaseCoefficient = 0.0f;
++    if (disabled < 0)
++    {
++        const char* setting = getenv("AUDIO_NO_LIMITER");
++        disabled = setting && setting[0] && setting[0] != '0';
++        for (u32 index = 0; index < AUDIO_LIMIT_LOOKAHEAD; index++)
++        {
++            needLine[index] = 1.0f;
++        }
++        attackCoefficient = expf(-1.0f / 12.0f);
++        releaseCoefficient = expf(-1.0f / (0.080f * (float)CELL_AUDIO_SAMPLE_RATE));
++    }
++    float lowestGain = 1.0f;
++    for (u32 sample = 0; sample < CELL_AUDIO_BLOCK_SAMPLES; sample++)
++    {
++        float left = stereo[sample * 2 + 0];
++        float right = stereo[sample * 2 + 1];
++        if (!disabled)
++        {
++            const float peak = fmaxf(fabsf(left), fabsf(right));
++            const float need = peak > AUDIO_LIMIT_THRESHOLD ? AUDIO_LIMIT_THRESHOLD / peak : 1.0f;
++            /* The gain the output sample (the oldest in the delay line) and
++             * everything after it up to this input need. */
++            float windowNeed = need;
++            for (u32 index = 0; index < AUDIO_LIMIT_LOOKAHEAD; index++)
++            {
++                if (needLine[index] < windowNeed)
++                {
++                    windowNeed = needLine[index];
++                }
++            }
++            const float delayedLeft = delayLine[position][0];
++            const float delayedRight = delayLine[position][1];
++            delayLine[position][0] = left;
++            delayLine[position][1] = right;
++            needLine[position] = need;
++            position = (position + 1u) % AUDIO_LIMIT_LOOKAHEAD;
++            const float coefficient = windowNeed < gain ? attackCoefficient : releaseCoefficient;
++            gain = windowNeed + (gain - windowNeed) * coefficient;
++            if (gain < lowestGain)
++            {
++                lowestGain = gain;
++            }
++            left = delayedLeft * gain;
++            right = delayedRight * gain;
++        }
++        stereo[sample * 2 + 0] = left > 1.0f ? 1.0f : (left < -1.0f ? -1.0f : left);
++        stereo[sample * 2 + 1] = right > 1.0f ? 1.0f : (right < -1.0f ? -1.0f : right);
++    }
++    if (lowestGain < 0.999f)
++    {
++        s_audio_limited_blocks++;
++        if (lowestGain < s_audio_deepest_gain)
++        {
++            s_audio_deepest_gain = lowestGain;
++        }
++    }
++}
++
+ /* Mix one block from all active ports into s_mix_buffer (stereo float) */
+ static void audio_mix_one_block(void)
+ {
+@@ -439,6 +531,28 @@ static void audio_mix_one_block(void)
+ 
+         u32 nch    = (u32)port->param.nChannel;
+         u32 nblock = (u32)port->param.nBlock;
++        /* A playing port whose next block is still all zero (the firmware
++         * clears each block it consumes, so zero means not rewritten) right
++         * after a block with sound: the game's mixer was late. */
++        {
++            static int portHadSound[CELL_AUDIO_PORT_MAX];
++            const u32 peekIndex = (u32)(port->read_index % nblock);
++            const u32* peekWords = (const u32*)(port->buffer + peekIndex * CELL_AUDIO_BLOCK_SAMPLES * nch);
++            int blockHasSound = 0;
++            for (u32 word = 0; word < CELL_AUDIO_BLOCK_SAMPLES * nch; word++)
++            {
++                if (peekWords[word] & 0x7FFFFFFFu)
++                {
++                    blockHasSound = 1;
++                    break;
++                }
++            }
++            if (!blockHasSound && portHadSound[p])
++            {
++                s_audio_game_late++;
++            }
++            portHadSound[p] = blockHasSound;
++        }
+         float level = port->param.level;
+         if (level <= 0.0f) level = 1.0f;
+         if (level > 1.0f) level = 1.0f;
+@@ -508,11 +622,7 @@ static void audio_mix_one_block(void)
+ 
+     mutex_unlock(&s_audio_mutex);
+ 
+-    /* Clip to [-1.0, 1.0] */
+-    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) {
+-        if (s_mix_buffer[i] > 1.0f) s_mix_buffer[i] = 1.0f;
+-        if (s_mix_buffer[i] < -1.0f) s_mix_buffer[i] = -1.0f;
+-    }
++    audio_limit_block(s_mix_buffer);
+ }
+ 
+ /* ---------------------------------------------------------------------------
+@@ -535,6 +645,81 @@ static void audio_notify_event_queues(void)
+ }
+ 
+ #ifdef _WIN32
++/* The mixing thread does almost nothing per block, but must not wait behind
++ * the game's busy threads: register it with MMCSS ("Pro Audio") and raise
++ * it. avrt.dll is loaded by hand so nothing new has to be linked. */
++static void audio_raise_thread_priority(void)
++{
++    typedef HANDLE (WINAPI* AvSetTaskFunction)(LPCWSTR, LPDWORD);
++    HMODULE avrt = LoadLibraryA("avrt.dll");
++    if (avrt)
++    {
++        AvSetTaskFunction setTask = (AvSetTaskFunction)(void*)GetProcAddress(avrt, "AvSetMmThreadCharacteristicsW");
++        DWORD taskIndex = 0;
++        if (setTask && setTask(L"Pro Audio", &taskIndex))
++        {
++            return;
++        }
++    }
++    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
++}
++
++/* How far ahead of the device the mixer stays, in frames: AUDIO_LATENCY_MS
++ * (default 32 ms, 6 blocks), kept within the device buffer. */
++static int audio_target_frames(void)
++{
++    int milliseconds = 32;
++    const char* setting = getenv("AUDIO_LATENCY_MS");
++    if (setting && setting[0])
++    {
++        milliseconds = atoi(setting);
++    }
++    int frames = milliseconds * (CELL_AUDIO_SAMPLE_RATE / 1000);
++    if (frames < CELL_AUDIO_BLOCK_SAMPLES * 2)
++    {
++        frames = CELL_AUDIO_BLOCK_SAMPLES * 2;
++    }
++#if AUDIO_BACKEND_WASAPI
++    if (s_wasapi_buf_frames && frames > (int)s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES)
++    {
++        frames = (int)s_wasapi_buf_frames - CELL_AUDIO_BLOCK_SAMPLES;
++    }
++#endif
++    return frames;
++}
++
++/* A millisecond: the pacing needs finer steps than the device's 10 ms
++ * period event (the process runs with a 1 ms timer resolution). */
++static void audio_backend_wait_short(void)
++{
++#if AUDIO_BACKEND_WASAPI
++    if (s_wasapi_event)
++    {
++        WaitForSingleObject(s_wasapi_event, 1);
++        return;
++    }
++#endif
++    Sleep(1);
++}
++
++/* One line every 10 s, only when something was wrong. */
++static void audio_report_problems(void)
++{
++    const unsigned dry = s_audio_device_dry;
++    const unsigned late = s_audio_game_late;
++    const unsigned limited = s_audio_limited_blocks;
++    if (dry || late || limited)
++    {
++        fprintf(stderr, "[cellAudio] last 10 s: device ran dry %u times, game late with %u blocks, "
++                        "limiter turned %u blocks down (deepest %.1f dB)\n",
++                dry, late, limited, 20.0 * log10((double)(s_audio_deepest_gain > 1e-6f ? s_audio_deepest_gain : 1e-6f)));
++    }
++    s_audio_device_dry = 0;
++    s_audio_game_late = 0;
++    s_audio_limited_blocks = 0;
++    s_audio_deepest_gain = 1.0f;
++}
++
+ static unsigned __stdcall audio_mix_thread_func(void* arg)
+ {
+     (void)arg;
+@@ -548,9 +733,45 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
+      * With no device, pace on the performance counter instead. */
+     LARGE_INTEGER qf, q0; QueryPerformanceFrequency(&qf); QueryPerformanceCounter(&q0);
+     unsigned long long blocks = 0;
++    audio_raise_thread_priority();
++    /* Keep the device ~32 ms ahead (AUDIO_LATENCY_MS), and never take the
++     * game's blocks faster than 1.25x real time. The PS3 reads one block
++     * every 5.33 ms, and the game's mixer writes just ahead of that read
++     * index; after a late wake-up this thread used to refill the whole
++     * device buffer in one burst, reading blocks the game had not written
++     * yet -- gaps, heard as crackle in busy scenes. Now the cushion absorbs
++     * the late wake-up and refills at a pace the game keeps up with. */
++    const int targetFrames = audio_target_frames();
++    const LONGLONG blockTicks = qf.QuadPart * CELL_AUDIO_BLOCK_SAMPLES / CELL_AUDIO_SAMPLE_RATE;
++    const LONGLONG minimumSpacing = blockTicks * 4 / 5;
++    LARGE_INTEGER lastMix; lastMix.QuadPart = 0;
++    LARGE_INTEGER lastReport; QueryPerformanceCounter(&lastReport);
+     while (s_mix_thread_running) {
+         const int room = audio_backend_room();
+-        if (room >= 0 && room < CELL_AUDIO_BLOCK_SAMPLES) { audio_backend_wait(); continue; }
++        if (room >= 0) {
++#if AUDIO_BACKEND_WASAPI
++            const int queued = (int)s_wasapi_buf_frames - room;
++#else
++            const int queued = 0;
++#endif
++            if (room < CELL_AUDIO_BLOCK_SAMPLES || queued >= targetFrames) {
++                audio_backend_wait_short();
++                continue;
++            }
++            LARGE_INTEGER now; QueryPerformanceCounter(&now);
++            if (queued >= CELL_AUDIO_BLOCK_SAMPLES && now.QuadPart - lastMix.QuadPart < minimumSpacing) {
++                audio_backend_wait_short();
++                continue;
++            }
++            if (queued == 0 && blocks > (unsigned long long)(targetFrames / CELL_AUDIO_BLOCK_SAMPLES) + 4u) {
++                s_audio_device_dry++;
++            }
++            lastMix = now;
++            if (now.QuadPart - lastReport.QuadPart >= qf.QuadPart * 10) {
++                audio_report_problems();
++                lastReport = now;
++            }
++        }
+         if (room < 0) {
+             LARGE_INTEGER now; QueryPerformanceCounter(&now);
+             const long long due = q0.QuadPart +

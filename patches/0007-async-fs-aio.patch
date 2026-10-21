@@ -1,0 +1,337 @@
+From: Folklore port <noreply@localhost>
+Subject: [PATCH 0007] cellFs AIO completes asynchronously; cellVdec playback counters
+
+1. cellFsAioRead ran the read and the completion callback inside the submit
+   call. Folklore's movie streamer submits, then marks the request outstanding
+   under a mutex and waits for the callback to clear it -- a callback that had
+   already run -- so the logo movie never got its first 512 KB and the screen
+   stayed black. Reads now complete on a worker thread through their own host
+   handle, as lv2 does. PS3_FS_AIO_SYNC=1 restores the old behaviour.
+2. ppu_guest_call_set_stack(): a host thread that calls guest code gets its own
+   guest stack (the default scratch stack is the same address on every host
+   thread). sys_ppu_thread_alloc_host_stack() hands one out from the PPU stack
+   region under the thread-table lock.
+3. cellVdec: playback counters (AUs, BUSY, decoded, taken, empty) at doubling
+   intervals; the per-AU DecodeAu line now needs PS3_VDEC_LOG=1.
+
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index a411dbd..4f3f3ce 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -56,6 +56,17 @@ typedef struct {
+ 
+ static VdecSlot s_vdec[MAX_VDEC];
+ 
++/* Playback counters, reported at doubling intervals so a stalled movie shows
++ * which side stopped: the title submitting AUs, the decoder producing
++ * pictures, or the title taking them (GetPicture). */
++static u32 s_statAu, s_statBusy, s_statPics, s_statTaken, s_statEmpty;
++static void vdec_stat(const char* what, u32 count)
++{
++    if (count && (count & (count - 1)) == 0 && count >= 4)
++        fprintf(stderr, "[cellVdec] %s=%u (au=%u busy=%u decoded=%u taken=%u empty=%u)\n",
++                what, count, s_statAu, s_statBusy, s_statPics, s_statTaken, s_statEmpty);
++}
++
+ /* Deliver a vdec message to the guest callback (handle, msgType, msgData,
+  * cbArg). It is a guest OPD, so it goes through g_ps3_guest_caller; this used
+  * to call it as a host function pointer, which crashes the first time a
+@@ -113,6 +124,7 @@ static void vdec_on_picture(void* ctx, const VdecFfPicture* pic)
+     q->item.height    = (u16)pic->height;
+     v->qCount++;
+     v->newPics++;
++    vdec_stat("decoded", ++s_statPics);
+ }
+ 
+ /* PICOUT for each picture the last decoder call queued. */
+@@ -259,13 +271,17 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
+     au.dts       = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, dts));
+     au.userData  = vm_read64(au_ea + (u32)offsetof(CellVdecAuInfo, userData));
+ 
+-    printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
+-           handle, au.startAddr, au.size,
+-           (unsigned long long)au.pts);
++    if (getenv("PS3_VDEC_LOG"))
++        printf("[cellVdec] DecodeAu(handle=%u, addr=0x%X, size=%u, pts=%llu)\n",
++               handle, au.startAddr, au.size,
++               (unsigned long long)au.pts);
+ 
+     if (v->ff) {
+-        if (v->qCount >= VDEC_BUSY_AT)
++        if (v->qCount >= VDEC_BUSY_AT) {
++            vdec_stat("busy", ++s_statBusy);
+             return (s32)CELL_VDEC_ERROR_BUSY;  /* title must take pictures */
++        }
++        vdec_stat("au", ++s_statAu);
+         v->auCount++;
+         v->aus[v->auCount % VDEC_AU_RING] = au;
+         v->newPics = 0;
+@@ -398,8 +414,11 @@ s32 cellVdecGetPicItem(CellVdecHandle handle, const CellVdecPicItem** picItem)
+  * that only pace playback on PICOUT/GetPicture run as they should. */
+ static s32 vdec_take_picture(VdecSlot* v, u32 dst, u32 type, u32 matrix, u8 alpha)
+ {
+-    if (!v->qCount)
++    if (!v->qCount) {
++        vdec_stat("empty", ++s_statEmpty);
+         return (s32)CELL_VDEC_ERROR_EMPTY;
++    }
++    vdec_stat("taken", ++s_statTaken);
+     VdecPic* q = &v->queue[v->qHead];
+     v->qHead = (v->qHead + 1) % VDEC_QUEUE;
+     v->qCount--;
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 3aa8404..3fd258f 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -20,6 +20,12 @@
+ #include "sdata_decrypt.h"   /* SDATA/EDAT (NPD) decryption for cellFsSdataOpen */
+ #include <stdint.h>
+ #include <stdio.h>
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <string>
++#include <thread>
+ #include <string.h>
+ #include <stdlib.h>
+ #include <errno.h>
+@@ -198,7 +204,8 @@ static void host_path(char* out, size_t cap, const char* guest)
+ #define FS_MAX 256
+ static FILE* g_files[FS_MAX];
+ static uint8_t g_fd_usm[FS_MAX];
+-static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */   /* 1 if this fd is an open .usm movie (read tracker) */
++static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */
++static char    g_fd_host_path[FS_MAX][512];   /* host path per fd (AIO reads it on its own handle) */   /* 1 if this fd is an open .usm movie (read tracker) */
+ static DIR*  g_dirs[FS_MAX];
+ static char  g_dir_path[FS_MAX][1024];   /* host path per open dir (for readdir stat) */
+ 
+@@ -278,7 +285,8 @@ static void cellFsOpen(ppu_context* ctx)
+      * streaming layer opens a file and never reads it (You Don't Know Jack's
+      * movies) is diagnosed from the opener: its sibling read path is the one
+      * that is not running. */
+-    if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0; }
++    if (fd >= 0 && fd < FS_MAX) { strncpy(g_fd_path[fd], gpath, sizeof g_fd_path[fd]-1); g_fd_path[fd][sizeof g_fd_path[fd]-1]=0;
++                                  snprintf(g_fd_host_path[fd], sizeof g_fd_host_path[fd], "%s", hpath); }
+     { char who[64] = "?";
+       if (getenv("FS_CALLER")) { ppu_guest_caller(who, sizeof who);
+           fprintf(stderr, "[fs] open '%s' -> fd %d  (opened by %s)\n", gpath, fd, who);
+@@ -906,39 +914,137 @@ static void cellFsAioFinish(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+  * done", which is exactly true here. */
+ static void cellFsAioCancel(ppu_context* ctx) { ctx->gpr[3] = CELL_OK; }
+ 
++/* Completion runs on a worker thread, as lv2's does (RPCS3 shows the title's
++ * own _fs_aio_thread). Completing inside the submit call was wrong for
++ * Folklore: its movie streamer submits a read, THEN marks it outstanding under
++ * a mutex and waits for the callback to clear the mark -- a callback that had
++ * already run before the mark was set, so the logo movie never got its first
++ * 512 KB and the screen stayed black. PS3_FS_AIO_SYNC=1 restores the old
++ * synchronous completion.
++ *
++ * The worker reads through its own host handle, opened from the path, so the
++ * guest's fd position and stdio buffer are untouched (AIO reads are absolute).
++ * It calls the guest back on a guest stack of its own (ppu_guest_call_set_stack). */
++extern "C" void ppu_guest_call_set_stack(uint32_t top);
++extern "C" uint32_t sys_ppu_thread_alloc_host_stack(uint32_t stack_size);
++
++struct FsAioRequest
++{
++    uint32_t aio;
++    uint32_t callbackOpd;
++    int32_t  id;
++    int      fd;
++    uint64_t offset;
++    uint32_t buffer;
++    uint64_t size;
++    std::string hostPath;
++};
++
++static std::mutex                s_aioMutex;
++static std::condition_variable   s_aioWake;
++static std::deque<FsAioRequest>  s_aioQueue;
++static bool                      s_aioStarted = false;
++
++static size_t fs_aio_perform(const FsAioRequest& request, int32_t* error)
++{
++    size_t bytesRead = 0;
++    *error = CELL_FS_ENOENT;
++    FILE* file = request.hostPath.empty() ? nullptr : fopen(request.hostPath.c_str(), "rb");
++    if (!file)
++    {
++        return 0;
++    }
++    uint64_t size = request.size;
++    if (ppu_vm_size && (uint64_t)request.buffer + size > ppu_vm_size)
++    {
++        size = ppu_vm_size - request.buffer;
++    }
++    fs_prefault(request.buffer, size);
++    if (HOST_FSEEK64(file, request.offset) == 0)
++    {
++        bytesRead = fread(vm_base + request.buffer, 1, (size_t)size, file);
++    }
++    fclose(file);
++    *error = CELL_OK;
++    return bytesRead;
++}
++
++static void fs_aio_worker(uint32_t stackTop)
++{
++    ppu_guest_call_set_stack(stackTop);
++    for (;;)
++    {
++        FsAioRequest request;
++        {
++            std::unique_lock<std::mutex> lock(s_aioMutex);
++            s_aioWake.wait(lock, [] { return !s_aioQueue.empty(); });
++            request = std::move(s_aioQueue.front());
++            s_aioQueue.pop_front();
++        }
++        int32_t error = CELL_OK;
++        size_t bytesRead = fs_aio_perform(request, &error);
++        if (getenv("PS3_FSLOG"))
++        {
++            fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu (async)\n",
++                    request.id, request.fd, (unsigned long long)request.offset,
++                    (unsigned long long)request.size, bytesRead);
++        }
++        if (request.callbackOpd)
++        {
++            ps3_invoke_guest(request.callbackOpd, request.aio, (uint64_t)(int64_t)error,
++                             (uint64_t)(int64_t)request.id, (uint64_t)bytesRead, 0, 0, 0, 0);
++        }
++    }
++}
++
+ static void cellFsAioRead(ppu_context* ctx)
+ {
+     uint32_t aio    = (uint32_t)ctx->gpr[3];
+     uint32_t id_ptr = (uint32_t)ctx->gpr[4];
+     uint32_t cb_opd = (uint32_t)ctx->gpr[5];
+ 
+-    int      fd     = (int)guest_be32(aio + 0x00);
+-    uint64_t offset = guest_be64(aio + 0x08);
+-    uint32_t buf    = guest_be32(aio + 0x10);
+-    uint64_t size   = guest_be64(aio + 0x18);
++    FsAioRequest request;
++    request.aio         = aio;
++    request.callbackOpd = cb_opd;
++    request.fd          = (int)guest_be32(aio + 0x00);
++    request.offset      = guest_be64(aio + 0x08);
++    request.buffer      = guest_be32(aio + 0x10);
++    request.size        = guest_be64(aio + 0x18);
++    if (request.fd >= 0 && request.fd < FS_MAX && g_files[request.fd])
++    {
++        request.hostPath = g_fd_host_path[request.fd];
++    }
+ 
+-    static int32_t s_next_id = 1;
+-    int32_t id = s_next_id++;
+-    if (id_ptr) vm_write32(id_ptr, (uint32_t)id);
++    static std::atomic<int32_t> s_nextId(1);
++    request.id = s_nextId++;
++    if (id_ptr) vm_write32(id_ptr, (uint32_t)request.id);
++    ctx->gpr[3] = CELL_OK;
+ 
+-    size_t n = 0;
+-    int32_t err = CELL_FS_ENOENT;
+-    if (fd >= 0 && fd < FS_MAX && g_files[fd]) {
+-        if (ppu_vm_size && (uint64_t)buf + size > ppu_vm_size) size = ppu_vm_size - buf;
+-        fs_prefault(buf, size);
+-        /* AIO reads are absolute -- they do not disturb the fd's own file
+-         * position, and the guest interleaves them freely across threads. */
+-        if (HOST_FSEEK64(g_files[fd], offset) == 0)
+-            n = fread(vm_base + buf, 1, (size_t)size, g_files[fd]);
+-        err = CELL_OK;
++    static int s_sync = -1;
++    if (s_sync < 0) s_sync = getenv("PS3_FS_AIO_SYNC") ? 1 : 0;
++    if (s_sync)
++    {
++        int32_t error = CELL_OK;
++        size_t bytesRead = fs_aio_perform(request, &error);
++        if (getenv("PS3_FSLOG"))
++            fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu (sync)\n",
++                    request.id, request.fd, (unsigned long long)request.offset,
++                    (unsigned long long)request.size, bytesRead);
++        if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)error,
++                                     (uint64_t)(int64_t)request.id, (uint64_t)bytesRead, 0, 0, 0, 0);
++        return;
+     }
+-    if (getenv("PS3_FSLOG"))
+-        fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu\n",
+-                id, fd, (unsigned long long)offset, (unsigned long long)size, n);
+ 
+-    ctx->gpr[3] = CELL_OK;
+-    if (cb_opd) ps3_invoke_guest(cb_opd, aio, (uint64_t)(int64_t)err,
+-                                 (uint64_t)(int64_t)id, (uint64_t)n, 0, 0, 0, 0);
++    std::lock_guard<std::mutex> lock(s_aioMutex);
++    if (!s_aioStarted)
++    {
++        /* 64 KB of guest stack for the callbacks, from the PPU stack region. */
++        uint32_t stackTop = sys_ppu_thread_alloc_host_stack(0x10000u);
++        std::thread(fs_aio_worker, stackTop).detach();
++        s_aioStarted = true;
++    }
++    s_aioQueue.push_back(std::move(request));
++    s_aioWake.notify_one();
+ }
+ 
+ extern "C" void ppu_fs_register(void)
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 1baea72..52353b0 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -3646,6 +3646,13 @@ extern "C" void ppu_register_opd_fixup(uint32_t opd, uint32_t code, uint32_t toc
+         s_opd_fixups[s_opd_fixup_n].code = code; s_opd_fixups[s_opd_fixup_n].toc = toc; s_opd_fixup_n++; }
+ }
+ 
++/* A host thread that makes guest calls of its own (an HLE worker, such as the
++ * cellFs AIO thread) gets its own guest stack: the default scratch top is the
++ * same address on every host thread, so two of them calling back at once --
++ * the AIO worker and the vblank ticker, say -- would share one stack. */
++static PPU_THREAD_LOCAL uint32_t s_host_cb_stack_top = 0;
++extern "C" void ppu_guest_call_set_stack(uint32_t top) { s_host_cb_stack_top = top & ~0xFu; }
++
+ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+                                    uint64_t a0, uint64_t a1, uint64_t a2, uint64_t a3,
+                                    uint64_t a4, uint64_t a5, uint64_t a6, uint64_t a7)
+@@ -3673,7 +3680,7 @@ extern "C" uint64_t ppu_guest_call(uint32_t opd_addr,
+     /* Private scratch stack high in the guest stack region, distinct from the
+      * main + ppu_thread stacks. One callback at a time per caller thread. */
+     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
+-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
++    if (!s_cb_sp) s_cb_sp = s_host_cb_stack_top ? s_host_cb_stack_top : 0xCFFE0000u;
+ 
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof(ctx));
+@@ -3718,7 +3725,7 @@ extern "C" uint64_t ppu_guest_call_ct(uint32_t code, uint32_t toc,
+     if (!fn) { fprintf(stderr, "[ppu] guest_call_ct: code 0x%08X not registered\n", code); return 0; }
+ 
+     static PPU_THREAD_LOCAL uint32_t s_cb_sp = 0;
+-    if (!s_cb_sp) s_cb_sp = 0xCFFE0000u;
++    if (!s_cb_sp) s_cb_sp = s_host_cb_stack_top ? s_host_cb_stack_top : 0xCFFE0000u;
+ 
+     ppu_context ctx;
+     memset(&ctx, 0, sizeof(ctx));
+diff --git a/runtime/syscalls/sys_ppu_thread.c b/runtime/syscalls/sys_ppu_thread.c
+index 326dea4..9d801fa 100644
+--- a/runtime/syscalls/sys_ppu_thread.c
++++ b/runtime/syscalls/sys_ppu_thread.c
+@@ -1279,6 +1279,17 @@ int64_t sys_ppu_thread_get_stack_information(ppu_context* ctx)
+ /* ---------------------------------------------------------------------------
+  * Registration
+  * -----------------------------------------------------------------------*/
++/* A guest stack for a HOST thread that calls into guest code (an HLE worker,
++ * such as the cellFs AIO completion thread). Same region and allocator as the
++ * PPU threads' stacks, under the same lock. Returns the usable top, 0 if none. */
++uint32_t sys_ppu_thread_alloc_host_stack(uint32_t stack_size)
++{
++    table_lock();
++    uint32_t base = vm_stack_allocate(&g_vm_stack_alloc, stack_size);
++    table_unlock();
++    return base ? base + stack_size - 0x100u : 0;
++}
++
+ void sys_ppu_thread_init(lv2_syscall_table* tbl)
+ {
+     /* Initialize stack allocator */

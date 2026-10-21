@@ -1,0 +1,470 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+index 5e5c13c..a9d1878 100644
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -225,6 +225,363 @@ static void pad_poll_keyboard(void)
+ }
+ #endif
+ 
++/* ---------------------------------------------------------------------------
++ * DualShock 3 / SIXAXIS over HID (Windows)
++ *
++ * XInput has no motion sensors, so a title that reads the SIXAXIS (Folklore
++ * captures Folks with a pull gesture) needs the real controller. Nefarius'
++ * DsHidMini driver in its SXS mode (the one RPCS3 uses) presents a DS3 the
++ * way Sony's sixaxis.sys does: HID device 054C:0268 whose state -- buttons,
++ * sticks, pressure and the four sensor words -- is read as a feature report.
++ * This follows RPCS3's ds3_pad_handler (Windows path): probe feature report
++ * 0xF2 (else 0x00) to learn the report id, then read that report; the
++ * 49-byte state follows the id byte:
++ *
++ *   [2] SELECT L3 R3 START UP RIGHT DOWN LEFT  (= CELL_PAD DIGITAL1)
++ *   [3] L2 R2 L1 R1 TRIANGLE CIRCLE CROSS SQUARE (= CELL_PAD DIGITAL2)
++ *   [4] PS   [6..9] LX LY RX RY   [14..25] pressure, up..square
++ *   [41] accel X  [43] accel Z  [45] accel Y  [47] gyro   (u16 little endian,
++ *        already in the PS3's 0..1023 scale, 512 = zero)
++ *
++ * A thread polls it every 2 ms so a slow USB control transfer never stalls
++ * the game's pad read. The controller takes port 0 when present; XInput pads
++ * keep the other ports (and port 0 when there is no DS3). PAD_NO_DS3=1 turns
++ * this off.
++ * -----------------------------------------------------------------------*/
++#ifdef _WIN32
++#include <setupapi.h>
++#include <hidsdi.h>
++#include <winioctl.h>
++#pragma comment(lib, "setupapi.lib")
++#pragma comment(lib, "hid.lib")
++
++#ifndef IOCTL_HID_GET_FEATURE
++#define IOCTL_HID_GET_FEATURE CTL_CODE(FILE_DEVICE_KEYBOARD, 100, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
++#endif
++
++typedef struct {
++    int connected;
++    u16 buttons;            /* CELL_PAD_CTRL_* packing, as PadHostState */
++    int psButton;
++    u8  stickLeftX, stickLeftY, stickRightX, stickRightY;
++    u8  pressure[12];       /* up right down left L2 R2 L1 R1 tri circle cross square */
++    u16 sensor[4];          /* X Y Z G, 0..1023 */
++    unsigned long long reports;
++} PadDs3State;
++
++static SRWLOCK      s_ds3_lock = SRWLOCK_INIT;
++static PadDs3State  s_ds3_state;
++static HANDLE       s_ds3_thread = NULL;
++static volatile LONG s_ds3_stop = 0;
++/* Sensor source for the guest (cellPad_set_motion_mode): */
++static volatile LONG s_motion_mode = 0;   /* see cellPad_set_motion_mode */
++
++static int pad_ds3_feature(HANDLE device, u8* buffer, DWORD length)
++{
++    DWORD returned = 0;
++    if (!DeviceIoControl(device, IOCTL_HID_GET_FEATURE, buffer, length, buffer, length, &returned, NULL))
++    {
++        return 0;
++    }
++    return 1;
++}
++
++static u16 pad_ds3_sensor_word(const u8* bytes)
++{
++    u16 value = (u16)(bytes[0] | (bytes[1] << 8));
++    if (value > 1023u)
++    {
++        /* Big-endian on some driver; take whichever reading is in range. */
++        const u16 swapped = (u16)((bytes[0] << 8) | bytes[1]);
++        if (swapped <= 1023u)
++        {
++            value = swapped;
++        }
++        else
++        {
++            value = 1023u;
++        }
++    }
++    return value;
++}
++
++static HANDLE pad_ds3_open(u8* reportIdOut)
++{
++    GUID hidGuid;
++    HidD_GetHidGuid(&hidGuid);
++    HDEVINFO deviceSet = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
++    if (deviceSet == INVALID_HANDLE_VALUE)
++    {
++        return INVALID_HANDLE_VALUE;
++    }
++    HANDLE found = INVALID_HANDLE_VALUE;
++    SP_DEVICE_INTERFACE_DATA interfaceData;
++    interfaceData.cbSize = sizeof(interfaceData);
++    for (DWORD interfaceIndex = 0;
++         found == INVALID_HANDLE_VALUE &&
++         SetupDiEnumDeviceInterfaces(deviceSet, NULL, &hidGuid, interfaceIndex, &interfaceData);
++         interfaceIndex++)
++    {
++        DWORD detailSize = 0;
++        SetupDiGetDeviceInterfaceDetailW(deviceSet, &interfaceData, NULL, 0, &detailSize, NULL);
++        if (!detailSize)
++        {
++            continue;
++        }
++        SP_DEVICE_INTERFACE_DETAIL_DATA_W* detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(detailSize);
++        if (!detail)
++        {
++            continue;
++        }
++        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
++        if (!SetupDiGetDeviceInterfaceDetailW(deviceSet, &interfaceData, detail, detailSize, NULL, NULL))
++        {
++            free(detail);
++            continue;
++        }
++        HANDLE device = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
++                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
++        free(detail);
++        if (device == INVALID_HANDLE_VALUE)
++        {
++            continue;
++        }
++        HIDD_ATTRIBUTES attributes;
++        attributes.Size = sizeof(attributes);
++        if (!HidD_GetAttributes(device, &attributes) ||
++            attributes.VendorID != 0x054C || attributes.ProductID != 0x0268)
++        {
++            CloseHandle(device);
++            continue;
++        }
++        u8 probe[0xFF];
++        memset(probe, 0, sizeof(probe));
++        probe[0] = 0xF2;
++        if (!pad_ds3_feature(device, probe, sizeof(probe)) || probe[0] != 0xF2)
++        {
++            memset(probe, 0, sizeof(probe));
++            probe[0] = 0x00;
++            if (!pad_ds3_feature(device, probe, sizeof(probe)) || probe[0] != 0x00)
++            {
++                printf("[cellPad] DS3 054C:0268 found but its state report could not be read "
++                       "(set DsHidMini to SXS mode)\n");
++                fflush(stdout);
++                CloseHandle(device);
++                continue;
++            }
++        }
++        *reportIdOut = probe[0];
++        found = device;
++    }
++    SetupDiDestroyDeviceInfoList(deviceSet);
++    return found;
++}
++
++static void pad_ds3_parse(const u8* report)
++{
++    PadDs3State next;
++    memset(&next, 0, sizeof(next));
++    next.connected = 1;
++    next.buttons = (u16)(report[2] | (report[3] << 8));
++    next.psButton = (report[4] & 0x01) != 0;
++    next.stickLeftX = report[6];
++    next.stickLeftY = report[7];
++    next.stickRightX = report[8];
++    next.stickRightY = report[9];
++    memcpy(next.pressure, report + 14, sizeof(next.pressure));
++    next.sensor[0] = pad_ds3_sensor_word(report + 41);
++    next.sensor[1] = pad_ds3_sensor_word(report + 45);
++    next.sensor[2] = pad_ds3_sensor_word(report + 43);
++    next.sensor[3] = pad_ds3_sensor_word(report + 47);
++    AcquireSRWLockExclusive(&s_ds3_lock);
++    next.reports = s_ds3_state.reports + 1;
++    s_ds3_state = next;
++    ReleaseSRWLockExclusive(&s_ds3_lock);
++}
++
++static void pad_ds3_mark_disconnected(void)
++{
++    AcquireSRWLockExclusive(&s_ds3_lock);
++    s_ds3_state.connected = 0;
++    ReleaseSRWLockExclusive(&s_ds3_lock);
++}
++
++static DWORD WINAPI pad_ds3_thread(LPVOID unused)
++{
++    (void)unused;
++    HANDLE device = INVALID_HANDLE_VALUE;
++    u8 reportId = 0;
++    unsigned long long nextScanMs = 0;
++    while (!InterlockedCompareExchange(&s_ds3_stop, 0, 0))
++    {
++        if (device == INVALID_HANDLE_VALUE)
++        {
++            const unsigned long long nowMs = GetTickCount64();
++            if (nowMs >= nextScanMs)
++            {
++                device = pad_ds3_open(&reportId);
++                nextScanMs = nowMs + 2000ull;
++                if (device != INVALID_HANDLE_VALUE)
++                {
++                    printf("[cellPad] DualShock 3 (SIXAXIS) connected over HID, report id 0x%02X\n", reportId);
++                    fflush(stdout);
++                }
++            }
++            if (device == INVALID_HANDLE_VALUE)
++            {
++                Sleep(100);
++                continue;
++            }
++        }
++        u8 buffer[64];
++        memset(buffer, 0, sizeof(buffer));
++        buffer[0] = reportId;
++        if (!pad_ds3_feature(device, buffer, sizeof(buffer)))
++        {
++            printf("[cellPad] DualShock 3 disconnected\n");
++            fflush(stdout);
++            CloseHandle(device);
++            device = INVALID_HANDLE_VALUE;
++            pad_ds3_mark_disconnected();
++            continue;
++        }
++        if (buffer[0] == reportId)
++        {
++            pad_ds3_parse(buffer + 1);
++        }
++        Sleep(2);
++    }
++    if (device != INVALID_HANDLE_VALUE)
++    {
++        CloseHandle(device);
++    }
++    pad_ds3_mark_disconnected();
++    return 0;
++}
++
++static void pad_ds3_start(void)
++{
++    static int disabled = -1;
++    if (disabled < 0)
++    {
++        disabled = getenv("PAD_NO_DS3") ? 1 : 0;
++    }
++    if (disabled || s_ds3_thread)
++    {
++        return;
++    }
++    InterlockedExchange(&s_ds3_stop, 0);
++    s_ds3_thread = CreateThread(NULL, 0, pad_ds3_thread, NULL, 0, NULL);
++}
++
++static int pad_ds3_snapshot(PadDs3State* out)
++{
++    AcquireSRWLockShared(&s_ds3_lock);
++    *out = s_ds3_state;
++    ReleaseSRWLockShared(&s_ds3_lock);
++    return out->connected;
++}
++
++/* Port 0 from the DS3, when one is connected. */
++static void pad_apply_ds3(void)
++{
++    PadDs3State ds3;
++    if (!pad_ds3_snapshot(&ds3))
++    {
++        return;
++    }
++    PadHostState* hostState = &s_host_state[0];
++    hostState->connected = 1;
++    hostState->buttons = ds3.buttons;
++    hostState->analog_lx = ds3.stickLeftX;
++    hostState->analog_ly = ds3.stickLeftY;
++    hostState->analog_rx = ds3.stickRightX;
++    hostState->analog_ry = ds3.stickRightY;
++    hostState->press_up = ds3.pressure[0];
++    hostState->press_right = ds3.pressure[1];
++    hostState->press_down = ds3.pressure[2];
++    hostState->press_left = ds3.pressure[3];
++    hostState->trigger_l2 = ds3.pressure[4];
++    hostState->trigger_r2 = ds3.pressure[5];
++    hostState->press_l1 = ds3.pressure[6];
++    hostState->press_r1 = ds3.pressure[7];
++    hostState->press_triangle = ds3.pressure[8];
++    hostState->press_circle = ds3.pressure[9];
++    hostState->press_cross = ds3.pressure[10];
++    hostState->press_square = ds3.pressure[11];
++}
++
++/* For a port's own UI (engine menus): the DS3's buttons and left stick,
++ * unaffected by g_cellpad_block_guest_input. Returns 0 with no DS3. */
++int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton)
++{
++    PadDs3State ds3;
++    if (!pad_ds3_snapshot(&ds3))
++    {
++        return 0;
++    }
++    if (buttons)
++    {
++        *buttons = ds3.buttons;
++    }
++    if (stickLeftX)
++    {
++        *stickLeftX = ds3.stickLeftX;
++    }
++    if (stickLeftY)
++    {
++        *stickLeftY = ds3.stickLeftY;
++    }
++    if (psButton)
++    {
++        *psButton = ds3.psButton;
++    }
++    return 1;
++}
++#else
++int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton)
++{
++    (void)buttons; (void)stickLeftX; (void)stickLeftY; (void)psButton;
++    return 0;
++}
++static volatile long s_motion_mode = 0;
++#endif
++
++/* Where the guest's sensor words come from:
++ *   0  automatic: the SIXAXIS when a DS3 is connected, otherwise "automatic
++ *      capture" (below), so a pad without motion sensors can still play
++ *   1  SIXAXIS only: the DS3's sensors, or a controller at rest without one
++ *   2  automatic capture: every axis reads full scale, which a motion
++ *      gesture accepts at once (what the port did before motion support:
++ *      sensor mode was never recorded, so the words read 0)
++ * While a port's menu blocks guest input the sensors read at rest.
++ * Returns the previous mode. */
++int cellPad_set_motion_mode(int mode)
++{
++    if (mode < 0 || mode > 2)
++    {
++        mode = 0;
++    }
++#ifdef _WIN32
++    return (int)InterlockedExchange(&s_motion_mode, (LONG)mode);
++#else
++    const int previous = (int)s_motion_mode;
++    s_motion_mode = mode;
++    return previous;
++#endif
++}
++
++/* 1 when the guest is getting live SIXAXIS data right now. */
++int cellPad_motion_live(void)
++{
++#ifdef _WIN32
++    PadDs3State ds3;
++    return pad_ds3_snapshot(&ds3) && InterlockedCompareExchange(&s_motion_mode, 0, 0) != 2;
++#else
++    return 0;
++#endif
++}
++
+ static void pad_poll_xinput(void)
+ {
+     for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+@@ -290,7 +647,8 @@ static void pad_poll_xinput(void)
+ 
+ static void pad_init_backend(void)
+ {
+-    /* XInput needs no explicit init */
++    /* XInput needs no explicit init; the DS3 reader runs on its own thread. */
++    pad_ds3_start();
+ }
+ 
+ static void pad_shutdown_backend(void)
+@@ -478,6 +836,7 @@ static void pad_poll_backend(void)
+ 
+ #if PAD_BACKEND_XINPUT
+     pad_poll_xinput();
++    pad_apply_ds3();
+ #elif PAD_BACKEND_SDL2
+     pad_poll_sdl2();
+ #endif
+@@ -844,10 +1203,28 @@ skip_inject: ;
+     /* Sensor data (only meaningful if SENSOR_ON) */
+     if (setting & CELL_PAD_SETTING_SENSOR_ON) {
+         /* Default sensor values: accelerometer at rest (512 = 1g center) */
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = 512;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = 399; /* gravity */
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = 512;
+-        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = 512;
++        u16 sensorWords[4] = { 512, 399 /* gravity */, 512, 512 };
++#if PAD_BACKEND_XINPUT
++        const LONG motionMode = InterlockedCompareExchange(&s_motion_mode, 0, 0);
++        PadDs3State ds3;
++        const int haveDs3 = port_no == 0 && pad_ds3_snapshot(&ds3);
++        if (g_cellpad_block_guest_input)
++        {
++            /* menu open: at rest */
++        }
++        else if (motionMode == 2 || (motionMode == 0 && !haveDs3))
++        {
++            sensorWords[0] = sensorWords[1] = sensorWords[2] = sensorWords[3] = 0;
++        }
++        else if (haveDs3)
++        {
++            memcpy(sensorWords, ds3.sensor, sizeof(sensorWords));
++        }
++#endif
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = sensorWords[0];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Y] = sensorWords[1];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_Z] = sensorWords[2];
++        data->button[CELL_PAD_BTN_OFFSET_SENSOR_G] = sensorWords[3];
+     }
+     }  /* end connected block */
+ 
+@@ -1094,6 +1471,33 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
+     return CELL_OK;
+ }
+ 
++/* cellPadInfoSensorMode / cellPadSetSensorMode: the SIXAXIS counterpart of
++ * press mode. Without Set recording CELL_PAD_SETTING_SENSOR_ON, GetData left
++ * the four sensor words 0 -- full scale negative on every axis -- which a
++ * motion-gesture title reads as the controller being yanked in every
++ * direction at once. */
++s32 cellPadInfoSensorMode(u32 port_no)
++{
++    if (!s_pad_initialized)
++        return CELL_PAD_ERROR_NOT_OPENED;
++    if (port_no >= CELL_PAD_MAX_PORT_NUM)
++        return CELL_PAD_ERROR_INVALID_PARAMETER;
++    return 1;                                  /* supported */
++}
++
++s32 cellPadSetSensorMode(u32 port_no, u32 mode)
++{
++    if (!s_pad_initialized)
++        return CELL_PAD_ERROR_NOT_OPENED;
++    if (port_no >= CELL_PAD_MAX_PORT_NUM)
++        return CELL_PAD_ERROR_INVALID_PARAMETER;
++    if (mode)
++        s_port_setting[port_no] |= CELL_PAD_SETTING_SENSOR_ON;
++    else
++        s_port_setting[port_no] &= ~(u32)CELL_PAD_SETTING_SENSOR_ON;
++    return CELL_OK;
++}
++
+ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
+ {
+     if (!s_pad_initialized)
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+index 89c58ab..b4ebabf 100644
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -199,6 +199,12 @@ s32 cellPadClearBuf(u32 port_no);
+ 
+ /* Internal: call once per frame to update pad state from host input */
+ void cellPad_poll(void);
++s32 cellPadInfoSensorMode(u32 port_no);
++s32 cellPadSetSensorMode(u32 port_no, u32 mode);
++/* Host-side DualShock 3 (SIXAXIS) support, Windows: see cellPad.c. */
++int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton);
++int cellPad_set_motion_mode(int mode);
++int cellPad_motion_live(void);
+ 
+ #ifdef __cplusplus
+ }

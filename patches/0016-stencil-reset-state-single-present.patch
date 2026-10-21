@@ -1,0 +1,64 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index 6e90bc8..404191b 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -171,6 +171,35 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
+      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
+     rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+ 
++    /* NV40 reset stencil state (RPCS3 rsx_methods.cpp reset image): write
++     * and compare masks 0xFF, func ALWAYS, ops KEEP, front and back. A title
++     * that never sets the stencil write mask relies on that 0xFF -- Folklore
++     * marks lit geometry with REPLACE 0x80, decrements inside its shadow
++     * volumes, then darkens wherever stencil < 0x80. With the mask left at
++     * zero nothing was ever written, the whole frame read as "in shadow",
++     * and gameplay was far too dark. */
++    {
++        static const u32 stencilResetState[][2] = {
++            { 0x032C, 0xFFu },     /* STENCIL_MASK */
++            { 0x0330, 0x0207u },   /* STENCIL_FUNC = ALWAYS */
++            { 0x0338, 0xFFu },     /* STENCIL_FUNC_MASK */
++            { 0x033C, 0x1E00u },   /* STENCIL_OP_FAIL = KEEP */
++            { 0x0340, 0x1E00u },   /* STENCIL_OP_ZFAIL */
++            { 0x0344, 0x1E00u },   /* STENCIL_OP_ZPASS */
++            { 0x034C, 0xFFu },     /* BACK_STENCIL_MASK */
++            { 0x0350, 0x0207u },   /* BACK_STENCIL_FUNC */
++            { 0x0358, 0xFFu },     /* BACK_STENCIL_FUNC_MASK */
++            { 0x035C, 0x1E00u },   /* BACK_STENCIL_OP_FAIL */
++            { 0x0360, 0x1E00u },   /* BACK_STENCIL_OP_ZFAIL */
++            { 0x0364, 0x1E00u },   /* BACK_STENCIL_OP_ZPASS */
++        };
++        if (!getenv("PS3_RSX_NO_STENCIL_RESET")) {
++            for (u32 index = 0; index < sizeof(stencilResetState) / sizeof(stencilResetState[0]); index++) {
++                rsx->regs[stencilResetState[index][0] >> 2] = stencilResetState[index][1];
++            }
++        }
++    }
++
+     /* Execution methods */
+     mark_class(rsx, M_VERTEX_BEGIN_END,  1, RSX_DSP_CLASS_EXEC);
+     mark_class(rsx, M_VB_VERTEX_BATCH,   1, RSX_DSP_CLASS_EXEC);
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 1658fae..7bfefe4 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -594,7 +594,18 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+                  * during boot. */
+                 unsigned fc = cellGcm_flip_request_count();
+                 if (fc != last_flip || fc == 0) {
+-                    if (fc) present_guest_frame(); else rsx_present_frame();
++                    /* A flip the drain just reached raises the count AND the
++                     * pending flag; present it here and the flag would
++                     * present the same frame again on the next pass (every
++                     * in-FIFO flip showed twice: 120 presents a second for a
++                     * 60 fps title, half of them wasted). Consume the flag
++                     * with the count. */
++                    if (fc) {
++                        (void)cellGcm_take_flip_pending();
++                        present_guest_frame();
++                    } else {
++                        rsx_present_frame();
++                    }
+                     last_flip = fc;
+                 } else if (fc == 0) {
+                     rsx_backend_present();

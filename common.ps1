@@ -1,0 +1,94 @@
+# common.ps1 -- shared paths and helpers for setup.ps1 / build.ps1 / run.ps1.
+# Everything lives under the folder this file is in.
+
+$ErrorActionPreference = 'Stop'
+[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+$ProgressPreference = 'SilentlyContinue'   # Invoke-WebRequest is very slow with the progress bar on
+
+$Root          = $PSScriptRoot
+$Tools         = Join-Path $Root 'tools'
+$Downloads     = Join-Path $Tools '_downloads'
+$Ps3RecompDir  = Join-Path $Root 'ps3recomp'
+$PortDir       = Join-Path $Root 'folklore'
+$LogDir        = Join-Path $Root 'logs'
+
+# The ps3recomp revision the lifted code in folklore\src was generated and
+# test-built against. Change it only together with a relift (tools\relift.sh).
+$Ps3RecompCommit = '39a36296511c445707adabcd312f0b740cfbd694'
+
+$GitExe    = Join-Path $Tools 'git\cmd\git.exe'
+$CMakeExe  = Join-Path $Tools 'cmake\bin\cmake.exe'
+$NinjaDir  = Join-Path $Tools 'ninja'
+$PythonExe = Join-Path $Tools 'python\tools\python.exe'
+$FfmpegDir = Join-Path $Tools 'ffmpeg'
+$VsBuildToolsDir = Join-Path $Tools 'VSBuildTools'
+
+function Invoke-Native([scriptblock]$command)
+{
+    # Windows PowerShell 5.1 turns every stderr line of a native program into an
+    # error record when stderr is redirected, and with 'Stop' the first one
+    # (a compiler warning, a log line from the game) aborts the script.
+    # Run native tools with 'Continue' and judge them by $LASTEXITCODE instead.
+    $previousPreference = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try
+    {
+        & $command
+    }
+    finally
+    {
+        $ErrorActionPreference = $previousPreference
+    }
+}
+
+function Write-Step([string]$message)
+{
+    Write-Host ''
+    Write-Host "==> $message" -ForegroundColor Cyan
+}
+
+function Find-VsInstall
+{
+    # 1) Build Tools installed by setup.ps1 into tools\VSBuildTools.
+    $localClang = Join-Path $VsBuildToolsDir 'VC\Tools\Llvm\x64\bin\clang-cl.exe'
+    if (Test-Path $localClang)
+    {
+        return $VsBuildToolsDir
+    }
+
+    # 2) An existing Visual Studio that already has the C++ tools AND clang-cl.
+    $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+    if (Test-Path $vswhere)
+    {
+        $candidates = & $vswhere -all -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        foreach ($candidate in $candidates)
+        {
+            if (Test-Path (Join-Path $candidate 'VC\Tools\Llvm\x64\bin\clang-cl.exe'))
+            {
+                return $candidate
+            }
+        }
+    }
+    return $null
+}
+
+function Import-BuildEnvironment
+{
+    $vsPath = Find-VsInstall
+    if (-not $vsPath)
+    {
+        throw 'No Visual Studio / Build Tools with clang-cl found. Run setup.ps1 first.'
+    }
+    $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+    $lines = & cmd.exe /c "`"$vcvars`" >nul 2>&1 && set"
+    foreach ($line in $lines)
+    {
+        if ($line -match '^([^=]+)=(.*)$')
+        {
+            Set-Item -Path "env:$($matches[1])" -Value $matches[2]
+        }
+    }
+    $clangBin = Join-Path $vsPath 'VC\Tools\Llvm\x64\bin'
+    $extraPaths = @((Split-Path $CMakeExe), $NinjaDir, (Split-Path $PythonExe), (Split-Path $GitExe), $clangBin, (Join-Path $FfmpegDir 'bin'))
+    $env:PATH = ($extraPaths -join ';') + ';' + $env:PATH
+}

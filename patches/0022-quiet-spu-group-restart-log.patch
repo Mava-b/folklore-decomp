@@ -1,0 +1,162 @@
+diff --git a/runtime/spu/spu_lifted_thread.c b/runtime/spu/spu_lifted_thread.c
+index fbd439b..52ae709 100644
+--- a/runtime/spu/spu_lifted_thread.c
++++ b/runtime/spu/spu_lifted_thread.c
+@@ -8,6 +8,21 @@
+ #include <stdlib.h>
+ #include <string.h>
+ 
++/* The per-run start/stop lines repeat for as long as a title restarts its SPU
++ * group per unit of work (Folklore's audio: ~185 a second), each flushed
++ * through the console. Log the first 16, then every 4096th;
++ * PS3_SPU_LOG_ALL=1 logs them all. */
++static int spu_run_log_wanted(volatile unsigned* counter)
++{
++    static int logAll = -1;
++    if (logAll < 0)
++    {
++        logAll = getenv("PS3_SPU_LOG_ALL") ? 1 : 0;
++    }
++    const unsigned count = (*counter)++;
++    return logAll || count < 16u || (count % 4096u) == 0u;
++}
++
+ extern uint8_t* vm_base;
+ 
+ /* The lifted-code registry, the dispatcher and the per-context MFC engine
+@@ -111,9 +126,13 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
+     memset(&r, 0, sizeof(r));
+     if (!ctx) { if (out) *out = r; return; }
+ 
+-    fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X (image %d)\n",
+-            ctx->spu_id, ctx->pc, ctx->image_id);
+-    fflush(stderr);
++    static volatile unsigned runningLogs = 0;
++    if (spu_run_log_wanted(&runningLogs))
++    {
++        fprintf(stderr, "[SPU] tid=0x%X RUNNING lifted image entry=0x%05X (image %d)\n",
++                ctx->spu_id, ctx->pc, ctx->image_id);
++        fflush(stderr);
++    }
+ 
+     ctx->status = SPU_STATUS_RUNNING;
+     /* The dispatcher resolves ctx->pc in ctx->image_id and runs it; the halt
+@@ -143,11 +162,15 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
+         r.faulted = 1;
+     }
+ 
+-    fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X) "
+-            "-> status=%d%s%s\n",
+-            ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
+-            r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
+-    fflush(stderr);
++    static volatile unsigned stoppedLogs = 0;
++    if (r.faulted || spu_run_log_wanted(&stoppedLogs))
++    {
++        fprintf(stderr, "[SPU] tid=0x%X stopped (status=0x%X pc=0x%05X code=0x%X) "
++                "-> status=%d%s%s\n",
++                ctx->spu_id, ctx->status, ctx->pc, ctx->stop_code, r.exit_status,
++                r.group_exit ? " group-exit" : "", r.faulted ? " FAULT" : "");
++        fflush(stderr);
++    }
+ 
+     /* This thread run has ended; remove observer references and release its
+      * private engine before restart can reset the context or destroy frees it. */
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index f105b82..57b6b4e 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -11,6 +11,21 @@
+  */
+ 
+ #include <stdlib.h>   /* calloc, free */
++
++/* SPU thread-group start/stop lines repeat for as long as a title restarts a
++ * group per unit of work -- Folklore's audio does it ~185 times a second, one
++ * group per mix block -- and every line is flushed through the console. Log
++ * the first 16 of each kind, then every 4096th. PS3_SPU_LOG_ALL=1 logs all. */
++static int spu_group_log_wanted(volatile unsigned* counter)
++{
++    static int logAll = -1;
++    if (logAll < 0)
++    {
++        logAll = getenv("PS3_SPU_LOG_ALL") ? 1 : 0;
++    }
++    const unsigned count = (*counter)++;
++    return logAll || count < 16u || (count % 4096u) == 0u;
++}
+ #include "ps3emu/nid.h"   /* ps3_compute_nid (static inline) */
+ #include "lv2_syscall_table.h"
+ #include "sys_ppu_thread.h"
+@@ -1037,14 +1052,18 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+                 t->finish_event.done = 0;
+                 spu_spawn_host_thread(&t->host_thread, spu_exec_thread_proc, t);
+ #endif
+-                fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
+-                        "args=0x%08X -> LIFTED SPU execution (image %d, "
+-                        "r3=0x%08X%08X r4=0x%08X%08X r5=0x%08X%08X r6=0x%08X%08X)\n",
+-                        id, t->tid, t->entry_point, t->args_ea, t->sctx->image_id,
+-                        t->sctx->gpr[3]._u32[0], t->sctx->gpr[3]._u32[1],
+-                        t->sctx->gpr[4]._u32[0], t->sctx->gpr[4]._u32[1],
+-                        t->sctx->gpr[5]._u32[0], t->sctx->gpr[5]._u32[1],
+-                        t->sctx->gpr[6]._u32[0], t->sctx->gpr[6]._u32[1]);
++                static volatile unsigned liftedStartLogs = 0;
++                if (spu_group_log_wanted(&liftedStartLogs))
++                {
++                    fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X "
++                            "args=0x%08X -> LIFTED SPU execution (image %d, "
++                            "r3=0x%08X%08X r4=0x%08X%08X r5=0x%08X%08X r6=0x%08X%08X)\n",
++                            id, t->tid, t->entry_point, t->args_ea, t->sctx->image_id,
++                            t->sctx->gpr[3]._u32[0], t->sctx->gpr[3]._u32[1],
++                            t->sctx->gpr[4]._u32[0], t->sctx->gpr[4]._u32[1],
++                            t->sctx->gpr[5]._u32[0], t->sctx->gpr[5]._u32[1],
++                            t->sctx->gpr[6]._u32[0], t->sctx->gpr[6]._u32[1]);
++                }
+                 spawned++;
+                 continue;
+             }
+@@ -1183,8 +1202,12 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+                         "a context -- mailbox writes will fall back to re-runs\n",
+                         t->tid);
+         }
+-        fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X args=0x%08X -> spawned host thread\n",
+-                id, t->tid, t->entry_point, t->args_ea);
++        static volatile unsigned spawnedLogs = 0;
++        if (spu_group_log_wanted(&spawnedLogs))
++        {
++            fprintf(stderr, "[SPU] group_start id=0x%X tid=0x%X entry=0x%08X args=0x%08X -> spawned host thread\n",
++                    id, t->tid, t->entry_point, t->args_ea);
++        }
+         spawned++;
+     }
+ 
+@@ -1199,8 +1222,12 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+         fprintf(stderr, "[SPU] group_start id=0x%X (%u thread(s), none spawned: %d ran synchronously, %d had no fallback)\n",
+                 id, g->num_threads, instant - nofb, nofb);
+     } else {
+-        fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
+-                id, spawned, instant);
++        static volatile unsigned runningLogs = 0;
++        if (spu_group_log_wanted(&runningLogs))
++        {
++            fprintf(stderr, "[SPU] group_start id=0x%X (%d host threads running, %d instant)\n",
++                    id, spawned, instant);
++        }
+     }
+     fflush(stderr);
+     ctx->gpr[3] = 0;
+@@ -1302,8 +1329,12 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
+     vm_write_be32(cause_ea,  g->cause);
+     vm_write_be32(status_ea, (uint32_t)g->exit_status);
+ 
+-    fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
+-            id, g->cause, g->exit_status, g->event_queue_id);
++    static volatile unsigned joinLogs = 0;
++    if (spu_group_log_wanted(&joinLogs))
++    {
++        fprintf(stderr, "[SPU] group_join id=0x%X cause=%u status=%d (event_queue=0x%X)\n",
++                id, g->cause, g->exit_status, g->event_queue_id);
++    }
+     fflush(stderr);
+     ctx->gpr[3] = 0;
+     return 0;

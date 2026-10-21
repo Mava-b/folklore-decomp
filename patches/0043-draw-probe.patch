@@ -1,0 +1,358 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 753bc50..96e65a6 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -3636,6 +3636,7 @@ static int surface_containing(u32 location, u32 abs, u32 pitch, u32 w, u32 h,
+  * Returns 1 when handled, <= 0 when not (reason codes in ld_blit_gpu). */
+ static FILE* s_csv_file;       /* defined with live_draw_csv_emit */
+ static int   s_csv_gate_open;
++static u32   s_csv_gate_session;
+ 
+ static int ld_blit_gpu(u32 src_loc, u32 src_abs, u32 src_pitch,
+                        u32 dst_loc, u32 dst_abs, u32 dst_pitch, u32 w, u32 h);
+@@ -5145,6 +5146,297 @@ static int ld_scale_wpos(char* hlsl, u32 capacity, u32 drawScale, float drawScal
+     return replaced;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Draw probe (diagnostics).
++ *
++ * LD_PROBE_PSO=<key>[,<key>...] (keys as the pso_key column of draws.csv):
++ * while a render capture is open, the first draws with those keys write
++ * their state to <LD_DRAW_DUMP>/probe.txt -- every non-zero vertex constant,
++ * the texture units and a summary of unit 0's texels -- so a draw that
++ * executes but shows nothing can be followed offline.
++ *
++ * LD_PROBE_AB=<prim>: during a capture, matching draws of that primitive
++ * type render as an A/B over consecutive frames (frame % 4): 0 as the game asks, 1 without the
++ * depth test, 2 without the alpha test, 3 with texture unit 0 white. A
++ * capture's flip images then show which change makes the draw appear.
++ * -----------------------------------------------------------------------*/
++static u64 g_ld_probe_keys[8];
++static u32 g_ld_probe_key_count = 0;
++static int g_ld_probe_ab_prim = -1;
++static int g_ld_probe_variant = 0;      /* set per draw before get_pso */
++
++static void ld_probe_init(void)
++{
++    static int initialized = 0;
++    if (initialized)
++    {
++        return;
++    }
++    initialized = 1;
++    const char* keys = getenv("LD_PROBE_PSO");
++    while (keys && *keys && g_ld_probe_key_count < 8)
++    {
++        char* end = NULL;
++        const u64 key = _strtoui64(keys, &end, 16);
++        if (end == keys)
++        {
++            break;
++        }
++        g_ld_probe_keys[g_ld_probe_key_count++] = key;
++        keys = end;
++        while (*keys == ',' || *keys == ' ')
++        {
++            keys++;
++        }
++    }
++    const char* abText = getenv("LD_PROBE_AB");
++    if (abText && *abText)
++    {
++        g_ld_probe_ab_prim = atoi(abText);
++    }
++    if (g_ld_probe_key_count)
++    {
++        fprintf(stderr, "[probe] %u key(s), A/B on prim %d\n", g_ld_probe_key_count, g_ld_probe_ab_prim);
++    }
++}
++
++static int ld_probe_matches(u64 key)
++{
++    for (u32 keyIndex = 0; keyIndex < g_ld_probe_key_count; keyIndex++)
++    {
++        if (g_ld_probe_keys[keyIndex] == key)
++        {
++            return (int)keyIndex + 1;
++        }
++    }
++    return 0;
++}
++
++static float ld_probe_half(u16 bits)
++{
++    const u32 sign = (u32)(bits >> 15) << 31;
++    const u32 exponent = (bits >> 10) & 0x1Fu;
++    const u32 mantissa = bits & 0x3FFu;
++    u32 out;
++    if (exponent == 0)
++    {
++        out = sign;
++    }
++    else if (exponent == 31)
++    {
++        out = sign | 0x7F800000u | (mantissa << 13);
++    }
++    else
++    {
++        out = sign | ((exponent + 112u) << 23) | (mantissa << 13);
++    }
++    float value;
++    memcpy(&value, &out, sizeof value);
++    return value;
++}
++
++/* Texel summary of a texture's first level from guest memory. */
++static void ld_probe_texture_summary(FILE* file, const rsx_dsp_texture* texture)
++{
++    const u32 baseFormat = texture->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    const u32 width = texture->width;
++    const u32 height = texture->height;
++    if (!width || !height || width > 4096 || height > 4096)
++    {
++        return;
++    }
++    if (baseFormat == TEX_FMT_DXT1 || baseFormat == TEX_FMT_DXT23 || baseFormat == TEX_FMT_DXT45)
++    {
++        const u32 blockBytes = baseFormat == TEX_FMT_DXT1 ? 8u : 16u;
++        const u32 blocksWide = (width + 3u) / 4u;
++        const u32 blocksHigh = (height + 3u) / 4u;
++        const u8* source = guest_ptr(texture->location, texture->offset, blocksWide * blocksHigh * blockBytes);
++        if (!source)
++        {
++            fprintf(file, "    texels: unreadable\n");
++            return;
++        }
++        u32 alphaMin = 255;
++        u32 alphaMax = 0;
++        unsigned long long alphaSum = 0;
++        u32 colorMax = 0;
++        u32 zeroBlocks = 0;
++        const u32 blockCount = blocksWide * blocksHigh;
++        for (u32 blockIndex = 0; blockIndex < blockCount; blockIndex++)
++        {
++            const u8* block = source + (size_t)blockIndex * blockBytes;
++            int allZero = 1;
++            for (u32 byteIndex = 0; byteIndex < blockBytes; byteIndex++)
++            {
++                if (block[byteIndex])
++                {
++                    allZero = 0;
++                    break;
++                }
++            }
++            if (allZero)
++            {
++                zeroBlocks++;
++            }
++            u32 alphaHigh = 255;
++            u32 alphaLow = 255;
++            const u8* colorBlock = block;
++            if (baseFormat == TEX_FMT_DXT45)
++            {
++                alphaHigh = block[0] > block[1] ? block[0] : block[1];
++                alphaLow = block[0] < block[1] ? block[0] : block[1];
++                colorBlock = block + 8;
++            }
++            else if (baseFormat == TEX_FMT_DXT23)
++            {
++                alphaHigh = 0;
++                alphaLow = 255;
++                for (u32 nibbleIndex = 0; nibbleIndex < 16; nibbleIndex++)
++                {
++                    const u32 nibble = (block[nibbleIndex / 2] >> ((nibbleIndex & 1u) * 4u)) & 0xFu;
++                    const u32 alpha = nibble * 17u;
++                    alphaHigh = alpha > alphaHigh ? alpha : alphaHigh;
++                    alphaLow = alpha < alphaLow ? alpha : alphaLow;
++                }
++                colorBlock = block + 8;
++            }
++            alphaMin = alphaLow < alphaMin ? alphaLow : alphaMin;
++            alphaMax = alphaHigh > alphaMax ? alphaHigh : alphaMax;
++            alphaSum += alphaHigh;
++            /* Endpoints as stored (byte order as in guest memory). */
++            const u32 endpointA = (u32)colorBlock[0] | ((u32)colorBlock[1] << 8);
++            const u32 endpointB = (u32)colorBlock[2] | ((u32)colorBlock[3] << 8);
++            colorMax = endpointA > colorMax ? endpointA : colorMax;
++            colorMax = endpointB > colorMax ? endpointB : colorMax;
++        }
++        fprintf(file, "    texels: %u blocks, %u all-zero, block alpha min %u max %u mean-of-max %.1f, "
++                      "max colour endpoint 0x%04X\n",
++                blockCount, zeroBlocks, alphaMin, alphaMax,
++                blockCount ? (double)alphaSum / (double)blockCount : 0.0, colorMax);
++        fprintf(file, "    first block:");
++        for (u32 byteIndex = 0; byteIndex < blockBytes; byteIndex++)
++        {
++            fprintf(file, " %02X", source[byteIndex]);
++        }
++        fprintf(file, "\n");
++        return;
++    }
++    if (baseFormat == TEX_FMT_A8R8G8B8)
++    {
++        const u8* source = guest_ptr(texture->location, texture->offset, width * height * 4u);
++        if (!source)
++        {
++            fprintf(file, "    texels: unreadable\n");
++            return;
++        }
++        u32 channelMax[4] = {0, 0, 0, 0};
++        for (u32 texelIndex = 0; texelIndex < width * height; texelIndex++)
++        {
++            for (u32 channel = 0; channel < 4; channel++)
++            {
++                const u32 value = source[(size_t)texelIndex * 4u + channel];
++                channelMax[channel] = value > channelMax[channel] ? value : channelMax[channel];
++            }
++        }
++        fprintf(file, "    texels: byte maxima %u %u %u %u\n",
++                channelMax[0], channelMax[1], channelMax[2], channelMax[3]);
++    }
++}
++
++static void ld_probe_draw(u64 key, u32 prim)
++{
++    if (!g_ld_probe_key_count || !s_csv_file || !s_csv_gate_open)
++    {
++        return;
++    }
++    const int match = ld_probe_matches(key);
++    if (!match)
++    {
++        return;
++    }
++    /* Six draws per key and primitive type per capture, so a key's rarer
++     * primitive (the tether's tri-strips among its quads) is reached too. */
++    static u32 written[8][16];
++    static u32 session = 0;
++    if (session != s_csv_gate_session)
++    {
++        session = s_csv_gate_session;
++        memset(written, 0, sizeof written);
++    }
++    const u32 primSlot = prim & 15u;
++    if (written[match - 1][primSlot] >= 6u)
++    {
++        return;
++    }
++    written[match - 1][primSlot]++;
++    static FILE* file = NULL;
++    if (!file)
++    {
++        const char* directory = getenv("LD_DRAW_DUMP");
++        char path[MAX_PATH * 2];
++        snprintf(path, sizeof path, "%s\\probe.txt", directory && *directory ? directory : ".");
++        file = fopen(path, "a");
++        if (!file)
++        {
++            return;
++        }
++    }
++    render_state_t state;
++    decode_render_state(&state);
++    rsx_dsp_surface surface;
++    rsx_dsp_get_surface(&g.rsx, &surface);
++    fprintf(file, "== capture %u frame %u key %016llx prim %u variant %d\n", s_csv_gate_session, g_ld_frames,
++            (unsigned long long)key, prim, g_ld_probe_variant);
++    fprintf(file, "  alpha test %u func 0x%X ref 0x%X (fmt %u -> %.4f), depth test %u write %u func 0x%X, "
++                  "blend %u sf 0x%X df 0x%X, cull %u, zeta 0x%X, clip %ux%u, vp_start %u\n",
++            state.alpha_test_enable, state.alpha_func, state.alpha_ref_raw, state.alpha_ref_format,
++            rsx_fp_alpha_ref(state.alpha_ref_raw, state.alpha_ref_format), state.depth_test,
++            state.depth_write, state.depth_func, state.blend_enable, state.sf_rgb, state.df_rgb,
++            state.cull_enable, surface.zeta_offset, surface.clip_w, surface.clip_h, rsx_dsp_vp_start(&g.rsx));
++    for (u32 constantIndex = 0; constantIndex < 512; constantIndex++)
++    {
++        const u32* words = g.rsx.constants[constantIndex];
++        if (!(words[0] | words[1] | words[2] | words[3]))
++        {
++            continue;
++        }
++        float values[4];
++        memcpy(values, words, sizeof values);
++        fprintf(file, "  c%u = %.6g %.6g %.6g %.6g\n", constantIndex, values[0], values[1], values[2], values[3]);
++    }
++    for (u32 unit = 0; unit < 4; unit++)
++    {
++        rsx_dsp_texture texture;
++        rsx_dsp_get_texture(&g.rsx, unit, &texture);
++        if (!texture.enabled)
++        {
++            continue;
++        }
++        fprintf(file, "  tex%u %u:0x%08X fmt 0x%02X %ux%u mips %u pitch %u wrap 0x%08X remap 0x%08X "
++                      "filter 0x%08X control0 0x%08X border 0x%08X\n",
++                unit, texture.location, texture.offset, texture.format, texture.width, texture.height,
++                texture.mipmaps, texture.pitch, texture.wrap, texture.remap, texture.filter, texture.control0,
++                texture.border_color);
++        if (unit == 0)
++        {
++            ld_probe_texture_summary(file, &texture);
++        }
++    }
++    (void)ld_probe_half;
++    fflush(file);
++}
++
++/* The A/B variant this draw renders with (0 = as asked). */
++static int ld_probe_choose_variant(u64 key, u32 prim)
++{
++    if (g_ld_probe_ab_prim < 0 || (int)prim != g_ld_probe_ab_prim || !ld_probe_matches(key) ||
++        !s_csv_file || !s_csv_gate_open)
++    {
++        return 0;
++    }
++    return (int)(g_ld_frames & 3u);
++}
++
+ static ID3D12PipelineState* get_pso(
+     const rsx_vertex_layout_plan* masked_layout, int packed_payload)
+ {
+@@ -5248,6 +5540,14 @@ static ID3D12PipelineState* get_pso(
+ 
+     render_state_t rs;
+     decode_render_state(&rs);
++    if (g_ld_probe_variant == 1)
++    {
++        rs.depth_test = 0;
++    }
++    else if (g_ld_probe_variant == 2)
++    {
++        rs.alpha_test_enable = 0;
++    }
+     if (rsx_fp_collect_constants(
+             fp_uc, fp_size, &g.fp_constants) < 0) {
+         LD_PSO_BAIL("fragment program constant collection failed");
+@@ -7337,7 +7637,7 @@ static FILE* s_csv_file;
+ static int   s_csv_gate_open = 1;
+ /* Counts gate openings, so LD_DRAW_DUMP and the flip dumps re-arm for each
+  * capture instead of only the first one of the run. */
+-static u32   s_csv_gate_session = 0;
++static u32   s_csv_gate_session;
+ 
+ /* Capture-only geometry diagnostics for one draw, appended to its CSV row:
+  *   ar=first+count,...      the DRAW_ARRAYS batches (first four)
+@@ -8346,6 +8646,14 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         write_topology_indices(
+             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+ 
++    ld_probe_init();
++    g_ld_probe_variant = 0;
++    if (g_ld_probe_key_count)
++    {
++        const u64 probeKey = live_legacy_pso_key();
++        ld_probe_draw(probeKey, prim);
++        g_ld_probe_variant = ld_probe_choose_variant(probeKey, prim);
++    }
+     ID3D12PipelineState* pso = get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+         ld_vertex_compact_payload());
+@@ -8795,7 +9103,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+                 if (!seen && n_zdepth_used < SRV_TABLE_SIZE)
+                     zdepth_used[n_zdepth_used++] = (u32)sampled_depth;
+             } else {
+-                slots[u] = texture_srv_slot(&t);
++                slots[u] = (g_ld_probe_variant == 3 && u == 0) ? SRV_WHITE : texture_srv_slot(&t);
+                 if (slots[u] == SRV_WHITE) g_ld_bind_white++; else g_ld_bind_real++;
+             }
+         }

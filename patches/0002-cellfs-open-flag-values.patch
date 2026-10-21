@@ -1,0 +1,57 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 3203246..0992a2b 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -90,9 +90,15 @@ extern "C" const char* ppu_vfs_root = ".";
+ #define CELL_FS_O_RDONLY     0
+ #define CELL_FS_O_WRONLY     1
+ #define CELL_FS_O_RDWR       2
+-#define CELL_FS_O_CREAT      0x0200
+-#define CELL_FS_O_TRUNC      0x0400
+-#define CELL_FS_O_APPEND     0x0100
++/* PS3 SDK values, which are OCTAL like POSIX (cellFs.h: O_CREAT 000100,
++ * O_TRUNC 001000, O_APPEND 002000). These were 0x200/0x400/0x100, so a plain
++ * O_WRONLY|O_CREAT (0x41) never created the file -- Folklore's first-boot HDD
++ * install opens TMP_HDD_COPY.DAT that way and stops with "HDD access error".
++ * O_CREAT|O_TRUNC (0x241) only worked because 0x200 was read as "create". */
++#define CELL_FS_O_CREAT      0x0040
++#define CELL_FS_O_EXCL       0x0080
++#define CELL_FS_O_TRUNC      0x0200
++#define CELL_FS_O_APPEND     0x0400
+ #define CELL_FS_SEEK_SET     0
+ #define CELL_FS_SEEK_CUR     1
+ #define CELL_FS_SEEK_END     2
+@@ -227,12 +233,14 @@ static void cellFsOpen(ppu_context* ctx)
+      * real open() flags from the access mode (low 2 bits) + the modifiers, then
+      * wrap the fd in a FILE* with fdopen() (which neither creates nor truncates
+      * -- that was already decided by open()). */
++    if (getenv("PS3_FS_OPENFLAGS")) fprintf(stderr, "[fs] open flags=0x%X '%s'\n", flags, gpath);
+     int acc = flags & 0x3;
+     int oflags = (acc == CELL_FS_O_RDWR)   ? O_RDWR
+                : (acc == CELL_FS_O_WRONLY) ? O_WRONLY : O_RDONLY;
+     if (flags & CELL_FS_O_CREAT)  oflags |= O_CREAT;
+     if (flags & CELL_FS_O_TRUNC)  oflags |= O_TRUNC;
+     if (flags & CELL_FS_O_APPEND) oflags |= O_APPEND;
++    if (flags & CELL_FS_O_EXCL)   oflags |= O_EXCL;
+ 
+     /* A bare device root ("/dev_bdvd") resolves to a DIRECTORY, and open() on a
+      * directory fails on Windows. Real cellFsOpen answers EISDIR there, and a
+diff --git a/runtime/syscalls/sys_fs.h b/runtime/syscalls/sys_fs.h
+index dbe84c4..4cbad6a 100644
+--- a/runtime/syscalls/sys_fs.h
++++ b/runtime/syscalls/sys_fs.h
+@@ -70,10 +70,11 @@ extern "C" {
+ #define CELL_FS_O_WRONLY   0x000001
+ #define CELL_FS_O_RDWR     0x000002
+ #define CELL_FS_O_ACCMODE  0x000003
+-#define CELL_FS_O_CREAT    0x000100
++/* Octal in the SDK (000100 / 001000 / 000200 / 002000), as in libs/filesystem/cellFs.h. */
++#define CELL_FS_O_CREAT    0x000040
+ #define CELL_FS_O_TRUNC    0x000200
+-#define CELL_FS_O_EXCL     0x000400
+-#define CELL_FS_O_APPEND   0x002000
++#define CELL_FS_O_EXCL     0x000080
++#define CELL_FS_O_APPEND   0x000400
+ 
+ /* Seek modes */
+ #define CELL_FS_SEEK_SET   0

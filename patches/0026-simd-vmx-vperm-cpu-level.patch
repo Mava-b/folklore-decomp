@@ -1,0 +1,234 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index cefc2a9..fc8b38d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -335,6 +335,17 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
+     if(PS3RECOMP_HAS_MSSE41)
+         target_compile_options(ps3recomp_runtime PRIVATE -msse4.1)
+     endif()
++    # PS3RECOMP_CPU_LEVEL=<march> (e.g. x86-64-v3): build the runtime -- the
++    # renderer's vertex/texture work, the SPU helpers -- for a newer CPU level.
++    # Empty (the default) keeps the baseline above.
++    set(PS3RECOMP_CPU_LEVEL "" CACHE STRING "-march level for the runtime (empty = baseline)")
++    if(PS3RECOMP_CPU_LEVEL)
++        if(CMAKE_C_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
++            target_compile_options(ps3recomp_runtime PRIVATE /clang:-march=${PS3RECOMP_CPU_LEVEL})
++        else()
++            target_compile_options(ps3recomp_runtime PRIVATE -march=${PS3RECOMP_CPU_LEVEL})
++        endif()
++    endif()
+ elseif(MSVC)
+     # Real cl.exe -- clang-cl reports its id as Clang and is handled above.
+     #
+diff --git a/runtime/ppu/ppu_vmx.h b/runtime/ppu/ppu_vmx.h
+index 35052c6..fc9ec34 100644
+--- a/runtime/ppu/ppu_vmx.h
++++ b/runtime/ppu/ppu_vmx.h
+@@ -270,17 +270,17 @@ VMX_INL float vmx_minf(float x, float y) {
+     if (x == 0 && y == 0) return signbit(x) ? x : y;      /* min(-0,+0) = -0 */
+     return x < y ? x : y;
+ }
+-VMX_FBIN(vmx_vaddfp, vmx_f(x) + vmx_f(y), 1)
+-VMX_FBIN(vmx_vsubfp, vmx_f(x) - vmx_f(y), 1)
++VMX_FBIN(vmx_vaddfp_ref, vmx_f(x) + vmx_f(y), 1)
++VMX_FBIN(vmx_vsubfp_ref, vmx_f(x) - vmx_f(y), 1)
+ VMX_FBIN(vmx_vmaxfp, vmx_maxf(vmx_f(x), vmx_f(y)), 0)
+ VMX_FBIN(vmx_vminfp, vmx_minf(vmx_f(x), vmx_f(y)), 0)
+ 
+-VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
++VMX_INL void vmx_vmaddfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+     for (int i = 0; i < 4; i++) {
+         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
+               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
+         vmx_sw(r, i, vmx_flush(vmx_fix(vmx_u(fmaf(x, z, y))), vscr)); } VMX_OUT; }
+-VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
++VMX_INL void vmx_vnmsubfp_ref(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { VMX_ARGS_PREP; const uint8_t* c = (const uint8_t*)c_;
+     for (int i = 0; i < 4; i++) {
+         float x = vmx_f(vmx_flush(vmx_w(a, i), vscr)), y = vmx_f(vmx_flush(vmx_w(b, i), vscr)),
+               z = vmx_f(vmx_flush(vmx_w(c, i), vscr));
+@@ -291,8 +291,8 @@ VMX_INL void name(VMX_D, VMX_B, uint32_t vscr) { const uint8_t* b = (const uint8
+     for (int i = 0; i < 4; i++) { uint32_t y = vmx_w(b, i); if (flush_in) y = vmx_flush(y, vscr); \
+         float f = vmx_f(y); uint32_t z = vmx_u(expr); \
+         vmx_sw(r, i, nanmode == 2 ? vmx_flush(vmx_vnan1(z, y), vscr) : vmx_fix(z)); } VMX_OUT; }
+-VMX_FUN(vmx_vrefp, 1.0f / f, 1, 2)
+-VMX_FUN(vmx_vrsqrtefp, 1.0f / sqrtf(f), 1, 2)
++VMX_FUN(vmx_vrefp_ref, 1.0f / f, 1, 2)
++VMX_FUN(vmx_vrsqrtefp_ref, 1.0f / sqrtf(f), 1, 2)
+ VMX_FUN(vmx_vexptefp, exp2f(f), 0, 1)
+ VMX_FUN(vmx_vlogefp, log2f(f), 0, 1)
+ VMX_FUN(vmx_vrfin, nearbyintf(f), 0, 2)      /* host default rounding: to nearest even */
+@@ -300,6 +300,150 @@ VMX_FUN(vmx_vrfiz, truncf(f), 0, 2)
+ VMX_FUN(vmx_vrfip, ceilf(f), 1, 2)
+ VMX_FUN(vmx_vrfim, floorf(f), 1, 2)
+ 
++/* ---- SIMD fast paths -------------------------------------------------------
++ * The float ops above are the reference: one lane at a time, through byte
++ * assembly. They are the bulk of a game's vector maths (Folklore's lift has
++ * ~10k vmaddfp sites) and, scalar, the hottest code in its frame. With SSE4.1
++ * and FMA available at compile time (-march=x86-64-v3) the same operations run
++ * as one byte-swap, one vector op and the same fix-ups, bit for bit:
++ *   - inputs and results flushed to signed zero when VSCR[NJ] is set;
++ *   - add/sub/refp/rsqrtefp: an input NaN propagates (A before B) quieted, a
++ *     NaN made from non-NaN inputs becomes 0x7FC00000 -- done with explicit
++ *     blends, so the result never depends on which operand x86 propagates;
++ *   - madd/nmsub: fused (one rounding, as fmaf), any NaN becomes 0x7FC00000;
++ *     nmsub negates the fused a*c-b, so a zero result keeps fmaf's sign.
++ * VMX_NO_SIMD forces the reference path (tests compare the two). */
++#if defined(__SSSE3__) && defined(__SSE4_1__) && defined(__FMA__) && !defined(VMX_NO_SIMD)
++#include <immintrin.h>
++#define VMX_SIMD 1
++
++VMX_INL __m128i vmx_simd_swap_mask(void)
++{
++    return _mm_setr_epi8(3, 2, 1, 0, 7, 6, 5, 4, 11, 10, 9, 8, 15, 14, 13, 12);
++}
++VMX_INL __m128 vmx_simd_load(const void* source)
++{
++    const __m128i raw = _mm_loadu_si128((const __m128i*)source);
++    return _mm_castsi128_ps(_mm_shuffle_epi8(raw, vmx_simd_swap_mask()));
++}
++VMX_INL void vmx_simd_store(void* destination, __m128 value)
++{
++    _mm_storeu_si128((__m128i*)destination,
++                     _mm_shuffle_epi8(_mm_castps_si128(value), vmx_simd_swap_mask()));
++}
++VMX_INL __m128 vmx_simd_flush(__m128 value, uint32_t vscr)
++{
++    if (!(vscr & VMX_NJ))
++    {
++        return value;
++    }
++    const __m128i bits = _mm_castps_si128(value);
++    const __m128i exponentZero = _mm_cmpeq_epi32(
++        _mm_and_si128(bits, _mm_set1_epi32(0x7F800000)), _mm_setzero_si128());
++    const __m128i signOnly = _mm_and_si128(bits, _mm_set1_epi32((int)0x80000000u));
++    return _mm_castsi128_ps(_mm_blendv_epi8(bits, signOnly, exponentZero));
++}
++VMX_INL __m128 vmx_simd_fix(__m128 value)
++{
++    const __m128 isNan = _mm_cmpunord_ps(value, value);
++    return _mm_blendv_ps(value, _mm_castsi128_ps(_mm_set1_epi32(0x7FC00000)), isNan);
++}
++VMX_INL __m128 vmx_simd_quiet(__m128 value)
++{
++    return _mm_or_ps(value, _mm_castsi128_ps(_mm_set1_epi32(0x00400000)));
++}
++/* vnan2: A's NaN, else B's NaN (quieted), else the fixed result. */
++VMX_INL __m128 vmx_simd_nan2(__m128 result, __m128 x, __m128 y)
++{
++    __m128 out = vmx_simd_fix(result);
++    out = _mm_blendv_ps(out, vmx_simd_quiet(y), _mm_cmpunord_ps(y, y));
++    out = _mm_blendv_ps(out, vmx_simd_quiet(x), _mm_cmpunord_ps(x, x));
++    return out;
++}
++VMX_INL __m128 vmx_simd_nan1(__m128 result, __m128 y)
++{
++    return _mm_blendv_ps(vmx_simd_fix(result), vmx_simd_quiet(y), _mm_cmpunord_ps(y, y));
++}
++
++VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr)
++{
++    const __m128 x = vmx_simd_flush(vmx_simd_load(a_), vscr);
++    const __m128 y = vmx_simd_flush(vmx_simd_load(b_), vscr);
++    vmx_simd_store(d_, vmx_simd_flush(vmx_simd_nan2(_mm_add_ps(x, y), x, y), vscr));
++}
++VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr)
++{
++    const __m128 x = vmx_simd_flush(vmx_simd_load(a_), vscr);
++    const __m128 y = vmx_simd_flush(vmx_simd_load(b_), vscr);
++    vmx_simd_store(d_, vmx_simd_flush(vmx_simd_nan2(_mm_sub_ps(x, y), x, y), vscr));
++}
++VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr)
++{
++    const __m128 x = vmx_simd_flush(vmx_simd_load(a_), vscr);
++    const __m128 y = vmx_simd_flush(vmx_simd_load(b_), vscr);
++    const __m128 z = vmx_simd_flush(vmx_simd_load(c_), vscr);
++    vmx_simd_store(d_, vmx_simd_flush(vmx_simd_fix(_mm_fmadd_ps(x, z, y)), vscr));
++}
++VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr)
++{
++    const __m128 x = vmx_simd_flush(vmx_simd_load(a_), vscr);
++    const __m128 y = vmx_simd_flush(vmx_simd_load(b_), vscr);
++    const __m128 z = vmx_simd_flush(vmx_simd_load(c_), vscr);
++    const __m128 negated = _mm_xor_ps(_mm_fmsub_ps(x, z, y),
++                                      _mm_castsi128_ps(_mm_set1_epi32((int)0x80000000u)));
++    vmx_simd_store(d_, vmx_simd_flush(vmx_simd_fix(negated), vscr));
++}
++VMX_INL void vmx_vrefp(VMX_D, VMX_B, uint32_t vscr)
++{
++    const __m128 y = vmx_simd_flush(vmx_simd_load(b_), vscr);
++    const __m128 result = _mm_div_ps(_mm_set1_ps(1.0f), y);
++    vmx_simd_store(d_, vmx_simd_flush(vmx_simd_nan1(result, y), vscr));
++}
++VMX_INL void vmx_vrsqrtefp(VMX_D, VMX_B, uint32_t vscr)
++{
++    const __m128 y = vmx_simd_flush(vmx_simd_load(b_), vscr);
++    const __m128 result = _mm_div_ps(_mm_set1_ps(1.0f), _mm_sqrt_ps(y));
++    vmx_simd_store(d_, vmx_simd_flush(vmx_simd_nan1(result, y), vscr));
++}
++#else
++VMX_INL void vmx_vaddfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vaddfp_ref(d_, a_, b_, vscr); }
++VMX_INL void vmx_vsubfp(VMX_D, VMX_A, VMX_B, uint32_t vscr) { vmx_vsubfp_ref(d_, a_, b_, vscr); }
++VMX_INL void vmx_vmaddfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vmaddfp_ref(d_, a_, b_, c_, vscr); }
++VMX_INL void vmx_vnmsubfp(VMX_D, VMX_A, VMX_B, VMX_C, uint32_t vscr) { vmx_vnmsubfp_ref(d_, a_, b_, c_, vscr); }
++VMX_INL void vmx_vrefp(VMX_D, VMX_B, uint32_t vscr) { vmx_vrefp_ref(d_, b_, vscr); }
++VMX_INL void vmx_vrsqrtefp(VMX_D, VMX_B, uint32_t vscr) { vmx_vrsqrtefp_ref(d_, b_, vscr); }
++#endif
++
++/* vperm: d[i] = (c[i] & 0x10 ? b : a)[c[i] & 0x0F], bytes in register order
++ * (which is guest order, so no swap). One pshufb per source and a blend. */
++VMX_INL void vmx_vperm_ref(VMX_D, VMX_A, VMX_B, VMX_C)
++{
++    const uint8_t* a = (const uint8_t*)a_;
++    const uint8_t* b = (const uint8_t*)b_;
++    const uint8_t* c = (const uint8_t*)c_;
++    uint8_t r[16];
++    for (int index = 0; index < 16; index++)
++    {
++        const uint8_t select = c[index] & 0x1F;
++        r[index] = select < 16 ? a[select] : b[select - 16];
++    }
++    VMX_OUT;
++}
++#ifdef VMX_SIMD
++VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C)
++{
++    const __m128i a = _mm_loadu_si128((const __m128i*)a_);
++    const __m128i b = _mm_loadu_si128((const __m128i*)b_);
++    const __m128i c = _mm_loadu_si128((const __m128i*)c_);
++    const __m128i index = _mm_and_si128(c, _mm_set1_epi8(0x0F));
++    const __m128i useB = _mm_cmpeq_epi8(_mm_and_si128(c, _mm_set1_epi8(0x10)), _mm_set1_epi8(0x10));
++    const __m128i result = _mm_blendv_epi8(_mm_shuffle_epi8(a, index), _mm_shuffle_epi8(b, index), useB);
++    _mm_storeu_si128((__m128i*)d_, result);
++}
++#else
++VMX_INL void vmx_vperm(VMX_D, VMX_A, VMX_B, VMX_C) { vmx_vperm_ref(d_, a_, b_, c_); }
++#endif
++
+ /* int <-> float with a 2^uimm scale */
+ VMX_INL void vmx_vcfux(VMX_D, VMX_B, unsigned uimm) { const uint8_t* b = (const uint8_t*)b_; uint8_t r[16];
+     for (int i = 0; i < 4; i++) vmx_sw(r, i, vmx_u(ldexpf((float)vmx_w(b, i), -(int)uimm))); VMX_OUT; }
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 7089aa4..8ffd271 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -2931,15 +2931,10 @@ class PPULifter:
+             va = int(ops[1][1:])
+             vb = int(ops[2][1:])
+             vc = int(ops[3][1:])
+-            return (f"{{ uint8_t* a = (uint8_t*)&ctx->vr[{va}]; "
+-                    f"uint8_t* b = (uint8_t*)&ctx->vr[{vb}]; "
+-                    f"uint8_t* c = (uint8_t*)&ctx->vr[{vc}]; "
+-                    f"uint8_t* d = (uint8_t*)&ctx->vr[{vd}]; "
+-                    f"uint8_t tmp[16]; "
+-                    f"for (int i = 0; i < 16; i++) {{ "
+-                    f"uint8_t sel = c[i] & 0x1F; "
+-                    f"tmp[i] = (sel < 16) ? a[sel] : b[sel - 16]; }} "
+-                    f"memcpy(d, tmp, 16); }}")
++            # ppu_vmx.h: one pshufb per source and a blend where SSE4.1 is
++            # available, the byte loop otherwise; d may alias any source.
++            return (f"vmx_vperm(&ctx->vr[{vd}], &ctx->vr[{va}], "
++                    f"&ctx->vr[{vb}], &ctx->vr[{vc}]);")
+ 
+         # VMX splat (vspltw, vsplth, vspltb) — duplicate one element across vector
+         if mn == "vspltw":

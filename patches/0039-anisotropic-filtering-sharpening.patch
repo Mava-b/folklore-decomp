@@ -1,0 +1,213 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index a681133..1d3f3c5 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -56,6 +56,8 @@ void rsx_live_draw_set_render_scale(u32 s) { (void)s; }
+ u32  rsx_live_draw_get_render_scale(void) { return 1; }
+ void rsx_live_draw_set_post_aa(int m) { (void)m; }
+ void rsx_live_draw_set_async_shaders(int e) { (void)e; }
++void rsx_live_draw_set_anisotropy(u32 l) { (void)l; }
++void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
+ void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
+ { if (p) *p = 0; if (b) *b = 0; if (s) *s = 0; }
+ u32  rsx_live_draw_get_frames(void) { return 0; }
+@@ -446,6 +448,9 @@ static ld_state g;
+ static u32 g_ld_requested_scale = 1;
+ static volatile LONG g_ld_post_aa = 0;          /* 0 off, 1 FXAA */
+ static volatile LONG g_ld_async_shaders = 1;    /* compile new shaders in the background */
++static volatile LONG g_ld_anisotropy = 1;       /* requested max anisotropy: 1 (off), 2, 4, 8, 16 */
++static u32 s_ld_sampler_anisotropy = 1;         /* what the cached samplers were built with (render thread) */
++static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
+ static volatile LONG g_ld_pso_jobs_pending = 0;
+ static volatile LONG g_ld_pso_jobs_done = 0;
+ static volatile LONG g_ld_pso_draws_skipped = 0;
+@@ -1728,8 +1733,41 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
+     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
+     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
+     sd.MaxAnisotropy = 1;
++    /* Anisotropic filtering (engine setting): only for mip-mapped textures
++     * the game already filters linearly -- the world's surfaces. Render
++     * targets read back by post effects have no mips and point-sampled
++     * lookups keep their filter, so nothing that relies on exact texels
++     * changes. Anisotropic implies trilinear between mips. */
++    if (s_ld_sampler_anisotropy > 1u && mip_present && min_linear && mag_linear)
++    {
++        sd.Filter = D3D12_FILTER_ANISOTROPIC;
++        sd.MaxAnisotropy = s_ld_sampler_anisotropy;
++    }
+     return sd;
+ }
++
++/* A changed anisotropy setting rebuilds the sampler cache at a frame
++ * boundary, once the GPU has finished with every table that holds the old
++ * descriptors. */
++static void ld_wait_idle(void);
++static void ld_refresh_sampler_settings(void)
++{
++    u32 requested = (u32)InterlockedCompareExchange(&g_ld_anisotropy, 0, 0);
++    if (requested != 2u && requested != 4u && requested != 8u && requested != 16u)
++    {
++        requested = 1u;
++    }
++    if (requested == s_ld_sampler_anisotropy)
++    {
++        return;
++    }
++    ld_wait_idle();
++    s_ld_sampler_anisotropy = requested;
++    g.n_samplers = 0;
++    g.smp_ring_used = 0;
++    memset(g.smp_table_fence, 0, sizeof(g.smp_table_fence));
++    fprintf(stderr, "[live-draw] anisotropic filtering %ux\n", requested);
++}
+ /* Cache key of a sampler: exactly the fields decode_sampler reads, so two states share a descriptor only when
+  * they decode alike. The previous key kept wrap bits 0-11 (U and V, none of W at bits 16-19) and shifted the 21-bit
+  * LOD field of control0 left by 18, which drops its top seven bits: min LOD (control0 bits 19-30) above bit 20
+@@ -2083,6 +2121,7 @@ static void ld_submit_frame(void)
+     {
+         ld_flush(LD_FLUSH_PRESENT);
+         ld_rings_reset();
++        ld_refresh_sampler_settings();
+         return;
+     }
+     const HRESULT closeResult = g.list->lpVtbl->Close(g.list);
+@@ -2127,6 +2166,7 @@ static void ld_submit_frame(void)
+     g.list->lpVtbl->Reset(g.list, g.alloc, NULL);
+     g.upload_used = ld_upload_base();
+     ld_rings_reset();
++    ld_refresh_sampler_settings();
+ }
+ 
+ /* Public wrapper for the RSX SET_REFERENCE / sync fence: block until the GPU
+@@ -2172,6 +2212,16 @@ void rsx_live_draw_set_async_shaders(int enabled)
+     InterlockedExchange(&g_ld_async_shaders, enabled ? 1 : 0);
+ }
+ 
++void rsx_live_draw_set_anisotropy(u32 level)
++{
++    InterlockedExchange(&g_ld_anisotropy, (LONG)level);
++}
++
++void rsx_live_draw_set_sharpening(u32 percent)
++{
++    InterlockedExchange(&g_ld_sharpen_percent, (LONG)(percent > 100u ? 100u : percent));
++}
++
+ void rsx_live_draw_get_shader_stats(u32* pending, u32* built, u32* skippedDraws)
+ {
+     if (pending)
+@@ -9058,9 +9108,30 @@ static const char k_ld_present_hlsl[] =
+     "{\n"
+     "    return dot(fetchColor(uv), float3(0.299, 0.587, 0.114));\n"
+     "}\n"
++    "/* Contrast-adaptive sharpening (after AMD FidelityFX CAS): a cross of\n"
++    " * neighbours one pixel away, weighted down where the local contrast is\n"
++    " * already high so edges do not ring. presentOptions.y is 0-1. */\n"
++    "float3 sharpenColor(float2 uv, float3 center, float2 pixelStep)\n"
++    "{\n"
++    "    float strength = presentOptions.y;\n"
++    "    [branch] if (strength <= 0.0)\n"
++    "    {\n"
++    "        return center;\n"
++    "    }\n"
++    "    float3 north = fetchColor(uv - float2(0.0, pixelStep.y));\n"
++    "    float3 south = fetchColor(uv + float2(0.0, pixelStep.y));\n"
++    "    float3 west = fetchColor(uv - float2(pixelStep.x, 0.0));\n"
++    "    float3 east = fetchColor(uv + float2(pixelStep.x, 0.0));\n"
++    "    float3 minimum = min(center, min(min(north, south), min(west, east)));\n"
++    "    float3 maximum = max(center, max(max(north, south), max(west, east)));\n"
++    "    float3 amplitude = sqrt(saturate(min(minimum, 1.0 - maximum) / max(maximum, 1e-5)));\n"
++    "    float peak = -1.0 / lerp(8.0, 5.0, strength);\n"
++    "    float3 weight = amplitude * peak;\n"
++    "    return saturate((center + (north + south + west + east) * weight) / (1.0 + 4.0 * weight));\n"
++    "}\n"
+     "float4 presentScalePs(PresentVertex input) : SV_Target\n"
+     "{\n"
+-    "    return float4(fetchColor(input.uv), 1.0);\n"
++    "    return float4(sharpenColor(input.uv, fetchColor(input.uv), sourceSize.zw), 1.0);\n"
+     "}\n"
+     "float4 presentBoxPs(PresentVertex input) : SV_Target\n"
+     "{\n"
+@@ -9075,7 +9146,7 @@ static const char k_ld_present_hlsl[] =
+     "            total += fetchColor(input.uv + tapPosition * footprint * sourceSize.zw);\n"
+     "        }\n"
+     "    }\n"
+-    "    return float4(total / (tapCount * tapCount), 1.0);\n"
++    "    return float4(sharpenColor(input.uv, total / (tapCount * tapCount), targetSize.zw), 1.0);\n"
+     "}\n"
+     "float4 presentFxaaPs(PresentVertex input) : SV_Target\n"
+     "{\n"
+@@ -9092,7 +9163,7 @@ static const char k_ld_present_hlsl[] =
+     "    float lumaRange = lumaMax - lumaMin;\n"
+     "    if (lumaRange < max(0.0312, lumaMax * 0.125))\n"
+     "    {\n"
+-    "        return float4(colorCenter, 1.0);\n"
++    "        return float4(sharpenColor(uv, colorCenter, texel), 1.0);\n"
+     "    }\n"
+     "    float lumaDownLeft = lumaAt(uv + float2(-texel.x, texel.y));\n"
+     "    float lumaUpRight = lumaAt(uv + float2(texel.x, -texel.y));\n"
+@@ -9392,8 +9463,9 @@ static void ld_sync_swapchain_size(void)
+ /* Draw the image in SRV slot `sourceSlot` (sourceWidth x sourceHeight host
+  * pixels, already in PIXEL_SHADER_RESOURCE) into back buffer `bufferIndex`,
+  * which is in PRESENT and is left in RENDER_TARGET. */
++/* gameImage: 1 for the game's frame (sharpening applies), 0 for a movie. */
+ static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
+-                           ID3D12Resource* backBuffer, u32 bufferIndex)
++                           ID3D12Resource* backBuffer, u32 bufferIndex, int gameImage)
+ {
+     int mode = LD_PRESENT_SCALE;
+     if (InterlockedCompareExchange(&g_ld_post_aa, 0, 0) == 1 && g.present_pso[LD_PRESENT_FXAA])
+@@ -9467,7 +9539,9 @@ static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
+     const float constants[12] = {
+         (float)sourceWidth, (float)sourceHeight, 1.0f / (float)sourceWidth, 1.0f / (float)sourceHeight,
+         imageWidth, imageHeight, 1.0f / imageWidth, 1.0f / imageHeight,
+-        (float)mode, 0.0f, 0.0f, 0.0f
++        (float)mode,
++        gameImage ? (float)InterlockedCompareExchange(&g_ld_sharpen_percent, 0, 0) / 100.0f : 0.0f,
++        0.0f, 0.0f
+     };
+     g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 12, constants, 0);
+     g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+@@ -10361,7 +10435,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+-        const int drawn = ld_present_pass(SRV_PRESENT_MOVIE, w, h, bb, bbi);
++        const int drawn = ld_present_pass(SRV_PRESENT_MOVIE, w, h, bb, bbi, 0);
+         b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+         b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+@@ -10951,13 +11025,14 @@ void rsx_live_draw_present(u32 buffer_id)
+     const int presentPass = g.present_pso[LD_PRESENT_SCALE] &&
+         (sourceWidth != g.bb_w || sourceHeight != g.bb_h ||
+          presented_surface->fmt != DXGI_FORMAT_R8G8B8A8_UNORM ||
+-         InterlockedCompareExchange(&g_ld_post_aa, 0, 0) != 0);
++         InterlockedCompareExchange(&g_ld_post_aa, 0, 0) != 0 ||
++         InterlockedCompareExchange(&g_ld_sharpen_percent, 0, 0) != 0);
+     if (presentPass)
+     {
+         bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, bar);
+         const int drawn = ld_present_pass(SRV_SURFACE_BASE + target, sourceWidth,
+-                                          sourceHeight, bb, bbi);
++                                          sourceHeight, bb, bbi, 1);
+         bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+         bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+         g.list->lpVtbl->ResourceBarrier(g.list, 1, bar);
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+index ec4c904..7edbff5 100644
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -135,6 +135,12 @@ void rsx_live_draw_set_render_scale(u32 scale);
+ u32  rsx_live_draw_get_render_scale(void);
+ void rsx_live_draw_set_post_aa(int mode);
+ void rsx_live_draw_set_async_shaders(int enabled);
++/* Anisotropic filtering: max anisotropy 1 (off), 2, 4, 8 or 16 for the
++ * game's mip-mapped, linearly filtered textures (live; the sampler cache is
++ * rebuilt at the next frame boundary). Sharpening: 0-100 % contrast-adaptive
++ * sharpening of the presented game image (live; movies are not sharpened). */
++void rsx_live_draw_set_anisotropy(u32 level);
++void rsx_live_draw_set_sharpening(u32 percent);
+ /* Background shader builds queued now, built so far, and draws skipped while
+  * waiting for one (for a performance overlay). */
+ void rsx_live_draw_get_shader_stats(u32* pending, u32* built, u32* skipped_draws);

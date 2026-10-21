@@ -1,0 +1,228 @@
+diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
+index 34614a6..eccde26 100644
+--- a/libs/codec/cellVdec.c
++++ b/libs/codec/cellVdec.c
+@@ -17,6 +17,7 @@
+ #include "../guest_struct.h"   /* GUEST_EA, vm_read/vm_write: guest EA -> host */
+ #include "ps3emu/guest_call.h" /* g_ps3_guest_caller -- cbFunc is a GUEST OPD */
+ #include "../../runtime/memory/vm.h"     /* VM_HLE_INJECT_BASE */
++#include "../../runtime/ppu/ppu_context.h" /* g_active_ctx: the caller's registers */
+ 
+ /* ---------------------------------------------------------------------------
+  * Internal state
+@@ -297,7 +298,50 @@ s32 cellVdecDecodeAu(CellVdecHandle handle, s32 mode, const CellVdecAuInfo* auIn
+         v->auCount++;
+         v->aus[v->auCount % VDEC_AU_RING] = au;
+         v->newPics = 0;
+-        if (au.size) { /* an empty packet would mean end of stream to FFmpeg */
++        /* An AU that does not fit in guest memory is a corrupted descriptor,
++         * not data: copying it read wild host memory and crashed (Folklore's
++         * logo movie, AU ~56, size 1163982640). Skip it -- the title gets
++         * AUDONE and no picture, as if the decoder had rejected it -- and say
++         * what the caller's registers held so the source can be found. */
++        const u64 auEnd = (u64)au.startAddr + au.size;
++        const int auValid = au.startAddr != 0 && au.size <= 0x01000000u &&
++                            (ppu_vm_size == 0 || auEnd <= (u64)ppu_vm_size);
++        if (au.size && !auValid) {
++            static u32 s_badAuLogs = 0;
++            if (s_badAuLogs < 12) {
++                s_badAuLogs++;
++                extern PPU_THREAD_LOCAL ppu_context* g_active_ctx;
++                const ppu_context* caller = g_active_ctx;
++                fprintf(stderr, "[cellVdec] AU %u has an impossible range (addr 0x%08X size %u) -- skipped\n",
++                        v->auCount + 1, au.startAddr, au.size);
++                if (caller) {
++                    /* Folklore's movie input thread: r18 = player+0x134 (AU size
++                     * table at +0x10, its byte length at +0x14), r21 = next
++                     * table entry, r22 = player+0x1A0 (stream ring at +0). */
++                    const u32 sizeTableBase = (u32)caller->gpr[18];
++                    const u32 ringInfo = (u32)caller->gpr[22];
++                    fprintf(stderr, "[cellVdec]   caller lr=0x%08X r18=0x%08X r21=0x%08X r22=0x%08X\n",
++                            (u32)caller->lr, sizeTableBase, (u32)caller->gpr[21], ringInfo);
++                    if (sizeTableBase && (ppu_vm_size == 0 || sizeTableBase + 0x18u <= ppu_vm_size)) {
++                        const u32 table = vm_read32(sizeTableBase + 0x10u);
++                        const u32 tableBytes = vm_read32(sizeTableBase + 0x14u);
++                        fprintf(stderr, "[cellVdec]   size table 0x%08X (%u bytes)", table, tableBytes);
++                        const u32 entryIndex = (u32)caller->gpr[21] ? (u32)caller->gpr[21] - 1u : 0u;
++                        if (table && (ppu_vm_size == 0 || table + entryIndex * 8u + 8u <= ppu_vm_size)) {
++                            fprintf(stderr, " entry %u = %08X %08X", entryIndex,
++                                    vm_read32(table + entryIndex * 8u),
++                                    vm_read32(table + entryIndex * 8u + 4u));
++                        }
++                        fprintf(stderr, "\n");
++                    }
++                    if (ringInfo && (ppu_vm_size == 0 || ringInfo + 0xA0u <= ppu_vm_size)) {
++                        fprintf(stderr, "[cellVdec]   ring base 0x%08X pos 0x%08X\n",
++                                vm_read32(ringInfo), vm_read32(ringInfo + 0x90u));
++                    }
++                }
++            }
++        }
++        if (au.size && auValid) { /* an empty packet would mean end of stream to FFmpeg */
+             int rc = vdec_ff_decode(v->ff, vm_ptr8(au.startAddr), au.size, v->auCount,
+                                     vdec_on_picture, v);
+             /* Say what the failing AU held, so it can be checked against the
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 6b20639..915554f 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -441,6 +441,13 @@ static void cellFsRead(ppu_context* ctx)
+     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
+     fs_prefault(buf, nbytes);
+     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
++    if (getenv("PS3_FS_AIO_LOG"))
++    {
++        const char* slash = strrchr(g_fd_host_path[fd], '/');
++        fprintf(stderr, "[fs-read] fd=%d %s off=0x%lX buf=0x%08X..0x%08llX bytes=0x%zX lr=0x%08X\n",
++                fd, slash ? slash + 1 : g_fd_host_path[fd], fpos_before, buf,
++                (unsigned long long)buf + n, n, (uint32_t)ctx->lr);
++    }
+     /* PS3_FSLOG_EOF=<fd>,<bytes>: report end-of-file past <bytes> on one descriptor.
+      * The intro cinematic is 28 seconds and this port renders it at a few frames
+      * a second, so it cannot be watched to its end -- truncating the stream makes
+@@ -939,6 +946,24 @@ struct FsAioRequest
+     std::string hostPath;
+ };
+ 
++/* PS3_FS_AIO_LOG=1: one line per AIO submit and completion, with the guest
++ * buffer it lands in -- for finding which read overwrote a structure. */
++static bool fs_aio_log_enabled()
++{
++    static int s_enabled = -1;
++    if (s_enabled < 0)
++    {
++        s_enabled = getenv("PS3_FS_AIO_LOG") ? 1 : 0;
++    }
++    return s_enabled == 1;
++}
++
++static const char* fs_aio_file_name(const std::string& hostPath)
++{
++    const size_t slash = hostPath.find_last_of("/\\");
++    return slash == std::string::npos ? hostPath.c_str() : hostPath.c_str() + slash + 1;
++}
++
+ static std::mutex                s_aioMutex;
+ static std::condition_variable   s_aioWake;
+ static std::deque<FsAioRequest>  s_aioQueue;
+@@ -1000,6 +1025,12 @@ static void fs_aio_worker()
+         }
+         int32_t error = CELL_OK;
+         size_t bytesRead = fs_aio_perform(request, &error);
++        if (fs_aio_log_enabled())
++        {
++            fprintf(stderr, "[fs-aio] done   id=%d %s buf=0x%08X..0x%08llX bytes=0x%zX\n",
++                    request.id, fs_aio_file_name(request.hostPath), request.buffer,
++                    (unsigned long long)request.buffer + bytesRead, bytesRead);
++        }
+         if (getenv("PS3_FSLOG"))
+         {
+             fprintf(stderr, "[fs] aio read id=%d fd=%d off=%llu size=%llu -> %zu (async)\n",
+@@ -1056,6 +1087,13 @@ static void cellFsAioRead(ppu_context* ctx)
+ 
+     static std::atomic<int32_t> s_nextId(1);
+     request.id = s_nextId++;
++    if (fs_aio_log_enabled())
++    {
++        fprintf(stderr, "[fs-aio] submit id=%d %s off=0x%llX size=0x%llX buf=0x%08X lr=0x%08X\n",
++                request.id, fs_aio_file_name(request.hostPath),
++                (unsigned long long)request.offset, (unsigned long long)request.size,
++                request.buffer, (uint32_t)ctx->lr);
++    }
+     if (id_ptr) vm_write32(id_ptr, (uint32_t)request.id);
+     ctx->gpr[3] = CELL_OK;
+ 
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 30c7981..e0aa6fb 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -853,9 +853,12 @@ extern "C" void ppu_report_guest_lrs(void)
+     for (long i = 0; i < n; i++) {
+         ppu_context* c = g_resv_ctxs[i];
+         if (!c) continue;
+-        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X\n",
++        fprintf(stderr, "[WATCHDOG]   guest-tid %-3u lr=0x%08X  r3=0x%08X sp=0x%08X"
++                        " r11=0x%X r28=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n",
+                 (unsigned)c->thread_id, (uint32_t)c->lr,
+-                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1]);
++                (uint32_t)c->gpr[3], (uint32_t)c->gpr[1], (uint32_t)c->gpr[11],
++                (uint32_t)c->gpr[28], (uint32_t)c->gpr[29], (uint32_t)c->gpr[30],
++                (uint32_t)c->gpr[31]);
+         /* With BCTRL_RING armed, follow it with that thread's recent INDIRECT
+          * targets. lr cannot see those (bctrl does not write it), so for a
+          * thread looping on a vtable call the ring is the only record of where
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index a5c9bf6..8b95435 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -196,19 +196,28 @@ static LONG WINAPI ydkj_crash_filter(EXCEPTION_POINTERS* ep)
+     GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                        GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                        (LPCSTR)er->ExceptionAddress, &mod);
+-    fprintf(stderr, "[CRASH] module=%p rva=0x%llX  (llvm-symbolizer --obj=ydkj_boot.exe 0x%llX)\n",
+-            (void*)mod, (unsigned long long)((char*)er->ExceptionAddress - (char*)mod),
++    char modulePath[MAX_PATH] = "";
++    if (mod)
++        GetModuleFileNameA(mod, modulePath, sizeof modulePath);
++    const char* moduleName = strrchr(modulePath, '\\') ? strrchr(modulePath, '\\') + 1 : modulePath;
++    fprintf(stderr, "[CRASH] module=%p %s rva=0x%llX\n",
++            (void*)mod, moduleName[0] ? moduleName : "?",
+             (unsigned long long)((char*)er->ExceptionAddress - (char*)mod));
+-    /* Host call stack (RVAs) so the lifted caller can be symbolized. */
+-    void* frames[24];
+-    USHORT n = RtlCaptureStackBackTrace(0, 24, frames, NULL);
++    /* Host call stack, every module: a fault inside a system or FFmpeg DLL
++     * is only explained by the exe frames that called it (symbolize those
++     * with the .map: rva + 0x140000000). */
++    void* frames[32];
++    USHORT n = RtlCaptureStackBackTrace(0, 32, frames, NULL);
+     for (USHORT i = 0; i < n; i++) {
+         HMODULE m = NULL;
+         GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, (LPCSTR)frames[i], &m);
+-        if (m == mod)
+-            fprintf(stderr, "[CRASH]   #%-2u rva=0x%llX\n", i,
+-                    (unsigned long long)((char*)frames[i] - (char*)m));
++        char framePath[MAX_PATH] = "";
++        if (m)
++            GetModuleFileNameA(m, framePath, sizeof framePath);
++        const char* frameName = strrchr(framePath, '\\') ? strrchr(framePath, '\\') + 1 : framePath;
++        fprintf(stderr, "[CRASH]   #%-2u %s+0x%llX\n", i, frameName[0] ? frameName : "?",
++                (unsigned long long)((char*)frames[i] - (char*)m));
+     }
+     fflush(stderr);
+     return EXCEPTION_EXECUTE_HANDLER;
+@@ -635,6 +644,33 @@ static void dump_threads(const char* label, HMODULE self)
+       if (!any) dbg_printf("[WATCHDOG] no guest thread is inside an HLE\n"); }
+     dbg_printf("[WATCHDOG] guest threads, by guest lr:\n");
+     ppu_report_guest_lrs();
++    /* PS3_WATCHDOG_DUMP=0xADDR:0xLEN[,0xADDR:0xLEN...]: hex-dump guest memory
++     * with each sample -- the state a stuck handshake is waiting on (a SPURS
++     * instance, a job chain) next to the threads that are waiting. */
++    { const char* spec = getenv("PS3_WATCHDOG_DUMP");
++      while (spec && *spec) {
++          char* end = NULL;
++          const unsigned long address = strtoul(spec, &end, 0);
++          unsigned long length = 0x100;
++          if (end && *end == ':') {
++              length = strtoul(end + 1, &end, 0);
++          }
++          if (length > 0x4000) {
++              length = 0x4000;
++          }
++          for (unsigned long offset = 0; offset < length; offset += 32) {
++              const uint32_t lineAddress = (uint32_t)(address + offset);
++              if (ppu_vm_size && (uint64_t)lineAddress + 32 > ppu_vm_size) {
++                  break;
++              }
++              dbg_printf("[WATCHDOG] mem %08X:", lineAddress);
++              for (unsigned column = 0; column < 32; column += 4) {
++                  dbg_printf(" %08X", vm_read32(lineAddress + column));
++              }
++              dbg_printf("\n");
++          }
++          spec = (end && *end == ',') ? end + 1 : NULL;
++      } }
+     DWORD me = GetCurrentThreadId(), pid = GetCurrentProcessId();
+     HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+     THREADENTRY32 te; te.dwSize = sizeof te;

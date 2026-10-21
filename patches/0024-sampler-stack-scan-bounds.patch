@@ -1,0 +1,44 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 5d9e552..5fba382 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -690,12 +690,34 @@ static int   s_samp_main = -1;
+ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
+ {
+     (void)h;
++    /* Bound the scan to the committed, readable region the stack pointer is
++     * in. The __try alone is not enough: the runtime's crash reporter is a
++     * vectored handler, which sees a first-chance access violation before any
++     * __except does and ends the run -- a thread caught mid-creation, with no
++     * stack yet, took the whole process down this way. */
+     const uintptr_t* sp = (const uintptr_t*)c->Rsp;
+-    for (int i = 0; i < 512; i++) {          /* 4 KB of stack */
+-        uintptr_t v;
+-        __try { v = sp[i]; } __except (1) { return 0; }
+-        uint32_t g = samp_lookup(v);
+-        if (g) return g;
++    MEMORY_BASIC_INFORMATION region;
++    if (!sp || !VirtualQuery((LPCVOID)sp, &region, sizeof region) ||
++        region.State != MEM_COMMIT ||
++        (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++        !(region.Protect & (PAGE_READONLY | PAGE_READWRITE |
++                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
++    {
++        return 0;
++    }
++    const uintptr_t regionEnd = (uintptr_t)region.BaseAddress + region.RegionSize;
++    uintptr_t words = (regionEnd - (uintptr_t)sp) / sizeof(uintptr_t);
++    if (words > 512)
++    {
++        words = 512;                         /* 4 KB of stack */
++    }
++    for (uintptr_t index = 0; index < words; index++)
++    {
++        const uint32_t guestFunction = samp_lookup(sp[index]);
++        if (guestFunction)
++        {
++            return guestFunction;
++        }
+     }
+     return 0;
+ }

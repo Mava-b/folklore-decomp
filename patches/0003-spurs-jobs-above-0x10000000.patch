@@ -1,0 +1,16 @@
+diff --git a/libs/spurs/cellSpurs.c b/libs/spurs/cellSpurs.c
+index 015913a..8148c6b 100644
+--- a/libs/spurs/cellSpurs.c
++++ b/libs/spurs/cellSpurs.c
+@@ -2402,7 +2402,10 @@ static void jc_run_one_job(u32 job_ea, int idx, u32 size_desc)
+       }
+       _n++; }
+ 
+-    if (!ea_bin || !size_bin || ea_bin >= 0x10000000u) {
++    /* Any mapped guest range, not just below 0x10000000: Folklore keeps its
++     * nine job binaries in the EBOOT data segment at 0x10079E00.. and every
++     * one was skipped as "implausible". */
++    if (!ea_bin || !size_bin || !spurs_guest_range_valid(ea_bin, size_bin)) {
+         static int _b = 0;
+         if (_b++ < 4)
+             printf("[cellSpurs]   job[%d]: implausible binary (ea=0x%08X size=%u) -- skipped\n",

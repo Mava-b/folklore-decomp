@@ -1,0 +1,28 @@
+diff --git a/tools/ppu_lifter.py b/tools/ppu_lifter.py
+index 6e28f3b..0681074 100644
+--- a/tools/ppu_lifter.py
++++ b/tools/ppu_lifter.py
+@@ -5093,6 +5093,23 @@ def main() -> None:
+                 print(f"  TOC candidates: {', '.join(hex(t) for t in toc_candidates)}")
+             tables = discover_jump_tables(all_insns, _read_u32, toc_candidates, text_lo, text_hi,
+                                           func_starts=sorted(s for s, _ in func_bounds))
++            # PPU_JT_HINTS=dispatcher:table:count[,...] (hex): switch tables the
++            # scan cannot find, read as gcc's base-relative signed offsets
++            # (case = table + entry). Folklore 0x34D3C8 dispatches through a
++            # table base it spilled to the stack (ld r7,-0xD0(r1)); unlifted,
++            # its cases became an "unresolved indirect call" that returned
++            # from the function half done.
++            for _hint in filter(None, os.environ.get("PPU_JT_HINTS", "").split(",")):
++                _disp, _table, _count = (int(_x, 16) for _x in _hint.split(":"))
++                _cases = set()
++                for _k in range(_count):
++                    _entry = _read_u32(_table + 4 * _k)
++                    if _entry is None:
++                        break
++                    _entry = _entry - (1 << 32) if _entry & 0x80000000 else _entry
++                    _cases.add((_table + _entry) & 0xFFFFFFFF)
++                tables[_disp] = sorted(_cases)
++                print(f"  jump-table hint 0x{_disp:X}: {len(_cases)} cases from table 0x{_table:X}")
+             jt_dispatchers = tables
+             for ts in tables.values():
+                 jt_targets.update(ts)

@@ -1,0 +1,177 @@
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index dbe1198..5aa68f9 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -972,9 +972,38 @@ static volatile LONG g_resv_locks[PPU_RESV_LOCKS];
+  * vm_write* reads g_resv_store_active directly (a hot global) so the default-off
+  * path costs one predictable branch. */
+ extern "C" int g_resv_store_active = -1;   /* -1 uninit, 0 off, 1 on */
++/* An SPU committed a write to the 128-byte line at `line`: every PPU
++ * reservation inside it is lost, because that line is the PPU's reservation
++ * granule too (see spu_coh_break_ppu in spu_coherency.h). Runs under the
++ * lock-line lock, which ppu_stwcx32/ppu_stdcx64 also hold while they re-check
++ * the reservation and commit on an SPU-reserved line, so the SPU commit and
++ * the PPU store-conditional cannot interleave. PPU_RESV_LINE_OFF=1 restores
++ * the old word-only behaviour for A/B runs. */
++extern "C" void (*g_spu_break_ppu_resv_hook)(uint32_t line);
++static void ppu_resv_break_line(uint32_t line)
++{
++    long contextCount = g_resv_ctx_n;
++    if (contextCount > PPU_RESV_MAX)
++    {
++        contextCount = PPU_RESV_MAX;
++    }
++    for (long contextIndex = 0; contextIndex < contextCount; contextIndex++)
++    {
++        ppu_context* context = g_resv_ctxs[contextIndex];
++        if (context && context->reserve_addr < PPU_RESV_INVALID &&
++            ((uint32_t)context->reserve_addr & ~127u) == line)
++        {
++            context->reserve_addr = PPU_RESV_INVALID;
++        }
++    }
++}
+ extern "C" void ppu_resv_register(ppu_context* c)
+ {
+     if (g_resv_store_active < 0) g_resv_store_active = getenv("PPU_RESV_STORE") ? 1 : 0;
++    if (!g_spu_break_ppu_resv_hook && !getenv("PPU_RESV_LINE_OFF"))
++    {
++        g_spu_break_ppu_resv_hook = ppu_resv_break_line;
++    }
+     long i = _InterlockedExchangeAdd(&g_resv_ctx_n, 1);
+     if (i < PPU_RESV_MAX) g_resv_ctxs[i] = c;
+ }
+@@ -1109,6 +1138,14 @@ extern "C" int ppu_stwcx32(uint64_t ea, uint32_t expected, uint32_t val)
+                 fprintf(stderr, "[ppu-steals-resv] %llu: PPU CAS on reserved line 0x%08X\n",
+                         n, (uint32_t)ea & ~127u); } }
+     if (coh) spu_lockline_lock();
++    /* An SPU commit to this line since the check above broke the reservation
++     * (ppu_resv_break_line); look again now that no commit can land. */
++    if (coh && self && self->reserve_addr != (uint32_t)ea)
++    {
++        spu_lockline_unlock();
++        resv_unlock(L);
++        return 0;
++    }
+     int ok = __atomic_compare_exchange_n((uint32_t*)(vm_base + ea), &exp_raw, new_raw,
+                                          0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+     if (coh) {
+@@ -1180,6 +1217,12 @@ extern "C" int ppu_stdcx64(uint64_t ea, uint64_t expected, uint64_t val)
+     if (self && self->reserve_addr != (uint32_t)ea) { resv_unlock(L); return 0; }
+     int coh = spu_coh_is_reserved((uint32_t)ea);
+     if (coh) spu_lockline_lock();
++    if (coh && self && self->reserve_addr != (uint32_t)ea)
++    {
++        spu_lockline_unlock();
++        resv_unlock(L);
++        return 0;
++    }
+     int ok = __atomic_compare_exchange_n((uint64_t*)(vm_base + ea), &exp_raw, new_raw, 0, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST) ? 1 : 0;
+     if (coh) {
+         if (ok) spu_coh_notify_write((uint32_t)ea);
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index a8ecc1c..c10cd4a 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -694,6 +694,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+                                 n, ctx->image_id, (void*)ctx, ea,
+                                 w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]); } } }
+             spu_coh_notify_write(ea);
++            spu_coh_break_ppu(ea);
+             ctx->atomic_stat = 0;                      /* PUTLLC_SUCCESS */
+         } else {
+             ctx->atomic_stat = 1;                      /* PUTLLC_FAILURE -> retry */
+@@ -765,6 +766,7 @@ static int spu_mfc_atomic(spu_context* ctx, uint32_t cmd)
+          * reservation here would commit a PUTLLC against a snapshot this store
+          * has already overwritten. */
+         spu_coh_notify_write(ea);
++        spu_coh_break_ppu(ea);
+         ctx->resv_valid = 0; ctx->atomic_stat = 2;   /* PUTLLUC complete */
+         spu_lockline_unlock();
+         spu_taskset_line_committed(ea & ~127u);
+diff --git a/runtime/spu/spu_coherency.c b/runtime/spu/spu_coherency.c
+index 812f3c7..8f099b9 100644
+--- a/runtime/spu/spu_coherency.c
++++ b/runtime/spu/spu_coherency.c
+@@ -96,6 +96,9 @@ static spu_coh_entry* s_coh_ctxs;
+ 
+ unsigned long g_spu_lr_raise = 0;
+ 
++/* Installed by the PPU runtime (ppu_loader.cpp); see spu_coherency.h. */
++void (*g_spu_break_ppu_resv_hook)(uint32_t line) = 0;
++
+ void spu_coh_reserve(spu_context* ctx, uint32_t ea)
+ {
+     uint32_t line = ea >> SPU_COH_LINE_SHIFT;
+diff --git a/runtime/spu/spu_coherency.h b/runtime/spu/spu_coherency.h
+index ca76ccd..4931809 100644
+--- a/runtime/spu/spu_coherency.h
++++ b/runtime/spu/spu_coherency.h
+@@ -70,6 +70,31 @@ void spu_coh_forget_range(uintptr_t lo, uintptr_t hi);  /* thread exit */
+  * write does not cost it its reservation on hardware. */
+ void spu_coh_notify_write_except(uint32_t ea, const void* self);
+ 
++/* An SPU committed a write to `ea`'s 128-byte line (PUTLLC, PUTLLUC or a DMA
++ * PUT). Every PPU lwarx/ldarx reservation inside that line is lost, as on
++ * hardware, where the PPU reservation granule is the same 128-byte line.
++ *
++ * Without this a PPU store-conditional only compared its own word, so a
++ * libsre update that reads a neighbouring field inside its reservation could
++ * commit against a value an SPU had already changed. cellSpursShutdownWorkload
++ * does exactly that: lwarx the workload state, read the workload's SPU status
++ * byte 16 bytes away, then store SHUTTING_DOWN (status set) or REMOVABLE. If
++ * the SPURS kernel cleared the status and went idle between the two, the PPU
++ * still committed SHUTTING_DOWN, the kernel had already exited, and nobody
++ * ever completed the shutdown: Folklore froze on its install screen with the
++ * main thread waiting in cellSpursWaitForWorkloadShutdown.
++ *
++ * Call with the lock-line lock held. The PPU runtime installs the hook; with
++ * no PPU runtime linked (SPU unit tests) this does nothing. */
++extern void (*g_spu_break_ppu_resv_hook)(uint32_t line);
++static inline void spu_coh_break_ppu(uint32_t ea)
++{
++    if (g_spu_break_ppu_resv_hook)
++    {
++        g_spu_break_ppu_resv_hook(ea & ~127u);
++    }
++}
++
+ /* Count of LR events delivered. A parked SPURS service that never wakes with
+  * this at zero is a coherence miss; nonzero moves the question downstream. */
+ extern unsigned long g_spu_lr_raise;
+diff --git a/runtime/spu/spu_dma.h b/runtime/spu/spu_dma.h
+index 9820cc2..cf552e1 100644
+--- a/runtime/spu/spu_dma.h
++++ b/runtime/spu/spu_dma.h
+@@ -198,7 +198,10 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+         spu_lockline_lock();
+         memset(vm_base + (uint32_t)ea, 0, size);
+         for (uint32_t offset = 0; offset < size; offset += 128u)
++        {
+             spu_coh_notify_write_except((uint32_t)ea + offset, spu);
++            spu_coh_break_ppu((uint32_t)ea + offset);
++        }
+         spu_lockline_unlock();
+         return 0;
+     }
+@@ -682,7 +685,11 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                 spu_lockline_lock();
+                 memcpy(ea_ptr, ls_ptr, size);
+                 for (uint32_t a = a0; ; a += 128u) {
+-                    if (spu_coh_is_reserved(a)) spu_coh_notify_write_except(a, spu);
++                    if (spu_coh_is_reserved(a))
++                    {
++                        spu_coh_notify_write_except(a, spu);
++                        spu_coh_break_ppu(a);
++                    }
+                     if (a == a1) break;
+                 }
+                 spu_lockline_unlock();
+@@ -692,6 +699,7 @@ static inline int mfc_do_transfer(spu_context* spu, uint32_t lsa, uint64_t ea,
+                     if (spu_coh_is_reserved(a)) {
+                         spu_lockline_lock();
+                         spu_coh_notify_write_except(a, spu);
++                        spu_coh_break_ppu(a);
+                         spu_lockline_unlock();
+                     }
+                     if (a == a1) break;

@@ -1,0 +1,83 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 62a9c79..5a742f1 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6161,6 +6161,18 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+             fprintf(file, "%u:%u:%X:%02X:%ux%u ", u, t.location, t.offset,
+                     t.format & 0xFF, t.width, t.height);
+     }
++    /* Vertex attribute layout: index:type x size /stride @location:offset
++     * (type 1 s16n 2 f32 3 f16 4 u8n 5 s16 6 cmp 7 u8). A mesh that draws
++     * stray polygons can be told apart by its layout and its data address. */
++    fprintf(file, "vb=%X ", rsx_dsp_vertex_data_base_offset(&g.rsx));
++    for (u32 attr = 0; attr < 16; attr++) {
++        rsx_dsp_vertex_attr layout;
++        rsx_dsp_get_vertex_attr(&g.rsx, attr, &layout);
++        if (layout.type && layout.size) {
++            fprintf(file, "v%u:%ux%u/%u@%u:%X ", attr, layout.type, layout.size,
++                    layout.stride, layout.location, layout.offset);
++        }
++    }
+     if (rs.blend_enable)
+         fprintf(file, "bf=%X/%X/%X/%X eq=%X/%X ", rs.sf_rgb, rs.df_rgb, rs.sf_a, rs.df_a,
+                 rs.eq_rgb, rs.eq_a);
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 8b95435..1658fae 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -42,6 +42,7 @@
+ #include <stdint.h>
+ #include <stdio.h>
+ #include <stdlib.h>
++#include <chrono>
+ 
+ extern "C" {
+ uint32_t ppu_load_elf(const char* path);
+@@ -503,7 +504,22 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+      * window DXGI Present throttles hard, which previously stalled these ticks and
+      * paced the game's main loop to ~0.5fps. Drive the ticks off REAL elapsed time
+      * and catch up in a bounded burst so present latency never slows the game. */
+-    ULONGLONG next_tick = GetTickCount64();
++    /* The tick clock is steady_clock (QueryPerformanceCounter on Windows),
++     * not GetTickCount64: that only advances in ~15.6 ms steps whatever
++     * timeBeginPeriod says, so ticks spaced "16 ms" apart came in bursts --
++     * none in one step, two back to back in the next -- and ran 4% fast. A
++     * title that steps its simulation by the vblank count between frames
++     * (Folklore's camera) moved in uneven jumps. The period is the PS3's
++     * 59.94 Hz; PS3_VBLANK_US overrides it in microseconds. */
++    typedef std::chrono::steady_clock TickClock;
++    std::chrono::microseconds tickPeriod(16683);
++    if (const char* periodText = getenv("PS3_VBLANK_US")) {
++        const long periodMicroseconds = strtol(periodText, NULL, 0);
++        if (periodMicroseconds >= 1000) {
++            tickPeriod = std::chrono::microseconds(periodMicroseconds);
++        }
++    }
++    TickClock::time_point nextTick = TickClock::now();
+     for (;;) {
+         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
+          * fence queue, and had no waiter -- so a guest starved for `get` or a
+@@ -512,8 +528,9 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+          * does. */
+         cellGcm_fifo_kick_wait(4);
+         ULONGLONG now = GetTickCount64();
++        const TickClock::time_point tickNow = TickClock::now();
+         int fired = 0;
+-        while ((long long)(now - next_tick) >= 0 && fired < 240) {
++        while (tickNow >= nextTick && fired < 240) {
+             cellGcmTickVBlank();
+             cellGcmTickFlip();
+             /* Present a pending flip BEFORE draining further: the flip fires
+@@ -532,10 +549,10 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+              * Doing it here (not after present) keeps those fences advancing at 60Hz
+              * even when present() throttles on a hidden/occluded window. */
+             if (rsx_ok) cellGcm_rsx_process_fifo();
+-            next_tick += 16;                 /* ~60 Hz */
++            nextTick += tickPeriod;          /* 59.94 Hz */
+             fired++;
+         }
+-        if (fired >= 240) next_tick = now;   /* fell too far behind -> resync */
++        if (fired >= 240) nextTick = tickNow;   /* fell too far behind -> resync */
+         /* Drain at the outer ~4ms cadence too (not just the 16ms tick):
+          * titles fence EVERY render pass on an RSX label the drain writes;
+          * at 16ms per fence wave's six passes paced the guest to ~7 fps.

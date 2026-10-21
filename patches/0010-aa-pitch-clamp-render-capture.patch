@@ -1,0 +1,186 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index 62e9052..6e90bc8 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -457,6 +457,63 @@ u32 rsx_dsp_clear_zstencil(const rsx_dispatch* rsx)
+     return rsx_dsp_reg(rsx, M_CLEAR_DEPTH_VALUE);
+ }
+ 
++/* Bytes per pixel of a SURFACE_FORMAT colour format (0 = unknown). */
++static u32 surface_color_bytes(u32 colorFormat)
++{
++    switch (colorFormat) {
++    case 0x1: case 0x2: case 0x3: case 0xA:
++        return 2u;
++    case 0x9:
++        return 1u;
++    case 0xB:
++        return 8u;
++    case 0xC:
++        return 16u;
++    case 0x4: case 0x5: case 0x8: case 0xD: case 0xE: case 0xF: case 0x10:
++        return 4u;
++    default:
++        return 0u;
++    }
++}
++
++/* An antialiased linear surface is only as wide as its pitch holds.
++ *
++ * Folklore declares its 2x (DIAGONAL_CENTERED_2) scene targets with a
++ * 2560-pixel clip over a 10240-byte pitch and draws them through a
++ * 1280-pixel viewport: 2560 samples, which is all that memory can hold.
++ * clip x 2 gave a 5120-wide surface at the same address as the 2560-wide one
++ * the same buffer had been declared as before, so the scene went into one
++ * and the passes that sample it as a 2560x720 texture read the other (stale,
++ * or half empty) -- the dark layer over the player-select screen.
++ * PS3_RSX_NO_AA_PITCH_CLAMP=1 restores the unclamped width. */
++static u32 clamp_aa_width_to_pitch(u32 sampleWidth, u32 colorFormat,
++                                   u32 rasterType, u32 pitch, u32 offset,
++                                   u32 clipPixels, u32 antialias)
++{
++    static int disabled = -1;
++    static u32 clampLogs = 0;
++    if (disabled < 0) {
++        disabled = getenv("PS3_RSX_NO_AA_PITCH_CLAMP") ? 1 : 0;
++    }
++    const u32 bytesPerPixel = surface_color_bytes(colorFormat);
++    if (disabled || rasterType == 2u || pitch < 64u || !bytesPerPixel) {
++        return sampleWidth;
++    }
++    const u32 pitchWidth = pitch / bytesPerPixel;
++    if (sampleWidth <= pitchWidth) {
++        return sampleWidth;
++    }
++    if (clampLogs < 16u) {
++        clampLogs++;
++        fprintf(stderr,
++                "[surf-aa-clamp] 0x%X clip=%u aa=%u -> %u samples exceeds pitch %u "
++                "(fmt 0x%X); using %u\n",
++                offset, clipPixels, antialias, sampleWidth, pitch, colorFormat,
++                pitchWidth);
++    }
++    return pitchWidth;
++}
++
+ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
+ {
+     const u32 fmt = rsx_dsp_reg(rsx, M_RT_FORMAT);
+@@ -476,6 +533,7 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
+     out->antialias = (fmt >> 12) & 0xF;
+     out->aa_sx = (out->antialias >= 3 && out->antialias <= 5) ? 2u : 1u;
+     out->aa_sy = (out->antialias == 4 || out->antialias == 5) ? 2u : 1u;
++    const u32 clipPixels = out->clip_w;
+     out->clip_x *= out->aa_sx; out->clip_w *= out->aa_sx;
+     out->clip_y *= out->aa_sy; out->clip_h *= out->aa_sy;
+ 
+@@ -491,6 +549,12 @@ void rsx_dsp_get_surface(const rsx_dispatch* rsx, rsx_dsp_surface* out)
+     out->color_location[1] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR1));
+     out->color_location[2] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR2));
+     out->color_location[3] = dma_to_location(rsx_dsp_reg(rsx, M_DMA_COLOR3));
++    if (out->aa_sx > 1u) {
++        out->clip_w = clamp_aa_width_to_pitch(out->clip_w, out->color_format,
++                                              out->raster_type, out->color_pitch[0],
++                                              out->color_offset[0], clipPixels,
++                                              out->antialias);
++    }
+     out->color_target  = rsx_dsp_reg(rsx, M_RT_ENABLE);
+     out->zeta_offset   = rsx_dsp_reg(rsx, M_ZETA_OFFSET);
+     out->zeta_pitch    = rsx_dsp_reg(rsx, M_ZETA_PITCH);
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 9e3996b..62a9c79 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6005,6 +6005,9 @@ static u64 live_decoded_vertex_hash(u64 attr_hash[16])
+  * (rsx_live_draw_blit notes each 2D copy where it falls in the draw stream). */
+ static FILE* s_csv_file;
+ static int   s_csv_gate_open = 1;
++/* Counts gate openings, so LD_DRAW_DUMP and the flip dumps re-arm for each
++ * capture instead of only the first one of the run. */
++static u32   s_csv_gate_session = 0;
+ 
+ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+ {
+@@ -6027,7 +6030,16 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+     { static const char* gate = (const char*)-1; static int open_gate = 0; static unsigned poll;
+       if (gate == (const char*)-1) gate = getenv("RSX_DRAW_CSV_GATE");
+       if (gate) {
+-          if ((poll++ & 511u) == 0) { struct stat st; open_gate = stat(gate, &st) == 0; }
++          if ((poll++ & 511u) == 0) {
++              struct stat st;
++              const int nowOpen = stat(gate, &st) == 0;
++              if (nowOpen && !open_gate) {
++                  s_csv_gate_session++;
++                  fprintf(stderr, "[live-diff] capture %u opened at frame %u\n",
++                          s_csv_gate_session, g_ld_frames);
++              }
++              open_gate = nowOpen;
++          }
+           s_csv_gate_open = open_gate;
+           if (!open_gate) return;
+       } }
+@@ -6074,14 +6086,19 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+      * gated frame, read back each k-th draw's target BEFORE it is recorded,
+      * named by frame-relative index -- bisects which draw changes a surface. */
+     { static const char* dir = (const char*)-1; static u32 every, frame = ~0u, idx, dumped_frame = ~0u;
++      static u32 dumpedSession = 0;
+       if (dir == (const char*)-1) { dir = getenv("LD_DRAW_DUMP");
+           const char* e = getenv("LD_DRAW_DUMP_EVERY"); every = e ? (u32)atoi(e) : 10; if (!every) every = 10; }
++      if (dumpedSession != s_csv_gate_session) {
++          dumpedSession = s_csv_gate_session;
++          dumped_frame = ~0u;
++      }
+       if (frame != g_ld_frames) { frame = g_ld_frames; idx = 0; }
+       if (dir && target < g.n_surfaces && (dumped_frame == ~0u || dumped_frame == frame) &&
+           (idx % every) == 0) {
+           dumped_frame = frame;
+           char path[MAX_PATH * 2];
+-          snprintf(path, sizeof(path), "%s\\draw_f%06u_i%04u_%08X.ppm", dir, frame, idx, surf);
++          snprintf(path, sizeof(path), "%s\\draw_c%u_f%06u_i%04u_%08X.ppm", dir, s_csv_gate_session, frame, idx, surf);
+           ld_dump_surface_ppm(path, &g.surfaces[target]);
+       }
+       idx++; }
+@@ -6174,7 +6191,9 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+             fprintf(file, "bb=%.0f,%.0f-%.0f,%.0f ", x0, y0, x1, y1);
+         }
+     }
+-    fprintf(file, "A=%u:%X/%u fmt=%u rt=%u ", sf.color_location[0], sf.color_offset[0], sf.color_pitch[0], sf.color_format, sf.raster_type);
++    fprintf(file, "A=%u:%X/%u fmt=%u rt=%u aa=%u ", sf.color_location[0], sf.color_offset[0], sf.color_pitch[0], sf.color_format, sf.raster_type, sf.antialias);
++    fprintf(file, "slot=%u:%ux%u ", target, target < g.n_surfaces ? g.surfaces[target].w : 0u,
++            target < g.n_surfaces ? g.surfaces[target].h : 0u);
+     fprintf(file, "ct=0x%X B=%u:%X C=%u:%X D=%u:%X ", sf.color_target,
+             sf.color_location[1], sf.color_offset[1], sf.color_location[2], sf.color_offset[2],
+             sf.color_location[3], sf.color_offset[3]);
+@@ -8855,6 +8874,32 @@ void rsx_live_draw_present(u32 buffer_id)
+         return;
+     }
+     g_ld_last_present_target = target;
++    /* While an RSX_DRAW_CSV capture is open: a #flip row per present, and the
++     * first six presented frames of each capture into LD_DRAW_DUMP (flicker
++     * shows up as consecutive frames that differ). */
++    if (s_csv_file && s_csv_gate_open) {
++        fprintf(s_csv_file, "#flip,%u,buffer=%u,slot=%u,0x%X,%ux%u\n", g_ld_frames,
++                buffer_id, target, g.surfaces[target].offset,
++                g.surfaces[target].w, g.surfaces[target].h);
++        fflush(s_csv_file);
++        static const char* flipDir = (const char*)-1;
++        static u32 flipSession = 0;
++        static u32 flipDumps = 0;
++        if (flipDir == (const char*)-1) {
++            flipDir = getenv("LD_DRAW_DUMP");
++        }
++        if (flipSession != s_csv_gate_session) {
++            flipSession = s_csv_gate_session;
++            flipDumps = 0;
++        }
++        if (flipDir && flipDir[0] && flipDumps < 6u) {
++            char flipPath[MAX_PATH * 2];
++            snprintf(flipPath, sizeof(flipPath), "%s\\flip_c%u_f%06u_slot%u.ppm", flipDir,
++                     flipSession, g_ld_frames, target);
++            ld_dump_surface_ppm(flipPath, &g.surfaces[target]);
++            flipDumps++;
++        }
++    }
+     if (dump_now) {
+         char path[MAX_PATH * 2];
+         snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);

@@ -1,0 +1,209 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index a5228ef..d359f52 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -80,6 +80,11 @@ static u32  s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+  * while it's blocked in the FIFO-wrap recycle callback -- would show a
+  * clear+few-draws frame as a visible flicker). */
+ static volatile u32 s_flip_request_count = 0;
++/* Pipelined cellGcmSetWaitFlip (GCM_WAITFLIP_DEPTH): flips the guest has asked
++ * for, and flips actually on screen -- drained to their marker AND past a
++ * vblank, at most one per vblank (cellGcmTickFlip). */
++static volatile u32 s_flips_issued = 0;
++static volatile u32 s_flips_shown = 0;
+ 
+ u32 cellGcm_flip_request_count(void)
+ {
+@@ -610,13 +615,58 @@ void cellGcmSetFlipMode(u32 mode)
+ /* NID: 0xC44D8F34 */
+ void cellGcmSetWaitFlip(void)
+ {
++#ifdef _WIN32
++    __declspec(dllimport) void __stdcall Sleep(unsigned long);
++#endif  /* elsewhere: runtime/platform/win32_compat.h */
++    /* GCM_WAITFLIP_NONBLOCKING=1: return at once, as the hardware call does.
++     * On a PS3 this only puts a wait into the command buffer -- the RSX holds
++     * the next frame's commands until the flip is shown, while the PPU goes on
++     * building that frame. Blocking the calling thread here instead serializes
++     * every frame's CPU work with the next vblank: Folklore's main thread spent
++     * a third of each beach frame in this wait. The drain already executes the
++     * stream in order and presents at each flip marker, so the frame shown is
++     * the same; the title paces itself on its own labels and the vblank count.
++     * Off by default -- a title that relies on this to throttle (see below)
++     * would otherwise run unpaced. */
++    { static int nonBlocking = -1;
++      if (nonBlocking < 0)
++      {
++          nonBlocking = getenv("GCM_WAITFLIP_NONBLOCKING") ? 1 : 0;
++      }
++      if (nonBlocking)
++      {
++          return;
++      } }
++    /* GCM_WAITFLIP_DEPTH=<n> (1 is the useful value): wait only until no more
++     * than n flips are still waiting for the screen. On a PS3 the call queues
++     * an RSX wait and the PPU carries on, so the title builds frame N+1 while
++     * frame N waits for its vblank; it is held back only when the GPU side
++     * falls behind. Blocking until the flip just requested is shown (below)
++     * serializes every frame's CPU work with the next vblank instead. Not
++     * returning at once keeps the pacing: a title whose logos count frames ran
++     * them at 160 fps with GCM_WAITFLIP_NONBLOCKING. */
++    { static int depth = -1;
++      if (depth < 0)
++      {
++          const char* depthText = getenv("GCM_WAITFLIP_DEPTH");
++          depth = depthText ? atoi(depthText) : 0;
++          if (depth < 0)
++          {
++              depth = 0;
++          }
++      }
++      if (depth > 0)
++      {
++          for (int waited = 0; waited < 100 && (int)(s_flips_issued - s_flips_shown) > depth; waited++)
++          {
++              Sleep(1);
++          }
++          return;
++      } }
+     /* Block until the pending flip completes (the present thread marks it done
+      * via cellGcmTickFlip, ~once per display refresh). This throttles the title
+      * to vsync; without it the guest loops unthrottled and many frames batch
+      * into a single host present -> the console text stacks/duplicates. */
+-#ifdef _WIN32
+-    __declspec(dllimport) void __stdcall Sleep(unsigned long);
+-#endif  /* elsewhere: runtime/platform/win32_compat.h */
+     for (int i = 0; i < 64 && s_flip_status == CELL_GCM_FLIP_STATUS_WAITING; i++)
+         Sleep(1);
+     s_flip_status = CELL_GCM_FLIP_STATUS_DONE;
+@@ -764,6 +814,11 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+  * the callback IS the flip interrupt -- no flip, no callback. */
+ void cellGcmTickFlip(void)
+ {
++    /* One flip reaches the screen per vblank, once the drain has reached it. */
++    if (s_flips_shown < s_flips_issued && s_flips_shown < s_flip_request_count)
++    {
++        s_flips_shown++;
++    }
+     if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+         GCM_PENDING_SET(2);
+ }
+@@ -2431,6 +2486,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+     if (!s_display_buffer_set[bufferId])
+         return CELL_GCM_ERROR_INVALID_VALUE;
+ 
++    s_flips_issued++;
+ 
+     /* in_fifo: the flip sits in the command stream as a GCM_FLIP_MARKER, and
+      * the drain does this half when it reaches it (see the 0xFEAD case). */
+diff --git a/runtime/ppu/ppu_loader.cpp b/runtime/ppu/ppu_loader.cpp
+index 5fba382..dbe1198 100644
+--- a/runtime/ppu/ppu_loader.cpp
++++ b/runtime/ppu/ppu_loader.cpp
+@@ -590,7 +590,11 @@ static void samp_site_hit(uint32_t tid, uint32_t guestFunction, int waiting)
+ 
+ static void samp_site_report(void)
+ {
+-    for (int pass = 0; pass < 2; pass++)
++    /* Kinds: 1 waiting under a lifted function, 0 host work under one,
++     * 3 / 2 the same keyed by the runtime return address (an RVA). */
++    static const uint8_t passKind[4] = { 1, 0, 3, 2 };
++    static const char* const passName[4] = { "wait", "host", "wait-rva", "host-rva" };
++    for (int pass = 0; pass < 4; pass++)
+     {
+         for (int rank = 0; rank < 16; rank++)
+         {
+@@ -598,7 +602,7 @@ static void samp_site_report(void)
+             int bestSlot = -1;
+             for (int slot = 0; slot < SAMP_SITES; slot++)
+             {
+-                if (s_site_wait[slot] == (uint8_t)(pass == 0) && s_site_ct[slot] > best)
++                if (s_site_wait[slot] == passKind[pass] && s_site_ct[slot] > best)
+                 {
+                     best = s_site_ct[slot];
+                     bestSlot = slot;
+@@ -608,10 +612,19 @@ static void samp_site_report(void)
+             {
+                 break;
+             }
+-            fprintf(stderr, "[samp] %s tid %-6u under %s%08X  (%llu)\n",
+-                    pass == 0 ? "wait" : "host", s_site_tid[bestSlot],
+-                    (s_site_fn[bestSlot] & 0x80000000u) ? "spu_LS_" : "func_",
+-                    s_site_fn[bestSlot] & 0x7FFFFFFFu, (unsigned long long)best);
++            if (passKind[pass] >= 2)
++            {
++                fprintf(stderr, "[samp] %s tid %-6u rva 0x%08X  (%llu)\n",
++                        passName[pass], s_site_tid[bestSlot],
++                        (s_site_fn[bestSlot] & 0x3FFFFFFFu) << 4, (unsigned long long)best);
++            }
++            else
++            {
++                fprintf(stderr, "[samp] %s tid %-6u under %s%08X  (%llu)\n",
++                        passName[pass], s_site_tid[bestSlot],
++                        (s_site_fn[bestSlot] & 0x80000000u) ? "spu_LS_" : "func_",
++                        s_site_fn[bestSlot] & 0x7FFFFFFFu, (unsigned long long)best);
++            }
+             s_site_ct[bestSlot] = 0;
+         }
+     }
+@@ -687,6 +700,47 @@ static void samp_report(void)
+ static DWORD s_samp_boot_tid;
+ static int   s_samp_main = -1;
+ 
++/* The first return address on a sampled thread's stack that lands in this
++ * module but outside lifted code: the runtime function (an HLE, a wait helper)
++ * the thread is in. Returned as an RVA, for the link map. 0 when none. */
++static uint32_t samp_stack_runtime_rva(const CONTEXT* c)
++{
++    static uintptr_t moduleBase = 0, moduleEnd = 0;
++    if (!moduleBase)
++    {
++        const uintptr_t base = (uintptr_t)GetModuleHandleA(NULL);
++        const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
++        const IMAGE_NT_HEADERS* nt = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
++        moduleEnd = base + nt->OptionalHeader.SizeOfImage;
++        moduleBase = base;
++    }
++    const uintptr_t* sp = (const uintptr_t*)c->Rsp;
++    MEMORY_BASIC_INFORMATION region;
++    if (!sp || !VirtualQuery((LPCVOID)sp, &region, sizeof region) ||
++        region.State != MEM_COMMIT ||
++        (region.Protect & (PAGE_NOACCESS | PAGE_GUARD)) ||
++        !(region.Protect & (PAGE_READONLY | PAGE_READWRITE |
++                            PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)))
++    {
++        return 0;
++    }
++    const uintptr_t regionEnd = (uintptr_t)region.BaseAddress + region.RegionSize;
++    uintptr_t words = (regionEnd - (uintptr_t)sp) / sizeof(uintptr_t);
++    if (words > 512)
++    {
++        words = 512;
++    }
++    for (uintptr_t index = 0; index < words; index++)
++    {
++        const uintptr_t value = sp[index];
++        if (value > moduleBase + 0x1000 && value < moduleEnd && !samp_lookup(value))
++        {
++            return (uint32_t)(value - moduleBase);
++        }
++    }
++    return 0;
++}
++
+ static uint32_t samp_stack_guest(HANDLE h, const CONTEXT* c)
+ {
+     (void)h;
+@@ -760,6 +814,12 @@ static DWORD WINAPI samp_thread(LPVOID p)
+                                if (under)
+                                {
+                                    samp_site_hit(te.th32ThreadID, under, nt);
++                                   const uint32_t runtimeRva = samp_stack_runtime_rva(&c);
++                                   if (runtimeRva)
++                                   {
++                                       samp_site_hit(te.th32ThreadID,
++                                                     0x40000000u | (runtimeRva >> 4), nt + 2);
++                                   }
+                                } }
+                     }
+                     ResumeThread(h);

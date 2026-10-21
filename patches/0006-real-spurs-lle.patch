@@ -1,0 +1,217 @@
+From: Folklore port <noreply@localhost>
+Subject: [PATCH 0006] lv2 + SPU fixes needed to run Sony's real SPURS (libsre LLE)
+
+1. sys_process_is_spu_lock_line_reservation_address (lv2 14) accepted only the
+   first 256 MB, so a SPURS instance in the ELF data segment (0x10000000+) got
+   EINVAL and cellSpursInitialize failed. Main memory is 0x00010000..0x3FFFFFFF.
+2. spu_stop: stop 0x101 / 0x102 (sys_spu_thread_group_exit / thread_exit) now
+   end the SPU thread, as on hardware. Resuming past them kept the real SPURS
+   system service spinning in its exit path forever.
+3. SPU thread group events follow lv2: an event is sent only for the event
+   types the queue was connected for (RUN on group_start). The made-up
+   "group stopped" event told libsre's event helper to terminate. Queues
+   connected without a known type keep the old behaviour, as does
+   PS3_SPU_GROUP_STOP_EVENT=1.
+4. spu_overlay_register_region_at(): a code region valid at one LS address
+   only, for job managers that cache binaries in LS at varying addresses
+   (jm2). Placements are logged; a placement with no lift is reported and left
+   to the interpreter.
+5. boot_main.cpp: PS3_HAVE_PRX_MODULES drops the weak ps3_load_prx_modules
+   default, for titles that define it (COFF weak definitions are unreliable
+   under link.exe).
+
+diff --git a/runtime/spu/spu_channels.c b/runtime/spu/spu_channels.c
+index 506da3f..02c5f64 100644
+--- a/runtime/spu/spu_channels.c
++++ b/runtime/spu/spu_channels.c
+@@ -194,6 +194,14 @@ void spu_stop(spu_context* ctx)
+     if (s_halt < 0) s_halt = getenv("YDKJ_STOP_HALT") ? 1 : 0;
+     ctx->status = SPU_STATUS_STOPPED_BY_STOP;
+     if (s_halt) spu_halt(ctx);
++    /* The lv2 exit protocol is the exception: stop 0x101 is
++     * sys_spu_thread_group_exit and 0x102 sys_spu_thread_exit, and on hardware
++     * neither returns -- lv2 tears the thread down. Resuming past them ran the
++     * code after the stop as if the SPU were still alive: the real SPURS system
++     * service (libsre, firmware LLE) exits its group with 0x101 when there is
++     * no work, and continuing walked it back into its idle path forever, so the
++     * group never stopped and SPURS never restarted it for the next kick. */
++    if (ctx->stop_code == 0x101u || ctx->stop_code == 0x102u) spu_halt(ctx);
+ }
+ 
+ /* Run a lifted SPU entry with a halt landing pad. Returns 1 if the job halted
+@@ -1472,7 +1480,7 @@ spu_lifted_fn spu_lifted_lookup(const spu_context* ctx, uint32_t lsa)
+  * the image id its lifted functions were registered under. The MFC GET path
+  * marks that overlay resident in the streaming context; dispatch retries a
+  * primary-image miss against the resident overlay's registry. */
+-typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; } spu_ovl_src;
++typedef struct { uint32_t src_ea; int image_id; uint8_t sig[16]; int has_sig; uint32_t span; uint32_t at_lsa; } spu_ovl_src;
+ /* 6 FMOD codec/DSP overlays + up to 89 WWS job-code modules (all stream into
+  * the same job code buffer at LS 0x4000, dispatched by content signature). */
+ #define SPU_OVL_SRC_MAX 128
+@@ -1485,6 +1493,8 @@ void spu_overlay_register_source(uint32_t content_ea, int image_id)
+         s_ovl_src[s_ovl_src_count].src_ea = content_ea;
+         s_ovl_src[s_ovl_src_count].image_id = image_id;
+         s_ovl_src[s_ovl_src_count].has_sig = 0;
++        s_ovl_src[s_ovl_src_count].span = 0;
++        s_ovl_src[s_ovl_src_count].at_lsa = 0;
+         s_ovl_src_count++;
+     }
+ }
+@@ -1498,6 +1508,21 @@ void spu_overlay_register_region(uint32_t content_ea, uint32_t span, int image_i
+     s_ovl_src[s_ovl_src_count - 1].span = span;
+ }
+ 
++/* The same, for one local-store address only. A job manager with an LS binary
++ * cache (SPURS jm2) places the same job at different addresses over time, and
++ * a lift is only valid at the address it was made for: register one lift per
++ * address and the GET's destination picks the right one. An address with no
++ * lift registered leaves the range unowned, so it falls to the interpreter
++ * instead of running a lift made for somewhere else. */
++void spu_overlay_register_region_at(uint32_t content_ea, uint32_t span, uint32_t lsa, int image_id)
++{
++    if (!span || lsa >= SPU_LS_SIZE || span > SPU_LS_SIZE - lsa ||
++        s_ovl_src_count >= SPU_OVL_SRC_MAX) return;
++    spu_overlay_register_source(content_ea, image_id);
++    s_ovl_src[s_ovl_src_count - 1].span = span;
++    s_ovl_src[s_ovl_src_count - 1].at_lsa = lsa | 0x80000000u;   /* bit 31: set */
++}
++
+ /* Register one-way runtime entries that replace the guest call stack.
+  * Matching the resolved function, not just its LS address, avoids affecting
+  * unrelated overlays using the same address. Registration precedes execution. */
+@@ -1657,12 +1682,26 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+             (lsa < base || ea != ctx->resident_code[slot].source_ea + (lsa - base)))
+             ctx->resident_code[slot].image_id = 0;
+     }
++    int unplaced = 0;
+     for (int i = 0; i < s_ovl_src_count; i++) {
+         const spu_ovl_src* o = &s_ovl_src[i];
+         int hit = o->has_sig ? (size >= 512 && memcmp(ls, o->sig, 16) == 0)
+                              : (o->src_ea == ea);
++        if (hit && o->at_lsa && (o->at_lsa & SPU_LS_MASK) != lsa) { unplaced = o->image_id; continue; }
+         if (hit) {
+             if (o->span) {
++                /* Once per (image, LS address): where a job manager actually
++                 * placed a bounded code image. A region is lifted for ONE LS
++                 * address, so a second address here means a second lift. */
++                { static struct { int img; uint32_t lsa; } s_seen[64]; static int s_n;
++                  int known = 0;
++                  for (int k = 0; k < s_n; k++)
++                      if (s_seen[k].img == o->image_id && s_seen[k].lsa == lsa) known = 1;
++                  if (!known && s_n < 64) {
++                      s_seen[s_n].img = o->image_id; s_seen[s_n].lsa = lsa; s_n++;
++                      fprintf(stderr, "[spu-ovl] region image %d (src 0x%08X span 0x%X) "
++                              "resident at LS 0x%05X\n", o->image_id, ea, o->span, lsa);
++                  } }
+                 if (lsa + o->span > SPU_LS_SIZE) return;
+                 for (unsigned slot = 0; slot < 4; ++slot) {
+                     if (ctx->resident_code[slot].image_id && ctx->resident_code[slot].lsa != lsa)
+@@ -1687,6 +1726,17 @@ void spu_overlay_note_get(spu_context* ctx, uint32_t ea, const uint8_t* ls, uint
+             return;
+         }
+     }
++    if (unplaced) {
++        static struct { uint32_t ea, lsa; } s_miss[32]; static int s_m;
++        int known = 0;
++        for (int k = 0; k < s_m; k++) if (s_miss[k].ea == ea && s_miss[k].lsa == lsa) known = 1;
++        if (!known && s_m < 32) {
++            s_miss[s_m].ea = ea; s_miss[s_m].lsa = lsa; s_m++;
++            fprintf(stderr, "[spu-ovl] code from 0x%08X placed at LS 0x%05X, which has no "
++                    "lift (image %d is lifted elsewhere) -- it will be interpreted\n",
++                    ea, lsa, unplaced);
++        }
++    }
+ }
+ 
+ /* Match a 16-byte module header against the registered content signatures.
+diff --git a/runtime/syscalls/lv2_register.c b/runtime/syscalls/lv2_register.c
+index bcb1df4..f105b82 100644
+--- a/runtime/syscalls/lv2_register.c
++++ b/runtime/syscalls/lv2_register.c
+@@ -352,6 +352,9 @@ typedef struct {
+      * into this queue with source = SYS_SPU_THREAD_GROUP_EVENT (0x100..) so
+      * PPU code blocked on sys_event_queue_receive wakes up. */
+     uint32_t event_queue_id;
++    /* The event_type bits it was connected for (SYS_SPU_THREAD_GROUP_EVENT_RUN
++     * 1, _EXCEPTION 2, _SYSTEM_MODULE 4). 0 = unknown, the legacy behaviour. */
++    uint32_t event_type;
+     uint32_t user_event_ports[64];
+ } spu_group_t;
+ 
+@@ -940,6 +943,11 @@ static int64_t sys_spu_thread_group_start_handler(ppu_context* ctx)
+      * clean one or it would report the previous run's exit forever. */
+     g->cause       = 0;
+     g->exit_status = 0;
++    /* SYS_SPU_THREAD_GROUP_EVENT_RUN: lv2 announces the start on a queue
++     * connected for it (RPCS3 sys_spu.cpp: RUN_KEY, group id, 0, 0). */
++    if (g->event_queue_id && (g->event_type & 0x1u))
++        sys_event_queue_push_by_id(g->event_queue_id, 0xFFFFFFFF53505500ull,
++                                   (uint64_t)g->id, 0, 0);
+ 
+     /* DIAG (YDKJ_INSTDUMP): dump the CellSpurs instance at group_start time, to
+      * see whether libsre has populated it BEFORE the SPU kernel threads spawn.
+@@ -1273,7 +1281,17 @@ static int64_t sys_spu_thread_group_join_handler(ppu_context* ctx)
+      * event with type-specific data; we collapse to a "group stopped" tag
+      * (data1 = group_id, data2 = exit_status, data3 = cause). PPU code
+      * blocked in sys_event_queue_receive on this queue wakes up here. */
+-    if (g->event_queue_id) {
++    /* Real lv2 sends nothing on a group stop: the connected event types are
++     * RUN (sent by group_start), EXCEPTION and SYSTEM_MODULE. libsre connects
++     * its SPURS event queue for EXCEPTION, and its event-helper thread reads a
++     * user event whose data0 is 1 as "terminate the helper" -- so this made-up
++     * stop event (data2 = status 0, cause 1 = GROUP_EXIT) told the real SPURS
++     * to shut its helper down the first time its kernel exited for lack of
++     * work. Kept for queues connected without a known type, or
++     * PS3_SPU_GROUP_STOP_EVENT=1. */
++    { static int s_legacy = -1;
++      if (s_legacy < 0) s_legacy = getenv("PS3_SPU_GROUP_STOP_EVENT") ? 1 : 0;
++      if (g->event_queue_id && (g->event_type == 0 || s_legacy))
+         sys_event_queue_push_by_id(g->event_queue_id,
+                                    (uint64_t)g->id,
+                                    (uint64_t)(int64_t)g->exit_status,
+@@ -1564,8 +1582,9 @@ static int64_t sys_spu_thread_group_connect_event_handler(ppu_context* ctx)
+         return -1;
+     }
+     g->event_queue_id = queue_id;
+-    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X\n",
+-            group_id, queue_id);
++    g->event_type     = (uint32_t)ctx->gpr[5] & 0x7u;
++    fprintf(stderr, "[SPU] group_connect_event group=0x%X queue=0x%X type=0x%X\n",
++            group_id, queue_id, g->event_type);
+     fflush(stderr);
+     ctx->gpr[3] = 0;
+     return 0;
+@@ -2277,8 +2296,12 @@ static int64_t sys_process_is_spu_lock_line_reservation_address(ppu_context* ctx
+ 
+     if (!flags || (flags & ~0x3ull)) {
+         rc = (int64_t)(int32_t)CELL_EINVAL;
+-    } else if (addr >= VM_MAIN_MEM_BASE && addr < VM_MAIN_MEM_BASE + VM_MAIN_MEM_SIZE) {
+-        rc = 0;                                   /* main memory */
++    } else if (addr >= VM_MAIN_MEM_BASE && addr < 0x40000000u) {
++        /* main memory: RPCS3's "main" (0x00010000..), "user64k" (0x20000000..)
++         * and "user1m" (0x30000000..) areas. The ELF data segment at
++         * 0x10000000+ is here -- SPURS instances usually live in .bss, so
++         * accepting only the first 256 MB failed cellSpursInitialize. */
++        rc = 0;
+     } else if (addr >= 0x40000000u && addr < 0x50000000u) {
+         rc = 0;                                   /* sys_memory window */
+     } else if (addr >= 0xC0000000u && addr < 0xD0000000u) {
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 58254ad..a5c9bf6 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -63,8 +63,14 @@ void     cellGame_init_from_paramsfo(const char* sfo_path);  /* libs/system/cell
+  * guest RAM and register their exports. Weak default is a no-op; a title that
+  * links a lifted PRX defines a strong version. Called after the lifted function
+  * table is registered and vm_base is live, before the game runs. */
++/* PS3_HAVE_PRX_MODULES: the title defines it (strong), so no default is
++ * emitted at all -- COFF weak definitions are not reliable under link.exe. */
++#ifdef PS3_HAVE_PRX_MODULES
++void     ps3_load_prx_modules(void);
++#else
+ void     ps3_load_prx_modules(void) __attribute__((weak));
+ void     ps3_load_prx_modules(void) {}
++#endif
+ }
+ 
+ #include <string.h>

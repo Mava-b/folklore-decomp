@@ -1,0 +1,392 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index 2366f43..e308610 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -81,6 +81,12 @@ volatile u64 g_gcm_perf_swap_ns = 0;
+ volatile u64 g_gcm_perf_main_usleep_ns = 0;
+ volatile u64 g_gcm_perf_main_syscall_ns = 0;
+ volatile u64 g_gcm_perf_main_hle_ns = 0;
++/* The guest held in its flip until the drain had read the part of the
++ * command ring its next frame writes (gcm_ring_backpressure), the largest
++ * recent frame's command bytes, and the ring's size. */
++volatile u64 g_gcm_perf_ring_wait_ns = 0;
++volatile u32 g_gcm_ring_frame_peak = 0;
++volatile u32 g_gcm_ring_bytes = 0;
+ u64 gcm_perf_now_ns(void)
+ {
+     return get_timestamp_ns();
+@@ -359,6 +365,7 @@ static u32 s_labels[CELL_GCM_MAX_LABEL_COUNT];
+  * wait for the RSX to catch up before recycling the ring (else the frame's
+  * just-written commands are lost). Updated in cellGcm_rsx_process_fifo. */
+ volatile u32 g_gcm_fifo_drained_ea = 0;
++static void gcm_ring_setup(u32 ctx, u32 begin, u32 end);   /* back-pressure, below */
+ 
+ /* The guest variable cellGcmInit's ctx_out pointed at -- the title's own
+  * gCellGcmCurrentContext. A title that switches to a command buffer of its own
+@@ -587,6 +594,7 @@ u32 cellGcmSetupContext(u32 ctx_out_addr, u32 cmdSize, u32 ioSize, u32 ioAddress
+             gwrite32(ctx_out_addr, cdata);          /* *context = &ctxdata */
+         s_gcm_ctx_out_ea = ctx_out_addr;   /* the title's gCellGcmCurrentContext */
+         s_gcm_context_ea = cdata;                   /* RSX drains commands from here */
++        gcm_ring_setup(cdata, cmdbuf, cmdbuf + cmdSize);
+     }
+     return cdata;
+ }
+@@ -1774,6 +1782,14 @@ static void gcm_rsx_process_fifo_unlocked(void)
+     const char* why = "caught-up";
+     while (s_fifo_getoff != put && budget-- > 0) {
+         u32 ea = gcm_io2ea(s_fifo_getoff);
++        /* Publish progress during the pass as well as after it: a guest held
++         * by the ring back-pressure (gcm_ring_make_room) is waiting for the
++         * drain to move past the commands it is about to overwrite, and a
++         * pass covers a whole frame. Everything before `ea` has been read. */
++        if ((budget & 0x7FF) == 0 && ea)
++        {
++            g_gcm_fifo_drained_ea = ea;
++        }
+         if (!ea) {
+             /* get is sitting on an IO offset with no mapping -- the title
+              * branched into a region and then unmapped it, or the offset was
+@@ -2316,9 +2332,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
+          * overruns first, so the first overrun is recycled by the path above
+          * and near-end recycling is enabled from then on. */
+         static int s_title_overran = 0;
+-        if (begin && end > begin && cur >= end) { head_consumed = 1; s_title_overran = 1; }
++        /* The runtime's own ring (cellGcmSetupContext's callback) is wrapped
++         * by that callback and by gcm_flip_into_fifo, both on the guest
++         * thread. Recycling it from here as well rewound `current` and `put`
++         * under a guest still writing near `end`, and dropped the commands
++         * the drain had not read. `current == end` is a full ring whose
++         * callback is about to run, not an overrun. Only a write past `end`
++         * is left to this path. */
++        const u32 cbOpd = ctx ? vm_read32(ctx + 0xC) : 0;
++        const int runtimeRing = cbOpd && vm_read32(cbOpd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
++        const int pastEnd = begin && end > begin && (runtimeRing ? cur > end : cur >= end);
++        if (pastEnd) { head_consumed = 1; s_title_overran = 1; }
+         if (begin && end > begin && cur >= begin && cur + GCM_RECYCLE_SLACK >= end
+-                && head_consumed && s_title_overran) {
++                && head_consumed && s_title_overran && (!runtimeRing || pastEnd)) {
+             u32 io_begin = gcm_ea2io(begin);
+             if (io_begin != 0xFFFFFFFFu) {
+                 u32 jmp_at = (cur + 4 <= end) ? cur : end - 4;
+@@ -2583,14 +2609,219 @@ s32 cellGcmSetFlipCommand(u32 bufferId) { return gcm_flip_request(bufferId, 0);
+  * at ctx->current instead; the drain stops at it and fires the flip there,
+  * exactly as it does for the 0xFEAD words a statically-linked libgcm emits.
+  * Returns 0 when there is no room or ctx is not a mapped command buffer. */
++/* Back-pressure on the runtime's command ring.
++ *
++ * On a PS3 the RSX reads the ring while the PPU fills it, and libgcm's
++ * reserve stops the PPU short of `get`. Here nothing did: Folklore writes a
++ * whole frame and publishes `put` once, just after its flip, and its ring is
++ * 2 MB. At the original 30 fps the game sleeps out every frame and the drain
++ * has read everything by the time the next one starts. Uncapped,
++ * cellGcmSetWaitFlip lets it run a frame ahead, and at the beach two frames
++ * do not fit: the next frame overwrote commands the drain had not read yet.
++ * The drain then decoded vertex data as commands, gave up on the stream and
++ * skipped to `put` -- frames lost their flips (the 100 ms WaitFlip resyncs,
++ * the fall to 8 fps) and draws ran with the wrong state (white fans, a
++ * blown-out sky).
++ *
++ * The fix is the hardware's: the ring's `end` as the guest sees it is kept
++ * just short of the oldest command the drain has not read. The guest's own
++ * reserve check (current + n > end) then calls the buffer-full callback when
++ * it catches up, and the callback waits for the drain to move on
++ * (cellGcm_fifo_reserve). While the drain is behind the guest in the guest's
++ * own lap of the ring the limit is the real end. */
++static u32 s_ring_ctx = 0;          /* the context cellGcmSetupContext built */
++static u32 s_ring_begin = 0;
++static u32 s_ring_end = 0;          /* the real end; ctx->end may be lower */
++/* Where the frame being written began, and the largest recent frame. */
++static u32 s_ring_frame_start = 0;
++static u32 s_ring_frame_peak = 0;
++/* How far short of the drain the guest is stopped. */
++#define GCM_RING_GUARD 0x100u
++/* How long the guest may be held before it is let go regardless... */
++#define GCM_RING_WAIT_CAP_MS 500
++/* ...and how long the drain may sit still meanwhile: it can be parked on a
++ * label the guest only writes later. Longer than the present thread's
++ * slowest frame, during which the drain does not move either. */
++#define GCM_RING_STALL_MS 150
++
++/* The runtime's ring, unchanged since setup, still with the runtime's
++ * buffer-full callback. */
++static int gcm_ring_is_runtime(u32 ctx)
++{
++    if (!ctx || ctx != s_ring_ctx || s_ring_end <= s_ring_begin)
++    {
++        return 0;
++    }
++    if (vm_read32(ctx + 0x0) != s_ring_begin)
++    {
++        return 0;
++    }
++    const u32 callbackOpd = vm_read32(ctx + 0xC);
++    return callbackOpd && vm_read32(callbackOpd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
++}
++
++/* How far the guest may write from writePos without reaching a command the
++ * drain has not read. */
++static u32 gcm_ring_soft_end(u32 writePos)
++{
++    const u32 drainedEa = g_gcm_fifo_drained_ea;
++    /* Outside the ring (the drain is in a CALL target), or at or behind the
++     * guest in its own lap: up to the real end. */
++    if (drainedEa < s_ring_begin || drainedEa > s_ring_end + GCM_RECYCLE_SLACK || drainedEa <= writePos)
++    {
++        return s_ring_end;
++    }
++    /* Still in the previous lap, ahead of the guest in address: everything
++     * from drainedEa on is unread. */
++    u32 limit = drainedEa > GCM_RING_GUARD ? drainedEa - GCM_RING_GUARD : 0;
++    if (limit > s_ring_end)
++    {
++        limit = s_ring_end;
++    }
++    if (limit < writePos)
++    {
++        limit = writePos;
++    }
++    return limit;
++}
++
++static void gcm_ring_setup(u32 ctx, u32 begin, u32 end)
++{
++    s_ring_ctx = ctx;
++    s_ring_begin = begin;
++    s_ring_end = end;
++    s_ring_frame_start = begin;
++    s_ring_frame_peak = 0;
++}
++
++static void gcm_ring_publish_end(u32 ctx, u32 writePos)
++{
++    vm_write32(ctx + 0x4, gcm_ring_soft_end(writePos));
++}
++
++/* Record the frame that ends at frameEnd and return the room its successor
++ * is expected to need: the recent peak plus a quarter, plus 64 KB. */
++static u32 gcm_ring_note_frame(u32 frameEnd)
++{
++    u32 frameStart = s_ring_frame_start;
++    if (frameStart < s_ring_begin || frameStart > s_ring_end)
++    {
++        frameStart = s_ring_begin;
++    }
++    /* A frame the buffer-full callback wrapped spans the ring's tail and head. */
++    const u32 frameBytes = frameEnd >= frameStart ? frameEnd - frameStart
++                                                  : (s_ring_end - frameStart) + (frameEnd - s_ring_begin);
++    u32 peakBytes = s_ring_frame_peak - s_ring_frame_peak / 64u;
++    if (frameBytes > peakBytes)
++    {
++        peakBytes = frameBytes;
++    }
++    s_ring_frame_peak = peakBytes;
++    g_gcm_ring_frame_peak = peakBytes;
++    g_gcm_ring_bytes = s_ring_end - s_ring_begin;
++    return peakBytes + peakBytes / 4u + 0x10000u;
++}
++
++/* The buffer-full callback for the runtime's ring: the guest needs
++ * countWords more words at `current`. Returns 1 when the room was found
++ * short of the real end (waiting for the drain if it had to); 0 when the
++ * ring has to wrap. */
++static int gcm_ring_make_room(u32 ctx, u32 countWords)
++{
++    const u32 current = vm_read32(ctx + 0x8);
++    if (current < s_ring_begin || current > s_ring_end)
++    {
++        return 0;
++    }
++    if (countWords > 0x40000u)
++    {
++        countWords = 0x40000u;
++    }
++    /* Ask for a little more than this one reservation, so a guest chasing
++     * the drain is not back here on every command. */
++    u32 requiredBytes = countWords * 4u + 0x4000u;
++    if (current + requiredBytes > s_ring_end)
++    {
++        requiredBytes = countWords * 4u + 16u;
++        if (current + requiredBytes > s_ring_end)
++        {
++            return 0;
++        }
++    }
++    u64 waitBegin = 0;
++    int waitedMs = 0;
++    int stillMs = 0;
++    u32 lastDrainedEa = g_gcm_fifo_drained_ea;
++    while (gcm_ring_soft_end(current) < current + requiredBytes)
++    {
++        const u32 drainedEa = g_gcm_fifo_drained_ea;
++        if (drainedEa != lastDrainedEa)
++        {
++            lastDrainedEa = drainedEa;
++            stillMs = 0;
++        }
++        if (waitedMs >= GCM_RING_WAIT_CAP_MS || stillMs >= GCM_RING_STALL_MS)
++        {
++            static int reports = 0;
++            if (reports < 8)
++            {
++                reports++;
++                fprintf(stderr, "[gcm] ring back-pressure: drain still at 0x%08X, %u bytes past the guest at 0x%08X, after %d ms; letting the guest go\n",
++                        drainedEa, drainedEa - current, current, waitedMs);
++            }
++            vm_write32(ctx + 0x4, s_ring_end);
++            if (waitBegin)
++            {
++                g_gcm_perf_ring_wait_ns += gcm_perf_now_ns() - waitBegin;
++            }
++            return 1;
++        }
++        if (!waitBegin)
++        {
++            waitBegin = gcm_perf_now_ns();
++        }
++        Sleep(1);
++        waitedMs++;
++        stillMs++;
++    }
++    if (waitBegin)
++    {
++        g_gcm_perf_ring_wait_ns += gcm_perf_now_ns() - waitBegin;
++    }
++    gcm_ring_publish_end(ctx, current);
++    return 1;
++}
++
++/* The buffer-full callback (hle_gcm_callback): the guest needs countWords
++ * more words at ctx->current. On the runtime's ring that is usually the soft
++ * end -- wait for the drain and raise it -- and otherwise the real end, where
++ * the ring wraps. */
++void cellGcm_fifo_reserve(u32 ctx_ea, u32 countWords)
++{
++    const int runtimeRing = gcm_ring_is_runtime(ctx_ea);
++    if (runtimeRing && gcm_ring_make_room(ctx_ea, countWords))
++    {
++        return;
++    }
++    cellGcm_fifo_recycle(ctx_ea);
++    if (runtimeRing)
++    {
++        gcm_ring_publish_end(ctx_ea, vm_read32(ctx_ea + 0x8));
++    }
++}
++
+ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+ {
+     if (!ctx || bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM ||
+         !s_display_buffer_set[bufferId]) return 0;
+     const u32 end = vm_read32(ctx + 4), cur = vm_read32(ctx + 8);
++    /* The runtime's ring may show the guest a lower `end` (the drain's
++     * position, see gcm_ring_soft_end); the marker always fits under that,
++     * GCM_RING_GUARD short of the drain. */
++    const u32 realEnd = gcm_ring_is_runtime(ctx) ? s_ring_end : end;
+     /* Never near the end: those bytes are the title's reserve before its
+      * ring wraps, and the recycle above keys on them. */
+-    if (cur + 8 + GCM_RECYCLE_SLACK > end || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
++    if (cur + 8 + GCM_RECYCLE_SLACK > realEnd || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+     vm_write32(cur, GCM_FLIP_MARKER | bufferId);
+     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
+      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
+@@ -2610,13 +2841,44 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+     const u32 begin = vm_read32(ctx), io_begin = gcm_ea2io(begin);
+     const u32 cb_opd = vm_read32(ctx + 0xC);
+     const int runtime_ring = cb_opd && vm_read32(cb_opd) == GCM_FIFO_CALLBACK_SENTINEL_EA;
+-    if (runtime_ring && end - (cur + 4) < GCM_FLIP_WRAP_BYTES && io_begin != 0xFFFFFFFFu &&
+-        s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN) {
+-        vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
+-        vm_write32(ctx + 8, begin);
++    if (!runtime_ring || io_begin == 0xFFFFFFFFu)
++    {
++        vm_write32(ctx + 8, cur + 4);
+         return 1;
+     }
+-    vm_write32(ctx + 8, cur + 4);
++    if (!gcm_ring_is_runtime(ctx))
++    {
++        /* The runtime's callback on a ring it did not set up: the old rule. */
++        if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN)
++        {
++            vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
++            vm_write32(ctx + 8, begin);
++            return 1;
++        }
++        vm_write32(ctx + 8, cur + 4);
++        return 1;
++    }
++    /* Wrap here when a frame as large as the recent ones would not fit
++     * before the real end: running into it mid-frame calls the buffer-full
++     * callback, which then waits for the drain to empty the ring. Wrapping
++     * at the flip needs no wait -- the soft end below stops the guest short
++     * of anything the drain has not read. */
++    const u32 neededBytes = gcm_ring_note_frame(cur + 4);
++    const u32 wrapThreshold = neededBytes > GCM_FLIP_WRAP_BYTES ? neededBytes : GCM_FLIP_WRAP_BYTES;
++    u32 nextWrite = cur + 4;
++    if (realEnd - (cur + 4) < wrapThreshold)
++    {
++        vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
++        nextWrite = begin;
++    }
++    vm_write32(ctx + 8, nextWrite);
++    s_ring_frame_start = nextWrite;
++    /* Publish the finished frame now rather than at the guest's next flush,
++     * so the drain can start on it: it is complete up to its flip marker
++     * (and the JUMP, when wrapping). */
++    atomic_thread_fence(memory_order_release);
++    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(nextWrite));
++    gcm_ring_publish_end(ctx, nextWrite);
+     return 1;
+ }
+ 
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 1fea5e6..77ca541 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1749,6 +1749,9 @@ extern volatile u64 g_gcm_perf_present_idle_ns;
+ extern volatile u64 g_gcm_perf_main_usleep_ns;
+ extern volatile u64 g_gcm_perf_main_syscall_ns;
+ extern volatile u64 g_gcm_perf_main_hle_ns;
++extern volatile u64 g_gcm_perf_ring_wait_ns;
++extern volatile u32 g_gcm_ring_frame_peak;
++extern volatile u32 g_gcm_ring_bytes;
+ extern u64 gcm_perf_now_ns(void);
+ static void ld_flush(ld_flush_reason reason)
+ {
+@@ -10153,7 +10156,16 @@ void rsx_live_draw_present(u32 buffer_id)
+                       (double)(usleepNs - lastUsleep) / 1e6 / frameCount,
+                       (double)(syscallNs - lastSyscall) / 1e6 / frameCount,
+                       (double)(hleNs - lastHle) / 1e6 / frameCount);
+-              lastUsleep = usleepNs; lastSyscall = syscallNs; lastHle = hleNs; } }
++              lastUsleep = usleepNs; lastSyscall = syscallNs; lastHle = hleNs; }
++            { static u64 lastRingWait = 0;
++              const u64 ringWaitNs = g_gcm_perf_ring_wait_ns;
++              if (g_gcm_ring_bytes)
++              {
++                  fprintf(stderr, "[fps]   command ring: largest recent frame %u KB of %u KB, guest held for the drain %.1f ms per frame\n",
++                          g_gcm_ring_frame_peak / 1024u, g_gcm_ring_bytes / 1024u,
++                          (double)(ringWaitNs - lastRingWait) / 1e6 / frameCount);
++              }
++              lastRingWait = ringWaitNs; } }
+           fps_t0 = now; fps_f0 = g_ld_frames;
+       } }
+     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+diff --git a/runtime/ppu/ppu_sysprx.cpp b/runtime/ppu/ppu_sysprx.cpp
+index a85b99a..4da8435 100644
+--- a/runtime/ppu/ppu_sysprx.cpp
++++ b/runtime/ppu/ppu_sysprx.cpp
+@@ -494,11 +494,12 @@ static void gcm_guest_write32(unsigned int addr, unsigned int val) { vm_write32(
+  * garbage-vcall guard no-opped the callback, the FIFO never recycled and the
+  * title stopped flipping. One definition, one place. */
+ #define GCM_FIFO_CALLBACK_SENTINEL_EA (VM_HLE_INJECT_BASE + 0x2F00u)
+-extern "C" void cellGcm_fifo_recycle(unsigned int ctx_ea);
++extern "C" void cellGcm_fifo_reserve(unsigned int ctx_ea, unsigned int countWords);
+ extern "C" void ppu_register_function(uint64_t addr, void (*fn)(ppu_context*));
+ static void hle_gcm_callback(ppu_context* ctx)
+ {
+-    cellGcm_fifo_recycle((unsigned int)ctx->gpr[3]);   /* r3 = context EA */
++    /* r3 = context EA, r4 = words the guest needs */
++    cellGcm_fifo_reserve((unsigned int)ctx->gpr[3], (unsigned int)ctx->gpr[4]);
+     ctx->gpr[3] = 0;                                   /* CELL_OK */
+ }
+ 

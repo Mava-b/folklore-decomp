@@ -1,0 +1,26 @@
+diff --git a/libs/video/rsx_vp_decompiler.c b/libs/video/rsx_vp_decompiler.c
+index edd01d6..9513c1f 100644
+--- a/libs/video/rsx_vp_decompiler.c
++++ b/libs/video/rsx_vp_decompiler.c
+@@ -437,12 +437,19 @@ static int rsx_vp_decompile_impl(
+                 break;
+             }
+             case 0x0D: /* ARL: address register load, rounds down */
+-                if (vmx|vmy|vmz|vmw) {
++                /* The address register written is D0.dst_tmp (a0 or a1),
++                 * the field a temp destination would use -- NOT
++                 * addr_reg_sel, which picks the register an indexed
++                 * constant READ uses. Taking addr_reg_sel here sent every
++                 * ARL to a0, so a skinning program that loads one vertex's
++                 * bone indices into a1 and another's into a0 read the wrong
++                 * bones (Folklore's character shadow volumes). */
++                if ((vmx|vmy|vmz|vmw) && dst_tmp != 0x3F) {
+                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
+                     char line[256];
+                     snprintf(line,sizeof line,
+                         "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
+-                        A, addr_sel, m, m);
++                        A, dst_tmp & 1u, m, m);
+                     emit(&b, line);
+                 }
+                 handled = 0;

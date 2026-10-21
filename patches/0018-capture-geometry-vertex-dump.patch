@@ -1,0 +1,244 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index fb789d2..2cf967f 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -6009,6 +6009,231 @@ static int   s_csv_gate_open = 1;
+  * capture instead of only the first one of the run. */
+ static u32   s_csv_gate_session = 0;
+ 
++/* Capture-only geometry diagnostics for one draw, appended to its CSV row:
++ *   ar=first+count,...      the DRAW_ARRAYS batches (first four)
++ *   ix=loc:offset:16|32/n   the index array when the draw is indexed
++ *   el=min-max              the vertex element range the draw reads
++ *   pos=x0/x1/y0/y1/z0/z1 bad=N   attribute 0 bounding box as decoded, and
++ *                           how many vertices are non-finite or beyond 1e5
++ * With LD_VB_DUMP=<dir>, the raw guest bytes behind attribute 0 (the whole
++ * interleaved record range) and the index array are also written once per
++ * capture session, so a mesh that draws wrong can be inspected offline. */
++static void live_draw_csv_geometry(FILE* file, u32 session)
++{
++    const u32 baseIndex = rsx_dsp_vertex_data_base_index(&g.rsx);
++    rsx_dsp_index_array indexArray;
++    rsx_dsp_get_index_array(&g.rsx, &indexArray);
++    const u32 elementSize = indexArray.is_u32 ? 4u : 2u;
++    const int restartEnabled = rsx_dsp_restart_index_enabled(&g.rsx, indexArray.is_u32);
++    const u32 restartValue = rsx_dsp_restart_index(&g.rsx);
++    u32 minElement = 0xFFFFFFFFu;
++    u32 maxElement = 0;
++    u32 indexCount = 0;
++    u32 indexFirst = 0xFFFFFFFFu;
++
++    if (dc.n_arr)
++    {
++        fprintf(file, "ar=");
++        for (u32 batch = 0; batch < dc.n_arr; batch++)
++        {
++            if (batch < 4)
++            {
++                fprintf(file, "%u+%u%s", dc.arr[batch].first, dc.arr[batch].count,
++                        batch + 1 < dc.n_arr && batch < 3 ? "," : "");
++            }
++            if (dc.arr[batch].count)
++            {
++                const u32 batchFirst = dc.arr[batch].first;
++                const u32 batchLast = batchFirst + dc.arr[batch].count - 1;
++                if (batchFirst < minElement)
++                {
++                    minElement = batchFirst;
++                }
++                if (batchLast > maxElement)
++                {
++                    maxElement = batchLast;
++                }
++            }
++        }
++        fprintf(file, "%s ", dc.n_arr > 4 ? ",..." : "");
++    }
++    for (u32 batch = 0; batch < dc.n_idx; batch++)
++    {
++        const u32 first = dc.idx[batch].first;
++        const u32 count = dc.idx[batch].count;
++        if (first < indexFirst)
++        {
++            indexFirst = first;
++        }
++        indexCount += count;
++        for (u32 position = 0; position < count; position++)
++        {
++            const u8* source = guest_ptr(indexArray.location,
++                indexArray.offset + (first + position) * elementSize, elementSize);
++            if (!source)
++            {
++                break;
++            }
++            const u32 index = indexArray.is_u32
++                ? (((u32)source[0] << 24) | ((u32)source[1] << 16) |
++                   ((u32)source[2] << 8) | source[3])
++                : (u32)((source[0] << 8) | source[1]);
++            if (restartEnabled && index == restartValue)
++            {
++                continue;
++            }
++            const u32 element = index + baseIndex;
++            if (element < minElement)
++            {
++                minElement = element;
++            }
++            if (element > maxElement)
++            {
++                maxElement = element;
++            }
++        }
++    }
++    if (dc.n_idx)
++    {
++        fprintf(file, "ix=%u:%X:%u/%u ", indexArray.location, indexArray.offset,
++                elementSize * 8u, indexCount);
++    }
++    if (minElement != 0xFFFFFFFFu)
++    {
++        fprintf(file, "el=%u-%u ", minElement, maxElement);
++    }
++
++    const u32 vertexCount = dc.n_source_refs ? dc.n_source_refs : dc.n_verts;
++    if (vertexCount && dc.fetch_plan.attr[0].desc.type)
++    {
++        float lowest[3] = { 1e30f, 1e30f, 1e30f };
++        float highest[3] = { -1e30f, -1e30f, -1e30f };
++        u32 badCount = 0;
++        for (u32 occurrence = 0; occurrence < vertexCount; occurrence++)
++        {
++            const u32 vertex = dc.refs_remapped
++                ? rsx_vertex_remap_index(&dc.ref_remap, occurrence)
++                : occurrence;
++            float fallback[4];
++            const float* value = dc_vertex_attr_canonical(vertex, 0, fallback);
++            int vertexBad = 0;
++            for (u32 axis = 0; axis < 3; axis++)
++            {
++                const float component = value[axis];
++                if (!(component == component) || component > 1e5f || component < -1e5f)
++                {
++                    vertexBad = 1;
++                    continue;
++                }
++                if (component < lowest[axis])
++                {
++                    lowest[axis] = component;
++                }
++                if (component > highest[axis])
++                {
++                    highest[axis] = component;
++                }
++            }
++            badCount += (u32)vertexBad;
++        }
++        fprintf(file, "pos=%.1f/%.1f/%.1f/%.1f/%.1f/%.1f bad=%u ",
++                lowest[0], highest[0], lowest[1], highest[1], lowest[2], highest[2], badCount);
++    }
++
++    static const char* dumpDir = (const char*)-1;
++    if (dumpDir == (const char*)-1)
++    {
++        dumpDir = getenv("LD_VB_DUMP");
++    }
++    if (!dumpDir || !dumpDir[0])
++    {
++        return;
++    }
++    static u32 seenSession = ~0u;
++    static u64 seenKeys[8192];
++    static u32 seenCount = 0;
++    static u64 dumpedBytes = 0;
++    if (seenSession != session)
++    {
++        seenSession = session;
++        seenCount = 0;
++        dumpedBytes = 0;
++    }
++    const u64 dumpLimit = 512ull * 1024ull * 1024ull;
++    rsx_dsp_vertex_attr position;
++    rsx_dsp_get_vertex_attr(&g.rsx, 0, &position);
++    struct
++    {
++        u32 location;
++        u64 start;
++        u64 bytes;
++        const char* kind;
++        u32 stride;
++    } regions[2];
++    u32 regionCount = 0;
++    if (position.type && position.size && position.stride && minElement != 0xFFFFFFFFu &&
++        maxElement >= minElement && maxElement - minElement < 0x100000u)
++    {
++        regions[regionCount].location = position.location;
++        regions[regionCount].start = (u64)rsx_dsp_vertex_data_base_offset(&g.rsx) +
++            position.offset + (u64)minElement * position.stride;
++        regions[regionCount].bytes = (u64)(maxElement - minElement + 1) * position.stride;
++        regions[regionCount].kind = "vb";
++        regions[regionCount].stride = position.stride;
++        regionCount++;
++    }
++    if (dc.n_idx && indexCount && indexFirst != 0xFFFFFFFFu)
++    {
++        regions[regionCount].location = indexArray.location;
++        regions[regionCount].start = (u64)indexArray.offset + (u64)indexFirst * elementSize;
++        regions[regionCount].bytes = (u64)indexCount * elementSize;
++        regions[regionCount].kind = "ib";
++        regions[regionCount].stride = elementSize;
++        regionCount++;
++    }
++    for (u32 regionIndex = 0; regionIndex < regionCount; regionIndex++)
++    {
++        const u64 start = regions[regionIndex].start;
++        const u64 bytes = regions[regionIndex].bytes;
++        if (start > UINT32_MAX || bytes == 0 || bytes > 16u * 1024u * 1024u ||
++            dumpedBytes + bytes > dumpLimit || seenCount >= 8192)
++        {
++            continue;
++        }
++        const u64 key = ((u64)regions[regionIndex].location << 60) ^ (start << 24) ^ bytes;
++        int already = 0;
++        for (u32 seenIndex = 0; seenIndex < seenCount; seenIndex++)
++        {
++            if (seenKeys[seenIndex] == key)
++            {
++                already = 1;
++                break;
++            }
++        }
++        if (already)
++        {
++            continue;
++        }
++        seenKeys[seenCount++] = key;
++        const u8* source = guest_ptr(regions[regionIndex].location, (u32)start, (u32)bytes);
++        if (!source)
++        {
++            continue;
++        }
++        char dumpPath[MAX_PATH * 2];
++        snprintf(dumpPath, sizeof(dumpPath), "%s\\%s_c%u_f%06u_L%u_%08X_s%u_n%u.bin", dumpDir,
++                 regions[regionIndex].kind, session, g_ld_frames, regions[regionIndex].location,
++                 (u32)start, regions[regionIndex].stride, (u32)bytes);
++        FILE* dumpFile = fopen(dumpPath, "wb");
++        if (dumpFile)
++        {
++            fwrite(source, 1, (size_t)bytes, dumpFile);
++            fclose(dumpFile);
++            dumpedBytes += bytes;
++        }
++    }
++}
++
+ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+ {
+ #if defined(YZ_PERF_CLEAN) && !defined(YZ_PERF_PROFILE)
+@@ -6173,6 +6398,7 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
+                     layout.stride, layout.location, layout.offset);
+         }
+     }
++    live_draw_csv_geometry(file, s_csv_gate_session);
+     if (rs.blend_enable)
+         fprintf(file, "bf=%X/%X/%X/%X eq=%X/%X ", rs.sf_rgb, rs.df_rgb, rs.sf_a, rs.df_a,
+                 rs.eq_rgb, rs.eq_a);

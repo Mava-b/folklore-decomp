@@ -1,0 +1,97 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 2cf967f..eb3e955 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4638,6 +4638,7 @@ static int ld_upload_pixel_constants(u32* out_offset)
+  * -----------------------------------------------------------------------*/
+ typedef struct { float a[16][4]; } vtx_t;
+ typedef struct { u32 first, count; } batch_t;
++#define LD_MAX_BATCHES 4096u
+ 
+ typedef struct {
+     /* INLINE_ARRAY source for this primitive, or NULL. The stream is the
+@@ -4648,8 +4649,12 @@ typedef struct {
+      * index order, which is what makes the offsets derivable at all (an
+      * inline stream carries no per-array offset registers). */
+     const u8* inl; u32 inl_bytes, inl_stride; u32 inl_off[16];
+-    batch_t arr[256]; u32 n_arr;
+-    batch_t idx[256]; u32 n_idx;
++    /* One BEGIN/END can carry far more than 256 packets: each DRAW_ARRAYS /
++     * DRAW_INDEX_ARRAY word covers at most 256 vertices, so a 30k-triangle
++     * mesh arrives as ~350 of them. Contiguous packets are merged on arrival
++     * (dc_queue_batch), and the queue is sized for meshes that are not. */
++    batch_t arr[LD_MAX_BATCHES]; u32 n_arr;
++    batch_t idx[LD_MAX_BATCHES]; u32 n_idx;
+     u32     n_packets;
+     vtx_t*  verts; u32 n_verts, cap_verts;
+     rsx_vertex_ref* refs; u32 n_refs, cap_refs;
+@@ -5874,6 +5879,40 @@ static void ld_movie_capture_overlay(void)
+ }
+ 
+ static void sink_begin(void* u, const rsx_dispatch* r, u32 prim) { (void)u; (void)r; (void)prim; dc_reset(); }
++
++/* Queue one (first, count) packet. A packet that continues the previous one
++ * (first == previous first + count) extends it instead: the primitive stream
++ * is the concatenation of the packets either way, so this is exact, and it
++ * keeps a large mesh -- hundreds of 256-vertex packets -- in one batch. Only a
++ * full queue of non-contiguous packets drops one (counted as queue_full). */
++static int dc_queue_batch(batch_t* batches, u32* batchCount, u32 first, u32 count)
++{
++    if (*batchCount > 0)
++    {
++        batch_t* previous = &batches[*batchCount - 1];
++        if (previous->first + previous->count == first &&
++            previous->count + count >= previous->count)
++        {
++            previous->count += count;
++            return 1;
++        }
++    }
++    if (*batchCount >= LD_MAX_BATCHES)
++    {
++        static int warned = 0;
++        if (!warned)
++        {
++            warned = 1;
++            fprintf(stderr, "[live-draw] more than %u separate draw packets in one primitive: "
++                    "the rest are dropped\n", LD_MAX_BATCHES);
++        }
++        return 0;
++    }
++    batches[*batchCount].first = first;
++    batches[*batchCount].count = count;
++    (*batchCount)++;
++    return 1;
++}
+ static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 count)
+ {
+     (void)u; (void)r; g_ld_stats.packets_seen++;
+@@ -5882,8 +5921,7 @@ static void sink_draw_arrays(void* u, const rsx_dispatch* r, u32 first, u32 coun
+         return;
+     }
+     dc.n_packets++;
+-    if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
+-    dc.arr[dc.n_arr].first = first; dc.arr[dc.n_arr].count = count; dc.n_arr++;
++    if (!dc_queue_batch(dc.arr, &dc.n_arr, first, count)) { g_ld_stats.packets_queue_full++; return; }
+     g_ld_stats.packets_queued++;
+ }
+ /* INLINE_ARRAY arrives as one finished stream instead of a (first, count)
+@@ -5906,7 +5944,7 @@ static void sink_inline_array(void* u, const rsx_dispatch* r,
+ 
+     dc.inl = data; dc.inl_bytes = bytes; dc.inl_stride = stride;
+     dc.n_packets++;
+-    if (dc.n_arr >= 256) { g_ld_stats.packets_queue_full++; return; }
++    if (dc.n_arr >= LD_MAX_BATCHES) { g_ld_stats.packets_queue_full++; return; }
+     dc.arr[dc.n_arr].first = 0; dc.arr[dc.n_arr].count = bytes / stride;
+     dc.n_arr++;
+     g_ld_stats.packets_queued++;
+@@ -5920,8 +5958,7 @@ static void sink_draw_index(void* u, const rsx_dispatch* r, u32 first, u32 count
+         return;
+     }
+     dc.n_packets++;
+-    if (dc.n_idx >= 256) { g_ld_stats.packets_queue_full++; return; }
+-    dc.idx[dc.n_idx].first = first; dc.idx[dc.n_idx].count = count; dc.n_idx++;
++    if (!dc_queue_batch(dc.idx, &dc.n_idx, first, count)) { g_ld_stats.packets_queue_full++; return; }
+     g_ld_stats.packets_queued++;
+ }
+ 

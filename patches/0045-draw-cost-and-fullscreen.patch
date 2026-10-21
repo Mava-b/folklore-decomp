@@ -1,0 +1,594 @@
+diff --git a/libs/video/rsx_dispatch.c b/libs/video/rsx_dispatch.c
+index 404191b..e28eefc 100644
+--- a/libs/video/rsx_dispatch.c
++++ b/libs/video/rsx_dispatch.c
+@@ -271,6 +271,7 @@ void rsx_dispatch_seed_transform_program(rsx_dispatch* rsx, const u32* words, u3
+     if (count > RSX_DSP_VP_WORDS)
+         count = RSX_DSP_VP_WORDS;
+     memcpy(rsx->vp, words, count * sizeof(u32));
++    rsx->vp_generation++;
+ }
+ 
+ void rsx_dispatch_seed_transform_constants(rsx_dispatch* rsx, const u32* words, u32 count)
+@@ -370,7 +371,10 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
+         u32* load = &rsx->regs[M_VP_UPLOAD_FROM_ID >> 2];
+         const u32 pos = *load * 4 + lane;
+         if (pos < RSX_DSP_VP_WORDS)
++        {
+             rsx->vp[pos] = arg;
++            rsx->vp_generation++;
++        }
+         if (lane == 3)
+             (*load)++;
+         return;
+diff --git a/libs/video/rsx_dispatch.h b/libs/video/rsx_dispatch.h
+index b58a830..8e24515 100644
+--- a/libs/video/rsx_dispatch.h
++++ b/libs/video/rsx_dispatch.h
+@@ -122,6 +122,8 @@ struct rsx_dispatch {
+ 
+     int in_begin_end;                 /* between BEGIN_END(prim) and (0)    */
+     u32 current_primitive;
++    u32 vp_generation;                /* bumped on every vp[] write: lets the
++                                       * renderer reuse a program's hash  */
+ 
+     u32 inline_len;                   /* bytes accumulated this primitive   */
+     u32 inline_dropped;               /* streams lost to the cap            */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index fa56c36..3bd0dc6 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -289,6 +289,7 @@ typedef struct {
+     u64 key;
+     ID3D12PipelineState* volatile pso;
+     volatile LONG pending;
++    u32 ps_unit_mask;   /* texture units the fragment program samples */
+ } psocache_t;
+ typedef struct {
+     u64 hash;
+@@ -643,6 +644,7 @@ typedef struct {
+     u32 cube_mask, vtex_mask, txl_mask;
+     u32 input_mask, input_stride;
+     u32 packed_offsets;
++    u32 ps_unit_mask;
+ } ld_pso_metadata;
+ 
+ static ld_pso_metadata g_ld_current_pso;
+@@ -3072,6 +3074,61 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
+ /* Decode a guest texture descriptor into a cached SRV slot.  Unlike the old
+  * descriptor-only cache, re-hash the source once per frame and refresh the
+  * D3D resource when the game rewrites the same guest address. */
++/* Texture cache index.
++ *
++ * texture_srv_slot used to walk every cached texture (630 of them by the
++ * time Folklore reaches Doolin) comparing descriptors, for every enabled
++ * unit of every draw -- eight units on each of 2,000 draws a frame there.
++ * Cache keys are unique (an entry is only added when no entry matches), so
++ * a chained hash on the same fields finds the one entry directly. Entries
++ * are only ever added or replaced in place (LRU reuse), never removed. */
++#define LD_TEXTURE_BUCKETS 2048u
++static u16 g_ld_texture_bucket[LD_TEXTURE_BUCKETS];   /* entry index + 1, 0 = empty */
++static u16 g_ld_texture_next[MAX_TEXTURES];           /* entry index + 1, 0 = end   */
++
++static u32 ld_texture_key_bucket(u32 location, u32 offset, u32 format, u32 width, u32 height,
++                                 u32 pitch, u32 remap, u32 cubemap)
++{
++    u64 hash = 1469598103934665603ull;
++    const u32 fields[8] = { location, offset, format, width, height, pitch, remap, cubemap };
++    for (u32 fieldIndex = 0; fieldIndex < 8; fieldIndex++)
++    {
++        hash ^= fields[fieldIndex];
++        hash *= 1099511628211ull;
++        hash ^= hash >> 29;
++    }
++    return (u32)(hash & (LD_TEXTURE_BUCKETS - 1u));
++}
++
++static u32 ld_texture_entry_bucket(const texcache_t* entry)
++{
++    return ld_texture_key_bucket(entry->location, entry->offset, entry->format, entry->width,
++                                 entry->height, entry->pitch, entry->remap, entry->cubemap);
++}
++
++static void ld_texture_index_remove(u32 entryIndex)
++{
++    const u32 bucket = ld_texture_entry_bucket(&g.textures[entryIndex]);
++    u16* link = &g_ld_texture_bucket[bucket];
++    while (*link)
++    {
++        if ((u32)(*link - 1u) == entryIndex)
++        {
++            *link = g_ld_texture_next[entryIndex];
++            g_ld_texture_next[entryIndex] = 0;
++            return;
++        }
++        link = &g_ld_texture_next[*link - 1u];
++    }
++}
++
++static void ld_texture_index_insert(u32 entryIndex)
++{
++    const u32 bucket = ld_texture_entry_bucket(&g.textures[entryIndex]);
++    g_ld_texture_next[entryIndex] = g_ld_texture_bucket[bucket];
++    g_ld_texture_bucket[bucket] = (u16)(entryIndex + 1u);
++}
++
+ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+ {
+     const u32 remap = t->remap & 0xFFFF;
+@@ -3079,7 +3136,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+     if (refresh_enabled < 0)
+         refresh_enabled = getenv("RSX_NO_TEX_REFRESH") ? 0 : 1;
+ 
+-    for (u32 i = 0; i < g.n_textures; i++) {
++    const u32 lookupBucket = ld_texture_key_bucket(t->location, t->offset, t->format, t->width,
++                                                   t->height, t->pitch, remap, t->cubemap);
++    for (u32 link = g_ld_texture_bucket[lookupBucket]; link; link = g_ld_texture_next[link - 1u]) {
++        const u32 i = link - 1u;
+         texcache_t* entry = &g.textures[i];
+         if (entry->location != t->location || entry->offset != t->offset ||
+             entry->format != t->format || entry->width != t->width ||
+@@ -3211,11 +3271,19 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
+         texcache_t* entry = &g.textures[index];
+         if (evicted)
+             retire_texture(evicted);
++        if (cache_was_full)
++        {
++            ld_texture_index_remove(index);
++        }
+         *entry = replacement;
++        ld_texture_index_insert(index);
+         write_texture_srv(index, entry);
+     } else {
+         if (!cache_was_full)
++        {
+             g.textures[index] = replacement;
++            ld_texture_index_insert(index);
++        }
+         g_ld_texture_decode_fail++;
+         if (g_ld_texture_decode_fail <= 16 ||
+             (g_ld_texture_decode_fail & (g_ld_texture_decode_fail - 1)) == 0)
+@@ -5160,6 +5228,56 @@ static int ld_scale_wpos(char* hlsl, u32 capacity, u32 drawScale, float drawScal
+  * depth test, 2 without the alpha test, 3 with texture unit 0 white. A
+  * capture's flip images then show which change makes the draw appear.
+  * -----------------------------------------------------------------------*/
++/* Per-draw shader identity, memoised.
++ *
++ * Every draw used to rescan its vertex program for the END bit and FNV-hash
++ * all of its bytes (twice: the PSO key and the metadata hash) and scan it
++ * again for TXL -- several microseconds a draw, which is milliseconds a
++ * frame where Folklore issues 2,000 small particle draws. The program only
++ * changes when the guest uploads transform-program words, which bump
++ * rsx.vp_generation, so a small table keyed by start slot and generation
++ * returns the same answers without touching the bytes. */
++typedef struct
++{
++    u32 valid;
++    u32 start;
++    u32 generation;
++    u32 instructionCount;
++    u32 txlMask;
++    u64 programHash;
++} ld_vp_identity;
++
++static ld_vp_identity g_ld_vp_identities[16];
++static u64 g_ld_vp_identity_hits = 0;
++static u64 g_ld_vp_identity_misses = 0;
++
++static int ld_vp_identity_get(u32 start, ld_vp_identity* out)
++{
++    const u32 generation = g.rsx.vp_generation;
++    ld_vp_identity* entry = &g_ld_vp_identities[start & 15u];
++    if (entry->valid && entry->start == start && entry->generation == generation)
++    {
++        g_ld_vp_identity_hits++;
++        *out = *entry;
++        return 1;
++    }
++    g_ld_vp_identity_misses++;
++    const u8* programCode = (const u8*)(g.rsx.vp + start * 4);
++    const u32 instructionCount = rsx_vp_program_size_instrs(programCode, (RSX_DSP_VP_INSTR - start) * 16);
++    if (!instructionCount)
++    {
++        return 0;
++    }
++    entry->valid = 1;
++    entry->start = start;
++    entry->generation = generation;
++    entry->instructionCount = instructionCount;
++    entry->txlMask = vp_txl_unit_mask(programCode, instructionCount);
++    entry->programHash = fnv1a(programCode, instructionCount * 16, 1469598103934665603ull);
++    *out = *entry;
++    return 1;
++}
++
+ /* A texture that reads a depth buffer through A8R8G8B8 -- the zeta's own
+  * address, a colour format, and a zeta the host has drawn into. Returns that
+  * zeta's index in g.zdepths, or -1. The host depth never reaches guest VRAM,
+@@ -5480,8 +5598,9 @@ static ID3D12PipelineState* get_pso(
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+     if (start >= RSX_DSP_VP_INSTR) { LD_PSO_BAIL("no vertex program uploaded (vp start out of range)"); return NULL; }
+     const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
+-    const u32 vp_instrs = rsx_vp_program_size_instrs(vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
+-    if (!vp_instrs) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
++    ld_vp_identity vpIdentity;
++    if (!ld_vp_identity_get(start, &vpIdentity)) { LD_PSO_BAIL("vertex program has zero instructions"); return NULL; }
++    const u32 vp_instrs = vpIdentity.instructionCount;
+ 
+     u32 fp_loc = 0;
+     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+@@ -5548,7 +5667,7 @@ static ID3D12PipelineState* get_pso(
+             cube_mask |= 1u << unit;
+     }
+     const u32 vtex_mask = vertex_texture_mask();
+-    const u32 txl_mask = vp_txl_unit_mask(vp_uc, vp_instrs);
++    const u32 txl_mask = vpIdentity.txlMask;
+     if (txl_mask && !(txl_mask & vtex_mask)) {
+         g_ld_vtex_missing_for_txl++;
+         static u32 warned = 0;
+@@ -5592,8 +5711,7 @@ static ID3D12PipelineState* get_pso(
+     g.fp_alpha_ref = rsx_fp_alpha_ref(
+         rs.alpha_ref_raw, rs.alpha_ref_format);
+ 
+-    u64 key = fnv1a(
+-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
++    u64 key = vpIdentity.programHash;
+     if (ld_fp_constants_buffered())
+         key = rsx_fp_structural_hash(fp_uc, fp_size, key);
+     else
+@@ -5717,8 +5835,7 @@ static ID3D12PipelineState* get_pso(
+ #endif
+     g_ld_current_pso.valid = 1;
+     g_ld_current_pso.key = key;
+-    g_ld_current_pso.vp_hash = fnv1a(
+-        vp_uc, vp_instrs * 16, 1469598103934665603ull);
++    g_ld_current_pso.vp_hash = vpIdentity.programHash;
+     g_ld_current_pso.vp_start = start;
+     g_ld_current_pso.vp_instrs = vp_instrs;
+     g_ld_current_pso.fp_location = fp_loc;
+@@ -5745,6 +5862,7 @@ static ID3D12PipelineState* get_pso(
+ #if defined(YZ_PERF_PROFILE)
+             g_ld_profile.total.pso_hits++;
+ #endif
++            g_ld_current_pso.ps_unit_mask = g.psos[found].ps_unit_mask;
+             if (InterlockedCompareExchange(&g.psos[found].pending, 0, 0)) {
+                 InterlockedIncrement(&g_ld_pso_draws_skipped);
+                 return NULL;             /* still compiling (ld_pso_job) */
+@@ -5905,6 +6023,8 @@ static ID3D12PipelineState* get_pso(
+     g.psos[entryIndex].key = key;
+     g.psos[entryIndex].pso = NULL;
+     g.psos[entryIndex].pending = 0;
++    g.psos[entryIndex].ps_unit_mask = rsx_fp_texture_units(fp_uc, fp_size);
++    g_ld_current_pso.ps_unit_mask = g.psos[entryIndex].ps_unit_mask;
+     if (vi > 0 && fi > 0) {
+         if (ld_pso_job_submit(entryIndex, vs_hlsl, ps_hlsl, &rs, masked_layout,
+                               packed_payload)) {
+@@ -7649,11 +7769,11 @@ static u64 live_legacy_pso_key(void)
+     const u32 start = rsx_dsp_vp_start(&g.rsx);
+     if (start >= RSX_DSP_VP_INSTR)
+         return 0;
+-    const u8* vp_uc = (const u8*)(g.rsx.vp + start * 4);
+-    const u32 vp_instrs = rsx_vp_program_size_instrs(
+-        vp_uc, (RSX_DSP_VP_INSTR - start) * 16);
+-    if (!vp_instrs)
++    ld_vp_identity vpIdentity;
++    if (!ld_vp_identity_get(start, &vpIdentity))
++    {
+         return 0;
++    }
+ 
+     u32 fp_loc = 0;
+     const u32 fp_off = rsx_dsp_fragment_program(&g.rsx, &fp_loc);
+@@ -7667,7 +7787,7 @@ static u64 live_legacy_pso_key(void)
+     if (!fp_uc)
+         return 0;
+ 
+-    u64 key = fnv1a(vp_uc, vp_instrs * 16, 1469598103934665603ull);
++    u64 key = vpIdentity.programHash;
+     key = fnv1a(fp_uc, fp_size, key);
+     const u32 fp_ctrl_key = rsx_dsp_shader_control(&g.rsx) & 0x4Eu;
+     key = fnv1a(&fp_ctrl_key, sizeof(fp_ctrl_key), key);
+@@ -8596,6 +8716,39 @@ static void write_topology_indices(u32 prim, u32* indices)
+     }
+ }
+ 
++/* Where the present thread's per-draw time goes, for the [fps] report:
++ * every draw's sink_end, split into vertex fetch, shader lookup, texture
++ * binding and the rest (constants, state and the draw call). */
++typedef struct
++{
++    u64 draws;
++    u64 totalTicks;
++    u64 fetchTicks;
++    u64 shaderTicks;
++    u64 bindTicks;
++} ld_draw_perf;
++
++static ld_draw_perf g_ld_draw_perf;
++
++static u64 ld_perf_ticks(void)
++{
++    LARGE_INTEGER value;
++    QueryPerformanceCounter(&value);
++    return (u64)value.QuadPart;
++}
++
++static double ld_perf_ticks_to_ms(u64 ticks)
++{
++    static double millisecondsPerTick = 0.0;
++    if (millisecondsPerTick == 0.0)
++    {
++        LARGE_INTEGER frequency;
++        QueryPerformanceFrequency(&frequency);
++        millisecondsPerTick = 1000.0 / (double)frequency.QuadPart;
++    }
++    return (double)ticks * millisecondsPerTick;
++}
++
+ static void sink_end_impl(void* user, const rsx_dispatch* r)
+ {
+     (void)user; (void)r;
+@@ -8652,6 +8805,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_ld_profile.total_used_attribute_max = used_layout.count;
+     const LONGLONG fetch_pack_begin = ld_profile_qpc();
+ #endif
++    const u64 fetchBegin = ld_perf_ticks();
+     if (ld_vertex_compact_payload()) {
+         fetch_batches_hoisted(&used_layout, 1);
+     } else if (ld_vertex_hoist_fetch()) {
+@@ -8663,6 +8817,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     }
+     if (!dc.n_source_refs)
+         dc.n_source_refs = dc.n_verts;
++    g_ld_draw_perf.fetchTicks += ld_perf_ticks() - fetchBegin;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.vertex_fetch_pack_qpc +=
+         (u64)(ld_profile_qpc() - fetch_pack_begin);
+@@ -8728,9 +8883,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_ld_probe_variant = ld_probe_choose_variant(probeKey, prim);
+         ld_probe_draw(probeKey, prim);
+     }
++    const u64 shaderBegin = ld_perf_ticks();
+     ID3D12PipelineState* pso = get_pso(
+         ld_vertex_mask_signature() ? &used_layout : NULL,
+         ld_vertex_compact_payload());
++    g_ld_draw_perf.shaderTicks += ld_perf_ticks() - shaderBegin;
+     if (!pso) {
+ #if defined(YZ_PERF_PROFILE)
+         ld_profile_note_rejected_pso();
+@@ -8902,6 +9059,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+     const u32 current_zslot = g.depth
+         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
+         : 0;
++    const u64 bindBegin = ld_perf_ticks();
+     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
+     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
+     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
+@@ -8971,6 +9129,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+           if (fb0 && t.location == 1u && t.offset == 0x4003C0u)
+               t.offset = 0x400000u; }
+         if (!t.enabled) continue;
++        /* A unit the fragment program never samples keeps its white
++         * placeholder: games leave stale textures enabled on every unit
++         * (Folklore: eight per draw, one or two sampled), and resolving each
++         * one -- cache lookups, content hashes, surface searches and the
++         * barriers a stale render target needs -- was most of the per-draw
++         * cost of its particle-heavy scenes. LD_ALL_TEXTURE_UNITS=1 binds
++         * every enabled unit as before. */
++        { static int allUnits = -1;
++          if (allUnits < 0)
++          {
++              const char* text = getenv("LD_ALL_TEXTURE_UNITS");
++              allUnits = text && text[0] && text[0] != '0' ? 1 : 0;
++          }
++          if (!allUnits && !((g_ld_current_pso.ps_unit_mask >> u) & 1u))
++          {
++              continue;
++          } }
+         texture_mask |= 1u << u;
+         smp_slots[u] = sampler_slot(&t, sampler_key(&t));
+         /* Pick WHICH surface at this offset to sample.
+@@ -9217,6 +9392,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         if (!g.ready) return;
+         g.srv_ring_used = ld_srv_base();
+     }
++    g_ld_draw_perf.bindTicks += ld_perf_ticks() - bindBegin;
+ 
+     D3D12_RESOURCE_BARRIER bar = {0};
+     bar.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -9500,7 +9676,10 @@ static void sink_end(void* user, const rsx_dispatch* r)
+ #if defined(YZ_PERF_PROFILE)
+     const LONGLONG begin = ld_profile_qpc();
+ #endif
++    const u64 drawBegin = ld_perf_ticks();
+     sink_end_impl(user, r);
++    g_ld_draw_perf.totalTicks += ld_perf_ticks() - drawBegin;
++    g_ld_draw_perf.draws++;
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.sink_end_qpc += (u64)(ld_profile_qpc() - begin);
+ #endif
+@@ -12434,7 +12613,30 @@ void rsx_live_draw_present(u32 buffer_id)
+                       (double)(g_ld_geom_uncacheable - lastUncacheable) / frameCount,
+                       rsx_geom_cache_entries(), (double)rsx_geom_cache_bytes() / (1024.0 * 1024.0));
+               lastHits = g_ld_geom_hits; lastMisses = g_ld_geom_misses;
+-              lastStale = g_ld_geom_stale; lastUncacheable = g_ld_geom_uncacheable; } }
++              lastStale = g_ld_geom_stale; lastUncacheable = g_ld_geom_uncacheable; }
++            { static ld_draw_perf lastPerf;
++              static u64 lastIdentityHits = 0;
++              static u64 lastIdentityMisses = 0;
++              const ld_draw_perf nowPerf = g_ld_draw_perf;
++              const double drawCount = (double)(nowPerf.draws - lastPerf.draws);
++              const u64 totalTicks = nowPerf.totalTicks - lastPerf.totalTicks;
++              const u64 fetchTicks = nowPerf.fetchTicks - lastPerf.fetchTicks;
++              const u64 shaderTicks = nowPerf.shaderTicks - lastPerf.shaderTicks;
++              const u64 bindTicks = nowPerf.bindTicks - lastPerf.bindTicks;
++              const u64 stageTicks = fetchTicks + shaderTicks + bindTicks;
++              fprintf(stderr, "[fps]   draws per frame: %.0f, %.1f ms in the renderer (%.2f us each): vertex fetch %.1f, "
++                              "shader lookup %.1f, textures %.1f, constants+state+draw %.1f ms; vp hash reuse %llu/%llu\n",
++                      drawCount / frameCount, ld_perf_ticks_to_ms(totalTicks) / frameCount,
++                      drawCount > 0.0 ? ld_perf_ticks_to_ms(totalTicks) * 1000.0 / drawCount : 0.0,
++                      ld_perf_ticks_to_ms(fetchTicks) / frameCount, ld_perf_ticks_to_ms(shaderTicks) / frameCount,
++                      ld_perf_ticks_to_ms(bindTicks) / frameCount,
++                      ld_perf_ticks_to_ms(totalTicks > stageTicks ? totalTicks - stageTicks : 0) / frameCount,
++                      (unsigned long long)(g_ld_vp_identity_hits - lastIdentityHits),
++                      (unsigned long long)(g_ld_vp_identity_hits - lastIdentityHits +
++                                           g_ld_vp_identity_misses - lastIdentityMisses));
++              lastPerf = nowPerf;
++              lastIdentityHits = g_ld_vp_identity_hits;
++              lastIdentityMisses = g_ld_vp_identity_misses; } }
+           fps_t0 = now; fps_f0 = g_ld_frames;
+       } }
+     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
+index 32e8a95..0d7abe4 100644
+--- a/libs/video/rsx_null_backend.c
++++ b/libs/video/rsx_null_backend.c
+@@ -46,6 +46,83 @@ typedef struct {
+ 
+ static NullBackendState s_state;
+ 
++/* ---------------------------------------------------------------------------
++ * Borderless fullscreen
++ *
++ * Alt+Enter, or rsx_null_backend_set_fullscreen from any thread (the
++ * Folklore engine menu calls it from the present thread). The change itself
++ * is made on the window's own thread, in rsx_null_backend_pump_messages, so
++ * the renderer never waits on window messages. The window covers its
++ * monitor without a frame; the live renderer resizes its back buffers to the
++ * new client area on the next present. The swap chain stays windowed (flip
++ * model), which Windows promotes to independent flip -- the same latency as
++ * exclusive fullscreen without the mode change.
++ * -----------------------------------------------------------------------*/
++
++static volatile LONG s_fullscreen_wanted = 0;    /* what was asked for       */
++static int s_fullscreen_applied = 0;             /* what the window is now   */
++static WINDOWPLACEMENT s_windowed_placement;
++static LONG_PTR s_windowed_style = 0;
++
++static void null_apply_fullscreen(void)
++{
++    const int wanted = InterlockedCompareExchange(&s_fullscreen_wanted, 0, 0) != 0;
++    if (!s_state.hwnd || wanted == s_fullscreen_applied)
++    {
++        return;
++    }
++    if (wanted)
++    {
++        MONITORINFO monitorInfo;
++        memset(&monitorInfo, 0, sizeof(monitorInfo));
++        monitorInfo.cbSize = sizeof(monitorInfo);
++        s_windowed_placement.length = sizeof(s_windowed_placement);
++        if (!GetWindowPlacement(s_state.hwnd, &s_windowed_placement) ||
++            !GetMonitorInfoA(MonitorFromWindow(s_state.hwnd, MONITOR_DEFAULTTONEAREST), &monitorInfo))
++        {
++            InterlockedExchange(&s_fullscreen_wanted, 0);
++            return;
++        }
++        s_windowed_style = GetWindowLongPtrA(s_state.hwnd, GWL_STYLE);
++        SetWindowLongPtrA(s_state.hwnd, GWL_STYLE,
++                          (s_windowed_style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP);
++        SetWindowPos(s_state.hwnd, HWND_TOP, monitorInfo.rcMonitor.left, monitorInfo.rcMonitor.top,
++                     monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left,
++                     monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top,
++                     SWP_FRAMECHANGED | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
++        s_fullscreen_applied = 1;
++        printf("[RSX null] fullscreen on %ldx%ld\n",
++               (long)(monitorInfo.rcMonitor.right - monitorInfo.rcMonitor.left),
++               (long)(monitorInfo.rcMonitor.bottom - monitorInfo.rcMonitor.top));
++    }
++    else
++    {
++        SetWindowLongPtrA(s_state.hwnd, GWL_STYLE, s_windowed_style ? s_windowed_style
++                                                                    : (LONG_PTR)(WS_OVERLAPPEDWINDOW | WS_VISIBLE));
++        SetWindowPlacement(s_state.hwnd, &s_windowed_placement);
++        SetWindowPos(s_state.hwnd, NULL, 0, 0, 0, 0,
++                     SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
++        s_fullscreen_applied = 0;
++        printf("[RSX null] fullscreen off\n");
++    }
++}
++
++void rsx_null_backend_set_fullscreen(int enabled)
++{
++    InterlockedExchange(&s_fullscreen_wanted, enabled ? 1 : 0);
++}
++
++void rsx_null_backend_toggle_fullscreen(void)
++{
++    const LONG current = InterlockedCompareExchange(&s_fullscreen_wanted, 0, 0);
++    InterlockedExchange(&s_fullscreen_wanted, current ? 0 : 1);
++}
++
++int rsx_null_backend_is_fullscreen(void)
++{
++    return InterlockedCompareExchange(&s_fullscreen_wanted, 0, 0) != 0;
++}
++
+ /* ---------------------------------------------------------------------------
+  * Win32 window procedure
+  * -----------------------------------------------------------------------*/
+@@ -64,6 +141,28 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         PostQuitMessage(0);
+         return 0;
+ 
++    /* Alt+Enter: toggle borderless fullscreen (first press only, not the
++     * key repeat). Swallowing the key and its WM_SYSCHAR keeps Windows from
++     * playing the "no menu" chime. */
++    case WM_SYSKEYDOWN:
++        if (wp == VK_RETURN && (lp & (1 << 29)))
++        {
++            if (!(lp & (1 << 30)))
++            {
++                rsx_null_backend_toggle_fullscreen();
++                null_apply_fullscreen();
++            }
++            return 0;
++        }
++        break;
++
++    case WM_SYSCHAR:
++        if (wp == '\r')
++        {
++            return 0;
++        }
++        break;
++
+     case WM_PAINT: {
+         PAINTSTRUCT ps;
+         HDC hdc = BeginPaint(hwnd, &ps);
+@@ -303,6 +402,7 @@ int rsx_null_backend_pump_messages(void)
+         TranslateMessage(&msg);
+         DispatchMessageA(&msg);
+     }
++    null_apply_fullscreen();
+     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
+      * live-draw frame, window size. Here on the window's own thread, so the
+      * WM_SETTEXT never blocks the renderer. */
+@@ -719,6 +819,9 @@ int rsx_null_backend_pump_messages(void) { return 0; }
+ 
+ void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }
+ void* rsx_null_backend_get_hwnd(void) { return 0; }
++void  rsx_null_backend_set_fullscreen(int enabled) { (void)enabled; }
++void  rsx_null_backend_toggle_fullscreen(void) {}
++int   rsx_null_backend_is_fullscreen(void) { return 0; }
+ void  rsx_null_backend_suppress_present(int on) { (void)on; }
+ 
+ u32 rsx_null_backend_debug_color(void) { return s_soft.clear_argb; }
+diff --git a/libs/video/rsx_null_backend.h b/libs/video/rsx_null_backend.h
+index 21e8cc4..d09cd05 100644
+--- a/libs/video/rsx_null_backend.h
++++ b/libs/video/rsx_null_backend.h
+@@ -63,6 +63,13 @@ u32 rsx_null_backend_guest_draws(void);
+ void* rsx_null_backend_get_hwnd(void);
+ void  rsx_null_backend_suppress_present(int on);
+ 
++/* Borderless fullscreen on the window's monitor (Alt+Enter toggles it).
++ * Callable from any thread; the window changes on its own thread at the
++ * next message pump. is_fullscreen reports the requested state. */
++void  rsx_null_backend_set_fullscreen(int enabled);
++void  rsx_null_backend_toggle_fullscreen(void);
++int   rsx_null_backend_is_fullscreen(void);
++
+ #ifdef __cplusplus
+ }
+ #endif

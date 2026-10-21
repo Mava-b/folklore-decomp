@@ -1,0 +1,235 @@
+diff --git a/runtime/ppu/ppu_fs.cpp b/runtime/ppu/ppu_fs.cpp
+index 7f1ffc9..3203246 100644
+--- a/runtime/ppu/ppu_fs.cpp
++++ b/runtime/ppu/ppu_fs.cpp
+@@ -133,6 +133,16 @@ static void host_path(char* out, size_t cap, const char* guest)
+         for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+         return;
+     }
++    /* /dev_hdd1 is the system cache (cellSysCacheMount). Folklore copies its
++     * multi-GB model/mt/etc archives there on first boot, so it must be
++     * pointable away from the (possibly read-only) disc dump: PS3_HDD1_ROOT. */
++    static const char* hdd1_root = nullptr; static int hdd1_init = 0;
++    if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
++    if (hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
++        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
++        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
++        return;
++    }
+ 
+     /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
+      * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index a55afb0..58254ad 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -70,6 +70,9 @@ void     ps3_load_prx_modules(void) {}
+ #include <string.h>
+ #include <stdlib.h>
+ #include <signal.h>
++#ifndef _WIN32
++#include <sys/mman.h>
++#endif
+ 
+ #ifdef _WIN32
+ #include <windows.h>
+@@ -1139,7 +1142,16 @@ int main(int argc, char** argv)
+     vm_base = (uint8_t*)VirtualAlloc(NULL, VM_SIZE, MEM_RESERVE, PAGE_READWRITE);
+     ppu_vm_size = 0;   /* full 32-bit space backed -> OOB guard unnecessary */
+ #else
+-    vm_base = (uint8_t*)calloc(1, 0xE0000000u);
++    /* mmap, not calloc: glibc serves a 3.5 GB calloc from mmap but returns the
++     * mapping + 16 bytes of malloc header, so vm_base is not page-aligned and
++     * every vm_commit/vm_protect mprotect() fails with EINVAL (the first one
++     * is the CRT's sys_memory_allocate -> "not enough memory to initialize
++     * mutex"). Anonymous mmap is page-aligned and zero-filled. */
++    {
++        void* mapping = mmap(NULL, 0xE0000000u, PROT_READ | PROT_WRITE,
++                             MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
++        vm_base = (mapping == MAP_FAILED) ? nullptr : (uint8_t*)mapping;
++    }
+     ppu_vm_size = 0xE0000000u;
+ #endif
+     if (!vm_base) { printf("vm alloc failed\n"); return 1; }
+diff --git a/runtime/syscalls/sys_memory.c b/runtime/syscalls/sys_memory.c
+index bfbaac5..b6bc7bc 100644
+--- a/runtime/syscalls/sys_memory.c
++++ b/runtime/syscalls/sys_memory.c
+@@ -388,6 +388,151 @@ int64_t sys_mmapper_allocate_shared_memory(ppu_context* ctx)
+     return CELL_OK;
+ }
+ 
++/* ---------------------------------------------------------------------------
++ * Regions handed out by lv2 341, by base address.
++ *
++ * On a retail title 341 is sys_memory_container_create(cid*, size) (RPCS3's
++ * syscall table agrees), and 350 then allocates out of that container. This
++ * runtime answers 341 with a committed region instead (GT5P reads the value
++ * back as memory -- see below), so the "container id" a retail title holds is
++ * that region's base. Recording the regions lets 350 carve allocations out of
++ * the memory the title already reserved, instead of failing (Folklore's CRT
++ * aborts with "not enough memory to initialize mutex") or double-charging the
++ * 0x40000000 window.
++ * -----------------------------------------------------------------------*/
++#define CARVED_MAX 32
++static struct { uint32_t base, size; } s_carved[CARVED_MAX];
++static int s_carved_count = 0;
++
++static void carved_record(uint32_t base, uint32_t size)
++{
++    bump_lock();
++    if (s_carved_count < CARVED_MAX) {
++        s_carved[s_carved_count].base = base;
++        s_carved[s_carved_count].size = size;
++        s_carved_count++;
++    }
++    bump_unlock();
++}
++
++static int alloc_slot_claim(uint32_t addr, uint32_t size, int32_t container_id, uint32_t page_size)
++{
++    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
++        if (!g_sys_mem_allocs[i].active) {
++            g_sys_mem_allocs[i].active       = 1;
++            g_sys_mem_allocs[i].addr         = addr;
++            g_sys_mem_allocs[i].size         = size;
++            g_sys_mem_allocs[i].container_id = container_id;
++            g_sys_mem_allocs[i].page_size    = page_size;
++            return i;
++        }
++    }
++    return -1;
++}
++
++/* ---------------------------------------------------------------------------
++ * sys_memory_allocate_from_container (lv2 350)
++ *
++ * r3 = size
++ * r4 = container id
++ * r5 = flags (page size)
++ * r6 = pointer to receive allocated address (u32*)
++ * -----------------------------------------------------------------------*/
++int64_t sys_memory_allocate_from_container(ppu_context* ctx)
++{
++    uint32_t size     = LV2_ARG_U32(ctx, 0);
++    uint32_t cid      = LV2_ARG_U32(ctx, 1);
++    uint32_t flags    = LV2_ARG_U32(ctx, 2);
++    uint32_t addr_out = LV2_ARG_PTR(ctx, 3);
++
++    uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
++    size = VM_ALIGN_UP(size, alignment);
++    if (size == 0)
++        return (int64_t)(int32_t)CELL_EINVAL;
++
++    uint32_t alloc_addr = 0;
++
++    bump_lock();
++    for (int i = 0; i < s_carved_count; i++) {
++        if (s_carved[i].base != cid) continue;
++        /* First fit over the container's live allocations, so memory the title
++         * gives back with sys_memory_free (349) can be handed out again --
++         * Folklore frees and re-takes a whole container during data install. */
++        uint32_t limit = s_carved[i].base + s_carved[i].size;
++        uint32_t start = VM_ALIGN_UP(s_carved[i].base, alignment);
++        int moved = 1;
++        while (moved && start + size <= limit) {
++            moved = 0;
++            for (int k = 0; k < SYS_MEMORY_ALLOC_MAX; k++) {
++                const sys_mem_alloc_info* a = &g_sys_mem_allocs[k];
++                if (!a->active || a->container_id != (int32_t)cid) continue;
++                if (a->addr < start + size && start < a->addr + a->size) {
++                    start = VM_ALIGN_UP(a->addr + a->size, alignment);
++                    moved = 1;
++                }
++            }
++        }
++        if (start + size > limit) {
++            bump_unlock();
++            fprintf(stderr, "[sys_memory] allocate_from_container(cid=0x%08X, size=0x%X): container full\n",
++                    cid, size);
++            return (int64_t)(int32_t)CELL_ENOMEM;
++        }
++        alloc_addr = start;
++        /* Claim the record under the same lock, so two threads cannot be handed
++         * the same gap. */
++        if (alloc_slot_claim(alloc_addr, size, (int32_t)cid, alignment) < 0) {
++            bump_unlock();
++            return (int64_t)(int32_t)CELL_ENOMEM;
++        }
++        bump_unlock();
++        { static int n = 0; if (n++ < 16)
++            fprintf(stderr, "[sys_memory] allocate_from_container(cid=0x%08X, size=0x%X) -> 0x%08X\n",
++                    cid, size, alloc_addr); }
++        if (addr_out != 0)
++            write_be32(addr_out, alloc_addr);
++        return CELL_OK;
++    }
++    bump_unlock();
++
++    if (alloc_addr == 0) {
++        /* A container from lv2 324 (ids 1..SYS_MEMORY_CONTAINER_MAX): charge
++         * it and take fresh memory from the main window. */
++        if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
++            return (int64_t)(int32_t)CELL_ESRCH;
++        sys_mem_container_info* c = &g_sys_mem_containers[cid - 1];
++        if (c->used_size + size > c->total_size)
++            return (int64_t)(int32_t)CELL_ENOMEM;
++
++        bump_lock();
++        if (g_sys_mem_bump_ptr == 0)
++            g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
++        g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
++        if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
++            bump_unlock();
++            return (int64_t)(int32_t)CELL_ENOMEM;
++        }
++        alloc_addr = g_sys_mem_bump_ptr;
++        g_sys_mem_bump_ptr += size;
++        c->used_size += size;
++        bump_unlock();
++
++        if (vm_commit(alloc_addr, size) != CELL_OK)
++            return (int64_t)(int32_t)CELL_ENOMEM;
++    }
++
++    if (alloc_slot_claim(alloc_addr, size, (int32_t)cid, alignment) < 0)
++        return (int64_t)(int32_t)CELL_ENOMEM;
++
++    { static int n = 0; if (n++ < 16)
++        fprintf(stderr, "[sys_memory] allocate_from_container(cid=0x%08X, size=0x%X) -> 0x%08X\n",
++                cid, size, alloc_addr); }
++
++    if (addr_out != 0)
++        write_be32(addr_out, alloc_addr);
++    return CELL_OK;
++}
++
+ /* ---------------------------------------------------------------------------
+  * sys_mmapper_allocate_memory (lv2 341)
+  *
+@@ -433,6 +578,7 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
+     bump_unlock();
+ 
+     vm_commit(addr, size);
++    carved_record(addr, size);
+ 
+     if (addr_out != 0)
+         write_be32(addr_out, addr);
+@@ -512,4 +658,5 @@ void sys_memory_init(lv2_syscall_table* tbl)
+     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
+     lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
+     lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
++    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
+ }
+diff --git a/runtime/syscalls/sys_memory.h b/runtime/syscalls/sys_memory.h
+index 7ae67ac..3d53a1f 100644
+--- a/runtime/syscalls/sys_memory.h
++++ b/runtime/syscalls/sys_memory.h
+@@ -58,6 +58,7 @@ extern uint32_t                 g_sys_mem_bump_ptr;  /* bump allocator pointer *
+ /* Syscall handlers */
+ int64_t sys_memory_allocate(ppu_context* ctx);
+ int64_t sys_memory_free(ppu_context* ctx);
++int64_t sys_memory_allocate_from_container(ppu_context* ctx);
+ int64_t sys_memory_get_user_memory_size(ppu_context* ctx);
+ int64_t sys_memory_get_page_attribute(ppu_context* ctx);
+ int64_t sys_memory_container_create(ppu_context* ctx);

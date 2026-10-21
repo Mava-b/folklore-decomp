@@ -1,0 +1,316 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+index e308610..d2ebce6 100644
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -85,6 +85,10 @@ volatile u64 g_gcm_perf_main_hle_ns = 0;
+  * command ring its next frame writes (gcm_ring_backpressure), the largest
+  * recent frame's command bytes, and the ring's size. */
+ volatile u64 g_gcm_perf_ring_wait_ns = 0;
++/* The present thread: in the FIFO drain (decoding the game's commands and
++ * recording draws), and executing + presenting frames (boot_main.cpp). */
++volatile u64 g_gcm_perf_drain_ns = 0;
++volatile u64 g_gcm_perf_present_ns = 0;
+ volatile u32 g_gcm_ring_frame_peak = 0;
+ volatile u32 g_gcm_ring_bytes = 0;
+ u64 gcm_perf_now_ns(void)
+@@ -112,13 +116,38 @@ static volatile u32 s_flip_request_count = 0;
+  * vblank, at most one per vblank (cellGcmTickFlip). */
+ static volatile u32 s_flips_issued = 0;
+ static volatile u32 s_flips_shown = 0;
+-/* The flip-request count at the last flip cellGcmTickFlip retired. A flip is
+- * on screen once the drain has produced a new request since then; comparing
+- * the two absolute counters instead stuck for good once any flip went
+- * missing between them (a resync over a marker, a flip that never reached
+- * the drain): shown could never pass the request count again, every frame's
+- * wait ran into its 100 ms cap, and Folklore's beach fell to 4 fps. */
+-static volatile u32 s_flips_request_seen = 0;
++/* The newest issued flip the drain has reached. Each in-FIFO flip marker
++ * carries the low 5 bits of its flip number (gcm_flip_into_fifo), so the
++ * drain knows WHICH flip it reached, not just that it reached one: a flip
++ * whose marker was skipped (a FIFO resync) is retired by the next marker
++ * instead of leaving the counters apart for good. Before this, the counters
++ * were compared as plain counts, and the 100 ms WaitFlip cap forced `shown`
++ * ahead whenever they disagreed -- after a few of those the game was allowed
++ * further and further ahead of the renderer. */
++static volatile u32 s_flips_drained = 0;
++/* Flip latency, for the [fps] breakdown: when each flip (by its low 5 bits)
++ * was issued and when the drain reached it. */
++static u64 s_flip_issue_ns[32];
++static u64 s_flip_drain_ns[32];
++volatile u64 g_gcm_perf_flip_drain_lat_ns = 0;   /* issue -> drained, summed */
++volatile u64 g_gcm_perf_flip_show_lat_ns = 0;    /* drained -> shown, summed */
++volatile u32 g_gcm_perf_flips_shown = 0;
++volatile u32 g_gcm_perf_waitflip_timeouts = 0;
++
++/* Record that the drain (or an immediate flip) reached flip `flipNumber`;
++ * never moves backwards. */
++static void gcm_flip_note_drained(u32 flipNumber)
++{
++    u32 previous = __atomic_load_n(&s_flips_drained, __ATOMIC_ACQUIRE);
++    while ((s32)(flipNumber - previous) > 0)
++    {
++        if (__atomic_compare_exchange_n(&s_flips_drained, &previous, flipNumber, 0,
++                                        __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
++        {
++            break;
++        }
++    }
++}
+ 
+ u32 cellGcm_flip_request_count(void)
+ {
+@@ -703,21 +732,25 @@ void cellGcmSetWaitFlip(void)
+                   waited++;
+               }
+               g_gcm_perf_waitflip_ns += gcm_perf_now_ns() - waitBegin;
+-              /* 100 ms with no flip reaching the screen: the counters have
+-               * drifted apart (or the drain is stalled, where waiting longer
+-               * would not help either). Resynchronize instead of paying the
+-               * full cap again on every following frame. */
++              /* 100 ms with no flip reaching the screen: the renderer is
++               * stalled. Let the game go on, and count it ([fps] line). The
++               * flip counters cannot drift apart any more (the markers are
++               * numbered), so nothing is forced: `shown` only catches up with
++               * what the drain has actually reached. */
+               if ((int)(s_flips_issued - s_flips_shown) > depth)
+               {
+-                  static int resyncReports = 0;
+-                  if (resyncReports < 8)
++                  g_gcm_perf_waitflip_timeouts++;
++                  static int timeoutReports = 0;
++                  if (timeoutReports < 8)
++                  {
++                      timeoutReports++;
++                      fprintf(stderr, "[gcm] WaitFlip: no flip shown in %d ms (issued=%u drained=%u shown=%u)\n",
++                              waited, s_flips_issued, s_flips_drained, s_flips_shown);
++                  }
++                  if ((s32)(s_flips_drained - s_flips_shown) > 0)
+                   {
+-                      resyncReports++;
+-                      fprintf(stderr, "[gcm] WaitFlip: no flip shown in %d ms (issued=%u shown=%u requests=%u); resynchronizing\n",
+-                              waited, s_flips_issued, s_flips_shown, s_flip_request_count);
++                      s_flips_shown = s_flips_drained;
+                   }
+-                  s_flips_shown = s_flips_issued - (u32)depth;
+-                  s_flips_request_seen = s_flip_request_count;
+               }
+           }
+           return;
+@@ -875,14 +908,52 @@ void cellGcmTickVBlank(void) { s_vblank_count++; GCM_PENDING_SET(1); }
+  * and its handler runs code that puts the status back to WAITING, so the
+  * poll never saw DONE and the game never rendered another frame. On hardware
+  * the callback IS the flip interrupt -- no flip, no callback. */
++/* The present thread has just executed and presented a frame: every flip
++ * the drain has reached is now on screen. Retiring them here instead of at
++ * the next vblank tick takes the wait for that tick (up to 16.7 ms, plus the
++ * present thread's idle wait) out of the chain from one frame to the next:
++ * the game waits in cellGcmSetWaitFlip for exactly this. The vblank tick
++ * still retires flips on its own (GCM_FLIP_SHOWN_AT_PRESENT=0 leaves it to
++ * the tick alone). */
++void cellGcm_note_frame_presented(void)
++{
++    static int enabled = -1;
++    if (enabled < 0)
++    {
++        const char* text = getenv("GCM_FLIP_SHOWN_AT_PRESENT");
++        enabled = (text && *text == '0') ? 0 : 1;
++    }
++    if (!enabled)
++    {
++        return;
++    }
++    const u64 now = gcm_perf_now_ns();
++    while ((s32)(s_flips_issued - s_flips_shown) > 0 &&
++           (s32)(s_flips_drained - s_flips_shown) > 0)
++    {
++        s_flips_shown++;
++        const u64 drainedAt = s_flip_drain_ns[s_flips_shown & 31u];
++        if (drainedAt && now > drainedAt)
++        {
++            g_gcm_perf_flip_show_lat_ns += now - drainedAt;
++            g_gcm_perf_flips_shown++;
++        }
++    }
++}
++
+ void cellGcmTickFlip(void)
+ {
+     /* One flip reaches the screen per vblank, once the drain has reached it. */
+     if ((s32)(s_flips_issued - s_flips_shown) > 0 &&
+-        (s32)(s_flip_request_count - s_flips_request_seen) > 0)
++        (s32)(s_flips_drained - s_flips_shown) > 0)
+     {
+-        s_flips_request_seen++;
+         s_flips_shown++;
++        const u64 drainedAt = s_flip_drain_ns[s_flips_shown & 31u];
++        if (drainedAt)
++        {
++            g_gcm_perf_flip_show_lat_ns += gcm_perf_now_ns() - drainedAt;
++            g_gcm_perf_flips_shown++;
++        }
+     }
+     if (s_flip_status == CELL_GCM_FLIP_STATUS_WAITING)
+         GCM_PENDING_SET(2);
+@@ -1847,6 +1918,23 @@ static void gcm_rsx_process_fifo_unlocked(void)
+                 gcm_set_current_display_buffer(w & 7u);
+                 s_flip_pending = 1;
+                 s_flip_request_count++;
++                /* Which flip this is: the newest flip number (allowing for
++                 * one the guest has written but not counted yet) with these
++                 * low 5 bits. */
++                { const u32 lowBits = (w >> 3) & 31u;
++                  const u32 newestPossible = s_flips_issued + 1u;
++                  const u32 flipNumber = newestPossible - ((newestPossible - lowBits) & 31u);
++                  const u64 now = gcm_perf_now_ns();
++                  if ((s32)(flipNumber - s_flips_drained) > 0)
++                  {
++                      const u64 issuedAt = s_flip_issue_ns[flipNumber & 31u];
++                      if (issuedAt && now > issuedAt)
++                      {
++                          g_gcm_perf_flip_drain_lat_ns += now - issuedAt;
++                      }
++                      s_flip_drain_ns[flipNumber & 31u] = now;
++                  }
++                  gcm_flip_note_drained(flipNumber); }
+             } else {
+                 cellGcmSetFlipCommand(w & 0xFFu);
+             }
+@@ -2577,6 +2665,8 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
+         gcm_set_current_display_buffer(bufferId);
+         s_flip_pending = 1;   /* ticker: present BEFORE the next drain */
+         s_flip_request_count++;
++        s_flip_drain_ns[s_flips_issued & 31u] = gcm_perf_now_ns();
++        gcm_flip_note_drained(s_flips_issued);
+     }
+     /* Flip requested but not yet shown: a subsequent cellGcmSetWaitFlip blocks
+      * until the present thread's cellGcmTickFlip marks it done (vsync). */
+@@ -2779,6 +2869,7 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
+         if (!waitBegin)
+         {
+             waitBegin = gcm_perf_now_ns();
++            SetEvent((HANDLE)cellGcm_fifo_kick_event());
+         }
+         Sleep(1);
+         waitedMs++;
+@@ -2822,7 +2913,14 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+     /* Never near the end: those bytes are the title's reserve before its
+      * ring wraps, and the recycle above keys on them. */
+     if (cur + 8 + GCM_RECYCLE_SLACK > realEnd || gcm_ea2io(cur) == 0xFFFFFFFFu) return 0;
+-    vm_write32(cur, GCM_FLIP_MARKER | bufferId);
++    /* Bits 3-7 carry the flip's number (gcm_flip_request counts it right
++     * after this returns); the drain uses only bits 0-2 for the buffer. */
++    {
++        const u32 flipNumber = s_flips_issued + 1u;
++        s_flip_issue_ns[flipNumber & 31u] = gcm_perf_now_ns();
++        s_flip_drain_ns[flipNumber & 31u] = 0;
++        vm_write32(cur, GCM_FLIP_MARKER | ((flipNumber & 31u) << 3) | bufferId);
++    }
+     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
+      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
+      * (see "recycled the title's own ring"), rewriting ctx->current and put
+@@ -2878,6 +2976,9 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
+      * (and the JUMP, when wrapping). */
+     atomic_thread_fence(memory_order_release);
+     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(nextWrite));
++    /* ...and wake the present thread for it, rather than leaving the frame
++     * until its next 4 ms idle wait runs out. */
++    SetEvent((HANDLE)cellGcm_fifo_kick_event());
+     gcm_ring_publish_end(ctx, nextWrite);
+     return 1;
+ }
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+index 77ca541..a3e4c4d 100644
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -1752,6 +1752,12 @@ extern volatile u64 g_gcm_perf_main_hle_ns;
+ extern volatile u64 g_gcm_perf_ring_wait_ns;
+ extern volatile u32 g_gcm_ring_frame_peak;
+ extern volatile u32 g_gcm_ring_bytes;
++extern volatile u64 g_gcm_perf_drain_ns;
++extern volatile u64 g_gcm_perf_present_ns;
++extern volatile u64 g_gcm_perf_flip_drain_lat_ns;
++extern volatile u64 g_gcm_perf_flip_show_lat_ns;
++extern volatile u32 g_gcm_perf_flips_shown;
++extern volatile u32 g_gcm_perf_waitflip_timeouts;
+ extern u64 gcm_perf_now_ns(void);
+ static void ld_flush(ld_flush_reason reason)
+ {
+@@ -10165,7 +10171,27 @@ void rsx_live_draw_present(u32 buffer_id)
+                           g_gcm_ring_frame_peak / 1024u, g_gcm_ring_bytes / 1024u,
+                           (double)(ringWaitNs - lastRingWait) / 1e6 / frameCount);
+               }
+-              lastRingWait = ringWaitNs; } }
++              lastRingWait = ringWaitNs; }
++            /* The present thread's own split, and how long a flip takes to
++             * get from the game to the drain and from the drain to the
++             * screen (the vblank that retires it). */
++            { static u64 lastDrain = 0, lastPresent = 0, lastDrainLat = 0, lastShowLat = 0;
++              static u32 lastShown = 0, lastTimeouts = 0;
++              const u64 drainNs = g_gcm_perf_drain_ns;
++              const u64 presentNs = g_gcm_perf_present_ns;
++              const u64 drainLatNs = g_gcm_perf_flip_drain_lat_ns;
++              const u64 showLatNs = g_gcm_perf_flip_show_lat_ns;
++              const u32 shown = g_gcm_perf_flips_shown;
++              const u32 timeouts = g_gcm_perf_waitflip_timeouts;
++              const double shownCount = (shown > lastShown) ? (double)(shown - lastShown) : 1.0;
++              fprintf(stderr, "[fps]   present thread per frame: drain %.1f ms, execute+present %.1f ms; flip latency: game->drain %.1f ms, drain->shown %.1f ms; waitflip timeouts %u\n",
++                      (double)(drainNs - lastDrain) / 1e6 / frameCount,
++                      (double)(presentNs - lastPresent) / 1e6 / frameCount,
++                      (double)(drainLatNs - lastDrainLat) / 1e6 / shownCount,
++                      (double)(showLatNs - lastShowLat) / 1e6 / shownCount,
++                      timeouts - lastTimeouts);
++              lastDrain = drainNs; lastPresent = presentNs; lastDrainLat = drainLatNs;
++              lastShowLat = showLatNs; lastShown = shown; lastTimeouts = timeouts; } }
+           fps_t0 = now; fps_f0 = g_ld_frames;
+       } }
+     /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
+diff --git a/runtime/ppu/tests/boot_main.cpp b/runtime/ppu/tests/boot_main.cpp
+index 64fd9d6..acd9558 100644
+--- a/runtime/ppu/tests/boot_main.cpp
++++ b/runtime/ppu/tests/boot_main.cpp
+@@ -327,6 +327,16 @@ extern "C" void cellGcm_rsx_process_fifo(void);   /* cellGcmSys.c: drain get->pu
+ extern "C" void cellGcm_fifo_kick_wait(unsigned ms); /* idle wait, woken by a kick */
+ extern "C" volatile uint64_t g_gcm_perf_present_idle_ns;   /* [fps] breakdown, cellGcmSys.c */
+ extern "C" uint64_t gcm_perf_now_ns(void);
++extern "C" volatile uint64_t g_gcm_perf_drain_ns;     /* time in the FIFO drain */
++extern "C" volatile uint64_t g_gcm_perf_present_ns;   /* time executing + presenting frames */
++extern "C" void cellGcm_note_frame_presented(void);
++/* The FIFO drain, timed for the [fps] breakdown. */
++static void drain_fifo_timed(void)
++{
++    const uint64_t drainBegin = gcm_perf_now_ns();
++    cellGcm_rsx_process_fifo();
++    g_gcm_perf_drain_ns += gcm_perf_now_ns() - drainBegin;
++}
+ extern "C" unsigned cellGcm_flip_request_count(void);
+ extern "C" unsigned cellGcmGetCurrentDisplayBufferId(void);
+ extern "C" int sys_event_queue_inject(unsigned int, unsigned long long, unsigned long long, unsigned long long, unsigned long long);
+@@ -409,7 +419,10 @@ static volatile LONG g_frames_presented = 0;
+ extern "C" unsigned ppu_boot_frames_presented(void) { return (unsigned)g_frames_presented; }
+ static void present_guest_frame(void)
+ {
++    const uint64_t presentBegin = gcm_perf_now_ns();
+     rsx_present_frame();
++    g_gcm_perf_present_ns += gcm_perf_now_ns() - presentBegin;
++    cellGcm_note_frame_presented();
+     /* The ticker increments, a guest thread reads: interlocked rather than a
+      * volatile ++, which is neither atomic nor a fence on arm64. */
+     InterlockedIncrement(&g_frames_presented);
+@@ -554,7 +567,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+              * labels (e.g. @0x03000410) that the game's per-frame logic blocks on.
+              * Doing it here (not after present) keeps those fences advancing at 60Hz
+              * even when present() throttles on a hidden/occluded window. */
+-            if (rsx_ok) cellGcm_rsx_process_fifo();
++            if (rsx_ok) drain_fifo_timed();
+             nextTick += tickPeriod;          /* 59.94 Hz */
+             fired++;
+         }
+@@ -568,7 +581,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
+                 present_guest_frame();
+                 last_flip = cellGcm_flip_request_count();
+             }
+-            cellGcm_rsx_process_fifo();
++            drain_fifo_timed();
+         }
+         /* YDKJ_INJECT_Q3: the main thread polls q3 (load/state-complete) each frame but
+          * it's never posted (producer signals a condvar, never enqueues). Inject a q3
