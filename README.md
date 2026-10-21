@@ -1,5 +1,7 @@
 # Folklore (PS3) — native PC recompilation
 
+If you like this feel free to buy me a coffee :) https://ko-fi.com/mavab
+
 Folklore (Game Republic / SCE, 2007) statically recompiled from its PS3
 executable to native x86-64 Windows code with
 [ps3recomp](https://github.com/sp00nznet/ps3recomp). There is no emulator: the
