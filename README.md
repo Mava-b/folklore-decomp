@@ -221,6 +221,9 @@ checking the port's version against it:
 ```powershell
 .\package.ps1 -Kind BuildKit     # dist\Folklore-buildkit-<date>.zip: this repository's contents
 .\package.ps1                    # dist\Folklore-<date>.zip: your built game, ready to run
+.\package_all.ps1 -EuGameDir D:\Games\BCES00050
+                                 # both releases: builds this folder (US) and an EU copy beside it
+                                 # (Folklore-EU), then dist\Folklore-<date>.zip and Folklore-<date>_eu.zip
 ```
 
 The build kit contains nothing from the game or the firmware — the same as

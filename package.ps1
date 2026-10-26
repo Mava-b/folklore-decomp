@@ -7,7 +7,10 @@
 #                                      own dump (setup.ps1, build.ps1)
 #   ... package.ps1 -NoZip             leave the folder, skip the .zip
 #
-# Output goes to dist\ beside this script.
+# Output goes to dist\ beside this script (or -OutDir). A binaries package
+# is named Folklore-<date-time> for a build lifted from the US release and
+# Folklore-<date-time>_eu for the EU one (-Stamp sets the date-time part).
+# package_all.ps1 builds and packages both.
 #
 # What each one contains, and why it matters:
 #
@@ -27,6 +30,7 @@ param(
     [ValidateSet('Binaries', 'BuildKit')]
     [string]$Kind = 'Binaries',
     [string]$OutDir = '',
+    [string]$Stamp = '',
     [switch]$NoZip
 )
 
@@ -37,7 +41,7 @@ if (-not $OutDir)
     $OutDir = Join-Path $Root 'dist'
 }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
-$stamp = Get-Date -Format 'yyyyMMdd-HHmm'
+$stamp = if ($Stamp) { $Stamp } else { Get-Date -Format 'yyyyMMdd-HHmm' }
 
 function Copy-Tree([string]$source, [string]$destination, [string[]]$excludeRelative)
 {
@@ -104,7 +108,8 @@ if ($Kind -eq 'Binaries')
         }
     }
     $releaseLine = @{ 'US' = 'BCUS98147 (North America), v1.00'; 'EU' = 'BCES00050 (Europe), v1.00' }[$region]
-    $package = Join-Path $OutDir "Folklore-$region-$stamp"
+    $packageName = if ($region -eq 'EU') { "Folklore-$stamp" + '_eu' } else { "Folklore-$stamp" }
+    $package = Join-Path $OutDir $packageName
     if (Test-Path $package)
     {
         Remove-Item -Recurse -Force $package
@@ -261,7 +266,7 @@ else
 
     Write-Step 'Scripts and patches'
     foreach ($file in @('setup.ps1', 'build.ps1', 'run.ps1', 'common.ps1', 'package.ps1',
-                        'run.bat', 'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'README.md', 'LICENSE'))
+                        'run.bat', 'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'package_all.ps1', 'README.md', 'LICENSE'))
     {
         $source = Join-Path $Root $file
         if (Test-Path $source)
