@@ -1,13 +1,16 @@
 # package_all.ps1 -- build and package both releases into dist\.
 #
 #   powershell -ExecutionPolicy Bypass -File .\package_all.ps1
-#   ... package_all.ps1 -EuGameDir G:\Games\PS3\folklore_eu_dump
+#   ... package_all.ps1 -EuGameDir D:\Games\BCES00050
 #                                    the EU dump (needed the first time, when
 #                                    the EU folder does not exist yet)
 #   ... package_all.ps1 -EuDir D:\Folklore-EU
 #                                    where the EU copy of the project lives
 #                                    (default: Folklore-EU beside this folder)
 #   ... package_all.ps1 -NoZip       leave the package folders, skip the zips
+#   ... package_all.ps1 -Clean       full rebuild of both (build.ps1 -Clean)
+#   ... package_all.ps1 -BuildOnly   steps 1-3 only: update and build both,
+#                                    no packages (build_all.ps1 runs this)
 #
 # One build is lifted from one release (folklore/docs/REGIONS.md), so the EU
 # exe is built in a second copy of the project. This script:
@@ -27,7 +30,9 @@
 param(
     [string]$EuDir = '',
     [string]$EuGameDir = '',
-    [switch]$NoZip
+    [switch]$NoZip,
+    [switch]$Clean,
+    [switch]$BuildOnly
 )
 
 . (Join-Path $PSScriptRoot 'common.ps1')
@@ -37,8 +42,12 @@ if (-not $EuDir)
     $EuDir = Join-Path (Split-Path $Root) ((Split-Path -Leaf $Root) + '-EU')
 }
 $distDir = Join-Path $Root 'dist'
-New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 $stamp = Get-Date -Format 'yyyyMMdd-HHmm'
+$buildArguments = @()
+if ($Clean)
+{
+    $buildArguments += '-Clean'
+}
 
 function Get-LiftedRegionIn([string]$projectDir)
 {
@@ -114,7 +123,7 @@ if ($usRegion -ne 'US')
 {
     throw "This folder's game code is lifted from the '$usRegion' release, not the US one -- run setup.ps1 -GameDir <your BCUS98147 dump> here first"
 }
-Invoke-ProjectScript $Root 'build.ps1' @()
+Invoke-ProjectScript $Root 'build.ps1' $buildArguments
 
 # ---- 2. The EU copy: create it or bring it up to date ------------------------
 $firstTime = -not (Test-Path (Join-Path $EuDir 'setup.ps1'))
@@ -189,9 +198,16 @@ if ($firstTime -or $euRegion -ne 'EU' -or $patchesBefore -ne $patchesAfter)
 }
 
 # ---- 3. The EU build ---------------------------------------------------------
-Invoke-ProjectScript $EuDir 'build.ps1' @()
+Invoke-ProjectScript $EuDir 'build.ps1' $buildArguments
+if ($BuildOnly)
+{
+    Write-Step "Built both: $Root\folklore\build\folklore.exe (US), $EuDir\folklore\build\folklore.exe (EU)"
+    Write-Host "    Run them with run.bat in each folder."
+    return
+}
 
 # ---- 4. Both packages, into this folder's dist\ ------------------------------
+New-Item -ItemType Directory -Force -Path $distDir | Out-Null
 $packageArguments = @('-OutDir', $distDir, '-Stamp', $stamp)
 if ($NoZip)
 {

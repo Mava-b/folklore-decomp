@@ -266,7 +266,7 @@ else
 
     Write-Step 'Scripts and patches'
     foreach ($file in @('setup.ps1', 'build.ps1', 'run.ps1', 'common.ps1', 'package.ps1',
-                        'run.bat', 'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'package_all.ps1', 'README.md', 'LICENSE'))
+                        'run.bat', 'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'package_all.ps1', 'build_all.ps1', 'README.md', 'LICENSE'))
     {
         $source = Join-Path $Root $file
         if (Test-Path $source)

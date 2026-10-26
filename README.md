@@ -96,6 +96,10 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
    **run.bat** does the same with a double-click (any run.ps1 options can
    follow it, e.g. `run.bat -ResetInstall`).
 
+With both releases (an EU copy of this folder beside it, see *Sharing what
+you built*), `.\build_all.ps1` builds this folder, brings the EU copy up to
+date and builds that too; then `run.bat` in either folder runs its build.
+
 ### If something fails
 
 - Every step writes a log in `logs\` (`setup-*.log`, `build.log`,
