@@ -91,9 +91,8 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 3. **run.ps1** starts the game and writes `logs\run-<date-time>.log`. It
    uses the game folder you gave setup (saved in `folklore_settings.ini`), and
    the game's first boot copies several GB of data into `hdd1\`.
-
-After the first build you can also start `folklore\build\folklore.exe`
-directly (see *Running folklore.exe on its own*).
+   **run.bat** does the same with a double-click (any run.ps1 options can
+   follow it, e.g. `run.bat -ResetInstall`).
 
 ### If something fails
 
@@ -173,11 +172,17 @@ $env:AUDIO_LATENCY_MS = '48'; .\run.ps1   # more audio buffering if sound breaks
 
 ### Running folklore.exe on its own
 
-`folklore\build\folklore.exe` also starts without run.ps1 (double-click it or
-a shortcut). It asks once for the game folder and remembers it, sets the same
-runtime options run.ps1 sets, keeps `hdd0\`, `hdd1\`, `gamedata\` (saves), the
-shader cache and `logs\` beside the exe (or in `data_dir` from
-`folklore_settings.ini`), and writes its log to `logs\run-<date-time>.log`.
+Start the game with run.bat / run.ps1: that is the tested way. A binaries
+package (`package.ps1`) includes them, with run.ps1 finding `folklore.exe`
+beside itself.
+
+`folklore.exe` can also start without them (double-click it or a shortcut).
+It asks once for the game folder and remembers it, sets the main runtime
+options itself, keeps `hdd0\`, `hdd1\`, `gamedata\` (saves), the shader cache
+and `logs\` beside the exe (or in `data_dir` from `folklore_settings.ini`), and
+writes its log to `logs\run-<date-time>.log`. Started that way, the title
+screen has been seen drawing wrongly and the game stopping at a black
+screen; that is being looked into, so prefer run.bat for now.
 
 ### Render capture (for bug reports)
 

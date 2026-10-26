@@ -99,6 +99,16 @@ if ($Kind -eq 'Binaries')
     Write-Step 'folklore.exe'
     Copy-Item $exe $package
 
+    # The launcher: run.bat runs run.ps1 (with common.ps1), which sets the
+    # runtime up the way it is tested -- environment, log file, render
+    # capture (capture.bat). run.ps1 finds folklore.exe beside itself here.
+    Write-Step 'Launcher scripts'
+    foreach ($file in @('run.bat', 'run.ps1', 'common.ps1', 'capture.bat', 'capture.ps1'))
+    {
+        Copy-Item (Join-Path $Root $file) $package
+        Write-Host "    $file"
+    }
+
     # FFmpeg (LGPL) for the cutscenes: the exe loads these at run time and
     # finds them beside itself. Its licence travels with it.
     Write-Step 'FFmpeg DLLs'
@@ -189,12 +199,15 @@ dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
 1. Decrypt the game's EBOOT once with RPCS3: Utilities > Decrypt PS3 Binaries,
    choose <your dump>\PS3_GAME\USRDIR\EBOOT.BIN. RPCS3 writes EBOOT.elf beside it.
-2. Start folklore.exe. The first time it asks for the dump folder (the one that
-   contains PS3_GAME) and remembers it in folklore_settings.ini.
-3. The first start copies several GB of game data into hdd1 here; saves go in
-   gamedata, logs in logs. Keep this folder somewhere you can write to (not
-   Program Files) with enough free space, or set data_dir in
-   folklore_settings.ini to put all of that elsewhere.
+2. Double-click run.bat. The first time, folklore.exe asks for the dump folder
+   (the one that contains PS3_GAME) and remembers it in folklore_settings.ini.
+   run.bat starts the game through run.ps1, which sets the runtime up the way
+   it is tested and writes logs\run-<date-time>.log. Options go after it, e.g.
+       run.bat -ResetInstall      (wipe hdd0/hdd1 and redo the first-boot install)
+       run.bat -GameDir D:\Games\BCUS98147
+3. The first start copies several GB of game data into hdd1 here, so expect
+   a long first load. Saves go in gamedata, logs in logs. Keep this folder
+   somewhere you can write to (not Program Files) with enough free space.
 
 In the game
   F1 or L3+R3     engine menu: frame rate, resolution, aspect ratio, fullscreen,
@@ -207,7 +220,9 @@ Optional: system fonts. Copy a dev_flash folder (RPCS3's, from its firmware
 install) here, or set dev_flash in folklore_settings.ini.
 
 If something goes wrong, open an issue at the source link above with the
-newest file in logs\.
+newest file in logs\. To record what the renderer draws while a screen looks
+wrong, press F2 (or double-click capture.bat) while it is showing; the files
+go to logs\capture-<date-time>\.
 
 Licences of the code compiled into folklore.exe and of FFmpeg are in licences\.
 "@
@@ -230,7 +245,7 @@ else
 
     Write-Step 'Scripts and patches'
     foreach ($file in @('setup.ps1', 'build.ps1', 'run.ps1', 'common.ps1', 'package.ps1',
-                        'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'README.md', 'LICENSE'))
+                        'run.bat', 'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'README.md', 'LICENSE'))
     {
         $source = Join-Path $Root $file
         if (Test-Path $source)

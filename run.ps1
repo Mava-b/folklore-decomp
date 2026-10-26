@@ -67,7 +67,13 @@ param(
 . (Join-Path $PSScriptRoot 'common.ps1')
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 
+# The project folder keeps it in folklore\build; a binaries package
+# (package.ps1) has it beside this script.
 $exe = Join-Path $PortDir 'build\folklore.exe'
+if (-not (Test-Path $exe))
+{
+    $exe = Join-Path $Root 'folklore.exe'
+}
 if (-not (Test-Path $exe))
 {
     throw "folklore.exe not found -- run build.ps1 first"
@@ -122,8 +128,13 @@ if ($exeArguments.Count -eq 0)
 # log file only when started on its own).
 $env:FOLKLORE_LAUNCHER = 'run.ps1'
 
-# FFmpeg DLLs for the cutscenes are found through PATH.
-$env:PATH = (Join-Path $FfmpegDir 'bin') + ';' + $env:PATH
+# FFmpeg DLLs for the cutscenes: tools\ffmpeg\bin in the project folder (found
+# through PATH); a binaries package has them beside folklore.exe.
+$ffmpegBin = Join-Path $FfmpegDir 'bin'
+if (Test-Path $ffmpegBin)
+{
+    $env:PATH = $ffmpegBin + ';' + $env:PATH
+}
 
 if ($exeArguments.Count -gt 0)
 {
