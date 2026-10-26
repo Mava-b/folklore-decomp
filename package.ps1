@@ -36,6 +36,22 @@ param(
 
 . (Join-Path $PSScriptRoot 'common.ps1')
 
+function Write-RunBat([string]$folder)
+{
+    # run.bat is written rather than copied: the one in the project folder
+    # is easy to edit for a test (a fixed path, output to a log), and what is
+    # handed out must only ever start run.ps1 from wherever it was unzipped.
+    $runBatLines = @(
+        '@echo off',
+        'rem run.bat -- start Folklore through run.ps1, which sets up the runtime',
+        'rem (environment, log, capture). Double-click it, or pass run.ps1 options:',
+        'rem     run.bat -ResetInstall',
+        'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0run.ps1" %*',
+        'if errorlevel 1 pause')
+    [System.IO.File]::WriteAllText((Join-Path $folder 'run.bat'), (($runBatLines -join "`r`n") + "`r`n"),
+                                   [System.Text.Encoding]::ASCII)
+}
+
 if (-not $OutDir)
 {
     $OutDir = Join-Path $Root 'dist'
@@ -123,11 +139,13 @@ if ($Kind -eq 'Binaries')
     # runtime up the way it is tested -- environment, log file, render
     # capture (capture.bat). run.ps1 finds folklore.exe beside itself here.
     Write-Step 'Launcher scripts'
-    foreach ($file in @('run.bat', 'run.ps1', 'common.ps1', 'capture.bat', 'capture.ps1'))
+    foreach ($file in @('run.ps1', 'common.ps1', 'capture.bat', 'capture.ps1'))
     {
         Copy-Item (Join-Path $Root $file) $package
         Write-Host "    $file"
     }
+    Write-RunBat $package
+    Write-Host '    run.bat'
 
     # FFmpeg (LGPL) for the cutscenes: the exe loads these at run time and
     # finds them beside itself. Its licence travels with it.
@@ -267,7 +285,7 @@ else
 
     Write-Step 'Scripts and patches'
     foreach ($file in @('setup.ps1', 'build.ps1', 'run.ps1', 'common.ps1', 'package.ps1',
-                        'run.bat', 'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'package_all.ps1', 'build_all.ps1', 'README.md', 'LICENSE'))
+                        'capture.bat', 'capture.ps1', 'slice_trace.ps1', 'package_all.ps1', 'build_all.ps1', 'README.md', 'LICENSE'))
     {
         $source = Join-Path $Root $file
         if (Test-Path $source)
@@ -275,6 +293,7 @@ else
             Copy-Item $source $package
         }
     }
+    Write-RunBat $package
     Copy-Tree (Join-Path $Root 'patches') (Join-Path $package 'patches') @()
     # The included, already-patched ps3recomp (repository layout); a working
     # folder with a git clone instead lets the kit clone and patch upstream.
