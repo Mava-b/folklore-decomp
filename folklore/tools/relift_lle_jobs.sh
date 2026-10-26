@@ -101,7 +101,7 @@ open(sys.argv[2], 'wb').write(data[int(sys.argv[3], 16):int(sys.argv[3], 16) + i
             --out "analysis/spu_jobs/jobl_${VA}_${BASE}_funcs.json"
         # Switch-table case labels: position-independent code reaches them only
         # through computed branches, so discovery cannot see them.
-        EXTRA=$("$PYTHON" -I tools/spu_jump_tables.py "$BIN" --base "0x$BASE")
+        EXTRA=$("$PYTHON" -I tools/spu_jump_tables.py "$BIN" --base "0x$BASE" | tr -d '\r')
         EXTRA_ARGS=()
         if [ -n "$EXTRA" ]; then
             EXTRA_ARGS=(--extra-funcs "$EXTRA")

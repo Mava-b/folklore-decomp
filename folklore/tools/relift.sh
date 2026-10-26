@@ -110,6 +110,8 @@ open(sys.argv[2], 'wb').write(data[int(sys.argv[3], 16):int(sys.argv[3], 16) + i
     # 128 bytes (job 0x10079E00 is 0xD190 bytes in a 0xD200 section) and the
     # binary may itself end in zeros. Register every 16-byte size from just past
     # the last non-zero byte up to the section end; exactly one will match.
+    # (tr: Python on Windows ends its lines with CR LF, and $(...) keeps the CR,
+    # which turned 0x...ULL into 0x...<CR>ULL in spu_jobs.c.)
     FPS=$("$PYTHON" -I -c "
 import sys
 data = open(sys.argv[1], 'rb').read()
@@ -121,7 +123,7 @@ while size <= len(data):
         h ^= b
         h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
     print('%016X' % h)
-    size += 16" "$BIN")
+    size += 16" "$BIN" | tr -d '\r')
     PFX="job_${VA}_"
     "$PYTHON" "$PS3RECOMP/tools/find_spu_functions.py" "$BIN" --raw --base 0 \
         --out "analysis/spu_jobs/job_${VA}_funcs.json"
