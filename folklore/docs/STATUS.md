@@ -876,6 +876,23 @@ What 0006 fixes in ps3recomp to make that run:
     kill-on-close job. That plays normally. Closing the window used to only
     stop presenting, so a game with no visible console kept running and
     playing audio. patches/0051 ends the process when the window closes.
+65. The European release (BCES00050 v1.00) is supported, from a dump the
+    user provided. Aligning the two executables function by function
+    (folklore/docs/REGIONS.md) showed the same code with small shifts:
+    13,284 of 13,298 functions match. Ten places differ in content, one of
+    them the movie set-up the AU-table fix patches. The TOC is laid out a few
+    entries differently, and the nine SPU job binaries are byte-identical.
+    - tools/relift.sh recognises the release by EBOOT size, uses its code
+      end and switch-table hint, and writes src/recomp/folklore_region.h.
+    - game_patches.py takes --region, with each fix's function, anchors and
+      TOC offsets per release. US output is byte-identical to before.
+    - The aspect-ratio camera constants are per release (folklore_hle.cpp).
+    - The exe's title and size check follows the build's release.
+    - setup.ps1 accepts both, and relifts when -GameDir is the other
+      release.
+    - Binaries packages are named by release.
+    Lifted in the cloud: all five fixes and the ten frame-limiter sites
+    apply to the EU code. Untested in play as of this entry.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

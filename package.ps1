@@ -89,7 +89,22 @@ if ($Kind -eq 'Binaries')
     {
         throw 'folklore\build\folklore.exe not found -- run build.ps1 first'
     }
-    $package = Join-Path $OutDir "Folklore-$stamp"
+    # Which release this build was lifted from (tools\relift.sh writes it
+    # beside the lifted code; older lifts are the US release).
+    $region = 'US'
+    $regionHeader = Join-Path $PortDir 'src\recomp\folklore_region.h'
+    if (Test-Path $regionHeader)
+    {
+        foreach ($line in Get-Content -LiteralPath $regionHeader)
+        {
+            if ($line -match '#define FOLKLORE_REGION_NAME "(\w+)"')
+            {
+                $region = $matches[1]
+            }
+        }
+    }
+    $releaseLine = @{ 'US' = 'BCUS98147 (North America), v1.00'; 'EU' = 'BCES00050 (Europe), v1.00' }[$region]
+    $package = Join-Path $OutDir "Folklore-$region-$stamp"
     if (Test-Path $package)
     {
         Remove-Item -Recurse -Force $package
@@ -182,7 +197,7 @@ if ($Kind -eq 'Binaries')
     }
 
     $readme = @"
-Folklore (PS3) -- PC port, built $(Get-Date -Format 'yyyy-MM-dd')
+Folklore (PS3) -- PC port, $region build, $(Get-Date -Format 'yyyy-MM-dd')
 
 Source: https://github.com/Mava-b/folklore-decomp
 
@@ -194,7 +209,8 @@ everything the game shows and plays comes from your own disc dump, and it will
 not start without one. Not affiliated with or endorsed by Sony or Game
 Republic.
 
-You need your own copy of Folklore: the North American disc, BCUS98147, v1.00,
+You need your own copy of Folklore on the disc this build was made from:
+$releaseLine,
 dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
 1. Decrypt the game's EBOOT once with RPCS3: Utilities > Decrypt PS3 Binaries,
@@ -276,7 +292,7 @@ else
 Folklore (PS3) recompilation -- build kit, $(Get-Date -Format 'yyyy-MM-dd')
 
 This kit has no game code and no firmware in it. You need your own Folklore
-dump: North American disc BCUS98147, v1.00 (a folder that contains PS3_GAME),
+dump: v1.00 disc BCUS98147 (North America) or BCES00050 (Europe) (a folder that contains PS3_GAME),
 with PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf (RPCS3: Utilities >
 Decrypt PS3 Binaries). No PS3 firmware is needed.
 

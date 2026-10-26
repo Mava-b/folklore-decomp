@@ -14,6 +14,7 @@
  * generic table and can read every argument register directly.
  */
 #include "ppu_recomp.h"
+#include "engine_region.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -396,8 +397,14 @@ namespace
  * a value this function wrote before. */
 extern "C" void folklore_apply_aspect(float aspect)
 {
+    /* TOC-relative; the EU executable's TOC is laid out a few entries
+     * differently (folklore/docs/REGIONS.md). */
+#if defined(FOLKLORE_REGION_EU)
+    static const int32_t kAspectSlots[] = { -28188, -16232, -13544, -13372, -6692, 284, 4328 };
+#else
     static const int32_t kAspectSlots[] = { -28188, -16228, -13536, -13364, -6676, 316, 4360 };
-    const uint32_t tocBase = 0x0056EB00u;
+#endif
+    const uint32_t tocBase = FOLKLORE_TOC_BASE;
     const float original = 16.0f / 9.0f;
     static float applied = 0.0f;
     if (aspect < original)

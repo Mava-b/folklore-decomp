@@ -10,11 +10,41 @@ the lifted game code, so this file can be shared with the project.
 tools/relift.sh runs this after ppu_lifter.py. Running it twice is harmless:
 a function that already carries its FOLKLORE PATCH marker is skipped.
 
-  game_patches.py src/recomp
+  game_patches.py src/recomp [--region US|EU]
+
+The same fixes apply to both releases this port supports: BCUS98147 (US,
+the default) and BCES00050 (EU). Their executables are the same code shifted
+by a few bytes in places, with a handful of functions changed; REGIONS below
+holds each one's function names, addresses, call anchors and TOC offsets
+(found by aligning the two executables function by function,
+folklore/docs/REGIONS.md). The text of every fix is shared.
 """
 import pathlib
 import re
 import sys
+
+# Per release: where each fix goes. "toc" holds the r2-relative offsets of the
+# two TOC entries the movie-table fix reads (the work-area allocator's state).
+REGIONS = {
+    "US": {
+        "movieHold": ("func_001A4780", 0x001A48C4),
+        "movieTable": ("func_001A289C", [(0x001A3124, "0x001A3128", "0x001A314C"),
+                                         (0x001A33F4, "0x001A33F8", "0x001A341C")]),
+        "playerAlloc": ("func_001A3B78", 0x001A3BA4),
+        "physics": ("func_003C913C", 0x003C913C,
+                    {"loop": "003C9184", "back": "003C9170", "exit": "003C91A0"}),
+        "toc": {"workTop": 0x20C0, "allocator": 0x263C},
+    },
+    "EU": {
+        "movieHold": ("func_001A4784", 0x001A48C8),
+        "movieTable": ("func_001A2664", [(0x001A30E0, "0x001A30E4", "0x001A3108"),
+                                         (0x001A33F8, "0x001A33FC", "0x001A3420")]),
+        "playerAlloc": ("func_001A3B7C", 0x001A3BA8),
+        "physics": ("func_003C90F4", 0x003C90F4,
+                    {"loop": "003C913C", "back": "003C9128", "exit": "003C9158"}),
+        "toc": {"workTop": 0x20E0, "allocator": 0x265C},
+    },
+}
 
 MOVIE_TABLE_WHY = (
     "The movie player takes its AU size table (the .dat_ file, 8 bytes per picture) from the "
@@ -28,19 +58,20 @@ MOVIE_TABLE_WHY = (
 )
 
 
-def movieTableBranch(address):
+def movieTableBranch(address, region):
     """The table allocation at `address`: take the reserved block when the table fits."""
+    toc = region["toc"]
     return (
         "        /* FOLKLORE PATCH 0x%X: the movie's AU size table goes in the block reserved after\n"
-        "         * the player (FOLKLORE PATCH 0x1A3BA4), not at the shared work-area top (tools/game_patches.py) */\n"
+        "         * the player (FOLKLORE PATCH 0x%X), not at the shared work-area top (tools/game_patches.py) */\n"
         "        if ((uint32_t)ctx->gpr[0] <= 0x40000u) {\n"
-        "            ctx->gpr[0] = (uint32_t)(vm_read32(vm_read32(ctx->gpr[2] + -0x20C0)) + 0x240u);\n"
+        "            ctx->gpr[0] = (uint32_t)(vm_read32(vm_read32(ctx->gpr[2] + -0x%X)) + 0x240u);\n"
         "            ctx->gpr[4] = (int64_t)(int32_t)(0);\n"
         "            ctx->gpr[5] = (int64_t)(int32_t)(0);\n"
         "            vm_write32(ctx->gpr[31] + 0x0, ctx->gpr[0]);\n"
-        "            ctx->gpr[9] = vm_read32(ctx->gpr[2] + -0x263C);\n"
+        "            ctx->gpr[9] = vm_read32(ctx->gpr[2] + -0x%X);\n"
         "            ctx->gpr[3] = vm_read32(ctx->gpr[9]);\n"
-        "        } else {\n" % address
+        "        } else {\n" % (address, region["playerAlloc"][1], toc["workTop"], toc["allocator"])
     )
 
 
@@ -72,62 +103,61 @@ PHYSICS_PLAN = (
 #   ("after_line", pattern, text)      text goes after the line matching pattern
 #   ("replace", pattern, replacement)  re.sub of the one match of pattern
 # Every pattern must match exactly once in the function.
-PATCHES = [
-    {
-        "address": 0x001A48C4,
-        "function": "func_001A4780",
-        "why": (
-            "MoviePostThread waits for the movie player's 'hold' to be released "
-            "with an untimed sys_cond_wait (cond at player+0x8C). The release "
-            "only comes if MovieInputThread also saw the hold, and both threads "
-            "check it on separate 10 ms polls: on the PS3 their low priority "
-            "orders them, on PC threads they race, and when only MoviePost sees "
-            "the hold it waits forever -- the black screen on the logo movie. "
-            "A 100 ms timeout lets it re-check; the loop after the wait already "
-            "handles a hold that is still set or gone."
-        ),
-        "edits": [
-            # The wait's timeout argument (r4), set right after the cond is loaded from +0x64.
-            ("replace", r"(\+ 0x64\);\n\s*ctx->gpr\[4\] = )\(int64_t\)\(int32_t\)\(0\);",
-             r"\g<1>100000; /* FOLKLORE PATCH 0x1A48C4: timed hold wait (tools/game_patches.py) */"),
-        ],
-    },
-    {
-        "address": 0x001A3124,
-        "function": "func_001A289C",
-        "why": MOVIE_TABLE_WHY,
-        "edits": [
-            # Around the allocator calls returning to 0x1A3128 .. 0x1A314C.
-            ("before_line", r"ctx->lr = 0x001A3128;", movieTableBranch(0x1A3124)),
-            ("after_line", r"ctx->lr = 0x001A314C;", "        }\n"),
-        ],
-    },
-    {
-        "address": 0x001A33F4,
-        "function": "func_001A289C",
-        "why": MOVIE_TABLE_WHY,
-        "edits": [
-            ("before_line", r"ctx->lr = 0x001A33F8;", movieTableBranch(0x1A33F4)),
-            ("after_line", r"ctx->lr = 0x001A341C;", "        }\n"),
-        ],
-    },
-    {
-        "address": 0x001A3BA4,
-        "function": "func_001A3B78",
+def buildPatches(regionName):
+    region = REGIONS[regionName]
+    holdFunction, holdAddress = region["movieHold"]
+    tableFunction, tableSites = region["movieTable"]
+    allocFunction, allocAddress = region["playerAlloc"]
+    physicsFunction, physicsAddress, labels = region["physics"]
+    patches = [
+        {
+            "address": holdAddress,
+            "function": holdFunction,
+            "why": (
+                "MoviePostThread waits for the movie player's 'hold' to be released "
+                "with an untimed sys_cond_wait (cond at player+0x8C). The release "
+                "only comes if MovieInputThread also saw the hold, and both threads "
+                "check it on separate 10 ms polls: on the PS3 their low priority "
+                "orders them, on PC threads they race, and when only MoviePost sees "
+                "the hold it waits forever -- the black screen on the logo movie. "
+                "A 100 ms timeout lets it re-check; the loop after the wait already "
+                "handles a hold that is still set or gone."
+            ),
+            "edits": [
+                # The wait's timeout argument (r4), set right after the cond is loaded from +0x64.
+                ("replace", r"(\+ 0x64\);\n\s*ctx->gpr\[4\] = )\(int64_t\)\(int32_t\)\(0\);",
+                 r"\g<1>100000; /* FOLKLORE PATCH 0x%X: timed hold wait (tools/game_patches.py) */" % holdAddress),
+            ],
+        },
+    ]
+    for siteAddress, firstReturn, lastReturn in tableSites:
+        patches.append({
+            "address": siteAddress,
+            "function": tableFunction,
+            "why": MOVIE_TABLE_WHY,
+            "edits": [
+                # Around the allocator calls returning to firstReturn .. lastReturn.
+                ("before_line", r"ctx->lr = %s;" % firstReturn, movieTableBranch(siteAddress, region)),
+                ("after_line", r"ctx->lr = %s;" % lastReturn, "        }\n"),
+            ],
+        })
+    patches.append({
+        "address": allocAddress,
+        "function": allocFunction,
         "why": (
             "Movie init allocates the player struct (0x240 bytes) once at boot; 256 KB more right "
-            "after it holds the AU size table of whichever movie is open (see 0x1A3124), up to "
+            "after it holds the AU size table of whichever movie is open (see the movie table fix), up to "
             "32768 pictures."
         ),
         "edits": [
             # The size passed to the allocator.
             ("replace", r"(ctx->gpr\[3\] = ctx->gpr\[3\] \+ \(int64_t\)\(0x240)\);",
-             r"\g<1> + 0x40000); /* FOLKLORE PATCH 0x1A3BA4: 256 KB for the AU size table after the player struct (tools/game_patches.py) */"),
+             r"\g<1> + 0x40000); /* FOLKLORE PATCH 0x%X: 256 KB for the AU size table after the player struct (tools/game_patches.py) */" % allocAddress),
         ],
-    },
-    {
-        "address": 0x003C913C,
-        "function": "func_003C913C",
+    })
+    patches.append({
+        "address": physicsAddress,
+        "function": physicsFunction,
         "why": (
             "Every Havok world is stepped here: setFrameTimeMarker(frame time), then "
             "stepDeltaTime(1/30) until the simulation reaches the marker. The cloth and "
@@ -140,25 +170,26 @@ PATCHES = [
         ),
         "edits": [
             ("before_function",
-             'extern "C" int folklore_physics_plan_steps(float, float, float, float, float*); /* FOLKLORE PATCH 0x3C913C */\n'),
-            ("after_line", r"^void func_003C913C\(ppu_context\* ctx\) \{",
-             "        /* FOLKLORE PATCH 0x3C913C: step Havok by the frame time, not a fixed 1/30 s\n"
+             'extern "C" int folklore_physics_plan_steps(float, float, float, float, float*); /* FOLKLORE PATCH 0x%X */\n'
+             % physicsAddress),
+            ("after_line", r"^void %s\(ppu_context\* ctx\) \{" % physicsFunction,
+             "        /* FOLKLORE PATCH 0x%X: step Havok by the frame time, not a fixed 1/30 s\n"
              "         * (folklore_physics_plan_steps in src/engine/engine_settings.cpp, tools/game_patches.py) */\n"
              "        int physicsStepLimit = -1;\n"
-             "        int physicsStepsTaken = 0;\n"),
+             "        int physicsStepsTaken = 0;\n" % physicsAddress),
             # After setFrameTimeMarker/advanceTime, before the step loop is entered.
-            ("before_line", r"goto loc_003C9184;", PHYSICS_PLAN),
+            ("before_line", r"goto loc_%s;" % labels["loop"], PHYSICS_PLAN),
             # Count each step; stop when the frame is covered.
-            ("before_line", r"^loc_003C9184:", "        physicsStepsTaken++;\n"),
-            ("after_line", r"^loc_003C9184:",
+            ("before_line", r"^loc_%s:" % labels["loop"], "        physicsStepsTaken++;\n"),
+            ("after_line", r"^loc_%s:" % labels["loop"],
              "        if (physicsStepLimit >= 0 && physicsStepsTaken >= physicsStepLimit)\n"
              "        {\n"
-             "            goto loc_003C91A0;\n"
-             "        }\n"),
-            ("after_line", r"goto loc_003C9170;", "loc_003C91A0:\n"),
+             "            goto loc_%s;\n"
+             "        }\n" % labels["exit"]),
+            ("after_line", r"goto loc_%s;" % labels["back"], "loc_%s:\n" % labels["exit"]),
         ],
-    },
-]
+    })
+    return patches
 
 
 class PatchError(Exception):
@@ -229,10 +260,22 @@ def applyPatch(sources, patch):
 
 
 def main():
-    recompDirectory = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "src/recomp")
+    arguments = [argument for argument in sys.argv[1:] if not argument.startswith("--region")]
+    regionName = "US"
+    for index, argument in enumerate(sys.argv[1:]):
+        if argument.startswith("--region="):
+            regionName = argument.split("=", 1)[1]
+        elif argument == "--region" and index + 2 < len(sys.argv):
+            regionName = sys.argv[index + 2]
+            if regionName in arguments:
+                arguments.remove(regionName)
+    if regionName not in REGIONS:
+        print("unknown region %r (US or EU)" % regionName)
+        sys.exit(2)
+    recompDirectory = pathlib.Path(arguments[0] if arguments else "src/recomp")
     sources = sorted(recompDirectory.glob("*.cpp"))
     failures = 0
-    for patch in PATCHES:
+    for patch in buildPatches(regionName):
         try:
             status, sourceName = applyPatch(sources, patch)
             print("%s: 0x%08X (%s in %s)" % (status, patch["address"], patch["function"], sourceName))

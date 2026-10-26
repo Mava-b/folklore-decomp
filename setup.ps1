@@ -15,6 +15,9 @@
 # included: setup lifts it from your own dump. It asks for the dump folder at
 # the start (a folder picker), or take it on the command line:
 #     setup.ps1 -GameDir D:\Games\BCUS98147
+# Either supported release works (BCUS98147 or BCES00050, v1.00). Giving
+# -GameDir a dump of the other release than the one already set up lifts
+# that one instead.
 #
 # Folklore's SPU work runs on the port's own SPURS (folklore/docs/SPURS.md);
 # no firmware file is needed. For comparing against Sony's library, setup can
@@ -74,9 +77,42 @@ function Select-WithDialog([string]$kind, [string]$title, [string]$filter)
     }
 }
 
+# The releases this project supports, by decrypted EBOOT.elf size
+# (folklore/docs/REGIONS.md).
+$SupportedEboots = @{ 6518936 = 'US'; 6518912 = 'EU' }
+$ReleaseNames = @{ 'US' = 'BCUS98147 (North America)'; 'EU' = 'BCES00050 (Europe)' }
+
+function Get-EbootRegion([string]$eboot)
+{
+    $size = (Get-Item -LiteralPath $eboot).Length
+    if ($SupportedEboots.ContainsKey([int]$size))
+    {
+        return $SupportedEboots[[int]$size]
+    }
+    return ''
+}
+
+function Get-LiftedRegion
+{
+    # The release folklore\src\recomp was lifted from (tools\relift.sh writes
+    # folklore_region.h; lifted code from before that is the US release).
+    $header = Join-Path $PortDir 'src\recomp\folklore_region.h'
+    if (Test-Path $header)
+    {
+        foreach ($line in Get-Content -LiteralPath $header)
+        {
+            if ($line -match '#define FOLKLORE_REGION_NAME "(\w+)"')
+            {
+                return $matches[1]
+            }
+        }
+    }
+    return 'US'
+}
+
 function Resolve-GameEboot([string]$folder)
 {
-    # The decrypted EBOOT.elf of a BCUS98147 v1.00 dump, from the dump folder
+    # The decrypted EBOOT.elf of a supported v1.00 dump, from the dump folder
     # (or its PS3_GAME / USRDIR). Throws with what is wrong.
     $folder = $folder.Trim().Trim('"').TrimEnd('\')
     if ((Split-Path -Leaf $folder) -eq 'USRDIR') { $folder = Split-Path (Split-Path $folder) }
@@ -91,9 +127,9 @@ function Resolve-GameEboot([string]$folder)
     {
         throw "No decrypted EBOOT.elf in $usrdir -- decrypt EBOOT.BIN there with RPCS3 (Utilities > Decrypt PS3 Binaries) first"
     }
-    if ((Get-Item $eboot).Length -ne 6518936)
+    if (-not (Get-EbootRegion $eboot))
     {
-        throw "$eboot is not the BCUS98147 v1.00 EBOOT this project was made from (expected 6,518,936 bytes)"
+        throw "$eboot is not a v1.00 EBOOT of a supported release -- BCUS98147 (6,518,936 bytes decrypted) or BCES00050 (6,518,912 bytes)"
     }
     return $eboot
 }
@@ -175,15 +211,38 @@ function Set-SavedSetting([string]$key, [string]$value)
 
 $needGameCode = $null -eq (Get-ChildItem -Path (Join-Path $PortDir 'src\recomp') -Filter '*.cpp' -ErrorAction SilentlyContinue |
                            Select-Object -First 1)
-$needLibsre = ($LibsrePrx -or $WithLibsre) -and -not (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp'))
 $sourceEboot = ''
-if ($needGameCode)
+# A dump of the other release than the one already lifted: lift that one
+# instead (a full rebuild follows).
+if (-not $needGameCode -and $GameDir)
+{
+    try
+    {
+        $givenEboot = Resolve-GameEboot $GameDir
+        $givenRegion = Get-EbootRegion $givenEboot
+        $liftedRegion = Get-LiftedRegion
+        if ($givenRegion -ne $liftedRegion)
+        {
+            Write-Step "Switching from $($ReleaseNames[$liftedRegion]) to $($ReleaseNames[$givenRegion])"
+            Write-Host '    The game code will be lifted again from this dump, and build.ps1 then rebuilds everything.'
+            $needGameCode = $true
+            $sourceEboot = $givenEboot
+            Set-SavedSetting 'game_dir' (Split-Path (Split-Path (Split-Path $givenEboot)))
+        }
+    }
+    catch
+    {
+        Write-Host "    $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
+$needLibsre = ($LibsrePrx -or $WithLibsre) -and -not (Test-Path (Join-Path $PortDir 'firmware_lle\libsre_recomp.cpp'))
+if ($needGameCode -and -not $sourceEboot)
 {
     Write-Step 'Your Folklore dump'
     Write-Host '    This build kit has none of the game''s code: setup translates it from your own copy.'
-    Write-Host '    Needed: the folder of your Folklore dump (North American disc, BCUS98147, v1.00) -- the'
-    Write-Host '    one that contains PS3_GAME -- with PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf'
-    Write-Host '    (RPCS3: Utilities > Decrypt PS3 Binaries).'
+    Write-Host '    Needed: the folder of your Folklore dump (v1.00 disc: BCUS98147, North America, or'
+    Write-Host '    BCES00050, Europe) -- the one that contains PS3_GAME -- with PS3_GAME\USRDIR\EBOOT.BIN'
+    Write-Host '    decrypted to EBOOT.elf (RPCS3: Utilities > Decrypt PS3 Binaries).'
     while (-not $sourceEboot)
     {
         if (-not $GameDir)
@@ -197,7 +256,7 @@ if ($needGameCode)
         try
         {
             $sourceEboot = Resolve-GameEboot $GameDir
-            Write-Host "    $sourceEboot"
+            Write-Host "    $sourceEboot -- $($ReleaseNames[(Get-EbootRegion $sourceEboot)])"
             # run.ps1 and folklore.exe start from this folder from now on.
             Set-SavedSetting 'game_dir' (Split-Path (Split-Path (Split-Path $sourceEboot)))
         }

@@ -26,6 +26,7 @@
  */
 #include "engine_portable.h"
 #include "engine_settings.h"
+#include "engine_region.h"
 
 #ifdef _WIN32
 
@@ -49,11 +50,12 @@
 
 namespace
 {
-    /* What this build was lifted from (tools/relift.sh): the North American
-     * disc, v1.00. Its decrypted EBOOT.elf is this size; the lifted code
-     * matches no other version. */
-    constexpr const char* kTitleId = "BCUS98147";
-    constexpr unsigned long long kEbootSize = 6518936ull;
+    /* What this build was lifted from (tools/relift.sh, src/recomp/
+     * folklore_region.h): the North American (BCUS98147) or European
+     * (BCES00050) disc, v1.00. Its decrypted EBOOT.elf is this size; the
+     * lifted code matches no other version. */
+    constexpr const char* kTitleId = FOLKLORE_TITLE_ID;
+    constexpr unsigned long long kEbootSize = FOLKLORE_EBOOT_SIZE;
 
     bool fileExists(const std::string& path)
     {
@@ -453,13 +455,18 @@ bool engineCheckGameFolder(const std::string& folder, std::string* problem)
         }
         else if (!sfo.empty() && !containsText(sfo, kTitleId))
         {
-            reason = std::string("This is not the North American release of Folklore (") + kTitleId +
-                     "), the version this build was made from. Other versions will not run.";
+            const bool otherSupported = containsText(sfo, FOLKLORE_US_TITLE_ID) || containsText(sfo, FOLKLORE_EU_TITLE_ID);
+            reason = std::string("This build of the port was made from the ") + FOLKLORE_RELEASE_NAME +
+                     " release of Folklore (" + kTitleId + ")" +
+                     (otherSupported ? ", and this dump is the other release. Use the build made from this "
+                                       "release, or build one from this dump (setup.ps1)."
+                                     : ". Other versions will not run.");
         }
         else if (fileSize(eboot) != kEbootSize)
         {
-            reason = "This EBOOT.elf is not the v1.00 disc version this build was made from (the decrypted file "
-                     "should be 6,518,936 bytes).";
+            reason = std::string("This EBOOT.elf is not the v1.00 disc version this build was made from (the "
+                                 "decrypted ") + kTitleId + " EBOOT.elf is " + std::to_string(kEbootSize) +
+                     " bytes).";
         }
     }
     if (problem)
@@ -597,7 +604,7 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         else
         {
             MessageBoxA(nullptr,
-                        "Choose the folder of your Folklore (BCUS98147) disc dump: the folder that contains "
+                        "Choose the folder of your Folklore (" FOLKLORE_TITLE_ID ") disc dump: the folder that contains "
                         "PS3_GAME. Its PS3_GAME\\USRDIR\\EBOOT.BIN must be decrypted to EBOOT.elf with RPCS3 "
                         "first.\n\nThe game remembers the folder; change it later in the engine menu (F1).",
                         "Folklore", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);

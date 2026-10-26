@@ -30,11 +30,12 @@ sharpening, borderless fullscreen, save backups.
 You need **both** of these. Neither is in this repository and neither can be
 downloaded from it.
 
-### 1. Your own Folklore disc, North American release, v1.00
+### 1. Your own Folklore disc: North American or European release, v1.00
 
-- **Title ID BCUS98147, disc version 1.00.** The code is translated from that
-  exact executable; the European/Japanese releases and the 1.10 update will
-  not work.
+- **Title ID BCUS98147 (North America) or BCES00050 (Europe), disc version
+  1.00.** The code is translated from those exact executables; the Japanese
+  release and the 1.10 update will not work. A build is made from one of the
+  two and runs that one ([`folklore/docs/REGIONS.md`](folklore/docs/REGIONS.md)).
 - Dumped from your disc to a **folder** (the "JB folder" format RPCS3 uses): a
   folder that contains `PS3_GAME\`, with `PS3_GAME\PARAM.SFO` and
   `PS3_GAME\USRDIR\EBOOT.BIN` in it. Your dump is only ever read, never
@@ -46,7 +47,8 @@ The dumped `PS3_GAME\USRDIR\EBOOT.BIN` is encrypted. Decrypt it with
 [RPCS3](https://rpcs3.net/): **Utilities → Decrypt PS3 Binaries**, choose that
 `EBOOT.BIN`. RPCS3 writes **`EBOOT.elf`** beside it — leave it there.
 
-The decrypted file must be **6,518,936 bytes**; setup checks this.
+The decrypted file must be **6,518,936 bytes** (BCUS98147) or **6,518,912
+bytes** (BCES00050); setup checks this.
 
 ### Also needed
 
@@ -104,8 +106,13 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
   again.
 - **"EBOOT.BIN is still encrypted"**: decrypt it with RPCS3 as described
   above.
-- **"not the BCUS98147 v1.00 EBOOT"**: your disc is another region or the
-  EBOOT is from the 1.10 update. Only the North American v1.00 disc works.
+- **"not a v1.00 EBOOT of a supported release"**: your disc is the Japanese
+  release, or the EBOOT is from the 1.10 update. Only the v1.00 discs
+  BCUS98147 and BCES00050 work.
+- **Both releases:** a build follows the dump setup lifted. `.\setup.ps1
+  -GameDir <dump of the other release>` switches it (setup lifts the game code
+  again, then `build.ps1` rebuilds everything). To keep one of each, use two
+  copies of this folder.
 - setup and build are safe to re-run; each step skips what is already done.
 
 ---

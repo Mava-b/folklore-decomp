@@ -1,4 +1,4 @@
-# Folklore (Game Republic / SCE, 2007) -- BCUS98147, disc v1.00
+# Folklore (Game Republic / SCE, 2007) -- BCUS98147 or BCES00050, disc v1.00 (docs/REGIONS.md)
 # Static recompilation port on the shared ps3recomp runtime.
 #
 # Layout follows sp00nznet/tornado (Tornado Outbreak), the closest in-game
