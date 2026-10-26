@@ -79,16 +79,40 @@ function Import-BuildEnvironment
     {
         throw 'No Visual Studio / Build Tools with clang-cl found. Run setup.ps1 first.'
     }
-    $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
-    $lines = & cmd.exe /c "`"$vcvars`" >nul 2>&1 && set"
-    foreach ($line in $lines)
+    # Once per PowerShell session: vcvars64 adds to PATH every time it runs,
+    # so running build.ps1 / package.ps1 again and again in one window grows
+    # PATH each time. A session whose PATH had lost System32 failed here with
+    # "'cmd.exe' is not recognized" (2026-10-26), so cmd.exe is named by its
+    # full path, and System32 is put back below if it is missing.
+    if (-not $env:VSCMD_VER)
     {
-        if ($line -match '^([^=]+)=(.*)$')
+        $cmdExe = $env:ComSpec
+        if (-not $cmdExe -or -not (Test-Path $cmdExe))
         {
-            Set-Item -Path "env:$($matches[1])" -Value $matches[2]
+            $cmdExe = Join-Path $env:SystemRoot 'System32\cmd.exe'
+        }
+        $vcvars = Join-Path $vsPath 'VC\Auxiliary\Build\vcvars64.bat'
+        $lines = & $cmdExe /c "`"$vcvars`" >nul 2>&1 && set"
+        foreach ($line in $lines)
+        {
+            if ($line -match '^([^=]+)=(.*)$')
+            {
+                Set-Item -Path "env:$($matches[1])" -Value $matches[2]
+            }
         }
     }
+    # The project's own tools first, each only once.
     $clangBin = Join-Path $vsPath 'VC\Tools\Llvm\x64\bin'
     $extraPaths = @((Split-Path $CMakeExe), $NinjaDir, (Split-Path $PythonExe), (Split-Path $GitExe), $clangBin, (Join-Path $FfmpegDir 'bin'))
-    $env:PATH = ($extraPaths -join ';') + ';' + $env:PATH
+    $currentPaths = @($env:PATH -split ';' | Where-Object { $_ -and ($extraPaths -notcontains $_) })
+    $systemPaths = @((Join-Path $env:SystemRoot 'System32'), $env:SystemRoot,
+                     (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0'))
+    foreach ($systemPath in $systemPaths)
+    {
+        if ($currentPaths -notcontains $systemPath)
+        {
+            $currentPaths += $systemPath
+        }
+    }
+    $env:PATH = (@($extraPaths) + $currentPaths) -join ';'
 }
