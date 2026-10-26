@@ -866,6 +866,16 @@ What 0006 fixes in ps3recomp to make that run:
     - the two-job load chain no longer puts its first job's working memory
       above the previous job's binary after a wait at the guard, which
       libsre only did once.
+64. folklore.exe on its own, fixed. Double-clicked, it drew the title
+    screen wrongly and stopped at a black screen, while the same exe in the
+    same fresh folder played normally under run.ps1. The exact cause in the
+    single-process start was not found. Now the double-clicked exe acts as
+    its own launcher (engine_portable.cpp): it sets run.ps1's whole
+    environment and starts itself again as a child, with the data folder as
+    its working folder and output to logs\run-<stamp>.log. The child is in a
+    kill-on-close job. That plays normally. Closing the window used to only
+    stop presenting, so a game with no visible console kept running and
+    playing audio. patches/0051 ends the process when the window closes.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

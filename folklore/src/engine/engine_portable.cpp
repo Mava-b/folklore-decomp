@@ -368,8 +368,9 @@ namespace
         startup.hStdError = logFile;
         PROCESS_INFORMATION process;
         std::memset(&process, 0, sizeof(process));
-        const BOOL started = CreateProcessA(exePath, commandBuffer.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
-                                            nullptr, dataDirectory.c_str(), &startup, &process);
+        const BOOL started = CreateProcessA(exePath, commandBuffer.data(), nullptr, nullptr, TRUE,
+                                            CREATE_NO_WINDOW | CREATE_SUSPENDED, nullptr, dataDirectory.c_str(),
+                                            &startup, &process);
         const DWORD startError = GetLastError();
         CloseHandle(logFile);
         if (nothing != INVALID_HANDLE_VALUE)
@@ -382,6 +383,18 @@ namespace
             SetLastError(startError);
             return false;
         }
+        /* The game goes when this launcher goes (ended from Task Manager,
+         * say): the job is closed with this process and takes the child. */
+        HANDLE job = CreateJobObjectA(nullptr, nullptr);
+        if (job)
+        {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits;
+            std::memset(&limits, 0, sizeof(limits));
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
+            AssignProcessToJobObject(job, process.hProcess);
+        }
+        ResumeThread(process.hThread);
         CloseHandle(process.hThread);
         WaitForSingleObject(process.hProcess, INFINITE);
         GetExitCodeProcess(process.hProcess, exitCode);
