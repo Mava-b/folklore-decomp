@@ -15,6 +15,14 @@
  *   - finds the game: the EBOOT given on the command line, else the game_dir
  *     setting, else a folder picker, and checks the folder before using it;
  *   - writes the log to logs\run-<date-time>.log when nothing else captures it.
+ *
+ * Started on its own (double-clicked: no FOLKLORE_LAUNCHER), the exe does
+ * what run.ps1 does instead of running the game in its own process: it finds
+ * the game, sets run.ps1's whole environment, and starts itself again as a
+ * child with that environment, the data folder as its working folder and its
+ * output going to the log file -- then waits for it. Run in the first
+ * process, the game drew the title screen wrongly and stopped at a black
+ * screen (2026-10-26), while the same exe under run.ps1 played normally.
  */
 #include "engine_portable.h"
 #include "engine_settings.h"
@@ -284,6 +292,104 @@ namespace
     }
 }
 
+namespace
+{
+    std::string timeStamp()
+    {
+        char stamp[32];
+        const std::time_t now = std::time(nullptr);
+        std::tm localTime;
+        localtime_s(&localTime, &now);
+        std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &localTime);
+        return stamp;
+    }
+
+    /* The rest of what run.ps1 sets: diagnostics it always has on, and the
+     * render capture (F2 / capture.bat) armed into logs\capture-<stamp>. */
+    void applyLauncherEnvironment(const std::string& dataDirectory, const std::string& gameFolder,
+                                  const std::string& stamp)
+    {
+        defaultEnvironment("FOLKLORE_SPURS", "native");
+        defaultEnvironment("PS3_FS_AIO_LOG", "1");
+        defaultEnvironment("PS3_WATCHDOG_DUMP", "0x10A60C00:0x1000");
+        if (!gameFolder.empty())
+        {
+            defaultEnvironment("PS3_VFS_ROOT", gameFolder);
+        }
+        const std::string logDirectory = dataDirectory + "\\logs";
+        const std::string captureDirectory = logDirectory + "\\capture-" + stamp;
+        const std::string captureGate = logDirectory + "\\capture.go";
+        makeDirectory(logDirectory);
+        makeDirectory(captureDirectory);
+        makeDirectory(captureDirectory + "\\hlsl");
+        DeleteFileA(captureGate.c_str());
+        defaultEnvironment("RSX_DRAW_CSV", captureDirectory + "\\draws.csv");
+        defaultEnvironment("RSX_DRAW_CSV_GATE", captureGate);
+        defaultEnvironment("LD_DRAW_DUMP", captureDirectory);
+        defaultEnvironment("LD_DRAW_DUMP_EVERY", "100000");
+        defaultEnvironment("LD_VB_DUMP", captureDirectory);
+        defaultEnvironment("LD_HLSL_DUMP", captureDirectory + "\\hlsl");
+    }
+
+    /* Start this exe again on `eboot`, the way run.ps1 starts it, and wait.
+     * Returns false when it could not be started. */
+    bool runAsLauncher(const std::string& eboot, const std::string& dataDirectory, const std::string& logPath,
+                       DWORD* exitCode)
+    {
+        char exePath[MAX_PATH * 2];
+        const DWORD exeLength = GetModuleFileNameA(nullptr, exePath, (DWORD)sizeof(exePath));
+        if (exeLength == 0 || exeLength >= sizeof(exePath))
+        {
+            return false;
+        }
+        SECURITY_ATTRIBUTES inheritable = {sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
+        HANDLE logFile = CreateFileA(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                     &inheritable, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (logFile == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+        HANDLE nothing = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, &inheritable,
+                                     OPEN_EXISTING, 0, nullptr);
+
+        /* The child is the game; this marks it as started by a launcher, so
+         * it neither starts another nor redirects its own output. */
+        SetEnvironmentVariableA("FOLKLORE_LAUNCHER", "folklore.exe");
+
+        std::string commandLine = std::string("\"") + exePath + "\" \"" + eboot + "\"";
+        std::vector<char> commandBuffer(commandLine.begin(), commandLine.end());
+        commandBuffer.push_back('\0');
+        STARTUPINFOA startup;
+        std::memset(&startup, 0, sizeof(startup));
+        startup.cb = sizeof(startup);
+        startup.dwFlags = STARTF_USESTDHANDLES;
+        startup.hStdInput = nothing;
+        startup.hStdOutput = logFile;
+        startup.hStdError = logFile;
+        PROCESS_INFORMATION process;
+        std::memset(&process, 0, sizeof(process));
+        const BOOL started = CreateProcessA(exePath, commandBuffer.data(), nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+                                            nullptr, dataDirectory.c_str(), &startup, &process);
+        const DWORD startError = GetLastError();
+        CloseHandle(logFile);
+        if (nothing != INVALID_HANDLE_VALUE)
+        {
+            CloseHandle(nothing);
+        }
+        SetEnvironmentVariableA("FOLKLORE_LAUNCHER", nullptr);
+        if (!started)
+        {
+            SetLastError(startError);
+            return false;
+        }
+        CloseHandle(process.hThread);
+        WaitForSingleObject(process.hProcess, INFINITE);
+        GetExitCodeProcess(process.hProcess, exitCode);
+        CloseHandle(process.hProcess);
+        return true;
+    }
+}
+
 std::string engineNormaliseGameFolder(const std::string& folder)
 {
     std::string normalised = folder;
@@ -404,6 +510,30 @@ std::string engineDataDirectory()
     return engineExecutableDirectory();
 }
 
+/* Standalone: set run.ps1's environment, start the game as a child the way
+ * run.ps1 does, wait for it and exit with its code. If the child cannot be
+ * started, run the game here after all, logging to the file. */
+static const char* launchAndExit(const std::string& eboot, const std::string& dataDirectory)
+{
+    static std::string fallback;
+    const std::string stamp = timeStamp();
+    const std::string gameFolder = parentFolder(parentFolder(parentFolder(eboot)));
+    applyLauncherEnvironment(dataDirectory, gameFolder, stamp);
+    const std::string logPath = dataDirectory + "\\logs\\run-" + stamp + ".log";
+    DWORD exitCode = 0;
+    if (runAsLauncher(eboot, dataDirectory, logPath, &exitCode))
+    {
+        ExitProcess(exitCode);
+    }
+    const DWORD startError = GetLastError();
+    redirectLogIfStandalone(dataDirectory);
+    SetCurrentDirectoryA(dataDirectory.c_str());
+    std::fprintf(stderr, "[engine] could not start the game as a child process (error %lu) -- running it here\n",
+                 startError);
+    fallback = eboot;
+    return fallback.c_str();
+}
+
 /* Called by the boot harness (patches/0046) before it loads the ELF. Returns
  * the EBOOT to run, or nullptr to quit (the user closed the picker). */
 extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
@@ -413,7 +543,18 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     const std::string baseDirectory = engineExecutableDirectory();
     const std::string dataDirectory = engineDataDirectory();
     makeDirectory(dataDirectory);
-    redirectLogIfStandalone(dataDirectory);
+    const bool standalone = !environmentSet("FOLKLORE_LAUNCHER");
+    if (standalone)
+    {
+        /* This first process only finds the game and starts the real run;
+         * the console Windows opened for a double-click has nothing to show.
+         * A console someone started the exe from is left alone. */
+        DWORD processes[4];
+        if (GetConsoleProcessList(processes, 4) == 1)
+        {
+            FreeConsole();
+        }
+    }
     applyEnvironmentDefaults(baseDirectory, dataDirectory);
 
     if (elfFromCommandLine && *elfFromCommandLine)
@@ -422,17 +563,13 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         const DWORD length = GetFullPathNameA(elfFromCommandLine, (DWORD)sizeof(fullPath), fullPath, nullptr);
         ebootPath = (length > 0 && length < sizeof(fullPath)) ? std::string(fullPath, length) : elfFromCommandLine;
     }
-    /* Started on its own, the working directory is wherever the shortcut or
-     * Explorer says. The runtime keeps saves (gamedata\), the shader cache
-     * (scratch\) and the engine menu's save backups relative to it, so make
-     * it the data folder. run.ps1 chooses its own. */
-    if (!environmentSet("FOLKLORE_LAUNCHER"))
-    {
-        SetCurrentDirectoryA(dataDirectory.c_str());
-    }
     if (!ebootPath.empty())
     {
-        return ebootPath.c_str();     /* run.ps1, or a shortcut with the EBOOT path */
+        if (standalone)
+        {
+            return launchAndExit(ebootPath, dataDirectory);     /* a shortcut with the EBOOT path */
+        }
+        return ebootPath.c_str();     /* run.ps1, or this exe as the launcher */
     }
 
     std::string gameFolder = engineNormaliseGameFolder(settings.gameDir);
@@ -469,6 +606,10 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     defaultEnvironment("PS3_VFS_ROOT", gameFolder);
     ebootPath = gameFolder + "\\PS3_GAME\\USRDIR\\EBOOT.elf";
     std::fprintf(stderr, "[engine] game folder: %s\n", gameFolder.c_str());
+    if (standalone)
+    {
+        return launchAndExit(ebootPath, dataDirectory);
+    }
     return ebootPath.c_str();
 }
 

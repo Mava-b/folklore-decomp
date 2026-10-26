@@ -199,10 +199,10 @@ dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
 1. Decrypt the game's EBOOT once with RPCS3: Utilities > Decrypt PS3 Binaries,
    choose <your dump>\PS3_GAME\USRDIR\EBOOT.BIN. RPCS3 writes EBOOT.elf beside it.
-2. Double-click run.bat. The first time, folklore.exe asks for the dump folder
-   (the one that contains PS3_GAME) and remembers it in folklore_settings.ini.
-   run.bat starts the game through run.ps1, which sets the runtime up the way
-   it is tested and writes logs\run-<date-time>.log. Options go after it, e.g.
+2. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
+   for the dump folder (the one that contains PS3_GAME) and remembers it in
+   folklore_settings.ini. Either way the game starts with the same settings
+   and writes logs\run-<date-time>.log. run.bat takes options, e.g.
        run.bat -ResetInstall      (wipe hdd0/hdd1 and redo the first-boot install)
        run.bat -GameDir D:\Games\BCUS98147
 3. The first start copies several GB of game data into hdd1 here, so expect

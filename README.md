@@ -177,12 +177,13 @@ package (`package.ps1`) includes them, with run.ps1 finding `folklore.exe`
 beside itself.
 
 `folklore.exe` can also start without them (double-click it or a shortcut).
-It asks once for the game folder and remembers it, sets the main runtime
-options itself, keeps `hdd0\`, `hdd1\`, `gamedata\` (saves), the shader cache
-and `logs\` beside the exe (or in `data_dir` from `folklore_settings.ini`), and
-writes its log to `logs\run-<date-time>.log`. Started that way, the title
-screen has been seen drawing wrongly and the game stopping at a black
-screen; that is being looked into, so prefer run.bat for now.
+It asks once for the game folder and remembers it, then does what run.ps1
+does: it sets the same environment and starts the game as a second
+`folklore.exe` process, with its output going to `logs\run-<date-time>.log`.
+`hdd0\`, `hdd1\`, `gamedata\` (saves), the shader cache and `logs\` go beside
+the exe (or in `data_dir` from `folklore_settings.ini`). (Running the game in
+the first process instead, as earlier builds did, drew the title screen
+wrongly and stopped at a black screen.)
 
 ### Render capture (for bug reports)
 
