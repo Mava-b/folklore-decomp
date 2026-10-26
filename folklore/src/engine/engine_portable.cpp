@@ -25,6 +25,9 @@
 #include <windows.h>
 #include <shobjidl.h>
 
+#include <fcntl.h>
+#include <io.h>
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -181,11 +184,35 @@ namespace
         localtime_s(&localTime, &now);
         std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &localTime);
         const std::string logPath = logDirectory + "\\run-" + stamp + ".log";
-        if (!std::freopen(logPath.c_str(), "a", stdout))
+        /* One handle on the file, put under file descriptors 1 and 2 and the
+         * Win32 standard handles. (The earlier freopen of stdout and stderr
+         * left the log empty in a packaged run, 2026-10-26.) */
+        HANDLE logFile = CreateFileA(logPath.c_str(), FILE_APPEND_DATA, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
+                                     OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (logFile == INVALID_HANDLE_VALUE)
         {
             return;
         }
-        std::freopen(logPath.c_str(), "a", stderr);
+        const int logDescriptor = _open_osfhandle(reinterpret_cast<intptr_t>(logFile), _O_APPEND | _O_BINARY);
+        if (logDescriptor < 0)
+        {
+            CloseHandle(logFile);
+            return;
+        }
+        std::fflush(stdout);
+        std::fflush(stderr);
+        if (_dup2(logDescriptor, 1) != 0 || _dup2(logDescriptor, 2) != 0)
+        {
+            /* No console at all (stdout/stderr were never opened): attach the
+             * streams to the file instead. */
+            std::freopen("NUL", "w", stdout);
+            std::freopen("NUL", "w", stderr);
+            _dup2(logDescriptor, _fileno(stdout));
+            _dup2(logDescriptor, _fileno(stderr));
+        }
+        SetStdHandle(STD_OUTPUT_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(1)));
+        SetStdHandle(STD_ERROR_HANDLE, reinterpret_cast<HANDLE>(_get_osfhandle(2)));
+        std::setvbuf(stdout, nullptr, _IONBF, 0);
         std::setvbuf(stderr, nullptr, _IONBF, 0);
         /* Only this process on the console: it was opened for us by a
          * double-click, and would sit there empty. A console someone started
