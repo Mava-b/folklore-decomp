@@ -139,6 +139,10 @@ saved to `folklore_settings.ini`.
   **SIXAXIS (original)** or **Auto-capture**.
 - **Physics**: step physics by the frame time, which keeps cloth and hair
   stable above 30 fps (on by default).
+- **Language** (European build only): English, French, Spanish, German or
+  Italian, for the menus, text, subtitles and cutscene sound. The game picks
+  its language as it starts, so a change applies on the next start. The North
+  American disc only has English.
 - **Graphics**
   - *Fullscreen* (borderless; **Alt+Enter** toggles it any time).
   - *Render resolution*: 1x (1280×720, the PS3's), 2x or 3x. Applies on the

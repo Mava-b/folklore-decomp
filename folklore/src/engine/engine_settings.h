@@ -39,6 +39,20 @@ enum class AntiAliasing : int
     Fxaa = 1,           /* FXAA over the presented image */
 };
 
+/* The console language the game is told (cellSysutilGetSystemParamInt,
+ * CELL_SYSUTIL_SYSTEMPARAM_ID_LANG); the values are the system's own
+ * CELL_SYSUTIL_LANG_* codes. The European release has text, subtitles and
+ * the movie_996 video in these five and turns any other language into
+ * English; the North American release only has English on the disc. */
+enum class GameLanguage : int
+{
+    English = 1,
+    French = 2,
+    Spanish = 3,
+    German = 4,
+    Italian = 5,
+};
+
 struct EngineSettings
 {
     FrameRateCap frameRateCap = FrameRateCap::Original;
@@ -69,6 +83,10 @@ struct EngineSettings
     /* Borderless fullscreen on the window's monitor. Alt+Enter toggles it
      * too; the menu keeps this in step with the window. Applies at once. */
     bool fullscreen = false;
+    /* The European release only (the North American one always gets
+     * English). The game reads the language once, as it starts, so a
+     * change applies on the next launch. */
+    GameLanguage language = GameLanguage::English;
     /* Where things are (engine_portable.cpp). gameDir: the folder holding
      * PS3_GAME, with the decrypted PS3_GAME\USRDIR\EBOOT.elf; asked for with
      * a folder picker on the first start. devFlashDir: optional firmware
@@ -94,6 +112,12 @@ void engineSettingsApplyGraphics();
 void engineSettingsApplyInput();
 /* The aspect ratio a setting asks for (16:9 for Original). */
 float engineSettingsAspectValue(AspectRatio aspectRatio);
+/* Whether this build's release has more than one language (the EU one). */
+bool engineSettingsLanguageSelectable();
+/* The language this run of the game was given (fixed once the game has
+ * asked), for the menu to compare with the setting. */
+GameLanguage engineSettingsActiveLanguage();
+const char* engineSettingsLanguageName(GameLanguage language);
 
 extern "C"
 {
@@ -104,4 +128,7 @@ extern "C"
      * tools/game_patches.py, patch 0x3C913C). */
     int folklore_physics_plan_steps(float currentTime, float simulatedTime, float markerTime,
                                     float fixedStep, float* stepSize);
+    /* The CELL_SYSUTIL_LANG_* value for the game's language query
+     * (src/hle/folklore_hle.cpp). The first call fixes it for the run. */
+    int folklore_system_language(void);
 }

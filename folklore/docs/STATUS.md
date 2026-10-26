@@ -893,6 +893,21 @@ What 0006 fixes in ps3recomp to make that run:
     - Binaries packages are named by release.
     Lifted in the cloud: all five fixes and the ten frame-limiter sites
     apply to the EU code. Untested in play as of this entry.
+66. A language setting for the European release. The game asks for the
+    console language once, as it starts (cellSysutilGetSystemParamInt,
+    CELL_SYSUTIL_SYSTEMPARAM_ID_LANG), and the runtime always answered
+    English. The EU executable keeps CELL_SYSUTIL_LANG 1-5 (English, French,
+    Spanish, German, Italian) and turns anything else into English. Its
+    text, subtitle, movie and sound loaders pick their files by that value,
+    from a suffix table of _jp/_uk/_fr/_sp/_ge/_it (folklore/docs/REGIONS.md).
+    - folklore_hle.cpp answers the language query from the engine menu's
+      new Language setting (`language =` in folklore_settings.ini) and hands
+      every other setting to the runtime.
+    - The game reads it once, so a change applies on the next launch. The
+      menu says so when the setting and the running language differ.
+    - The US build is always told English. Its code accepts the same five,
+      but its disc has only the English subtitle files.
+    Untested in play as of this entry.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

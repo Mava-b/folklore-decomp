@@ -232,7 +232,8 @@ dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
 In the game
   F1 or L3+R3     engine menu: frame rate, resolution, aspect ratio, fullscreen,
-                  motion controls, game folder, save backups
+                  motion controls, game folder, save backups, and on the
+                  European release the language (applies on the next start)
   Alt+Enter       fullscreen on/off
   Controller      any XInput pad; a DualShock 3 through DsHidMini (SXS mode)
                   gives the original motion controls

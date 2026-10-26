@@ -6,6 +6,7 @@
  * folklore_settings.ini in the working directory.
  */
 #include "engine_settings.h"
+#include "engine_region.h"
 
 #include <cmath>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <windows.h>
 #include <cstdlib>
 #include <cstring>
+#include <mutex>
 
 namespace
 {
@@ -60,6 +62,36 @@ namespace
         return std::strcmp(value, "1") == 0 || std::strcmp(value, "true") == 0 ||
                std::strcmp(value, "on") == 0 || std::strcmp(value, "yes") == 0;
     }
+
+    struct LanguageEntry
+    {
+        GameLanguage language;
+        const char* key;    /* in folklore_settings.ini */
+        const char* name;   /* in the menu and the log */
+    };
+
+    const LanguageEntry kLanguages[] = {
+        { GameLanguage::English, "english", "English" },
+        { GameLanguage::French,  "french",  "French" },
+        { GameLanguage::Spanish, "spanish", "Spanish" },
+        { GameLanguage::German,  "german",  "German" },
+        { GameLanguage::Italian, "italian", "Italian" },
+    };
+
+    const LanguageEntry& languageEntry(GameLanguage language)
+    {
+        for (const LanguageEntry& entry : kLanguages)
+        {
+            if (entry.language == language)
+            {
+                return entry;
+            }
+        }
+        return kLanguages[0];
+    }
+
+    /* 0 until the game first asks, then the CELL_SYSUTIL_LANG_* value it got. */
+    int activeLanguageCode = 0;
 }
 
 LoadAtStartup loadAtStartup;
@@ -210,6 +242,17 @@ void engineSettingsLoad()
         {
             settingsInstance.fullscreen = parseBool(value);
         }
+        else if (std::strcmp(key, "language") == 0)
+        {
+            settingsInstance.language = GameLanguage::English;
+            for (const LanguageEntry& entry : kLanguages)
+            {
+                if (_stricmp(value, entry.key) == 0)
+                {
+                    settingsInstance.language = entry.language;
+                }
+            }
+        }
         else if (std::strcmp(key, "game_dir") == 0)
         {
             settingsInstance.gameDir = value;
@@ -259,6 +302,8 @@ void engineSettingsSave()
                            : "16:9";
     std::fprintf(file, "aspect_ratio = %s\n", aspectText);
     std::fprintf(file, "fullscreen = %d\n", current.fullscreen ? 1 : 0);
+    std::fprintf(file, "# European release only: english, french, spanish, german or italian (next launch)\n");
+    std::fprintf(file, "language = %s\n", languageEntry(current.language).key);
     std::fprintf(file, "# The folder that holds PS3_GAME (with the decrypted PS3_GAME\\USRDIR\\EBOOT.elf)\n");
     std::fprintf(file, "game_dir = %s\n", current.gameDir.c_str());
     std::fprintf(file, "# Optional: a firmware dev_flash folder (RPCS3's), for the system fonts\n");
@@ -322,6 +367,64 @@ float engineSettingsAspectValue(AspectRatio aspectRatio)
 void engineSettingsApplyInput()
 {
     cellPad_set_motion_mode((int)engineSettings().motionControls);
+}
+
+bool engineSettingsLanguageSelectable()
+{
+#if defined(FOLKLORE_REGION_EU)
+    return true;
+#else
+    return false;
+#endif
+}
+
+const char* engineSettingsLanguageName(GameLanguage language)
+{
+    return languageEntry(language).name;
+}
+
+namespace
+{
+    std::mutex languageLock;
+
+    GameLanguage languageToGive()
+    {
+        if (engineSettingsLanguageSelectable())
+        {
+            return engineSettings().language;
+        }
+        return GameLanguage::English;
+    }
+}
+
+GameLanguage engineSettingsActiveLanguage()
+{
+    std::lock_guard<std::mutex> guard(languageLock);
+    if (activeLanguageCode == 0)
+    {
+        /* Not asked yet: the setting is what it will get. */
+        return languageToGive();
+    }
+    return (GameLanguage)activeLanguageCode;
+}
+
+/* The game asks as it starts (func_0020C324 in the EU executable,
+ * func_0020C320 in the US one) and keeps the answer in a global its text,
+ * subtitle and movie loaders index by, so the first answer is the run's
+ * language. The EU executable turns anything but CELL_SYSUTIL_LANG 1-5 into
+ * English (its "_uk" files). The US one does the same into "_en", but its
+ * disc has only the English subtitle files, so it is always told English. */
+extern "C" int folklore_system_language(void)
+{
+    std::lock_guard<std::mutex> guard(languageLock);
+    if (activeLanguageCode == 0)
+    {
+        const GameLanguage language = languageToGive();
+        activeLanguageCode = (int)language;
+        std::fprintf(stderr, "[engine] game language: %s (%s release)\n", engineSettingsLanguageName(language),
+                     FOLKLORE_RELEASE_NAME);
+    }
+    return activeLanguageCode;
 }
 
 extern "C" int folklore_limiter_target(int originalTarget)

@@ -527,6 +527,52 @@ namespace
         return false;
     }
 
+    bool radioLanguage(GameLanguage value)
+    {
+        EngineSettings& settings = engineSettings();
+        if (ImGui::RadioButton(engineSettingsLanguageName(value), settings.language == value))
+        {
+            settings.language = value;
+            return true;
+        }
+        return false;
+    }
+
+    /* The European release's five languages. The game reads the language
+     * once, as it starts, so a change shows on the next launch. */
+    bool drawLanguage()
+    {
+        if (!engineSettingsLanguageSelectable())
+        {
+            return false;
+        }
+        EngineSettings& settings = engineSettings();
+        bool changed = false;
+        ImGui::SeparatorText("Language");
+        static const GameLanguage kChoices[5] = {GameLanguage::English, GameLanguage::French, GameLanguage::Spanish,
+                                                 GameLanguage::German, GameLanguage::Italian};
+        for (int choiceIndex = 0; choiceIndex < 5; choiceIndex++)
+        {
+            if (choiceIndex > 0)
+            {
+                ImGui::SameLine();
+            }
+            changed |= radioLanguage(kChoices[choiceIndex]);
+        }
+        const GameLanguage activeLanguage = engineSettingsActiveLanguage();
+        if (activeLanguage != settings.language)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Now %s; %s applies when you next start the game.",
+                               engineSettingsLanguageName(activeLanguage),
+                               engineSettingsLanguageName(settings.language));
+        }
+        else
+        {
+            ImGui::TextDisabled("Menus, text, subtitles and the cutscenes' sound (the disc has each per language).");
+        }
+        return changed;
+    }
+
     bool radioAnisotropy(const char* label, int value)
     {
         EngineSettings& settings = engineSettings();
@@ -739,6 +785,7 @@ namespace
             ImGui::SeparatorText("Pacing");
             changed |= ImGui::Checkbox("Precise frame limiter (wake every 1 ms instead of 10 ms)", &settings.fineLimiterSleep);
 
+            changed |= drawLanguage();
             changed |= drawGraphics();
             changed |= drawGameFiles();
 

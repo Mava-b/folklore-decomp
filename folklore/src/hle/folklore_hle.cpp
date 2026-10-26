@@ -26,6 +26,8 @@ extern "C" int32_t cellSysutilQueueGuestCallback(uint32_t opd, uint64_t arg0, ui
 extern "C" int32_t cellRtcFormatRfc3339(char* dateTimeOut, const void* tick, int32_t timeZoneMinutes);
 extern "C" int32_t cellPadSetSensorMode(uint32_t portNumber, uint32_t mode);
 extern "C" int32_t cellPadInfoSensorMode(uint32_t portNumber);
+extern "C" int32_t cellSysutilGetSystemParamInt(int32_t id, uint32_t valueAddress);
+extern "C" int folklore_system_language(void);   /* src/engine/engine_settings.cpp */
 
 namespace
 {
@@ -80,6 +82,25 @@ namespace
         logOnce("cellPadInfoSensorMode");
         const uint32_t portNumber = (uint32_t)context->gpr[3];
         returnValue(context, (uint32_t)cellPadInfoSensorMode(portNumber));
+    }
+
+    /* ---- cellSysutil: system settings ------------------------------------
+     * cellSysutilGetSystemParamInt(id, value*): the runtime answers every
+     * setting, and always English for the language. The language comes
+     * from the engine menu instead (the European release has five). */
+    constexpr int32_t kSystemParamLanguage = 0x0111;   /* CELL_SYSUTIL_SYSTEMPARAM_ID_LANG */
+
+    void hleGetSystemParamInt(ppu_context* context)
+    {
+        const int32_t paramId = (int32_t)context->gpr[3];
+        const uint32_t valueAddress = (uint32_t)context->gpr[4];
+        if (paramId == kSystemParamLanguage && valueAddress != 0)
+        {
+            vm_write32(valueAddress, (uint32_t)folklore_system_language());
+            returnValue(context, kCellOk);
+            return;
+        }
+        returnValue(context, (uint32_t)cellSysutilGetSystemParamInt(paramId, valueAddress));
     }
 
     /* ---- cellSysutil: dialogs, storage, web browser --------------------- */
@@ -345,6 +366,7 @@ namespace
     const HandlerEntry kHandlers[] = {
         { 0xBE5BE3BAu, "cellPadSetSensorMode",               hlePadSetSensorMode },
         { 0x78200559u, "cellPadInfoSensorMode",              hlePadInfoSensorMode },
+        { 0x40E895D3u, "cellSysutilGetSystemParamInt",       hleGetSystemParamInt },
         { 0x3E22CB4Bu, "cellMsgDialogOpenErrorCode",         hleMsgDialogOpenErrorCode },
         { 0x918288FBu, "cellStorageDataImport",              hleStorageDataTransfer },
         { 0xABC3CD2Cu, "cellStorageDataExport",              hleStorageDataTransfer },

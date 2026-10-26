@@ -51,6 +51,33 @@ displacements and 16-bit immediates.
 | Switch-table hint (`relift.sh`) | `34D3C8:34D3CC:19` | `34D380:34D384:19` |
 | Frame limiter (`patch_limiter.py`) | 10 sites, found by pattern | the same 10 |
 
+## Languages
+
+Both executables ask for the console language once, as they start
+(`cellSysutilGetSystemParamInt(CELL_SYSUTIL_SYSTEMPARAM_ID_LANG)`, in
+`func_0020C324` in the EU executable and `func_0020C320` in the US one). They
+keep it in a global (EU `0x107FA170`) that the loaders use as an index into a
+table of file suffixes at `0x530A44` (EU):
+
+| Value | 0 | 1 | 2 | 3 | 4 | 5 | 6-8 | 9 | 10 | 11 | 12 |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| Suffix | `_jp` | `_uk` | `_fr` | `_sp` | `_ge` | `_it` | (none) | `_ko` | `_tr` | `_si` | `_en` |
+
+- **EU executable:** keeps 1-5 (the CELL_SYSUTIL_LANG codes for English,
+  French, Spanish, German and Italian) and turns anything else into 1. Its
+  disc has those five: `movie_00N_<lang>.dat2_` subtitles,
+  `movie_996_<lang>.m2v_`, and `_fr`/`_ge`/`_it`/`_sp` cutscene sound
+  (`mov_9xx`, `rtd_0xx`, `BgmHead`/`EnvHead`), with the unsuffixed files as
+  English.
+- **US executable:** keeps 2-5 and turns anything else into 12 (`_en`). Its
+  disc only has the `_en` subtitle files.
+
+The port tells the game the engine menu's **Language** setting on the EU
+build, and English on the US build (`folklore_hle.cpp`,
+`folklore_system_language` in `engine_settings.cpp`).
+
+## Notes
+
 The movie set-up function is one of the ten that differ. In the EU build the
 code around both table allocations is the same; the extra code is elsewhere
 in the function.
