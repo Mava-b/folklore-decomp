@@ -1,0 +1,91 @@
+diff --git a/libs/audio/cellAudio.c b/libs/audio/cellAudio.c
+--- a/libs/audio/cellAudio.c
++++ b/libs/audio/cellAudio.c
+@@ -294,30 +294,71 @@ static int audio_backend_init(void)
+     REFERENCE_TIME buf_duration = 1000000; /* 100 ms in 100 ns units */
+     s_wasapi_event = CreateEventW(NULL, FALSE, FALSE, NULL);
+ 
+-    hr = s_wasapi_client->lpVtbl->Initialize(
+-        s_wasapi_client,
+-        AUDCLNT_SHAREMODE_SHARED,
++    /* Shared mode takes only the device's own mix format unless Windows is
++     * asked to convert: a device set to 44.1 or 96 kHz, or to 5.1 / 7.1,
++     * refused this 48 kHz stereo stream with AUDCLNT_E_UNSUPPORTED_FORMAT
++     * (0x88890008) and the game ran silent. AUTOCONVERTPCM has the audio
++     * engine convert the rate and channel count; the attempts without it are
++     * kept last for systems that do not accept the flag. */
++#ifndef AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
++#define AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM 0x80000000
++#endif
++#ifndef AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY
++#define AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY 0x08000000
++#endif
++    const DWORD convertFlags = AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
++    const DWORD attemptFlags[4] = {
++        AUDCLNT_STREAMFLAGS_EVENTCALLBACK | convertFlags,
++        convertFlags,
+         AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+-        buf_duration, 0, &wfx, NULL);
+-
+-    if (FAILED(hr)) {
+-        /* Fallback: try without event callback */
++        0,
++    };
++    int attempt = 0;
++    hr = E_FAIL;
++    for (attempt = 0; attempt < 4; attempt++) {
+         hr = s_wasapi_client->lpVtbl->Initialize(
+             s_wasapi_client,
+             AUDCLNT_SHAREMODE_SHARED,
+-            0, buf_duration, 0, &wfx, NULL);
+-        if (FAILED(hr)) {
+-            printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
+-            s_wasapi_client->lpVtbl->Release(s_wasapi_client);
+-            s_wasapi_client = NULL;
+-            CloseHandle(s_wasapi_event);
+-            s_wasapi_event = NULL;
+-            return -1;
++            attemptFlags[attempt],
++            buf_duration, 0, &wfx, NULL);
++        if (SUCCEEDED(hr)) {
++            break;
++        }
++        if (hr != AUDCLNT_E_ALREADY_INITIALIZED) {
++            continue;
++        }
++        break;
++    }
++
++    if (FAILED(hr)) {
++        printf("[cellAudio] WASAPI Initialize failed: 0x%08lX\n", hr);
++        /* What the device wanted instead, for the bug report. */
++        WAVEFORMATEX* mixFormat = NULL;
++        if (SUCCEEDED(s_wasapi_client->lpVtbl->GetMixFormat(s_wasapi_client, &mixFormat)) && mixFormat) {
++            printf("[cellAudio] device mix format: %lu Hz, %u channels, %u bits, tag 0x%04X\n",
++                   (unsigned long)mixFormat->nSamplesPerSec, (unsigned)mixFormat->nChannels,
++                   (unsigned)mixFormat->wBitsPerSample, (unsigned)mixFormat->wFormatTag);
++            CoTaskMemFree(mixFormat);
+         }
++        s_wasapi_client->lpVtbl->Release(s_wasapi_client);
++        s_wasapi_client = NULL;
+         CloseHandle(s_wasapi_event);
+         s_wasapi_event = NULL;
+-    } else {
++        return -1;
++    }
++    if (attemptFlags[attempt] & AUDCLNT_STREAMFLAGS_EVENTCALLBACK) {
+         s_wasapi_client->lpVtbl->SetEventHandle(s_wasapi_client, s_wasapi_event);
++    } else {
++        CloseHandle(s_wasapi_event);
++        s_wasapi_event = NULL;
++    }
++    if (attemptFlags[attempt] & AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM) {
++        WAVEFORMATEX* mixFormat = NULL;
++        if (SUCCEEDED(s_wasapi_client->lpVtbl->GetMixFormat(s_wasapi_client, &mixFormat)) && mixFormat) {
++            printf("[cellAudio] WASAPI: 48000 Hz stereo, converted by Windows to the device's %lu Hz, %u channels\n",
++                   (unsigned long)mixFormat->nSamplesPerSec, (unsigned)mixFormat->nChannels);
++            CoTaskMemFree(mixFormat);
++        }
+     }
+ 
+     s_wasapi_client->lpVtbl->GetBufferSize(s_wasapi_client, &s_wasapi_buf_frames);

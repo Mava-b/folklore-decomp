@@ -932,6 +932,15 @@ What 0006 fixes in ps3recomp to make that run:
       (entry on Keats walking at diagonals), with a smaller deadzone.
     Untested on real controllers as of this entry; the sign of each axis is
     the one thing most likely to need a flip after a real capture.
+68. No sound on some PCs (user report, EU release, logs 20261027-103446/
+    -103736): `[cellAudio] WASAPI Initialize failed: 0x88890008`, then the
+    game ran on silently. 0x88890008 is AUDCLNT_E_UNSUPPORTED_FORMAT: the
+    port asked for 48 kHz stereo float in shared mode, which Windows only
+    accepts when it is the device's own mix format -- a device at 44.1 or
+    96 kHz, or set up as 5.1/7.1, refused it. patches/0053 asks for
+    AUTOCONVERTPCM | SRC_DEFAULT_QUALITY so Windows converts the rate and
+    channel count (the old requests stay as last fallbacks), logs the
+    conversion, and on failure logs the device's mix format.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
