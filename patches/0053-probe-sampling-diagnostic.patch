@@ -1,0 +1,126 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -290,6 +290,7 @@ typedef struct {
+     ID3D12PipelineState* volatile pso;
+     volatile LONG pending;
+     u32 ps_unit_mask;   /* texture units the fragment program samples */
++    u64 dump_key;       /* the CSV pso_key it was built under: its LD_HLSL_DUMP name */
+ } psocache_t;
+ typedef struct {
+     u64 hash;
+@@ -645,6 +646,7 @@ typedef struct {
+     u32 input_mask, input_stride;
+     u32 packed_offsets;
+     u32 ps_unit_mask;
++    u64 dump_key;       /* psocache_t.dump_key of the PSO this draw uses */
+ } ld_pso_metadata;
+ 
+ static ld_pso_metadata g_ld_current_pso;
+@@ -5863,6 +5865,7 @@ static ID3D12PipelineState* get_pso(
+             g_ld_profile.total.pso_hits++;
+ #endif
+             g_ld_current_pso.ps_unit_mask = g.psos[found].ps_unit_mask;
++            g_ld_current_pso.dump_key = g.psos[found].dump_key;
+             if (InterlockedCompareExchange(&g.psos[found].pending, 0, 0)) {
+                 InterlockedIncrement(&g_ld_pso_draws_skipped);
+                 return NULL;             /* still compiling (ld_pso_job) */
+@@ -6025,6 +6028,8 @@ static ID3D12PipelineState* get_pso(
+     g.psos[entryIndex].pending = 0;
+     g.psos[entryIndex].ps_unit_mask = rsx_fp_texture_units(fp_uc, fp_size);
+     g_ld_current_pso.ps_unit_mask = g.psos[entryIndex].ps_unit_mask;
++    g.psos[entryIndex].dump_key = live_legacy_pso_key();
++    g_ld_current_pso.dump_key = g.psos[entryIndex].dump_key;
+     if (vi > 0 && fi > 0) {
+         if (ld_pso_job_submit(entryIndex, vs_hlsl, ps_hlsl, &rs, masked_layout,
+                               packed_payload)) {
+@@ -8936,16 +8941,79 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
+         g_ld_stats.group_drop_surface++;
+         return;
+     }
+-    /* LD_SKIP_SAMPLING=<hex offset>: drop draws that sample a texture at that
+-     * offset. Debug only -- removing a post-process pass shows whether the
+-     * scene under it has any colour at all. */
+-    { static int64_t skip = -2;
+-      if (skip == -2) { const char* e = getenv("LD_SKIP_SAMPLING"); skip = e ? (int64_t)strtoul(e, 0, 16) : -1; }
+-      if (skip >= 0)
+-          for (u32 u = 0; u < 16; u++) {
+-              rsx_dsp_texture st; rsx_dsp_get_texture(&g.rsx, u, &st);
+-              if (st.enabled && st.offset == (u32)skip) return;
+-          } }
++    /* LD_SKIP_SAMPLING=<hex offset>[:<vertex count>]: drop draws whose
++     * fragment program samples a texture at that offset (and, when given,
++     * that draw that many vertices). Debug only -- removing a pass shows
++     * what it contributes. The vertex count tells apart draws that read the
++     * same surface: a full-screen copy (6) from an effect mesh.
++     *
++     * LD_PROBE_SAMPLING=<hex offset>[:<vertex count>]: log the draws that
++     * would match, each shader once, with the LD_HLSL_DUMP file its HLSL is
++     * in. The CSV's pso_key folds in the fragment program's inline
++     * constants, so an animated effect gets a new key every frame while the
++     * shader -- and its dump file, named by the first key -- stays the
++     * same; this names that file. */
++    { static int parsed = 0;
++      static int64_t skipOffset = -1, probeOffset = -1;
++      static u32 skipVerts = 0, probeVerts = 0;
++      if (!parsed) {
++          parsed = 1;
++          const char* skipText = getenv("LD_SKIP_SAMPLING");
++          if (skipText) {
++              char* rest = NULL;
++              skipOffset = (int64_t)strtoul(skipText, &rest, 16);
++              if (rest && *rest == ':') {
++                  skipVerts = (u32)strtoul(rest + 1, NULL, 10);
++              }
++          }
++          const char* probeText = getenv("LD_PROBE_SAMPLING");
++          if (probeText) {
++              char* rest = NULL;
++              probeOffset = (int64_t)strtoul(probeText, &rest, 16);
++              if (rest && *rest == ':') {
++                  probeVerts = (u32)strtoul(rest + 1, NULL, 10);
++              }
++          }
++      }
++      if (skipOffset >= 0 || probeOffset >= 0) {
++          int skipThis = 0;
++          for (u32 unit = 0; unit < 16; unit++) {
++              if (!((g_ld_current_pso.ps_unit_mask >> unit) & 1u)) {
++                  continue;
++              }
++              rsx_dsp_texture sampled;
++              rsx_dsp_get_texture(&g.rsx, unit, &sampled);
++              if (!sampled.enabled) {
++                  continue;
++              }
++              if (skipOffset >= 0 && sampled.offset == (u32)skipOffset && (!skipVerts || n_tri == skipVerts)) {
++                  skipThis = 1;
++              }
++              if (probeOffset >= 0 && sampled.offset == (u32)probeOffset && (!probeVerts || n_tri == probeVerts)) {
++                  static u64 loggedKeys[32];
++                  static u32 loggedCount = 0;
++                  int seen = 0;
++                  for (u32 index = 0; index < loggedCount; index++) {
++                      if (loggedKeys[index] == g_ld_current_pso.dump_key) {
++                          seen = 1;
++                      }
++                  }
++                  if (!seen && loggedCount < 32) {
++                      loggedKeys[loggedCount++] = g_ld_current_pso.dump_key;
++                      fprintf(stderr,
++                              "[probe-sampling] frame %u: unit %u samples 0x%X (format 0x%02X), %u vertices, "
++                              "prim %u, shader hlsl_%016llx (units 0x%X, draw key %016llx)\n",
++                              g_ld_frames, unit, sampled.offset, sampled.format, n_tri, prim,
++                              (unsigned long long)g_ld_current_pso.dump_key, g_ld_current_pso.ps_unit_mask,
++                              (unsigned long long)live_legacy_pso_key());
++                      fflush(stderr);
++                  }
++              }
++          }
++          if (skipThis) {
++              return;
++          }
++      } }
+     /* LD_TRACE_PSO=<hex key>: raw vertex attributes + unit-0 texels of the
+      * first three draws with that CSV pso_key. */
+     { static u64 tk = 1; static int tn;
