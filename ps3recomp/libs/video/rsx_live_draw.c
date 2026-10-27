@@ -9017,22 +9017,50 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                   skipThis = 1;
               }
               if (probeOffset >= 0 && sampled.offset == (u32)probeOffset && (!probeVerts || n_tri == probeVerts)) {
+                  /* Each shader up to three times, on different frames, so
+                   * animated constants show. */
                   static u64 loggedKeys[32];
+                  static u32 loggedTimes[32];
+                  static u32 loggedFrame[32];
                   static u32 loggedCount = 0;
-                  int seen = 0;
+                  u32 slot = loggedCount;
                   for (u32 index = 0; index < loggedCount; index++) {
                       if (loggedKeys[index] == g_ld_current_pso.dump_key) {
-                          seen = 1;
+                          slot = index;
                       }
                   }
-                  if (!seen && loggedCount < 32) {
-                      loggedKeys[loggedCount++] = g_ld_current_pso.dump_key;
+                  if (slot == loggedCount && loggedCount < 32) {
+                      loggedKeys[loggedCount] = g_ld_current_pso.dump_key;
+                      loggedTimes[loggedCount] = 0;
+                      loggedFrame[loggedCount] = ~0u;
+                      loggedCount++;
+                  }
+                  if (slot < loggedCount && loggedTimes[slot] < 3 && loggedFrame[slot] != g_ld_frames) {
+                      loggedTimes[slot]++;
+                      loggedFrame[slot] = g_ld_frames;
                       fprintf(stderr,
                               "[probe-sampling] frame %u: unit %u samples 0x%X (format 0x%02X), %u vertices, "
                               "prim %u, shader hlsl_%016llx (units 0x%X, draw key %016llx)\n",
                               g_ld_frames, unit, sampled.offset, sampled.format, n_tri, prim,
                               (unsigned long long)g_ld_current_pso.dump_key, g_ld_current_pso.ps_unit_mask,
                               (unsigned long long)live_legacy_pso_key());
+                      /* The state the game set for that unit, raw, and the
+                       * fragment program's inline constants as floats. */
+                      fprintf(stderr,
+                              "[probe-sampling]   %ux%u mipmaps %u pitch %u location %u dimension %u cubemap %u "
+                              "filter 0x%08X (min %u mag %u bias %d/256) control0 0x%08X (max lod %u/256 min lod %u/256) "
+                              "wrap 0x%08X remap 0x%08X\n",
+                              sampled.width, sampled.height, sampled.mipmaps, sampled.pitch, sampled.location,
+                              sampled.dimension, sampled.cubemap, sampled.filter, (sampled.filter >> 16) & 0x7u,
+                              (sampled.filter >> 24) & 0x7u, (int)((sampled.filter & 0x1FFFu) ^ 0x1000u) - 0x1000,
+                              sampled.control0, (sampled.control0 >> 7) & 0xFFFu, (sampled.control0 >> 19) & 0xFFFu,
+                              sampled.wrap, sampled.remap);
+                      for (u32 constant = 0; constant < g.fp_constants.count && constant < 16u; constant++) {
+                          float values[4];
+                          memcpy(values, g.fp_constants.values[constant], sizeof(values));
+                          fprintf(stderr, "[probe-sampling]   c%u = (%g, %g, %g, %g)\n", constant, values[0],
+                                  values[1], values[2], values[3]);
+                      }
                       fflush(stderr);
                   }
               }
