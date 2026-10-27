@@ -51,8 +51,10 @@ extern "C"
     void rsx_null_backend_set_fullscreen(int enabled);
     void rsx_live_draw_get_shader_stats(uint32_t* pending, uint32_t* built, uint32_t* skippedDraws);
     extern volatile int g_cellpad_block_guest_input;
-    /* DualShock 3 over HID (cellPad.c): buttons in CELL_PAD packing. */
+    /* A controller read over HID (cellPad.c): a DualShock 3 or 4, DualSense
+     * or Switch Pro. Buttons in CELL_PAD packing. */
     int cellPad_host_ds3_state(uint16_t* buttons, uint8_t* stickLeftX, uint8_t* stickLeftY, int* psButton);
+    const char* cellPad_host_pad_name(void);
     int cellPad_motion_live(void);
     /* [fps] breakdown counters (cellGcmSys.c), nanoseconds since start. */
     extern volatile uint64_t g_gcm_perf_main_usleep_ns;
@@ -223,8 +225,9 @@ namespace
         return changed;
     }
 
-    /* A DualShock 3 read over HID (DsHidMini SXS mode) is not an XInput pad;
-     * give the menu its buttons in XInput terms. */
+    /* A controller read over HID (a DualShock 3 in DsHidMini's SXS mode, a
+     * DualShock 4, DualSense or Switch Pro) is not an XInput pad; give the
+     * menu its buttons in XInput terms. */
     SHORT ds3AxisToXInput(uint8_t value, bool invert)
     {
         int centred = (int)value - 128;
@@ -244,7 +247,7 @@ namespace
         return (SHORT)scaled;
     }
 
-    bool readDualShock3(ControllerState& state)
+    bool readHidController(ControllerState& state)
     {
         uint16_t cellButtons = 0;
         uint8_t stickX = 128;
@@ -286,7 +289,7 @@ namespace
     ControllerState readController()
     {
         ControllerState state;
-        if (readDualShock3(state))
+        if (readHidController(state))
         {
             return state;
         }
@@ -515,18 +518,6 @@ namespace
         return false;
     }
 
-    bool radioMotion(const char* label, MotionControls value)
-    {
-        EngineSettings& settings = engineSettings();
-        if (ImGui::RadioButton(label, settings.motionControls == value))
-        {
-            settings.motionControls = value;
-            engineSettingsApplyInput();
-            return true;
-        }
-        return false;
-    }
-
     bool radioLanguage(GameLanguage value)
     {
         EngineSettings& settings = engineSettings();
@@ -750,31 +741,31 @@ namespace
             ImGui::TextDisabled("Above 30 fps the game logic may run differently (timing).");
 
             ImGui::SeparatorText("Controls");
-            ImGui::TextUnformatted("Motion controls (capturing Folks)");
-            changed |= radioMotion("Automatic", MotionControls::Automatic);
-            ImGui::SameLine();
-            changed |= radioMotion("SIXAXIS (original)", MotionControls::Sixaxis);
-            ImGui::SameLine();
-            changed |= radioMotion("Auto-capture", MotionControls::AutoCapture);
+            if (ImGui::Checkbox("Motion controls (move the controller to capture Folks)", &settings.motionControls))
             {
-                uint16_t unusedButtons = 0;
-                const bool haveDualShock3 = cellPad_host_ds3_state(&unusedButtons, nullptr, nullptr, nullptr) != 0;
-                if (haveDualShock3 && cellPad_motion_live())
+                engineSettingsApplyInput();
+                changed = true;
+            }
+            {
+                const char* padName = cellPad_host_pad_name();
+                if (!settings.motionControls)
                 {
-                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "DualShock 3 connected: motion controls active.");
+                    ImGui::TextDisabled("Off: captures complete by themselves, with any controller.");
                 }
-                else if (haveDualShock3)
+                else if (padName && cellPad_motion_live())
                 {
-                    ImGui::TextDisabled("DualShock 3 connected; captures complete by themselves.");
+                    ImGui::TextColored(ImVec4(0.5f, 1.0f, 0.5f, 1.0f), "%s connected: motion controls active.", padName);
                 }
-                else if (settings.motionControls == MotionControls::Sixaxis)
+                else if (padName)
                 {
                     ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
-                                       "No DualShock 3 found (DsHidMini in SXS mode) -- captures need one.");
+                                       "%s connected, but its motion sensors are not reporting; captures complete by "
+                                       "themselves.", padName);
                 }
                 else
                 {
-                    ImGui::TextDisabled("No DualShock 3 found (DsHidMini in SXS mode); captures complete by themselves.");
+                    ImGui::TextDisabled("No motion controller found (DualShock 3 or 4, DualSense, Switch Pro); captures "
+                                        "complete by themselves.");
                 }
             }
 

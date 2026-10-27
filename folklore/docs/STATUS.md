@@ -908,6 +908,30 @@ What 0006 fixes in ps3recomp to make that run:
     - The US build is always told English. Its code accepts the same five,
       but its disc has only the English subtitle files.
     Untested in play as of this entry.
+67. Motion controls on any controller that has them, and one switch for
+    them. The menu's three-way choice (Automatic / SIXAXIS / Auto-capture)
+    tied motion to the DualShock 3. It is now one setting, Motion controls,
+    on or off (`motion_controls = on|off`; the old values still load):
+    - on: the connected controller's motion sensors drive the gestures; a
+      controller without them captures by itself (cellPad motion mode 0);
+    - off: every capture completes by itself (mode 2).
+    patches/0052 reads a DualShock 4, DualSense / Edge or Switch Pro
+    Controller over HID, USB or Bluetooth. None of them is an XInput device,
+    so before this they were not seen at all. Each gives buttons, sticks and
+    motion on port 0, as the DS3 does (a DS3 wins if both are connected).
+    - Report layouts and set-up follow SDL's HIDAPI drivers. A Bluetooth
+      DualShock 4 / DualSense is switched to its full report by reading its
+      calibration feature reports. A Switch Pro gets the USB handshake, IMU
+      on, its stick calibration read from SPI, and full report mode 0x30.
+    - Sensors become the SIXAXIS words the way RPCS3 converts a DualShock 4:
+      113 per g and 123/90 per degree/s about 512, axes negated. The Switch
+      Pro's axes are turned into the DualShock 4's frame first. A test
+      against built reports checks that the same pose gives the same words on
+      both.
+    - The sticks go through the XInput path's round-to-square gate mapping
+      (entry on Keats walking at diagonals), with a smaller deadzone.
+    Untested on real controllers as of this entry; the sign of each axis is
+    the one thing most likely to need a flip after a real capture.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

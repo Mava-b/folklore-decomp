@@ -253,8 +253,11 @@ In the game
                   motion controls, game folder, save backups, and on the
                   European release the language (applies on the next start)
   Alt+Enter       fullscreen on/off
-  Controller      any XInput pad; a DualShock 3 through DsHidMini (SXS mode)
-                  gives the original motion controls
+  Controller      any XInput pad. For motion controls (capturing Folks by
+                  moving the controller): a DualShock 4, DualSense or Switch
+                  Pro Controller over USB or Bluetooth, or a DualShock 3
+                  through DsHidMini (SXS mode). Turn them off in the menu
+                  and captures complete by themselves.
 
 Optional: system fonts. Copy a dev_flash folder (RPCS3's, from its firmware
 install) here, or set dev_flash in folklore_settings.ini.

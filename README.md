@@ -57,9 +57,10 @@ bytes** (BCES00050); setup checks this.
 - About **30 GB** free on the drive you clone to (tools, build files, and the
   game's own first-boot install of several GB).
 - An internet connection for setup (it downloads its tools).
-- A controller: any XInput pad, or a **DualShock 3** with
-  [DsHidMini](https://github.com/nefarius/DsHidMini) in **SXS** mode for the
-  original motion controls.
+- A controller: any XInput pad, or for motion controls a **DualShock 4**,
+  **DualSense** (or Edge), **Switch Pro Controller** (USB or Bluetooth, no
+  extra software), or a **DualShock 3** with
+  [DsHidMini](https://github.com/nefarius/DsHidMini) in **SXS** mode.
 
 ---
 
@@ -134,9 +135,11 @@ saved to `folklore_settings.ini`.
   Above 30 is experimental — the game was built for 30.
 - **Precise frame limiter**: wakes every 1 ms instead of every 10 ms, so
   frames end on time (on by default).
-- **Controls**: motion controls for capturing Folks — **Automatic** (motion when
-  a DualShock 3 is connected, otherwise captures complete by themselves),
-  **SIXAXIS (original)** or **Auto-capture**.
+- **Motion controls** (on by default): capture Folks by moving the controller,
+  as on the PS3. Works with any controller that has motion sensors (below); a
+  controller without them still captures by itself. Turn it off and every
+  capture completes by itself, whatever the controller. The menu shows which
+  controller is connected and whether its sensors are live.
 - **Physics**: step physics by the frame time, which keeps cloth and hair
   stable above 30 fps (on by default).
 - **Language** (European build only): English, French, Spanish, German or
@@ -161,14 +164,24 @@ saved to `folklore_settings.ini`.
 Escape closes the menu; it does not quit the game (use the window's close
 button or Alt+F4).
 
-### DualShock 3 / SIXAXIS
+### Motion controllers
 
-Folklore captures Folks with motion gestures. With
-[DsHidMini](https://github.com/nefarius/DsHidMini) set to **SXS** mode
-(change it in DSHMC, the DsHidMini control app), the game reads the DualShock
-3 directly — buttons, sticks, pressure and the motion sensors — on controller
-port 0. XInput mode has no motion data; without a DS3, use *Automatic* or
-*Auto-capture*.
+Folklore captures Folks with motion gestures. These controllers are read
+directly — buttons, sticks and the motion sensors — and take controller port
+0 (an XInput pad takes the next port):
+
+| Controller | Connection | Notes |
+|---|---|---|
+| DualShock 4 (and Sony's wireless adapter) | USB or Bluetooth | no extra software |
+| DualSense, DualSense Edge | USB or Bluetooth | no extra software |
+| Switch Pro Controller | USB or Bluetooth | buttons by position: B = Cross, A = Circle, Y = Square, X = Triangle |
+| DualShock 3 | USB or Bluetooth | needs [DsHidMini](https://github.com/nefarius/DsHidMini) in **SXS** mode (set in DSHMC); also gives pressure-sensitive buttons |
+
+A controller presented as an XInput pad by another program (DS4Windows,
+Steam Input, DsHidMini in XInput mode) has no motion data. If DS4Windows hides
+the real controller (HidHide), the game cannot see it either; close it or let
+the game through. If two of these controllers are connected, the DualShock 3
+is used, otherwise the first one found.
 
 ### run.ps1 options
 

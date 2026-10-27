@@ -1,0 +1,1168 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -125,12 +125,12 @@ static u8 pad_axis_to_u8(float value)
+     return (u8)converted;
+ }
+ 
+-static void pad_xinput_stick_pair(short rawX, short rawY, short deadzone, u8* outX, u8* outY)
++/* stickX right, stickY up, both -1..1; the deadzone as a fraction of full
++ * travel. Also used for the DualShock 4, DualSense and Switch Pro sticks,
++ * whose gates are round as well. */
++static void pad_stick_pair(float stickX, float stickY, float deadzoneFraction, u8* outX, u8* outY)
+ {
+-    const float stickX = (float)rawX / 32767.0f;
+-    const float stickY = (float)rawY / 32767.0f;
+     const float magnitude = sqrtf(stickX * stickX + stickY * stickY);
+-    const float deadzoneFraction = (float)deadzone / 32767.0f;
+     if (magnitude <= deadzoneFraction)
+     {
+         *outX = 128;
+@@ -151,6 +151,11 @@ static void pad_xinput_stick_pair(short rawX, short rawY, short deadzone, u8* ou
+     *outY = pad_axis_to_u8(-squareY);
+ }
+ 
++static void pad_xinput_stick_pair(short rawX, short rawY, short deadzone, u8* outX, u8* outY)
++{
++    pad_stick_pair((float)rawX / 32767.0f, (float)rawY / 32767.0f, (float)deadzone / 32767.0f, outX, outY);
++}
++
+ /* Keyboard fallback for port 0.
+  *
+  * The only backend here is XInput, so on a machine with no controller plugged
+@@ -251,6 +256,7 @@ static void pad_poll_keyboard(void)
+ #ifdef _WIN32
+ #include <setupapi.h>
+ #include <hidsdi.h>
++#include <hidpi.h>
+ #include <winioctl.h>
+ #pragma comment(lib, "setupapi.lib")
+ #pragma comment(lib, "hid.lib")
+@@ -259,6 +265,8 @@ static void pad_poll_keyboard(void)
+ #define IOCTL_HID_GET_FEATURE CTL_CODE(FILE_DEVICE_KEYBOARD, 100, METHOD_OUT_DIRECT, FILE_ANY_ACCESS)
+ #endif
+ 
++/* One controller read over HID: the DS3 here, or a DualShock 4, DualSense or
++ * Switch Pro Controller (further down), in the PS3's own terms. */
+ typedef struct {
+     int connected;
+     u16 buttons;            /* CELL_PAD_CTRL_* packing, as PadHostState */
+@@ -266,11 +274,12 @@ typedef struct {
+     u8  stickLeftX, stickLeftY, stickRightX, stickRightY;
+     u8  pressure[12];       /* up right down left L2 R2 L1 R1 tri circle cross square */
+     u16 sensor[4];          /* X Y Z G, 0..1023 */
++    int hasMotion;          /* sensor[] is live (0: a report without the sensors) */
+     unsigned long long reports;
+-} PadDs3State;
++} PadHidState;
+ 
+ static SRWLOCK      s_ds3_lock = SRWLOCK_INIT;
+-static PadDs3State  s_ds3_state;
++static PadHidState  s_ds3_state;
+ static HANDLE       s_ds3_thread = NULL;
+ static volatile LONG s_ds3_stop = 0;
+ /* Sensor source for the guest (cellPad_set_motion_mode): */
+@@ -379,7 +388,7 @@ static HANDLE pad_ds3_open(u8* reportIdOut)
+ 
+ static void pad_ds3_parse(const u8* report)
+ {
+-    PadDs3State next;
++    PadHidState next;
+     memset(&next, 0, sizeof(next));
+     next.connected = 1;
+     next.buttons = (u16)(report[2] | (report[3] << 8));
+@@ -393,6 +402,7 @@ static void pad_ds3_parse(const u8* report)
+     next.sensor[1] = pad_ds3_sensor_word(report + 45);
+     next.sensor[2] = pad_ds3_sensor_word(report + 43);
+     next.sensor[3] = pad_ds3_sensor_word(report + 47);
++    next.hasMotion = 1;
+     AcquireSRWLockExclusive(&s_ds3_lock);
+     next.reports = s_ds3_state.reports + 1;
+     s_ds3_state = next;
+@@ -474,7 +484,7 @@ static void pad_ds3_start(void)
+     s_ds3_thread = CreateThread(NULL, 0, pad_ds3_thread, NULL, 0, NULL);
+ }
+ 
+-static int pad_ds3_snapshot(PadDs3State* out)
++static int pad_ds3_snapshot(PadHidState* out)
+ {
+     AcquireSRWLockShared(&s_ds3_lock);
+     *out = s_ds3_state;
+@@ -482,75 +492,964 @@ static int pad_ds3_snapshot(PadDs3State* out)
+     return out->connected;
+ }
+ 
+-/* Port 0 from the DS3, when one is connected. */
+-static void pad_apply_ds3(void)
++/* ---------------------------------------------------------------------------
++ * DualShock 4, DualSense and Switch Pro Controller over HID (Windows)
++ *
++ * None of these is an XInput device, so without this they are not seen at
++ * all, and their motion sensors stand in for the SIXAXIS the same way RPCS3's
++ * handlers use them. Over USB or Bluetooth, through Windows' own HID driver:
++ *
++ *   DualShock 4  054C:05C4, 054C:09CC, wireless adapter 054C:0BA0
++ *     input report 0x01 (USB), 0x11-0x19 (Bluetooth, two more header bytes).
++ *     Reading feature report 0x02 (and 0x05 over Bluetooth) is what switches
++ *     a Bluetooth pad from its short 0x01 report to the full one.
++ *   DualSense    054C:0CE6, Edge 054C:0DF2
++ *     input report 0x01 (USB, 64 bytes), 0x31 (Bluetooth, one more header
++ *     byte); over Bluetooth the full report also starts once feature reports
++ *     0x05 / 0x09 / 0x20 have been read.
++ *   Switch Pro   057E:2009
++ *     needs to be told to send: over USB a handshake (output report 0x80:
++ *     0x02, 0x03, 0x02, 0x04), then subcommands in output report 0x01 --
++ *     0x40 01 (IMU on), 0x10 (read the sticks' factory calibration from SPI
++ *     0x603D) and 0x03 30 (full input report 0x30, three IMU samples each).
++ *
++ * The layouts follow SDL's HIDAPI drivers (zlib licence), re-implemented
++ * here. The sensors become the SIXAXIS's 0..1023 words as RPCS3 converts a
++ * DualShock 4: acceleration in g times 113 about 512 (1 g down reads 399 on
++ * Y, as a DS3 lying flat), yaw rate in degrees/s times 123/90 about 512,
++ * every axis negated from the DualShock 4's own frame (X right, Y up, Z
++ * toward the player). The Switch Pro's axes are turned into that frame first
++ * (SDL's mapping). Sensor scales are the parts' nominal ones: DualShock 4 /
++ * DualSense 8192 per g and 16 per degree/s, Switch Pro 4096 per g and 14.28
++ * per degree/s.
++ *
++ * Like the DS3 it takes port 0; a DS3 wins if both are connected.
++ * PAD_NO_HID_PADS=1 turns this off.
++ * -----------------------------------------------------------------------*/
++typedef enum {
++    PAD_HID_NONE = 0,
++    PAD_HID_DUALSHOCK4,
++    PAD_HID_DUALSENSE,
++    PAD_HID_SWITCH_PRO,
++} PadHidKind;
++
++typedef struct {
++    u16 vendorId;
++    u16 productId;
++    PadHidKind kind;
++} PadHidModel;
++
++static const PadHidModel s_hid_models[] = {
++    { 0x054C, 0x05C4, PAD_HID_DUALSHOCK4 },
++    { 0x054C, 0x09CC, PAD_HID_DUALSHOCK4 },
++    { 0x054C, 0x0BA0, PAD_HID_DUALSHOCK4 },   /* wireless adapter */
++    { 0x054C, 0x0CE6, PAD_HID_DUALSENSE },
++    { 0x054C, 0x0DF2, PAD_HID_DUALSENSE },    /* DualSense Edge */
++    { 0x057E, 0x2009, PAD_HID_SWITCH_PRO },
++};
++
++static const char* pad_hid_kind_name(PadHidKind kind)
++{
++    switch (kind)
++    {
++    case PAD_HID_DUALSHOCK4:
++        return "DualShock 4";
++    case PAD_HID_DUALSENSE:
++        return "DualSense";
++    case PAD_HID_SWITCH_PRO:
++        return "Switch Pro Controller";
++    default:
++        return NULL;
++    }
++}
++
++typedef struct {
++    HANDLE device;
++    HANDLE ioEvent;
++    PadHidKind kind;
++    int bluetooth;
++    USHORT inputLength;
++    USHORT outputLength;
++    USHORT featureLength;
++    u8 switchPacketNumber;
++    /* Switch Pro sticks: [stick][axis] centre and the travel either side */
++    int stickCentre[2][2];
++    int stickAbove[2][2];
++    int stickBelow[2][2];
++} PadHidDevice;
++
++#define PAD_HID_MAX_REPORT 1024
++
++static SRWLOCK       s_hidpad_lock = SRWLOCK_INIT;
++static PadHidState   s_hidpad_state;
++static volatile LONG s_hidpad_kind = PAD_HID_NONE;
++static HANDLE        s_hidpad_thread = NULL;
++
++static void pad_hid_close(PadHidDevice* pad)
++{
++    if (pad->device != INVALID_HANDLE_VALUE)
++    {
++        CancelIo(pad->device);
++        CloseHandle(pad->device);
++    }
++    if (pad->ioEvent)
++    {
++        CloseHandle(pad->ioEvent);
++    }
++    memset(pad, 0, sizeof(*pad));
++    pad->device = INVALID_HANDLE_VALUE;
++}
++
++/* The first supported controller that opens. */
++static int pad_hid_open(PadHidDevice* pad)
++{
++    GUID hidGuid;
++    HidD_GetHidGuid(&hidGuid);
++    HDEVINFO deviceSet = SetupDiGetClassDevsW(&hidGuid, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
++    if (deviceSet == INVALID_HANDLE_VALUE)
++    {
++        return 0;
++    }
++    int opened = 0;
++    SP_DEVICE_INTERFACE_DATA interfaceData;
++    interfaceData.cbSize = sizeof(interfaceData);
++    for (DWORD interfaceIndex = 0;
++         !opened && SetupDiEnumDeviceInterfaces(deviceSet, NULL, &hidGuid, interfaceIndex, &interfaceData);
++         interfaceIndex++)
++    {
++        DWORD detailSize = 0;
++        SetupDiGetDeviceInterfaceDetailW(deviceSet, &interfaceData, NULL, 0, &detailSize, NULL);
++        if (!detailSize)
++        {
++            continue;
++        }
++        SP_DEVICE_INTERFACE_DETAIL_DATA_W* detail = (SP_DEVICE_INTERFACE_DETAIL_DATA_W*)malloc(detailSize);
++        if (!detail)
++        {
++            continue;
++        }
++        detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
++        if (!SetupDiGetDeviceInterfaceDetailW(deviceSet, &interfaceData, detail, detailSize, NULL, NULL))
++        {
++            free(detail);
++            continue;
++        }
++        /* Attributes first, through a handle that asks for no access, so
++         * nothing else (keyboards, mice) is opened for reading. */
++        HANDLE probe = CreateFileW(detail->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                                   OPEN_EXISTING, 0, NULL);
++        if (probe == INVALID_HANDLE_VALUE)
++        {
++            free(detail);
++            continue;
++        }
++        HIDD_ATTRIBUTES attributes;
++        attributes.Size = sizeof(attributes);
++        PadHidKind kind = PAD_HID_NONE;
++        if (HidD_GetAttributes(probe, &attributes))
++        {
++            for (size_t modelIndex = 0; modelIndex < sizeof(s_hid_models) / sizeof(s_hid_models[0]); modelIndex++)
++            {
++                if (s_hid_models[modelIndex].vendorId == attributes.VendorID &&
++                    s_hid_models[modelIndex].productId == attributes.ProductID)
++                {
++                    kind = s_hid_models[modelIndex].kind;
++                }
++            }
++        }
++        CloseHandle(probe);
++        if (kind == PAD_HID_NONE)
++        {
++            free(detail);
++            continue;
++        }
++        HANDLE device = CreateFileW(detail->DevicePath, GENERIC_READ | GENERIC_WRITE,
++                                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
++                                    FILE_FLAG_OVERLAPPED, NULL);
++        if (device == INVALID_HANDLE_VALUE && kind != PAD_HID_SWITCH_PRO)
++        {
++            /* Read-only is enough for the Sony pads over USB. */
++            device = CreateFileW(detail->DevicePath, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
++                                 OPEN_EXISTING, FILE_FLAG_OVERLAPPED, NULL);
++        }
++        free(detail);
++        if (device == INVALID_HANDLE_VALUE)
++        {
++            printf("[cellPad] %s found but could not be opened (another program may have it exclusively)\n",
++                   pad_hid_kind_name(kind));
++            fflush(stdout);
++            continue;
++        }
++        PHIDP_PREPARSED_DATA preparsed = NULL;
++        HIDP_CAPS caps;
++        memset(&caps, 0, sizeof(caps));
++        if (!HidD_GetPreparsedData(device, &preparsed))
++        {
++            CloseHandle(device);
++            continue;
++        }
++        HidP_GetCaps(preparsed, &caps);
++        HidD_FreePreparsedData(preparsed);
++        if (caps.InputReportByteLength == 0 || caps.InputReportByteLength > PAD_HID_MAX_REPORT)
++        {
++            CloseHandle(device);
++            continue;
++        }
++        /* The fewest reports Windows will queue, so a read is never behind. */
++        HidD_SetNumInputBuffers(device, 2);
++        memset(pad, 0, sizeof(*pad));
++        pad->device = device;
++        pad->ioEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
++        pad->kind = kind;
++        pad->inputLength = caps.InputReportByteLength;
++        pad->outputLength = caps.OutputReportByteLength;
++        pad->featureLength = caps.FeatureReportByteLength;
++        /* Every one of them has a 64-byte input report over USB and a longer
++         * one in its Bluetooth descriptor. */
++        pad->bluetooth = caps.InputReportByteLength > 64;
++        opened = pad->ioEvent != NULL;
++        if (!opened)
++        {
++            pad_hid_close(pad);
++        }
++    }
++    SetupDiDestroyDeviceInfoList(deviceSet);
++    return opened;
++}
++
++/* One input report: its length, 0 when none came within timeoutMs, -1 when
++ * the controller has gone. */
++static int pad_hid_read(PadHidDevice* pad, u8* buffer, DWORD timeoutMs)
++{
++    OVERLAPPED overlapped;
++    memset(&overlapped, 0, sizeof(overlapped));
++    overlapped.hEvent = pad->ioEvent;
++    ResetEvent(pad->ioEvent);
++    DWORD bytesRead = 0;
++    if (!ReadFile(pad->device, buffer, pad->inputLength, &bytesRead, &overlapped))
++    {
++        if (GetLastError() != ERROR_IO_PENDING)
++        {
++            return -1;
++        }
++        if (WaitForSingleObject(pad->ioEvent, timeoutMs) != WAIT_OBJECT_0)
++        {
++            CancelIo(pad->device);
++            GetOverlappedResult(pad->device, &overlapped, &bytesRead, TRUE);
++            return 0;
++        }
++        if (!GetOverlappedResult(pad->device, &overlapped, &bytesRead, FALSE))
++        {
++            return GetLastError() == ERROR_OPERATION_ABORTED ? 0 : -1;
++        }
++    }
++    return (int)bytesRead;
++}
++
++static int pad_hid_write(PadHidDevice* pad, const u8* data, DWORD length)
++{
++    u8 buffer[PAD_HID_MAX_REPORT];
++    DWORD writeLength = pad->outputLength ? pad->outputLength : length;
++    if (writeLength > sizeof(buffer) || length > writeLength)
++    {
++        return 0;
++    }
++    memset(buffer, 0, writeLength);
++    memcpy(buffer, data, length);
++    OVERLAPPED overlapped;
++    memset(&overlapped, 0, sizeof(overlapped));
++    overlapped.hEvent = pad->ioEvent;
++    ResetEvent(pad->ioEvent);
++    DWORD written = 0;
++    if (!WriteFile(pad->device, buffer, writeLength, &written, &overlapped))
++    {
++        if (GetLastError() != ERROR_IO_PENDING)
++        {
++            return 0;
++        }
++        if (WaitForSingleObject(pad->ioEvent, 200) != WAIT_OBJECT_0)
++        {
++            CancelIo(pad->device);
++            GetOverlappedResult(pad->device, &overlapped, &written, TRUE);
++            return 0;
++        }
++        if (!GetOverlappedResult(pad->device, &overlapped, &written, FALSE))
++        {
++            return 0;
++        }
++    }
++    return 1;
++}
++
++/* A feature report, read only for what reading it does to the controller. */
++static void pad_hid_touch_feature(PadHidDevice* pad, u8 reportId)
++{
++    u8 buffer[PAD_HID_MAX_REPORT];
++    DWORD length = pad->featureLength ? pad->featureLength : 64;
++    if (length > sizeof(buffer))
++    {
++        length = sizeof(buffer);
++    }
++    memset(buffer, 0, length);
++    buffer[0] = reportId;
++    HidD_GetFeature(pad->device, buffer, length);
++}
++
++/* ---- Switch Pro Controller commands ------------------------------------- */
++
++/* Output report 0x80 (USB only); waits for its 0x81 acknowledgement. */
++static int pad_switch_proprietary(PadHidDevice* pad, u8 command, int waitForReply)
++{
++    u8 packet[2] = { 0x80, command };
++    u8 reply[PAD_HID_MAX_REPORT];
++    for (int attempt = 0; attempt < 3; attempt++)
++    {
++        if (!pad_hid_write(pad, packet, sizeof(packet)))
++        {
++            continue;
++        }
++        if (!waitForReply)
++        {
++            return 1;
++        }
++        const unsigned long long deadlineMs = GetTickCount64() + 100ull;
++        while (GetTickCount64() < deadlineMs)
++        {
++            const int bytesRead = pad_hid_read(pad, reply, 20);
++            if (bytesRead < 0)
++            {
++                return 0;
++            }
++            if (bytesRead >= 2 && reply[0] == 0x81 && reply[1] == command)
++            {
++                return 1;
++            }
++        }
++    }
++    return 0;
++}
++
++/* Output report 0x01: neutral rumble, then a subcommand. Waits for the 0x21
++ * reply and leaves it in replyOut (when given). */
++static int pad_switch_subcommand(PadHidDevice* pad, u8 subcommand, const u8* arguments, u8 argumentLength,
++                                 u8* replyOut)
++{
++    u8 packet[49];
++    u8 reply[PAD_HID_MAX_REPORT];
++    for (int attempt = 0; attempt < 3; attempt++)
++    {
++        memset(packet, 0, sizeof(packet));
++        packet[0] = 0x01;
++        packet[1] = pad->switchPacketNumber;
++        pad->switchPacketNumber = (u8)((pad->switchPacketNumber + 1) & 0x0F);
++        static const u8 neutralRumble[8] = { 0x00, 0x01, 0x40, 0x40, 0x00, 0x01, 0x40, 0x40 };
++        memcpy(packet + 2, neutralRumble, sizeof(neutralRumble));
++        packet[10] = subcommand;
++        if (arguments && argumentLength)
++        {
++            memcpy(packet + 11, arguments, argumentLength);
++        }
++        if (!pad_hid_write(pad, packet, sizeof(packet)))
++        {
++            continue;
++        }
++        const unsigned long long deadlineMs = GetTickCount64() + 150ull;
++        while (GetTickCount64() < deadlineMs)
++        {
++            const int bytesRead = pad_hid_read(pad, reply, 20);
++            if (bytesRead < 0)
++            {
++                return 0;
++            }
++            /* [13] ack (bit 7 set), [14] the subcommand it answers. */
++            if (bytesRead >= 15 && reply[0] == 0x21 && reply[14] == subcommand && (reply[13] & 0x80))
++            {
++                if (replyOut)
++                {
++                    memcpy(replyOut, reply, (size_t)bytesRead < 64 ? (size_t)bytesRead : 64);
++                }
++                return 1;
++            }
++        }
++    }
++    return 0;
++}
++
++static int pad_switch_unpack12(const u8* bytes, int highHalf)
++{
++    /* Two 12-bit values packed in three bytes. */
++    if (highHalf)
++    {
++        return (bytes[1] >> 4) | (bytes[2] << 4);
++    }
++    return bytes[0] | ((bytes[1] & 0x0F) << 8);
++}
++
++static void pad_switch_load_stick_calibration(PadHidDevice* pad)
+ {
+-    PadDs3State ds3;
+-    if (!pad_ds3_snapshot(&ds3))
++    for (int stick = 0; stick < 2; stick++)
++    {
++        for (int axis = 0; axis < 2; axis++)
++        {
++            pad->stickCentre[stick][axis] = 2048;
++            pad->stickAbove[stick][axis] = 1433;
++            pad->stickBelow[stick][axis] = 1433;
++        }
++    }
++    /* SPI 0x603D, 18 bytes: left stick then right, 12-bit values in a
++     * different order for each (SDL's LoadStickCalibration). */
++    const u8 spiRead[5] = { 0x3D, 0x60, 0x00, 0x00, 18 };
++    u8 reply[64];
++    memset(reply, 0, sizeof(reply));
++    if (!pad_switch_subcommand(pad, 0x10, spiRead, sizeof(spiRead), reply) ||
++        reply[15] != 0x3D || reply[16] != 0x60)
++    {
++        printf("[cellPad] Switch Pro Controller: no stick calibration, using defaults\n");
++        return;
++    }
++    const u8* left = reply + 20;
++    const u8* right = reply + 29;
++    pad->stickAbove[0][0] = pad_switch_unpack12(left + 0, 0);
++    pad->stickAbove[0][1] = pad_switch_unpack12(left + 0, 1);
++    pad->stickCentre[0][0] = pad_switch_unpack12(left + 3, 0);
++    pad->stickCentre[0][1] = pad_switch_unpack12(left + 3, 1);
++    pad->stickBelow[0][0] = pad_switch_unpack12(left + 6, 0);
++    pad->stickBelow[0][1] = pad_switch_unpack12(left + 6, 1);
++    pad->stickCentre[1][0] = pad_switch_unpack12(right + 0, 0);
++    pad->stickCentre[1][1] = pad_switch_unpack12(right + 0, 1);
++    pad->stickBelow[1][0] = pad_switch_unpack12(right + 3, 0);
++    pad->stickBelow[1][1] = pad_switch_unpack12(right + 3, 1);
++    pad->stickAbove[1][0] = pad_switch_unpack12(right + 6, 0);
++    pad->stickAbove[1][1] = pad_switch_unpack12(right + 6, 1);
++    for (int stick = 0; stick < 2; stick++)
++    {
++        for (int axis = 0; axis < 2; axis++)
++        {
++            /* 0xFFF: not written at the factory. */
++            if (pad->stickCentre[stick][axis] == 0xFFF)
++            {
++                pad->stickCentre[stick][axis] = 2048;
++            }
++            if (pad->stickAbove[stick][axis] == 0xFFF || pad->stickAbove[stick][axis] < 256)
++            {
++                pad->stickAbove[stick][axis] = 1433;
++            }
++            if (pad->stickBelow[stick][axis] == 0xFFF || pad->stickBelow[stick][axis] < 256)
++            {
++                pad->stickBelow[stick][axis] = 1433;
++            }
++        }
++    }
++}
++
++/* Get the controller sending its full reports. */
++static void pad_hid_start(PadHidDevice* pad)
++{
++    switch (pad->kind)
++    {
++    case PAD_HID_DUALSHOCK4:
++        pad_hid_touch_feature(pad, 0x02);
++        if (pad->bluetooth)
++        {
++            pad_hid_touch_feature(pad, 0x05);
++        }
++        break;
++    case PAD_HID_DUALSENSE:
++        pad_hid_touch_feature(pad, 0x05);
++        pad_hid_touch_feature(pad, 0x09);
++        pad_hid_touch_feature(pad, 0x20);
++        break;
++    case PAD_HID_SWITCH_PRO:
++    {
++        if (!pad->bluetooth)
++        {
++            /* USB: a handshake before anything else; no answer means it is
++             * really on Bluetooth after all. */
++            if (pad_switch_proprietary(pad, 0x02, 1))
++            {
++                pad_switch_proprietary(pad, 0x03, 1);
++                pad_switch_proprietary(pad, 0x02, 1);
++                pad_switch_proprietary(pad, 0x04, 0);
++            }
++        }
++        const u8 imuOn = 0x01;
++        if (!pad_switch_subcommand(pad, 0x40, &imuOn, 1, NULL))
++        {
++            printf("[cellPad] Switch Pro Controller: no answer to 'IMU on'\n");
++        }
++        pad_switch_load_stick_calibration(pad);
++        const u8 fullReports = 0x30;
++        if (!pad_switch_subcommand(pad, 0x03, &fullReports, 1, NULL))
++        {
++            printf("[cellPad] Switch Pro Controller: no answer to 'full reports'\n");
++        }
++        fflush(stdout);
++        break;
++    }
++    default:
++        break;
++    }
++}
++
++/* ---- Reports -> PS3 terms ----------------------------------------------- */
++
++static s16 pad_hid_s16(const u8* bytes)
++{
++    return (s16)(u16)(bytes[0] | (bytes[1] << 8));
++}
++
++static u16 pad_hid_sensor_word(float value)
++{
++    if (value < 0.0f)
++    {
++        return 0;
++    }
++    if (value > 1023.0f)
++    {
++        return 1023;
++    }
++    return (u16)(value + 0.5f);
++}
++
++/* Acceleration in g and yaw rate in degrees/s, in the DualShock 4's frame:
++ * X right, Y up out of the face, Z toward the player. */
++static void pad_hid_set_motion(PadHidState* state, float accelRight, float accelUp, float accelToPlayer,
++                               float yawDegreesPerSecond)
++{
++    state->sensor[0] = pad_hid_sensor_word(512.0f - 113.0f * accelRight);
++    state->sensor[1] = pad_hid_sensor_word(512.0f - 113.0f * accelUp);
++    state->sensor[2] = pad_hid_sensor_word(512.0f - 113.0f * accelToPlayer);
++    state->sensor[3] = pad_hid_sensor_word(512.0f - yawDegreesPerSecond * (123.0f / 90.0f));
++    state->hasMotion = 1;
++}
++
++/* The pressure words of a pad whose buttons are only on or off. */
++static void pad_hid_digital_pressure(PadHidState* state, u8 leftTrigger, u8 rightTrigger)
++{
++    static const u16 pressureButtons[12] = {
++        CELL_PAD_CTRL_UP, CELL_PAD_CTRL_RIGHT, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT,
++        CELL_PAD_CTRL_L2, CELL_PAD_CTRL_R2, CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1,
++        CELL_PAD_CTRL_TRIANGLE, CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_SQUARE,
++    };
++    for (int pressureIndex = 0; pressureIndex < 12; pressureIndex++)
++    {
++        state->pressure[pressureIndex] = (state->buttons & pressureButtons[pressureIndex]) ? 255 : 0;
++    }
++    state->pressure[4] = leftTrigger;
++    state->pressure[5] = rightTrigger;
++}
++
++static u16 pad_hid_hat_buttons(u8 hat)
++{
++    switch (hat & 0x0F)
++    {
++    case 0: return CELL_PAD_CTRL_UP;
++    case 1: return CELL_PAD_CTRL_UP | CELL_PAD_CTRL_RIGHT;
++    case 2: return CELL_PAD_CTRL_RIGHT;
++    case 3: return CELL_PAD_CTRL_DOWN | CELL_PAD_CTRL_RIGHT;
++    case 4: return CELL_PAD_CTRL_DOWN;
++    case 5: return CELL_PAD_CTRL_DOWN | CELL_PAD_CTRL_LEFT;
++    case 6: return CELL_PAD_CTRL_LEFT;
++    case 7: return CELL_PAD_CTRL_UP | CELL_PAD_CTRL_LEFT;
++    default: return 0;
++    }
++}
++
++/* DualShock 4 and DualSense share the face/hat byte and the shoulder byte. */
++static u16 pad_hid_sony_buttons(u8 hatAndFace, u8 shoulders)
++{
++    u16 buttons = pad_hid_hat_buttons(hatAndFace);
++    if (hatAndFace & 0x10) { buttons |= CELL_PAD_CTRL_SQUARE; }
++    if (hatAndFace & 0x20) { buttons |= CELL_PAD_CTRL_CROSS; }
++    if (hatAndFace & 0x40) { buttons |= CELL_PAD_CTRL_CIRCLE; }
++    if (hatAndFace & 0x80) { buttons |= CELL_PAD_CTRL_TRIANGLE; }
++    if (shoulders & 0x01) { buttons |= CELL_PAD_CTRL_L1; }
++    if (shoulders & 0x02) { buttons |= CELL_PAD_CTRL_R1; }
++    if (shoulders & 0x04) { buttons |= CELL_PAD_CTRL_L2; }
++    if (shoulders & 0x08) { buttons |= CELL_PAD_CTRL_R2; }
++    if (shoulders & 0x10) { buttons |= CELL_PAD_CTRL_SELECT; }   /* Share / Create */
++    if (shoulders & 0x20) { buttons |= CELL_PAD_CTRL_START; }    /* Options */
++    if (shoulders & 0x40) { buttons |= CELL_PAD_CTRL_L3; }
++    if (shoulders & 0x80) { buttons |= CELL_PAD_CTRL_R3; }
++    return buttons;
++}
++
++/* A small radial deadzone: these sticks rest much closer to centre than an
++ * XInput pad is assumed to. */
++#define PAD_HID_STICK_DEADZONE 0.08f
++
++/* A Sony stick byte (128 at rest) as -1..1, reaching both ends. */
++static float pad_hid_sony_axis(u8 raw)
++{
++    const float offset = (float)raw - 128.0f;
++    return offset >= 0.0f ? offset / 127.0f : offset / 128.0f;
++}
++
++/* Sony sticks are bytes, 128 at rest, down = 255 (the PS3's own sense). */
++static void pad_hid_sony_sticks(const u8* sticks, PadHidState* state)
++{
++    pad_stick_pair(pad_hid_sony_axis(sticks[0]), -pad_hid_sony_axis(sticks[1]),
++                   PAD_HID_STICK_DEADZONE, &state->stickLeftX, &state->stickLeftY);
++    pad_stick_pair(pad_hid_sony_axis(sticks[2]), -pad_hid_sony_axis(sticks[3]),
++                   PAD_HID_STICK_DEADZONE, &state->stickRightX, &state->stickRightY);
++}
++
++/* DualShock 4 state, from just after the report's header: sticks [0..3],
++ * hat/face [4], shoulders [5], PS [6], triggers [7..8], gyro [12..17],
++ * accelerometer [18..23]. */
++static void pad_parse_dualshock4(const u8* data, int withSensors, PadHidState* state)
++{
++    pad_hid_sony_sticks(data, state);
++    state->buttons = pad_hid_sony_buttons(data[4], data[5]);
++    state->psButton = (data[6] & 0x01) != 0;
++    pad_hid_digital_pressure(state, data[7], data[8]);
++    if (withSensors)
++    {
++        pad_hid_set_motion(state, pad_hid_s16(data + 18) / 8192.0f, pad_hid_s16(data + 20) / 8192.0f,
++                           pad_hid_s16(data + 22) / 8192.0f, pad_hid_s16(data + 14) / 16.0f);
++    }
++}
++
++/* DualSense full state: sticks [0..3], triggers [4..5], hat/face [7],
++ * shoulders [8], PS [9], gyro [15..20], accelerometer [21..26]. */
++static void pad_parse_dualsense(const u8* data, PadHidState* state)
++{
++    pad_hid_sony_sticks(data, state);
++    state->buttons = pad_hid_sony_buttons(data[7], data[8]);
++    state->psButton = (data[9] & 0x01) != 0;
++    pad_hid_digital_pressure(state, data[4], data[5]);
++    pad_hid_set_motion(state, pad_hid_s16(data + 21) / 8192.0f, pad_hid_s16(data + 23) / 8192.0f,
++                       pad_hid_s16(data + 25) / 8192.0f, pad_hid_s16(data + 17) / 16.0f);
++}
++
++/* DualSense over Bluetooth before its full reports: sticks [0..3],
++ * hat/face [4], shoulders [5], PS [6], triggers [7..8], no sensors. */
++static void pad_parse_dualsense_simple(const u8* data, PadHidState* state)
++{
++    pad_hid_sony_sticks(data, state);
++    state->buttons = pad_hid_sony_buttons(data[4], data[5]);
++    state->psButton = (data[6] & 0x01) != 0;
++    pad_hid_digital_pressure(state, data[7], data[8]);
++}
++
++/* One Switch Pro stick axis, -1..1 (up and right positive). */
++static float pad_switch_stick(const PadHidDevice* pad, int stick, int axis, int raw)
++{
++    const int offset = raw - pad->stickCentre[stick][axis];
++    /* Full deflection at 70% of the calibrated travel, as SDL does. */
++    const float travel = 0.7f * (float)(offset >= 0 ? pad->stickAbove[stick][axis] : pad->stickBelow[stick][axis]);
++    float position = travel > 0.0f ? (float)offset / travel : 0.0f;
++    if (position > 1.0f)
++    {
++        position = 1.0f;
++    }
++    if (position < -1.0f)
++    {
++        position = -1.0f;
++    }
++    return position;
++}
++
++/* Switch Pro report 0x30: buttons [3..5], sticks [6..11], three IMU samples
++ * from [13], 12 bytes each (accel X Y Z, gyro X Y Z); the last is newest.
++ * Buttons by position: B = Cross, A = Circle, Y = Square, X = Triangle. */
++static void pad_parse_switch_pro(const PadHidDevice* pad, const u8* report, PadHidState* state)
++{
++    const u8 right = report[3];
++    const u8 shared = report[4];
++    const u8 left = report[5];
++    u16 buttons = 0;
++    if (right & 0x01) { buttons |= CELL_PAD_CTRL_SQUARE; }     /* Y */
++    if (right & 0x02) { buttons |= CELL_PAD_CTRL_TRIANGLE; }   /* X */
++    if (right & 0x04) { buttons |= CELL_PAD_CTRL_CROSS; }      /* B */
++    if (right & 0x08) { buttons |= CELL_PAD_CTRL_CIRCLE; }     /* A */
++    if (right & 0x40) { buttons |= CELL_PAD_CTRL_R1; }         /* R */
++    if (right & 0x80) { buttons |= CELL_PAD_CTRL_R2; }         /* ZR */
++    if (shared & 0x01) { buttons |= CELL_PAD_CTRL_SELECT; }    /* - */
++    if (shared & 0x02) { buttons |= CELL_PAD_CTRL_START; }     /* + */
++    if (shared & 0x04) { buttons |= CELL_PAD_CTRL_R3; }
++    if (shared & 0x08) { buttons |= CELL_PAD_CTRL_L3; }
++    if (left & 0x01) { buttons |= CELL_PAD_CTRL_DOWN; }
++    if (left & 0x02) { buttons |= CELL_PAD_CTRL_UP; }
++    if (left & 0x04) { buttons |= CELL_PAD_CTRL_RIGHT; }
++    if (left & 0x08) { buttons |= CELL_PAD_CTRL_LEFT; }
++    if (left & 0x40) { buttons |= CELL_PAD_CTRL_L1; }          /* L */
++    if (left & 0x80) { buttons |= CELL_PAD_CTRL_L2; }          /* ZL */
++    state->buttons = buttons;
++    state->psButton = (shared & 0x10) != 0;                    /* Home */
++    pad_stick_pair(pad_switch_stick(pad, 0, 0, pad_switch_unpack12(report + 6, 0)),
++                   pad_switch_stick(pad, 0, 1, pad_switch_unpack12(report + 6, 1)),
++                   PAD_HID_STICK_DEADZONE, &state->stickLeftX, &state->stickLeftY);
++    pad_stick_pair(pad_switch_stick(pad, 1, 0, pad_switch_unpack12(report + 9, 0)),
++                   pad_switch_stick(pad, 1, 1, pad_switch_unpack12(report + 9, 1)),
++                   PAD_HID_STICK_DEADZONE, &state->stickRightX, &state->stickRightY);
++    pad_hid_digital_pressure(state, (buttons & CELL_PAD_CTRL_L2) ? 255 : 0, (buttons & CELL_PAD_CTRL_R2) ? 255 : 0);
++    /* Its X points away from the player, Y left, Z up out of the face. */
++    const u8* sample = report + 13 + 2 * 12;
++    const float accelX = pad_hid_s16(sample + 0) / 4096.0f;
++    const float accelY = pad_hid_s16(sample + 2) / 4096.0f;
++    const float accelZ = pad_hid_s16(sample + 4) / 4096.0f;
++    const float gyroZ = pad_hid_s16(sample + 10) / 14.2842f;
++    pad_hid_set_motion(state, -accelY, accelZ, -accelX, gyroZ);
++}
++
++/* A report into state; 0 for reports that carry no controller state. */
++static int pad_hid_parse(const PadHidDevice* pad, const u8* report, int length, PadHidState* state)
++{
++    memset(state, 0, sizeof(*state));
++    state->connected = 1;
++    state->sensor[0] = 512;
++    state->sensor[1] = 399;
++    state->sensor[2] = 512;
++    state->sensor[3] = 512;
++    switch (pad->kind)
++    {
++    case PAD_HID_DUALSHOCK4:
++        if (report[0] == 0x01 && length >= 25)
++        {
++            /* Over Bluetooth, 0x01 is the short report: no sensors. */
++            pad_parse_dualshock4(report + 1, !pad->bluetooth, state);
++            return 1;
++        }
++        if (report[0] >= 0x11 && report[0] <= 0x19 && length >= 27)
++        {
++            pad_parse_dualshock4(report + 3, 1, state);
++            return 1;
++        }
++        return 0;
++    case PAD_HID_DUALSENSE:
++        if (report[0] == 0x01 && !pad->bluetooth && length >= 28)
++        {
++            pad_parse_dualsense(report + 1, state);
++            return 1;
++        }
++        if (report[0] == 0x01 && length >= 10)
++        {
++            pad_parse_dualsense_simple(report + 1, state);
++            return 1;
++        }
++        if (report[0] == 0x31 && length >= 29)
++        {
++            pad_parse_dualsense(report + 2, state);
++            return 1;
++        }
++        return 0;
++    case PAD_HID_SWITCH_PRO:
++        if ((report[0] == 0x30 || report[0] == 0x31) && length >= 49)
++        {
++            pad_parse_switch_pro(pad, report, state);
++            return 1;
++        }
++        return 0;
++    default:
++        return 0;
++    }
++}
++
++static void pad_hidpad_store(const PadHidState* next, PadHidKind kind)
++{
++    AcquireSRWLockExclusive(&s_hidpad_lock);
++    const unsigned long long reports = s_hidpad_state.reports + 1;
++    s_hidpad_state = *next;
++    s_hidpad_state.reports = reports;
++    ReleaseSRWLockExclusive(&s_hidpad_lock);
++    InterlockedExchange(&s_hidpad_kind, (LONG)kind);
++}
++
++static void pad_hidpad_mark_disconnected(void)
++{
++    AcquireSRWLockExclusive(&s_hidpad_lock);
++    s_hidpad_state.connected = 0;
++    ReleaseSRWLockExclusive(&s_hidpad_lock);
++    InterlockedExchange(&s_hidpad_kind, (LONG)PAD_HID_NONE);
++}
++
++static DWORD WINAPI pad_hidpad_thread(LPVOID unused)
++{
++    (void)unused;
++    static u8 report[PAD_HID_MAX_REPORT];
++    PadHidDevice pad;
++    memset(&pad, 0, sizeof(pad));
++    pad.device = INVALID_HANDLE_VALUE;
++    unsigned long long nextScanMs = 0;
++    int haveMotionLogged = 0;
++    while (!InterlockedCompareExchange(&s_ds3_stop, 0, 0))
++    {
++        if (pad.device == INVALID_HANDLE_VALUE)
++        {
++            const unsigned long long nowMs = GetTickCount64();
++            if (nowMs >= nextScanMs)
++            {
++                nextScanMs = nowMs + 2000ull;
++                if (pad_hid_open(&pad))
++                {
++                    printf("[cellPad] %s connected over %s\n", pad_hid_kind_name(pad.kind),
++                           pad.bluetooth ? "Bluetooth" : "USB");
++                    fflush(stdout);
++                    pad_hid_start(&pad);
++                    haveMotionLogged = 0;
++                }
++            }
++            if (pad.device == INVALID_HANDLE_VALUE)
++            {
++                Sleep(100);
++                continue;
++            }
++        }
++        const int bytesRead = pad_hid_read(&pad, report, 250);
++        if (bytesRead < 0)
++        {
++            printf("[cellPad] %s disconnected\n", pad_hid_kind_name(pad.kind));
++            fflush(stdout);
++            pad_hid_close(&pad);
++            pad_hidpad_mark_disconnected();
++            continue;
++        }
++        if (bytesRead == 0)
++        {
++            continue;
++        }
++        PadHidState next;
++        if (pad_hid_parse(&pad, report, bytesRead, &next))
++        {
++            if (!haveMotionLogged && next.hasMotion)
++            {
++                printf("[cellPad] %s: motion sensors live\n", pad_hid_kind_name(pad.kind));
++                fflush(stdout);
++                haveMotionLogged = 1;
++            }
++            pad_hidpad_store(&next, pad.kind);
++        }
++    }
++    pad_hid_close(&pad);
++    pad_hidpad_mark_disconnected();
++    return 0;
++}
++
++static void pad_hidpad_start(void)
++{
++    static int disabled = -1;
++    if (disabled < 0)
++    {
++        disabled = getenv("PAD_NO_HID_PADS") ? 1 : 0;
++    }
++    if (disabled || s_hidpad_thread)
++    {
++        return;
++    }
++    s_hidpad_thread = CreateThread(NULL, 0, pad_hidpad_thread, NULL, 0, NULL);
++}
++
++/* The controller read over HID that port 0 follows: a DS3 if one is
++ * connected, else a DualShock 4 / DualSense / Switch Pro. Its name in
++ * nameOut (may be NULL). Returns 0 when neither is connected. */
++static int pad_motion_snapshot(PadHidState* out, const char** nameOut)
++{
++    if (pad_ds3_snapshot(out))
++    {
++        if (nameOut)
++        {
++            *nameOut = "DualShock 3";
++        }
++        return 1;
++    }
++    AcquireSRWLockShared(&s_hidpad_lock);
++    *out = s_hidpad_state;
++    ReleaseSRWLockShared(&s_hidpad_lock);
++    if (nameOut)
++    {
++        *nameOut = out->connected ? pad_hid_kind_name((PadHidKind)InterlockedCompareExchange(&s_hidpad_kind, 0, 0))
++                                  : NULL;
++    }
++    return out->connected;
++}
++
++/* Port 0 from the DS3 or another HID controller, when one is connected. */
++static void pad_apply_hid(void)
++{
++    PadHidState hid;
++    if (!pad_motion_snapshot(&hid, NULL))
+     {
+         return;
+     }
+     PadHostState* hostState = &s_host_state[0];
+     hostState->connected = 1;
+-    hostState->buttons = ds3.buttons;
+-    hostState->analog_lx = ds3.stickLeftX;
+-    hostState->analog_ly = ds3.stickLeftY;
+-    hostState->analog_rx = ds3.stickRightX;
+-    hostState->analog_ry = ds3.stickRightY;
+-    hostState->press_up = ds3.pressure[0];
+-    hostState->press_right = ds3.pressure[1];
+-    hostState->press_down = ds3.pressure[2];
+-    hostState->press_left = ds3.pressure[3];
+-    hostState->trigger_l2 = ds3.pressure[4];
+-    hostState->trigger_r2 = ds3.pressure[5];
+-    hostState->press_l1 = ds3.pressure[6];
+-    hostState->press_r1 = ds3.pressure[7];
+-    hostState->press_triangle = ds3.pressure[8];
+-    hostState->press_circle = ds3.pressure[9];
+-    hostState->press_cross = ds3.pressure[10];
+-    hostState->press_square = ds3.pressure[11];
+-}
+-
+-/* For a port's own UI (engine menus): the DS3's buttons and left stick,
+- * unaffected by g_cellpad_block_guest_input. Returns 0 with no DS3. */
++    hostState->buttons = hid.buttons;
++    hostState->analog_lx = hid.stickLeftX;
++    hostState->analog_ly = hid.stickLeftY;
++    hostState->analog_rx = hid.stickRightX;
++    hostState->analog_ry = hid.stickRightY;
++    hostState->press_up = hid.pressure[0];
++    hostState->press_right = hid.pressure[1];
++    hostState->press_down = hid.pressure[2];
++    hostState->press_left = hid.pressure[3];
++    hostState->trigger_l2 = hid.pressure[4];
++    hostState->trigger_r2 = hid.pressure[5];
++    hostState->press_l1 = hid.pressure[6];
++    hostState->press_r1 = hid.pressure[7];
++    hostState->press_triangle = hid.pressure[8];
++    hostState->press_circle = hid.pressure[9];
++    hostState->press_cross = hid.pressure[10];
++    hostState->press_square = hid.pressure[11];
++}
++
++/* For a port's own UI (engine menus): the HID controller's buttons and left
++ * stick (a DS3, DualShock 4, DualSense or Switch Pro), unaffected by
++ * g_cellpad_block_guest_input. Returns 0 with none. The name is kept from
++ * when it was the DS3 only. */
+ int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton)
+ {
+-    PadDs3State ds3;
+-    if (!pad_ds3_snapshot(&ds3))
++    PadHidState hid;
++    if (!pad_motion_snapshot(&hid, NULL))
+     {
+         return 0;
+     }
+     if (buttons)
+     {
+-        *buttons = ds3.buttons;
++        *buttons = hid.buttons;
+     }
+     if (stickLeftX)
+     {
+-        *stickLeftX = ds3.stickLeftX;
++        *stickLeftX = hid.stickLeftX;
+     }
+     if (stickLeftY)
+     {
+-        *stickLeftY = ds3.stickLeftY;
++        *stickLeftY = hid.stickLeftY;
+     }
+     if (psButton)
+     {
+-        *psButton = ds3.psButton;
++        *psButton = hid.psButton;
+     }
+     return 1;
+ }
++
++/* The connected HID controller ("DualShock 3", "DualShock 4", "DualSense",
++ * "Switch Pro Controller"), or NULL. */
++const char* cellPad_host_pad_name(void)
++{
++    PadHidState hid;
++    const char* name = NULL;
++    pad_motion_snapshot(&hid, &name);
++    return name;
++}
+ #else
+ int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton)
+ {
+     (void)buttons; (void)stickLeftX; (void)stickLeftY; (void)psButton;
+     return 0;
+ }
++const char* cellPad_host_pad_name(void)
++{
++    return NULL;
++}
+ static volatile long s_motion_mode = 0;
+ #endif
+ 
+ /* Where the guest's sensor words come from:
+- *   0  automatic: the SIXAXIS when a DS3 is connected, otherwise "automatic
+- *      capture" (below), so a pad without motion sensors can still play
+- *   1  SIXAXIS only: the DS3's sensors, or a controller at rest without one
++ *   0  automatic: the controller's motion sensors when it has them (DS3,
++ *      DualShock 4, DualSense, Switch Pro), otherwise "automatic capture"
++ *      (below), so a pad without motion sensors can still play
++ *   1  motion only: the sensors, or a controller at rest without them
+  *   2  automatic capture: every axis reads full scale, which a motion
+  *      gesture accepts at once (what the port did before motion support:
+  *      sensor mode was never recorded, so the words read 0)
+@@ -571,12 +1470,13 @@ int cellPad_set_motion_mode(int mode)
+ #endif
+ }
+ 
+-/* 1 when the guest is getting live SIXAXIS data right now. */
++/* 1 when the guest is getting live motion data right now. */
+ int cellPad_motion_live(void)
+ {
+ #ifdef _WIN32
+-    PadDs3State ds3;
+-    return pad_ds3_snapshot(&ds3) && InterlockedCompareExchange(&s_motion_mode, 0, 0) != 2;
++    PadHidState hid;
++    return pad_motion_snapshot(&hid, NULL) && hid.hasMotion &&
++           InterlockedCompareExchange(&s_motion_mode, 0, 0) != 2;
+ #else
+     return 0;
+ #endif
+@@ -647,8 +1547,10 @@ static void pad_poll_xinput(void)
+ 
+ static void pad_init_backend(void)
+ {
+-    /* XInput needs no explicit init; the DS3 reader runs on its own thread. */
++    /* XInput needs no explicit init; the DS3 reader and the other HID
++     * controllers' reader run on their own threads. */
+     pad_ds3_start();
++    pad_hidpad_start();
+ }
+ 
+ static void pad_shutdown_backend(void)
+@@ -836,7 +1738,7 @@ static void pad_poll_backend(void)
+ 
+ #if PAD_BACKEND_XINPUT
+     pad_poll_xinput();
+-    pad_apply_ds3();
++    pad_apply_hid();
+ #elif PAD_BACKEND_SDL2
+     pad_poll_sdl2();
+ #endif
+@@ -1206,19 +2108,19 @@ skip_inject: ;
+         u16 sensorWords[4] = { 512, 399 /* gravity */, 512, 512 };
+ #if PAD_BACKEND_XINPUT
+         const LONG motionMode = InterlockedCompareExchange(&s_motion_mode, 0, 0);
+-        PadDs3State ds3;
+-        const int haveDs3 = port_no == 0 && pad_ds3_snapshot(&ds3);
++        PadHidState hid;
++        const int haveMotion = port_no == 0 && pad_motion_snapshot(&hid, NULL) && hid.hasMotion;
+         if (g_cellpad_block_guest_input)
+         {
+             /* menu open: at rest */
+         }
+-        else if (motionMode == 2 || (motionMode == 0 && !haveDs3))
++        else if (motionMode == 2 || (motionMode == 0 && !haveMotion))
+         {
+             sensorWords[0] = sensorWords[1] = sensorWords[2] = sensorWords[3] = 0;
+         }
+-        else if (haveDs3)
++        else if (haveMotion)
+         {
+-            memcpy(sensorWords, ds3.sensor, sizeof(sensorWords));
++            memcpy(sensorWords, hid.sensor, sizeof(sensorWords));
+         }
+ #endif
+         data->button[CELL_PAD_BTN_OFFSET_SENSOR_X] = sensorWords[0];
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -201,8 +201,11 @@ s32 cellPadClearBuf(u32 port_no);
+ void cellPad_poll(void);
+ s32 cellPadInfoSensorMode(u32 port_no);
+ s32 cellPadSetSensorMode(u32 port_no, u32 mode);
+-/* Host-side DualShock 3 (SIXAXIS) support, Windows: see cellPad.c. */
++/* Host-side controllers read over HID, Windows: a DualShock 3 (SIXAXIS),
++ * DualShock 4, DualSense or Switch Pro Controller -- see cellPad.c. The
++ * state function's name is kept from when it was the DS3 only. */
+ int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton);
++const char* cellPad_host_pad_name(void);
+ int cellPad_set_motion_mode(int mode);
+ int cellPad_motion_live(void);
+ 

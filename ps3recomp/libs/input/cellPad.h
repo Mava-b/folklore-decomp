@@ -201,8 +201,11 @@ s32 cellPadClearBuf(u32 port_no);
 void cellPad_poll(void);
 s32 cellPadInfoSensorMode(u32 port_no);
 s32 cellPadSetSensorMode(u32 port_no, u32 mode);
-/* Host-side DualShock 3 (SIXAXIS) support, Windows: see cellPad.c. */
+/* Host-side controllers read over HID, Windows: a DualShock 3 (SIXAXIS),
+ * DualShock 4, DualSense or Switch Pro Controller -- see cellPad.c. The
+ * state function's name is kept from when it was the DS3 only. */
 int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton);
+const char* cellPad_host_pad_name(void);
 int cellPad_set_motion_mode(int mode);
 int cellPad_motion_live(void);
 

@@ -17,14 +17,6 @@ enum class FrameRateCap : int
     Unlimited = 2,      /* limiter off; still paced by the 59.94 Hz flip */
 };
 
-/* Where the game's SIXAXIS readings come from (cellPad_set_motion_mode). */
-enum class MotionControls : int
-{
-    Automatic = 0,      /* the DualShock 3's sensors when connected, else automatic capture */
-    Sixaxis = 1,        /* always the DS3's sensors: the original gestures */
-    AutoCapture = 2,    /* captures complete by themselves (no motion needed) */
-};
-
 enum class AspectRatio : int
 {
     Original = 0,       /* 16:9, the PS3's */
@@ -76,7 +68,11 @@ struct EngineSettings
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
     bool physicsFrameStep = true;
-    MotionControls motionControls = MotionControls::Automatic;
+    /* Motion controls for capturing Folks, whatever the controller: on, the
+     * gestures come from its motion sensors (DualShock 3 or 4, DualSense,
+     * Switch Pro) and a controller without them still captures by itself;
+     * off, every capture completes by itself (cellPad_set_motion_mode). */
+    bool motionControls = true;
     /* Ultrawide: the game's field of view is widened to this shape. Read
      * when the renderer starts, so a change applies on the next launch. */
     AspectRatio aspectRatio = AspectRatio::Original;

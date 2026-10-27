@@ -221,18 +221,11 @@ void engineSettingsLoad()
         }
         else if (std::strcmp(key, "motion_controls") == 0)
         {
-            if (std::strcmp(value, "sixaxis") == 0)
-            {
-                settingsInstance.motionControls = MotionControls::Sixaxis;
-            }
-            else if (std::strcmp(value, "auto_capture") == 0)
-            {
-                settingsInstance.motionControls = MotionControls::AutoCapture;
-            }
-            else
-            {
-                settingsInstance.motionControls = MotionControls::Automatic;
-            }
+            /* on / off; the older automatic / sixaxis / auto_capture choice
+             * reads as on, on, off. */
+            settingsInstance.motionControls = !(std::strcmp(value, "off") == 0 || std::strcmp(value, "0") == 0 ||
+                                                std::strcmp(value, "false") == 0 ||
+                                                std::strcmp(value, "auto_capture") == 0);
         }
         else if (std::strcmp(key, "physics_frame_step") == 0)
         {
@@ -292,10 +285,8 @@ void engineSettingsSave()
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
     std::fprintf(file, "physics_frame_step = %d\n", current.physicsFrameStep ? 1 : 0);
-    const char* motionText = current.motionControls == MotionControls::Sixaxis ? "sixaxis"
-                           : current.motionControls == MotionControls::AutoCapture ? "auto_capture"
-                           : "automatic";
-    std::fprintf(file, "motion_controls = %s\n", motionText);
+    std::fprintf(file, "# on: capture Folks by moving the controller (DualShock 3/4, DualSense, Switch Pro); off: captures complete by themselves\n");
+    std::fprintf(file, "motion_controls = %s\n", current.motionControls ? "on" : "off");
     const char* aspectText = current.aspectRatio == AspectRatio::MatchDisplay ? "display"
                            : current.aspectRatio == AspectRatio::Ultrawide ? "21:9"
                            : current.aspectRatio == AspectRatio::SuperUltrawide ? "32:9"
@@ -366,7 +357,9 @@ float engineSettingsAspectValue(AspectRatio aspectRatio)
 
 void engineSettingsApplyInput()
 {
-    cellPad_set_motion_mode((int)engineSettings().motionControls);
+    /* cellPad.c's modes: 0 = the controller's sensors when it has them,
+     * otherwise automatic capture; 2 = automatic capture always. */
+    cellPad_set_motion_mode(engineSettings().motionControls ? 0 : 2);
 }
 
 bool engineSettingsLanguageSelectable()

@@ -68,7 +68,8 @@ namespace
      * cellPadGetData left the four sensor words 0 -- full scale on every
      * axis, which the game took as a completed gesture: every capture
      * finished on its own. The runtime now records the mode and fills the
-     * words from the DualShock 3 (or the engine menu's motion setting). */
+     * words from the controller's motion sensors (a DualShock 3 or 4,
+     * DualSense or Switch Pro) or the engine menu's motion setting. */
     void hlePadSetSensorMode(ppu_context* context)
     {
         logOnce("cellPadSetSensorMode");
