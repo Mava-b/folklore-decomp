@@ -266,13 +266,8 @@ $env:RSX_DRAW_CSV = Join-Path $captureDir 'draws.csv'
 $env:RSX_DRAW_CSV_GATE = $captureGate
 $env:LD_DRAW_DUMP = $captureDir
 # Per-draw images are off (they slow a capture to two frames, which hides
-# performance problems). Set LD_DRAW_DUMP_EVERY before running (e.g. '4')
-# to get every 4th draw's target, as it was before that draw, in the first
-# captured frame -- it shows which draw puts something on screen.
-if (-not $env:LD_DRAW_DUMP_EVERY)
-{
-    $env:LD_DRAW_DUMP_EVERY = '100000'
-}
+# performance problems); set to '64' to get every 64th draw's target again.
+$env:LD_DRAW_DUMP_EVERY = '100000'
 # ...and the raw vertex/index data of each mesh drawn during a capture
 # (vb_*.bin / ib_*.bin), so broken geometry can be checked byte by byte.
 $env:LD_VB_DUMP = $captureDir
