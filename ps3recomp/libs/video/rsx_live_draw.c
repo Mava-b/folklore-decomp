@@ -1807,30 +1807,6 @@ static int ld_convolution_enabled(void)
     return enabled;
 }
 
-/* SET_TEXTURE_FILTER bits 0-12: the mip LOD bias, signed fixed point with
- * four integer and eight fraction bits (-16 .. +15.996), as RPCS3 decodes it
- * (decode_fxp<4, 8>). It was never applied, so a texture the game pushes
- * toward its blurrier levels was sampled at full detail. Folklore's
- * capturable-soul shimmer takes cos() of the creature's own texture times a
- * large constant: from the biased, smooth levels that is a soft glow, from
- * full detail every pixel lands somewhere else and the soul was TV static.
- * LD_NO_LOD_BIAS=1 drops it again, for comparison. */
-static float ld_texture_lod_bias(const rsx_dsp_texture* t)
-{
-    static int disabled = -1;
-    if (disabled < 0)
-    {
-        const char* text = getenv("LD_NO_LOD_BIAS");
-        disabled = text && text[0] && text[0] != '0' ? 1 : 0;
-    }
-    if (disabled)
-    {
-        return 0.0f;
-    }
-    const int biasFixed = (int)((t->filter & 0x1FFFu) ^ 0x1000u) - 0x1000;
-    return (float)biasFixed / 256.0f;
-}
-
 static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
 {
     D3D12_SAMPLER_DESC sd = {0};
@@ -1865,7 +1841,6 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
     sd.MinLOD = (float)min_lod_fx / 256.0f;
     sd.MaxLOD = mip_present ? (float)max_lod_fx / 256.0f : 0.0f;
     if (sd.MaxLOD < sd.MinLOD) sd.MaxLOD = sd.MinLOD;
-    sd.MipLODBias = ld_texture_lod_bias(t);
     sd.MaxAnisotropy = 1;
     /* Anisotropic filtering (engine setting): only for mip-mapped textures
      * the game already filters linearly -- the world's surfaces. Render
@@ -1915,9 +1890,7 @@ static u64 sampler_key(const rsx_dsp_texture* t)
     const u64 wrap_w  = (t->wrap >> 16) & 0xF;
     const u64 max_lod = (t->control0 >> 7) & 0xFFF;
     const u64 min_lod = (t->control0 >> 19) & 0xFFF;
-    const u64 lod_bias = t->filter & 0x1FFF;
-    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30) |
-           (lod_bias << 42);
+    return minf | (magf << 3) | (wrap_u << 6) | (wrap_v << 10) | (wrap_w << 14) | (max_lod << 18) | (min_lod << 30);
 }
 
 /* ---------------------------------------------------------------------------
