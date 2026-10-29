@@ -5,6 +5,10 @@
 #                                                   PS3_GAME). Without it, the game_dir
 #                                                   saved in folklore_settings.ini; with
 #                                                   none saved, folklore.exe asks once.
+#   ... run.ps1 -UpdateDir <RPCS3>\dev_hdd0\game\BCUS98147
+#                                                   1.10 builds: the installed 1.10
+#                                                   update (else update_dir from
+#                                                   folklore_settings.ini, else asked)
 #   ... run.ps1 -Verbose                            extra runtime logging
 #   ... run.ps1 -Libsre                             Sony's libsre instead of the port's own
 #                                                   SPURS, to compare (needs it lifted:
@@ -34,6 +38,9 @@
 
 param(
     [string]$GameDir = '',
+    # 1.10 builds only: the installed 1.10 update, the folder holding its
+    # PARAM.SFO and USRDIR\EBOOT.elf (decrypted).
+    [string]$UpdateDir = '',
     # PS3 firmware files (fonts etc.) -- e.g. RPCS3's dev_flash, read-only.
     # Optional; without it, dev_flash from folklore_settings.ini.
     [string]$DevFlash = '',
@@ -106,8 +113,30 @@ if (-not $DevFlash)
 {
     $DevFlash = Get-SavedSetting 'dev_flash'
 }
+# A 1.10 build runs the update's EBOOT; the disc dump still provides the
+# game's data (folklore/docs/REGIONS.md).
+$buildRelease = Get-BuildRelease
+$usesUpdate = $buildRelease.Version -eq '1.10'
+$updateDirGiven = $PSBoundParameters.ContainsKey('UpdateDir')
+if ($usesUpdate -and -not $UpdateDir)
+{
+    $UpdateDir = Get-SavedSetting 'update_dir'
+}
 $exeArguments = @()
-if ($GameDir)
+if ($GameDir -and $usesUpdate)
+{
+    # (Join-Path refuses an empty path, so the update folder is checked first.)
+    $eboot = if ($UpdateDir) { Join-Path $UpdateDir 'USRDIR\EBOOT.elf' } else { '' }
+    if ($eboot -and (Test-Path $eboot) -and (Test-Path (Join-Path $GameDir 'PS3_GAME')))
+    {
+        $exeArguments = @($eboot)
+    }
+    elseif ($gameDirGiven -or $updateDirGiven)
+    {
+        throw "This is a 1.10 build: it needs -GameDir <your disc dump> and -UpdateDir <the installed 1.10 update, with USRDIR\EBOOT.elf decrypted>"
+    }
+}
+elseif ($GameDir)
 {
     $eboot = Join-Path $GameDir 'PS3_GAME\USRDIR\EBOOT.elf'
     if (Test-Path $eboot)
@@ -121,8 +150,15 @@ if ($GameDir)
 }
 if ($exeArguments.Count -eq 0)
 {
-    # folklore.exe asks for the folder and saves it (engine_portable.cpp).
-    Write-Host "No game folder yet -- folklore.exe will ask for it (the dump folder that contains PS3_GAME)." -ForegroundColor Yellow
+    # folklore.exe asks for the folder(s) and saves them (engine_portable.cpp).
+    if ($usesUpdate)
+    {
+        Write-Host "No game or update folder yet -- folklore.exe will ask for them (the disc dump, then the installed 1.10 update)." -ForegroundColor Yellow
+    }
+    else
+    {
+        Write-Host "No game folder yet -- folklore.exe will ask for it (the dump folder that contains PS3_GAME)." -ForegroundColor Yellow
+    }
 }
 # Tells folklore.exe that this script captures its output (it writes its own
 # log file only when started on its own).

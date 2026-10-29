@@ -941,6 +941,22 @@ What 0006 fixes in ps3recomp to make that run:
     AUTOCONVERTPCM | SRC_DEFAULT_QUALITY so Windows converts the rate and
     channel count (the old requests stay as last fallbacks), logs the
     conversion, and on failure logs the device's mix format.
+69. The 1.10 update, both regions (folklore/docs/REGIONS.md, "The 1.10
+    update"). A third and fourth build target: relift.sh knows the two
+    update EBOOTs by size (US 6,520,504, EU 6,520,480 bytes decrypted),
+    game_patches.py has their addresses ("US-1.10", "EU-1.10"), and
+    folklore_region.h now records the version. All five game patches and
+    the 10 limiter sites apply to both lifts; the touched functions are
+    unchanged from 1.00, only moved. A 1.10 build loads the update folder's
+    EBOOT (update_dir / run.ps1 -UpdateDir / a second picker), reads the
+    rest from the disc dump, and on each start copies the update's three
+    data files (LMonS2.bi5_, the Spanish fix, their list) into hdd0 and
+    records them in install.dat_, as the game's own installer would.
+    setup.ps1 -UpdateDir lifts it; package_all.ps1 -UsUpdateDir/-EuUpdateDir
+    builds the two extra copies. Rumble, which 1.10 adds (its Vibration
+    option), goes to XInput pads, DualShock 4 and DualSense
+    (patches/0054); the DS3's on/off small motor had been sent to XInput as
+    257 of 65535. Lifted and patched here; not yet built or run on Windows.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

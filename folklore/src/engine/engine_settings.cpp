@@ -250,6 +250,10 @@ void engineSettingsLoad()
         {
             settingsInstance.gameDir = value;
         }
+        else if (std::strcmp(key, "update_dir") == 0)
+        {
+            settingsInstance.updateDir = value;
+        }
         else if (std::strcmp(key, "dev_flash") == 0)
         {
             settingsInstance.devFlashDir = value;
@@ -297,6 +301,8 @@ void engineSettingsSave()
     std::fprintf(file, "language = %s\n", languageEntry(current.language).key);
     std::fprintf(file, "# The folder that holds PS3_GAME (with the decrypted PS3_GAME\\USRDIR\\EBOOT.elf)\n");
     std::fprintf(file, "game_dir = %s\n", current.gameDir.c_str());
+    std::fprintf(file, "# 1.10 builds only: the installed 1.10 update (RPCS3: dev_hdd0\\game\\<title id>), with the decrypted USRDIR\\EBOOT.elf\n");
+    std::fprintf(file, "update_dir = %s\n", current.updateDir.c_str());
     std::fprintf(file, "# Optional: a firmware dev_flash folder (RPCS3's), for the system fonts\n");
     std::fprintf(file, "dev_flash = %s\n", current.devFlashDir.c_str());
     std::fprintf(file, "# Where hdd0/hdd1 (installed data), gamedata (saves) and logs go; empty = next to folklore.exe\n");

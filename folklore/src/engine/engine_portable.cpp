@@ -437,6 +437,18 @@ bool engineCheckGameFolder(const std::string& folder, std::string* problem)
         reason = "\"" + folder + "\" has no PS3_GAME folder. Choose the folder of your Folklore disc dump "
                  "(the one that contains PS3_GAME).";
     }
+    else if (FOLKLORE_USES_UPDATE)
+    {
+        /* A 1.10 build runs the update's EBOOT; only the disc's data is read
+         * from here, so its own EBOOT need not even be decrypted. */
+        const std::vector<unsigned char> sfo = readFile(folder + "\\PS3_GAME\\PARAM.SFO", 64 * 1024);
+        if (!sfo.empty() && !containsText(sfo, kTitleId))
+        {
+            reason = std::string("This build of the port was made from the ") + FOLKLORE_RELEASE_NAME +
+                     " release of Folklore (" + kTitleId + "), and this dump is a different release. Use the "
+                     "disc dump of the same release as your 1.10 update.";
+        }
+    }
     else if (!fileExists(eboot))
     {
         reason = fileExists(usrdir + "\\EBOOT.BIN")
@@ -476,7 +488,69 @@ bool engineCheckGameFolder(const std::string& folder, std::string* problem)
     return reason.empty();
 }
 
-std::string enginePickGameFolder(const std::string& startFolder)
+std::string engineNormaliseUpdateFolder(const std::string& folder)
+{
+    std::string normalised = folder;
+    while (normalised.size() > 3 && (normalised.back() == '\\' || normalised.back() == '/'))
+    {
+        normalised.pop_back();
+    }
+    if (endsWithFolder(normalised, "USRDIR"))
+    {
+        normalised = parentFolder(normalised);
+    }
+    return normalised;
+}
+
+bool engineCheckUpdateFolder(const std::string& folder, std::string* problem)
+{
+    std::string reason;
+    const std::string eboot = folder + "\\USRDIR\\EBOOT.elf";
+    const std::vector<unsigned char> sfo = readFile(folder + "\\PARAM.SFO", 64 * 1024);
+    if (folder.empty())
+    {
+        reason = "No 1.10 update folder is set.";
+    }
+    else if (sfo.empty() || !directoryExists(folder + "\\USRDIR"))
+    {
+        reason = "\"" + folder + "\" is not an installed game update (it needs PARAM.SFO and USRDIR). In RPCS3 "
+                 "the update is installed in dev_hdd0\\game\\" + kTitleId + ".";
+    }
+    else if (!containsText(sfo, kTitleId))
+    {
+        reason = std::string("This build of the port was made from the ") + FOLKLORE_RELEASE_NAME +
+                 " 1.10 update (" + kTitleId + "), and \"" + folder + "\" holds another game or release.";
+    }
+    else if (!fileExists(eboot))
+    {
+        reason = fileExists(folder + "\\USRDIR\\EBOOT.BIN")
+                     ? "The update's EBOOT.BIN is still encrypted. Decrypt it with RPCS3 (Utilities > Decrypt PS3 "
+                       "Binaries, choose USRDIR\\EBOOT.BIN in this folder), which writes EBOOT.elf beside it, then "
+                       "try again."
+                     : "There is no USRDIR\\EBOOT.elf in \"" + folder + "\".";
+    }
+    else
+    {
+        const std::vector<unsigned char> header = readFile(eboot, 4);
+        if (header.size() < 4 || header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
+        {
+            reason = "USRDIR\\EBOOT.elf is not a decrypted ELF. Decrypt EBOOT.BIN with RPCS3 (Utilities > Decrypt "
+                     "PS3 Binaries) and try again.";
+        }
+        else if (fileSize(eboot) != kEbootSize)
+        {
+            reason = std::string("This EBOOT.elf is not the 1.10 update this build was made from (the decrypted ") +
+                     kTitleId + " 1.10 EBOOT.elf is " + std::to_string(kEbootSize) + " bytes).";
+        }
+    }
+    if (problem)
+    {
+        *problem = reason;
+    }
+    return reason.empty();
+}
+
+std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate)
 {
     const HRESULT initialised = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     std::string chosen;
@@ -486,7 +560,9 @@ std::string enginePickGameFolder(const std::string& startFolder)
         DWORD options = 0;
         dialog->GetOptions(&options);
         dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        dialog->SetTitle(L"Folklore: choose your game folder (the one that contains PS3_GAME)");
+        dialog->SetTitle(forUpdate ? L"Folklore: choose the installed 1.10 update (the folder that contains "
+                                     L"PARAM.SFO and USRDIR)"
+                                   : L"Folklore: choose your game folder (the one that contains PS3_GAME)");
         if (!startFolder.empty() && directoryExists(startFolder))
         {
             IShellItem* startItem = nullptr;
@@ -505,7 +581,8 @@ std::string enginePickGameFolder(const std::string& startFolder)
                 PWSTR widePath = nullptr;
                 if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &widePath)))
                 {
-                    chosen = engineNormaliseGameFolder(wideToNarrow(widePath));
+                    chosen = forUpdate ? engineNormaliseUpdateFolder(wideToNarrow(widePath))
+                                       : engineNormaliseGameFolder(wideToNarrow(widePath));
                     CoTaskMemFree(widePath);
                 }
                 result->Release();
@@ -530,14 +607,225 @@ std::string engineDataDirectory()
     return engineExecutableDirectory();
 }
 
+namespace
+{
+    /* ---- The 1.10 update's data -------------------------------------------
+     *
+     * Besides its EBOOT the 1.10 update carries a few data files, delivered
+     * the way the game's downloadable packs are (folklore/docs/REGIONS.md):
+     * the package puts them in USRDIR\bin\17 with a list, download.dat_, and
+     * on its next start the game copies them into USRDIR\bin and adds them to
+     * its record of installed files, install.dat_. Both lists have the same
+     * format: a big-endian count, then per file its pack number (one byte)
+     * and its path under bin (NUL-terminated). For the update both regions
+     * have the same three files: LMonS2.bi5_ (the 1.10 executable's table of
+     * Folks; 1.00 reads LMonS.bi5_), a corrected Spanish text file and the
+     * list itself.
+     *
+     * The game reads LMonS2.bi5_ before it looks for packs to install, so the
+     * files are put where the game's installer would have put them, and
+     * recorded in install.dat_ as it would have, rather than left in bin\17
+     * for the game to find. They are taken from the update folder: installed
+     * already (USRDIR\bin, once the update has been started in RPCS3 or on a
+     * PS3) or not yet (USRDIR\bin\17). Nothing in the update folder is
+     * changed. */
+    struct InstallEntry
+    {
+        int pack;
+        std::string path;
+    };
+
+    bool readInstallList(const std::string& path, std::vector<InstallEntry>* entries)
+    {
+        const std::vector<unsigned char> bytes = readFile(path, 1024 * 1024);
+        if (bytes.size() < 4)
+        {
+            return false;
+        }
+        const size_t count = ((size_t)bytes[0] << 24) | ((size_t)bytes[1] << 16) | ((size_t)bytes[2] << 8) | bytes[3];
+        size_t position = 4;
+        for (size_t index = 0; index < count; index++)
+        {
+            if (position >= bytes.size())
+            {
+                return false;
+            }
+            InstallEntry entry;
+            entry.pack = bytes[position++];
+            while (position < bytes.size() && bytes[position] != 0)
+            {
+                entry.path.push_back((char)bytes[position++]);
+            }
+            if (position >= bytes.size())
+            {
+                return false;
+            }
+            position++;
+            entries->push_back(entry);
+        }
+        return true;
+    }
+
+    bool writeInstallList(const std::string& path, const std::vector<InstallEntry>& entries)
+    {
+        std::vector<unsigned char> bytes;
+        const size_t count = entries.size();
+        bytes.push_back((unsigned char)(count >> 24));
+        bytes.push_back((unsigned char)(count >> 16));
+        bytes.push_back((unsigned char)(count >> 8));
+        bytes.push_back((unsigned char)count);
+        for (const InstallEntry& entry : entries)
+        {
+            bytes.push_back((unsigned char)entry.pack);
+            bytes.insert(bytes.end(), entry.path.begin(), entry.path.end());
+            bytes.push_back(0);
+        }
+        FILE* file = std::fopen(path.c_str(), "wb");
+        if (!file)
+        {
+            return false;
+        }
+        const size_t written = std::fwrite(bytes.data(), 1, bytes.size(), file);
+        std::fclose(file);
+        return written == bytes.size();
+    }
+
+    std::string windowsPath(std::string path)
+    {
+        for (char& character : path)
+        {
+            if (character == '/')
+            {
+                character = '\\';
+            }
+        }
+        return path;
+    }
+
+    /* Every folder down to the one holding `filePath`. */
+    void makeParentDirectories(const std::string& filePath)
+    {
+        const std::string folder = parentFolder(filePath);
+        if (folder.empty() || folder == filePath || directoryExists(folder))
+        {
+            return;
+        }
+        makeParentDirectories(folder);
+        makeDirectory(folder);
+    }
+
+    /* Where /dev_hdd0 is: PS3_HDD0_ROOT (run.ps1's, or the default set
+     * above), read from the process environment itself -- the boot harness
+     * caches getenv results. */
+    std::string hdd0Root(const std::string& dataDirectory)
+    {
+        char value[MAX_PATH * 2];
+        const DWORD length = GetEnvironmentVariableA("PS3_HDD0_ROOT", value, (DWORD)sizeof(value));
+        if (length > 0 && length < sizeof(value))
+        {
+            return std::string(value, length);
+        }
+        return dataDirectory + "\\hdd0";
+    }
+
+    /* The update's data files into hdd0\game\<title id>\USRDIR\bin. Returns
+     * false, with a sentence for the user, when the update folder has none. */
+    bool installUpdateData(const std::string& updateFolder, const std::string& hdd0Folder, std::string* problem)
+    {
+        const std::string sourceBin = updateFolder + "\\USRDIR\\bin";
+        const std::string packFolder = sourceBin + "\\17";
+        std::string listPath = sourceBin + "\\download.dat_";
+        if (fileExists(packFolder + "\\download.dat_"))
+        {
+            listPath = packFolder + "\\download.dat_";     /* not yet installed by the game */
+        }
+        std::vector<InstallEntry> updateFiles;
+        if (!readInstallList(listPath, &updateFiles) || updateFiles.empty())
+        {
+            *problem = "The 1.10 update folder \"" + updateFolder + "\" has no USRDIR\\bin\\download.dat_ (the list "
+                       "of the update's data files). Install the update again in RPCS3.";
+            return false;
+        }
+        const std::string targetBin = hdd0Folder + "\\game\\" + kTitleId + "\\USRDIR\\bin";
+
+        /* What the game has recorded as installed: a file a later pack
+         * replaced (a DLC pack ships its own LMonS2.bi5_) is left alone. */
+        const std::string recordPath = targetBin + "\\install.dat_";
+        std::vector<InstallEntry> installed;
+        if (fileExists(recordPath) && !readInstallList(recordPath, &installed))
+        {
+            installed.clear();
+        }
+        bool recordChanged = !fileExists(recordPath);
+        int copied = 0;
+        for (const InstallEntry& entry : updateFiles)
+        {
+            const std::string relative = windowsPath(entry.path);
+            const std::string target = targetBin + "\\" + relative;
+            InstallEntry* recorded = nullptr;
+            for (InstallEntry& existing : installed)
+            {
+                if (_stricmp(existing.path.c_str(), entry.path.c_str()) == 0)
+                {
+                    recorded = &existing;
+                }
+            }
+            if (recorded && recorded->pack > entry.pack && fileExists(target))
+            {
+                continue;
+            }
+            std::string source = packFolder + "\\" + relative;
+            if (!fileExists(source))
+            {
+                source = sourceBin + "\\" + relative;
+            }
+            if (!fileExists(source))
+            {
+                *problem = "The 1.10 update folder \"" + updateFolder + "\" is missing USRDIR\\bin\\" + relative +
+                           ". Install the update again in RPCS3.";
+                return false;
+            }
+            if (!fileExists(target) || fileSize(target) != fileSize(source))
+            {
+                makeParentDirectories(target);
+                if (!CopyFileA(source.c_str(), target.c_str(), FALSE))
+                {
+                    *problem = "Could not copy the 1.10 update's " + relative + " to \"" + target + "\" (error " +
+                               std::to_string(GetLastError()) + ").";
+                    return false;
+                }
+                copied++;
+            }
+            if (!recorded)
+            {
+                installed.push_back(entry);
+                recordChanged = true;
+            }
+            else if (recorded->pack < entry.pack)
+            {
+                recorded->pack = entry.pack;
+                recordChanged = true;
+            }
+        }
+        if (recordChanged && !writeInstallList(recordPath, installed))
+        {
+            *problem = "Could not write \"" + recordPath + "\".";
+            return false;
+        }
+        std::fprintf(stderr, "[engine] 1.10 update data: %d of %d file(s) copied from %s\n", copied,
+                     (int)updateFiles.size(), updateFolder.c_str());
+        return true;
+    }
+}
+
 /* Standalone: set run.ps1's environment, start the game as a child the way
  * run.ps1 does, wait for it and exit with its code. If the child cannot be
  * started, run the game here after all, logging to the file. */
-static const char* launchAndExit(const std::string& eboot, const std::string& dataDirectory)
+static const char* launchAndExit(const std::string& eboot, const std::string& gameFolder,
+                                 const std::string& dataDirectory)
 {
     static std::string fallback;
     const std::string stamp = timeStamp();
-    const std::string gameFolder = parentFolder(parentFolder(parentFolder(eboot)));
     applyLauncherEnvironment(dataDirectory, gameFolder, stamp);
     const std::string logPath = dataDirectory + "\\logs\\run-" + stamp + ".log";
     DWORD exitCode = 0;
@@ -576,6 +864,8 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         }
     }
     applyEnvironmentDefaults(baseDirectory, dataDirectory);
+    std::fprintf(stderr, "[engine] this build: %s (%s) v%s\n", FOLKLORE_TITLE_ID, FOLKLORE_REGION_NAME,
+                 FOLKLORE_VERSION_NAME);
 
     if (elfFromCommandLine && *elfFromCommandLine)
     {
@@ -585,9 +875,32 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     }
     if (!ebootPath.empty())
     {
+        /* A 1.10 build given the update's EBOOT (run.ps1, a shortcut): the
+         * update folder is two folders up, and the disc dump comes from
+         * PS3_VFS_ROOT or the game_dir setting. */
+        std::string gameFolder;
+        if (FOLKLORE_USES_UPDATE)
+        {
+            char vfsRoot[MAX_PATH * 2];
+            const DWORD vfsLength = GetEnvironmentVariableA("PS3_VFS_ROOT", vfsRoot, (DWORD)sizeof(vfsRoot));
+            gameFolder = (vfsLength > 0 && vfsLength < sizeof(vfsRoot)) ? std::string(vfsRoot, vfsLength)
+                                                                         : engineNormaliseGameFolder(settings.gameDir);
+            const std::string updateFolder = parentFolder(parentFolder(ebootPath));
+            std::string problem;
+            if (engineCheckUpdateFolder(updateFolder, &problem) &&
+                !installUpdateData(updateFolder, hdd0Root(dataDirectory), &problem))
+            {
+                showError(problem);
+                return nullptr;
+            }
+        }
+        else
+        {
+            gameFolder = parentFolder(parentFolder(parentFolder(ebootPath)));
+        }
         if (standalone)
         {
-            return launchAndExit(ebootPath, dataDirectory);     /* a shortcut with the EBOOT path */
+            return launchAndExit(ebootPath, gameFolder, dataDirectory);     /* a shortcut with the EBOOT path */
         }
         return ebootPath.c_str();     /* run.ps1, or this exe as the launcher */
     }
@@ -600,6 +913,16 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         if (!firstAttempt || !settings.gameDir.empty())
         {
             showError(problem);
+        }
+        else if (FOLKLORE_USES_UPDATE)
+        {
+            MessageBoxA(nullptr,
+                        "This is the " FOLKLORE_VERSION_NAME " build of Folklore (" FOLKLORE_TITLE_ID "). It needs two "
+                        "folders:\n\n1. Your disc dump: the folder that contains PS3_GAME.\n2. The installed 1.10 "
+                        "update, with its USRDIR\\EBOOT.BIN decrypted to EBOOT.elf with RPCS3 (in RPCS3 it is "
+                        "dev_hdd0\\game\\" FOLKLORE_TITLE_ID ").\n\nChoose the disc dump first. The game remembers "
+                        "both; change them later in the engine menu (F1).",
+                        "Folklore", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
         }
         else
         {
@@ -626,9 +949,52 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     defaultEnvironment("PS3_VFS_ROOT", gameFolder);
     ebootPath = gameFolder + "\\PS3_GAME\\USRDIR\\EBOOT.elf";
     std::fprintf(stderr, "[engine] game folder: %s\n", gameFolder.c_str());
+
+    if (FOLKLORE_USES_UPDATE)
+    {
+        /* The 1.10 update: its EBOOT is what runs, and its data files go into
+         * the installed game data (installUpdateData). */
+        std::string updateFolder = engineNormaliseUpdateFolder(settings.updateDir);
+        bool firstUpdateAttempt = true;
+        while (!engineCheckUpdateFolder(updateFolder, &problem))
+        {
+            if (!firstUpdateAttempt || !settings.updateDir.empty())
+            {
+                showError(problem);
+            }
+            else
+            {
+                MessageBoxA(nullptr,
+                            "Now choose the installed 1.10 update: the folder that contains PARAM.SFO and USRDIR (in "
+                            "RPCS3: dev_hdd0\\game\\" FOLKLORE_TITLE_ID "). Its USRDIR\\EBOOT.BIN must be decrypted "
+                            "to EBOOT.elf with RPCS3 first. Nothing in that folder is changed.",
+                            "Folklore", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
+            }
+            firstUpdateAttempt = false;
+            const std::string picked = enginePickGameFolder(updateFolder.empty() ? gameFolder : updateFolder, true);
+            if (picked.empty())
+            {
+                std::fprintf(stderr, "[engine] no update folder chosen -- quitting\n");
+                return nullptr;
+            }
+            updateFolder = picked;
+        }
+        if (updateFolder != settings.updateDir)
+        {
+            settings.updateDir = updateFolder;
+            engineSettingsSave();
+        }
+        if (!installUpdateData(updateFolder, hdd0Root(dataDirectory), &problem))
+        {
+            showError(problem);
+            return nullptr;
+        }
+        ebootPath = updateFolder + "\\USRDIR\\EBOOT.elf";
+        std::fprintf(stderr, "[engine] 1.10 update folder: %s\n", updateFolder.c_str());
+    }
     if (standalone)
     {
-        return launchAndExit(ebootPath, dataDirectory);
+        return launchAndExit(ebootPath, gameFolder, dataDirectory);
     }
     return ebootPath.c_str();
 }

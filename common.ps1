@@ -116,3 +116,35 @@ function Import-BuildEnvironment
     }
     $env:PATH = (@($extraPaths) + $currentPaths) -join ';'
 }
+
+# Which executable this build was made from: Region 'US' or 'EU', Version
+# '1.00' (the disc) or '1.10' (the update's EBOOT). The project folder reads
+# what tools\relift.sh wrote beside the lifted code; a binaries package reads
+# release.txt, which package.ps1 writes from the same header. Lifted code from
+# before the header existed is the US disc; headers from before the version
+# was recorded are 1.00.
+function Get-BuildRelease
+{
+    $release = @{ Region = 'US'; Version = '1.00' }
+    $sources = @((Join-Path $PortDir 'src\recomp\folklore_region.h'), (Join-Path $Root 'release.txt'))
+    foreach ($source in $sources)
+    {
+        if (-not (Test-Path -LiteralPath $source))
+        {
+            continue
+        }
+        foreach ($line in Get-Content -LiteralPath $source)
+        {
+            if ($line -match '(#define FOLKLORE_REGION_NAME|^region\s*=)\s*"?(\w+)"?')
+            {
+                $release.Region = $matches[2]
+            }
+            if ($line -match '(#define FOLKLORE_VERSION_NAME|^version\s*=)\s*"?([\d.]+)"?')
+            {
+                $release.Version = $matches[2]
+            }
+        }
+        break
+    }
+    return $release
+}

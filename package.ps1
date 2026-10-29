@@ -109,22 +109,23 @@ if ($Kind -eq 'Binaries')
     {
         throw 'folklore\build\folklore.exe not found -- run build.ps1 first'
     }
-    # Which release this build was lifted from (tools\relift.sh writes it
-    # beside the lifted code; older lifts are the US release).
-    $region = 'US'
-    $regionHeader = Join-Path $PortDir 'src\recomp\folklore_region.h'
-    if (Test-Path $regionHeader)
-    {
-        foreach ($line in Get-Content -LiteralPath $regionHeader)
-        {
-            if ($line -match '#define FOLKLORE_REGION_NAME "(\w+)"')
-            {
-                $region = $matches[1]
-            }
-        }
-    }
+    # Which executable this build was lifted from (tools\relift.sh writes it
+    # beside the lifted code; older lifts are the US disc): the region, and
+    # the v1.00 disc or the 1.10 update.
+    $buildRelease = Get-BuildRelease
+    $region = $buildRelease.Region
+    $usesUpdate = $buildRelease.Version -eq '1.10'
+    $titleId = @{ 'US' = 'BCUS98147'; 'EU' = 'BCES00050' }[$region]
     $releaseLine = @{ 'US' = 'BCUS98147 (North America), v1.00'; 'EU' = 'BCES00050 (Europe), v1.00' }[$region]
-    $packageName = if ($region -eq 'EU') { "Folklore-$stamp" + '_eu' } else { "Folklore-$stamp" }
+    $packageName = "Folklore-$stamp"
+    if ($region -eq 'EU')
+    {
+        $packageName += '_eu'
+    }
+    if ($usesUpdate)
+    {
+        $packageName += '_1.10'
+    }
     $package = Join-Path $OutDir $packageName
     if (Test-Path $package)
     {
@@ -146,6 +147,9 @@ if ($Kind -eq 'Binaries')
     }
     Write-RunBat $package
     Write-Host '    run.bat'
+    # What run.ps1 reads to know the build (common.ps1 Get-BuildRelease).
+    Set-Content -Path (Join-Path $package 'release.txt') -Value @("region = $region", "version = $($buildRelease.Version)") -Encoding ASCII
+    Write-Host '    release.txt'
 
     # FFmpeg (LGPL) for the cutscenes: the exe loads these at run time and
     # finds them beside itself. Its licence travels with it.
@@ -219,19 +223,31 @@ if ($Kind -eq 'Binaries')
         Write-Host 'then package.ps1 again.' -ForegroundColor Yellow
     }
 
-    $readme = @"
-Folklore (PS3) -- PC port, $region build, $(Get-Date -Format 'yyyy-MM-dd')
+    if ($usesUpdate)
+    {
+        $gettingStarted = @"
+This is the 1.10 build: it runs the game's 1.10 update. You need your own
+copy of Folklore on the disc this build's release came on ($titleId),
+dumped to a folder (it contains PS3_GAME), AND the 1.10 update for it
+installed (in RPCS3: File > Install Packages, then it is in
+<RPCS3>\dev_hdd0\game\$titleId). No PS3 firmware is needed.
 
-Source: https://github.com/Mava-b/folklore-decomp
-
-What this is: folklore.exe is Folklore's own program code, statically translated
-from the PS3 executable to C++ and compiled for Windows, on top of the
-ps3recomp runtime and this project's own engine and SPURS code. It contains no
-game data (models, textures, sound, movies, text) and no Sony system software:
-everything the game shows and plays comes from your own disc dump, and it will
-not start without one. Not affiliated with or endorsed by Sony or Game
-Republic.
-
+1. Decrypt the update's EBOOT once with RPCS3: Utilities > Decrypt PS3
+   Binaries, choose <RPCS3>\dev_hdd0\game\$titleId\USRDIR\EBOOT.BIN (the
+   update's, not the disc's). RPCS3 writes EBOOT.elf beside it.
+2. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
+   for the disc dump folder (the one that contains PS3_GAME), then for the
+   update folder (the one that contains PARAM.SFO and USRDIR), and
+   remembers both in folklore_settings.ini. It copies the update's few data
+   files into hdd0 here; nothing in either folder is changed. The game
+   writes logs\run-<date-time>.log. run.bat takes options, e.g.
+       run.bat -ResetInstall      (wipe hdd0/hdd1 and redo the first-boot install)
+       run.bat -GameDir D:\Games\$titleId -UpdateDir D:\RPCS3\dev_hdd0\game\$titleId
+"@
+    }
+    else
+    {
+        $gettingStarted = @"
 You need your own copy of Folklore on the disc this build was made from:
 $releaseLine,
 dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
@@ -243,7 +259,24 @@ dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
    folklore_settings.ini. Either way the game starts with the same settings
    and writes logs\run-<date-time>.log. run.bat takes options, e.g.
        run.bat -ResetInstall      (wipe hdd0/hdd1 and redo the first-boot install)
-       run.bat -GameDir D:\Games\BCUS98147
+       run.bat -GameDir D:\Games\$titleId
+"@
+    }
+    $buildName = if ($usesUpdate) { "$region 1.10" } else { $region }
+    $readme = @"
+Folklore (PS3) -- PC port, $buildName build, $(Get-Date -Format 'yyyy-MM-dd')
+
+Source: https://github.com/Mava-b/folklore-decomp
+
+What this is: folklore.exe is Folklore's own program code, statically translated
+from the PS3 executable to C++ and compiled for Windows, on top of the
+ps3recomp runtime and this project's own engine and SPURS code. It contains no
+game data (models, textures, sound, movies, text) and no Sony system software:
+everything the game shows and plays comes from your own disc dump, and it will
+not start without one. Not affiliated with or endorsed by Sony or Game
+Republic.
+
+$gettingStarted
 3. The first start copies several GB of game data into hdd1 here, so expect
    a long first load. Saves go in gamedata, logs in logs. Keep this folder
    somewhere you can write to (not Program Files) with enough free space.
@@ -258,6 +291,8 @@ In the game
                   Pro Controller over USB or Bluetooth, or a DualShock 3
                   through DsHidMini (SXS mode). Turn them off in the menu
                   and captures complete by themselves.
+  Rumble          1.10 builds (the game's Vibration option): Xbox pads,
+                  DualShock 4 and DualSense.
 
 Optional: system fonts. Copy a dev_flash folder (RPCS3's, from its firmware
 install) here, or set dev_flash in folklore_settings.ini.

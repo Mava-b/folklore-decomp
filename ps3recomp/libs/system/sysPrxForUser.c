@@ -167,6 +167,8 @@ static u32 s_next_heap_id = 1;
 int g_sys_process_exit_called = 0;
 s32 g_sys_process_exit_code   = 0;
 
+extern void cellPad_stop_rumble(void);
+
 void sys_process_exit(s32 exitcode)
 {
     g_sys_process_exit_code   = exitcode;
@@ -194,6 +196,7 @@ void sys_process_exit(s32 exitcode)
 #endif
         }
     }
+    cellPad_stop_rumble();   /* libs/input/cellPad.c: no controller left buzzing */
     exit(exitcode);
 }
 

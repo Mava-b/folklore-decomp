@@ -19,6 +19,11 @@
 # -GameDir a dump of the other release than the one already set up lifts
 # that one instead.
 #
+# The 1.10 update instead of the disc version: add the installed update
+# (RPCS3: dev_hdd0\game\<title id>, with USRDIR\EBOOT.BIN decrypted):
+#     setup.ps1 -GameDir D:\Games\BCUS98147 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147
+# -GameDir on its own (without -UpdateDir) goes back to the disc version.
+#
 # Folklore's SPU work runs on the port's own SPURS (folklore/docs/SPURS.md);
 # no firmware file is needed. For comparing against Sony's library, setup can
 # still lift your own decrypted libsre.prx into folklore\firmware_lle:
@@ -30,6 +35,11 @@ param(
     # PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf (RPCS3: Utilities >
     # Decrypt PS3 Binaries). Only needed when folklore\src\recomp is empty.
     [string]$GameDir = '',
+    # The installed 1.10 update, to build that instead of the disc version:
+    # the folder holding its PARAM.SFO and USRDIR, with USRDIR\EBOOT.BIN
+    # decrypted to EBOOT.elf (RPCS3: Utilities > Decrypt PS3 Binaries).
+    # RPCS3 installs it in dev_hdd0\game\BCUS98147 (or BCES00050).
+    [string]$UpdateDir = '',
     # Optional, for comparison runs (run.ps1 -Libsre): your decrypted
     # libsre.prx -- dev_flash\sys\external\libsre.sprx from RPCS3's firmware
     # install, decrypted the same way. A dev_flash folder works too.
@@ -77,10 +87,12 @@ function Select-WithDialog([string]$kind, [string]$title, [string]$filter)
     }
 }
 
-# The releases this project supports, by decrypted EBOOT.elf size
-# (folklore/docs/REGIONS.md).
-$SupportedEboots = @{ 6518936 = 'US'; 6518912 = 'EU' }
-$ReleaseNames = @{ 'US' = 'BCUS98147 (North America)'; 'EU' = 'BCES00050 (Europe)' }
+# The executables this project supports, by decrypted EBOOT.elf size
+# (folklore/docs/REGIONS.md): each release's v1.00 disc and 1.10 update.
+$SupportedEboots = @{ 6518936 = 'US'; 6518912 = 'EU'; 6520504 = 'US-1.10'; 6520480 = 'EU-1.10' }
+$ReleaseNames = @{ 'US' = 'BCUS98147 (North America) v1.00'; 'EU' = 'BCES00050 (Europe) v1.00';
+                   'US-1.10' = 'BCUS98147 (North America) 1.10 update';
+                   'EU-1.10' = 'BCES00050 (Europe) 1.10 update' }
 
 function Get-EbootRegion([string]$eboot)
 {
@@ -94,20 +106,15 @@ function Get-EbootRegion([string]$eboot)
 
 function Get-LiftedRegion
 {
-    # The release folklore\src\recomp was lifted from (tools\relift.sh writes
-    # folklore_region.h; lifted code from before that is the US release).
-    $header = Join-Path $PortDir 'src\recomp\folklore_region.h'
-    if (Test-Path $header)
+    # The executable folklore\src\recomp was lifted from, as a key of
+    # $SupportedEboots (tools\relift.sh writes folklore_region.h; lifted code
+    # from before that is the US disc).
+    $release = Get-BuildRelease
+    if ($release.Version -eq '1.10')
     {
-        foreach ($line in Get-Content -LiteralPath $header)
-        {
-            if ($line -match '#define FOLKLORE_REGION_NAME "(\w+)"')
-            {
-                return $matches[1]
-            }
-        }
+        return "$($release.Region)-1.10"
     }
-    return 'US'
+    return $release.Region
 }
 
 function Resolve-GameEboot([string]$folder)
@@ -127,9 +134,33 @@ function Resolve-GameEboot([string]$folder)
     {
         throw "No decrypted EBOOT.elf in $usrdir -- decrypt EBOOT.BIN there with RPCS3 (Utilities > Decrypt PS3 Binaries) first"
     }
-    if (-not (Get-EbootRegion $eboot))
+    $release = Get-EbootRegion $eboot
+    if (-not $release -or $release.EndsWith('-1.10'))
     {
         throw "$eboot is not a v1.00 EBOOT of a supported release -- BCUS98147 (6,518,936 bytes decrypted) or BCES00050 (6,518,912 bytes)"
+    }
+    return $eboot
+}
+
+function Resolve-UpdateEboot([string]$folder)
+{
+    # The decrypted EBOOT.elf of an installed 1.10 update, from the update
+    # folder (or its USRDIR). Throws with what is wrong.
+    $folder = $folder.Trim().Trim('"').TrimEnd('\')
+    if ((Split-Path -Leaf $folder) -eq 'USRDIR') { $folder = Split-Path $folder }
+    $eboot = Join-Path $folder 'USRDIR\EBOOT.elf'
+    if (-not (Test-Path (Join-Path $folder 'PARAM.SFO')) -or -not (Test-Path (Join-Path $folder 'USRDIR')))
+    {
+        throw "$folder is not an installed game update (no PARAM.SFO and USRDIR) -- in RPCS3 the update is dev_hdd0\game\BCUS98147 or BCES00050"
+    }
+    if (-not (Test-Path $eboot))
+    {
+        throw "No decrypted EBOOT.elf in $folder\USRDIR -- decrypt EBOOT.BIN there with RPCS3 (Utilities > Decrypt PS3 Binaries) first"
+    }
+    $release = Get-EbootRegion $eboot
+    if (-not $release -or -not $release.EndsWith('-1.10'))
+    {
+        throw "$eboot is not the 1.10 update of a supported release -- BCUS98147 (6,520,504 bytes decrypted) or BCES00050 (6,520,480 bytes)"
     }
     return $eboot
 }
@@ -212,9 +243,40 @@ function Set-SavedSetting([string]$key, [string]$value)
 $needGameCode = $null -eq (Get-ChildItem -Path (Join-Path $PortDir 'src\recomp') -Filter '*.cpp' -ErrorAction SilentlyContinue |
                            Select-Object -First 1)
 $sourceEboot = ''
-# A dump of the other release than the one already lifted: lift that one
-# instead (a full rebuild follows).
-if (-not $needGameCode -and $GameDir)
+# The 1.10 update: lift its EBOOT (unless that is what is lifted already).
+# The disc dump is still where the game's data comes from.
+if ($UpdateDir)
+{
+    $givenEboot = Resolve-UpdateEboot $UpdateDir
+    $givenRegion = Get-EbootRegion $givenEboot
+    Write-Host "    1.10 update: $givenEboot -- $($ReleaseNames[$givenRegion])"
+    Set-SavedSetting 'update_dir' (Split-Path (Split-Path $givenEboot))
+    if ($GameDir)
+    {
+        $discFolder = $GameDir.Trim().Trim('"').TrimEnd('\')
+        if ((Split-Path -Leaf $discFolder) -eq 'USRDIR') { $discFolder = Split-Path (Split-Path $discFolder) }
+        if ((Split-Path -Leaf $discFolder) -eq 'PS3_GAME') { $discFolder = Split-Path $discFolder }
+        if (-not (Test-Path (Join-Path $discFolder 'PS3_GAME')))
+        {
+            throw "$discFolder has no PS3_GAME folder -- -GameDir is your disc dump (the folder that contains PS3_GAME)"
+        }
+        Set-SavedSetting 'game_dir' $discFolder
+    }
+    $liftedRegion = Get-LiftedRegion
+    if ($needGameCode -or $givenRegion -ne $liftedRegion)
+    {
+        if (-not $needGameCode)
+        {
+            Write-Step "Switching from $($ReleaseNames[$liftedRegion]) to $($ReleaseNames[$givenRegion])"
+            Write-Host '    The game code will be lifted again from this EBOOT, and build.ps1 then rebuilds everything.'
+        }
+        $needGameCode = $true
+        $sourceEboot = $givenEboot
+    }
+}
+# A dump of the other release (or the disc version, after the 1.10 update)
+# than the one already lifted: lift that one instead (a full rebuild follows).
+elseif (-not $needGameCode -and $GameDir)
 {
     try
     {

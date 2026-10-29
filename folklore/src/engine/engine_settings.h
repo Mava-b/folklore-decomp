@@ -89,8 +89,11 @@ struct EngineSettings
      * dev_flash (fonts). dataDir: where hdd0, hdd1 (several GB of installed
      * game data), gamedata (saves), the shader cache and logs go when the
      * exe runs on its own; empty = next to folklore.exe.
-     * run.ps1's environment overrides all three. */
+     * run.ps1's environment overrides all three. updateDir (1.10 builds
+     * only): the installed 1.10 update, RPCS3's or a PS3's
+     * dev_hdd0\game\<title id>, with the decrypted USRDIR\EBOOT.elf. */
     std::string gameDir;
+    std::string updateDir;
     std::string devFlashDir;
     std::string dataDir;
 };

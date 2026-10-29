@@ -17,6 +17,7 @@
 #include "engine_settings.h"
 #include "engine_saves.h"
 #include "engine_portable.h"
+#include "engine_region.h"
 
 #ifdef _WIN32
 
@@ -133,13 +134,14 @@ namespace
         std::mutex lock;
         bool running = false;
         bool done = false;
+        bool forUpdate = false;     /* the 1.10 update folder, not the disc dump */
         std::string folder;
         std::string problem;
     };
 
     FolderPickState folderPick;
 
-    void startGameFolderPick(const std::string& startFolder)
+    void startGameFolderPick(const std::string& startFolder, bool forUpdate = false)
     {
         {
             std::lock_guard<std::mutex> guard(folderPick.lock);
@@ -149,20 +151,28 @@ namespace
             }
             folderPick.running = true;
             folderPick.done = false;
+            folderPick.forUpdate = forUpdate;
         }
         /* A borderless fullscreen window would cover the dialog: step out of
          * fullscreen while it is open. */
         const bool wasFullscreen = rsx_null_backend_is_fullscreen() != 0;
-        std::thread([startFolder, wasFullscreen]() {
+        std::thread([startFolder, wasFullscreen, forUpdate]() {
             if (wasFullscreen)
             {
                 rsx_null_backend_set_fullscreen(0);
             }
-            const std::string picked = enginePickGameFolder(startFolder);
+            const std::string picked = enginePickGameFolder(startFolder, forUpdate);
             std::string problem;
             if (!picked.empty())
             {
-                engineCheckGameFolder(picked, &problem);
+                if (forUpdate)
+                {
+                    engineCheckUpdateFolder(picked, &problem);
+                }
+                else
+                {
+                    engineCheckGameFolder(picked, &problem);
+                }
             }
             if (wasFullscreen)
             {
@@ -192,7 +202,14 @@ namespace
                 folderPick.done = false;
                 if (!folderPick.folder.empty() && folderPick.problem.empty())
                 {
-                    settings.gameDir = folderPick.folder;
+                    if (folderPick.forUpdate)
+                    {
+                        settings.updateDir = folderPick.folder;
+                    }
+                    else
+                    {
+                        settings.gameDir = folderPick.folder;
+                    }
                     menu.gameFolderMessage = "Saved: the game uses this folder the next time you start it.";
                     changed = true;
                 }
@@ -205,6 +222,11 @@ namespace
         ImGui::SeparatorText("Game files");
         ImGui::TextWrapped("Game folder: %s",
                            settings.gameDir.empty() ? "(passed in by run.ps1)" : settings.gameDir.c_str());
+        if (FOLKLORE_USES_UPDATE)
+        {
+            ImGui::TextWrapped("1.10 update folder: %s",
+                               settings.updateDir.empty() ? "(passed in by run.ps1)" : settings.updateDir.c_str());
+        }
         {
             const char* installedData = std::getenv("PS3_HDD1_ROOT");
             char workingDirectory[MAX_PATH * 2] = {};
@@ -216,6 +238,14 @@ namespace
         if (ImGui::Button(pickRunning ? "Choosing a folder..." : "Change game folder..."))
         {
             startGameFolderPick(settings.gameDir);
+        }
+        if (FOLKLORE_USES_UPDATE)
+        {
+            ImGui::SameLine();
+            if (ImGui::Button(pickRunning ? "Choosing a folder...##update" : "Change update folder..."))
+            {
+                startGameFolderPick(settings.updateDir, true);
+            }
         }
         ImGui::EndDisabled();
         if (!menu.gameFolderMessage.empty())

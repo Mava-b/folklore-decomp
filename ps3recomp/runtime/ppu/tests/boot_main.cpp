@@ -289,6 +289,7 @@ extern "C" ps3_guest_caller_fn g_ps3_guest_caller;        /* libs/system/cellSys
 extern "C" uint64_t ppu_guest_call(uint32_t, uint64_t, uint64_t, uint64_t, uint64_t,
                                    uint64_t, uint64_t, uint64_t, uint64_t);
 extern "C" void cellGcmTickVBlank(void);
+extern "C" void cellPad_stop_rumble(void);   /* libs/input/cellPad.c */
 extern "C" void cellGcmTickFlip(void);
 extern "C" int  cellGcm_take_flip_pending(void);  /* hoisted to file scope: clang-cl rejects block-scope extern "C" */
 
@@ -600,6 +601,7 @@ static DWORD WINAPI vblank_ticker(LPVOID)
                 fprintf(stderr, "[boot] window closed -- exiting\n");
                 fflush(stdout);
                 fflush(stderr);
+                cellPad_stop_rumble();   /* libs/input/cellPad.c */
 #ifdef _WIN32
                 ExitProcess(0);
 #else

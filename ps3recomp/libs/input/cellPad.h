@@ -208,6 +208,8 @@ int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* ps
 const char* cellPad_host_pad_name(void);
 int cellPad_set_motion_mode(int mode);
 int cellPad_motion_live(void);
+/* Stop any rumble the guest left running (the process is ending). */
+void cellPad_stop_rumble(void);
 
 #ifdef __cplusplus
 }

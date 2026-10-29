@@ -82,6 +82,19 @@ static PadHostState  s_host_state[PAD_MAX_HOST_PORTS];
 /* Per-port "a report has arrived since your last read" flag; see cellPadGetData. */
 static int s_data_fresh[PAD_MAX_HOST_PORTS];
 
+/* ---------------------------------------------------------------------------
+ * Rumble
+ *
+ * The motor levels the guest last set for port 0 (cellPadSetActDirect), for
+ * the HID controller thread below to pass on. A DualShock 3 has a small motor
+ * that is only on or off and a large one with 0..255 levels; the generation
+ * counter goes up whenever either changes, so a game that sets the same
+ * levels every frame costs nothing.
+ * -----------------------------------------------------------------------*/
+static volatile int s_rumble_small = 0;
+static volatile int s_rumble_large = 0;
+static volatile int s_rumble_generation = 0;
+
 #if PAD_BACKEND_SDL2
 static SDL_GameController* s_sdl_controllers[PAD_MAX_HOST_PORTS];
 static int s_sdl_inited = 0;
@@ -1246,6 +1259,99 @@ static int pad_hid_parse(const PadHidDevice* pad, const u8* report, int length, 
     }
 }
 
+/* ---- Rumble output -------------------------------------------------------
+ *
+ * The report layouts are SDL's and RPCS3's (hidapi PS4 / PS5 drivers):
+ *   DualShock 4  USB 0x05 (32 bytes): [1] flags, 0x01 = motors only (0x02,
+ *                the light bar, is left clear so its colour is not changed),
+ *                [4] weak motor, [5] strong motor.
+ *                Bluetooth 0x11 (78 bytes): [1] 0xC4, [3] flags, [6] weak,
+ *                [7] strong, CRC-32 at [74].
+ *   DualSense    USB 0x02 (48 bytes): [1] 0x03 (compatible vibration, not
+ *                the audio haptics), [3] weak, [4] strong.
+ *                Bluetooth 0x31 (78 bytes): [1] 0x02, then the USB layout
+ *                one byte later, CRC-32 at [74].
+ * The Bluetooth CRC is CRC-32 over the byte 0xA2 and the first 74 bytes.
+ * The DS3's on/off small motor drives the weak motor at full speed, its large
+ * one the strong motor. The Switch Pro Controller's HD rumble is not sent. */
+static u32 pad_crc32(u32 crc, const u8* data, size_t length)
+{
+    crc = ~crc;
+    for (size_t index = 0; index < length; index++)
+    {
+        crc ^= data[index];
+        for (int bit = 0; bit < 8; bit++)
+        {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+static void pad_hid_put_bluetooth_crc(u8* report, size_t length)
+{
+    const u8 seed = 0xA2;
+    u32 crc = pad_crc32(0, &seed, 1);
+    crc = pad_crc32(crc, report, length - 4);
+    report[length - 4] = (u8)crc;
+    report[length - 3] = (u8)(crc >> 8);
+    report[length - 2] = (u8)(crc >> 16);
+    report[length - 1] = (u8)(crc >> 24);
+}
+
+static void pad_hid_rumble(PadHidDevice* pad, int smallMotor, int largeMotor)
+{
+    const u8 weak = smallMotor ? 0xFF : 0x00;
+    const u8 strong = (u8)largeMotor;
+    u8 report[78];
+    memset(report, 0, sizeof(report));
+    switch (pad->kind)
+    {
+    case PAD_HID_DUALSHOCK4:
+        if (pad->bluetooth)
+        {
+            report[0] = 0x11;
+            report[1] = 0xC4;
+            report[3] = 0x01;
+            report[6] = weak;
+            report[7] = strong;
+            pad_hid_put_bluetooth_crc(report, 78);
+            pad_hid_write(pad, report, 78);
+        }
+        else
+        {
+            report[0] = 0x05;
+            report[1] = 0x01;
+            report[4] = weak;
+            report[5] = strong;
+            pad_hid_write(pad, report, 32);
+        }
+        break;
+    case PAD_HID_DUALSENSE:
+        if (pad->bluetooth)
+        {
+            report[0] = 0x31;
+            report[1] = 0x02;
+            report[2] = 0x03;
+            report[4] = weak;
+            report[5] = strong;
+            pad_hid_put_bluetooth_crc(report, 78);
+            pad_hid_write(pad, report, 78);
+        }
+        else
+        {
+            report[0] = 0x02;
+            report[1] = 0x03;
+            report[3] = weak;
+            report[4] = strong;
+            pad_hid_write(pad, report, 48);
+        }
+        break;
+    default:
+        break;
+    }
+}
+
 static void pad_hidpad_store(const PadHidState* next, PadHidKind kind)
 {
     AcquireSRWLockExclusive(&s_hidpad_lock);
@@ -1273,6 +1379,8 @@ static DWORD WINAPI pad_hidpad_thread(LPVOID unused)
     pad.device = INVALID_HANDLE_VALUE;
     unsigned long long nextScanMs = 0;
     int haveMotionLogged = 0;
+    int rumbleGenerationSent = 0;
+    int rumbleRunning = 0;
     while (!InterlockedCompareExchange(&s_ds3_stop, 0, 0))
     {
         if (pad.device == INVALID_HANDLE_VALUE)
@@ -1288,6 +1396,8 @@ static DWORD WINAPI pad_hidpad_thread(LPVOID unused)
                     fflush(stdout);
                     pad_hid_start(&pad);
                     haveMotionLogged = 0;
+                    /* A newly connected controller gets the current levels. */
+                    rumbleGenerationSent = s_rumble_generation - 1;
                 }
             }
             if (pad.device == INVALID_HANDLE_VALUE)
@@ -1295,6 +1405,15 @@ static DWORD WINAPI pad_hidpad_thread(LPVOID unused)
                 Sleep(100);
                 continue;
             }
+        }
+        const int rumbleGeneration = s_rumble_generation;
+        if (rumbleGeneration != rumbleGenerationSent)
+        {
+            const int smallMotor = s_rumble_small;
+            const int largeMotor = s_rumble_large;
+            pad_hid_rumble(&pad, smallMotor, largeMotor);
+            rumbleRunning = smallMotor || largeMotor;
+            rumbleGenerationSent = rumbleGeneration;
         }
         const int bytesRead = pad_hid_read(&pad, report, 250);
         if (bytesRead < 0)
@@ -1320,6 +1439,12 @@ static DWORD WINAPI pad_hidpad_thread(LPVOID unused)
             }
             pad_hidpad_store(&next, pad.kind);
         }
+    }
+    if (pad.device != INVALID_HANDLE_VALUE && rumbleRunning)
+    {
+        /* The motors keep turning until told otherwise: stop them as the
+         * game ends rather than leave the controller buzzing. */
+        pad_hid_rumble(&pad, 0, 0);
     }
     pad_hid_close(&pad);
     pad_hidpad_mark_disconnected();
@@ -1432,7 +1557,42 @@ const char* cellPad_host_pad_name(void)
     pad_motion_snapshot(&hid, &name);
     return name;
 }
+
+/* Stop the motors as the process ends. A controller keeps rumbling at the
+ * last level it was sent, and the process ends with ExitProcess (window
+ * closed) or exit() (the game quit), neither of which stops the controller
+ * thread: this tells it to send zero and waits for it (at most 0.4 s). */
+void cellPad_stop_rumble(void)
+{
+    static volatile LONG stopped = 0;
+    if (InterlockedExchange(&stopped, 1))
+    {
+        return;
+    }
+    s_rumble_small = 0;
+    s_rumble_large = 0;
+    s_rumble_generation++;
+#if PAD_BACKEND_XINPUT
+    XINPUT_VIBRATION still;
+    memset(&still, 0, sizeof(still));
+    for (DWORD port = 0; port < PAD_MAX_HOST_PORTS; port++)
+    {
+        if (s_host_state[port].connected)
+        {
+            XInputSetState(port, &still);
+        }
+    }
+#endif
+    if (s_hidpad_thread)
+    {
+        InterlockedExchange(&s_ds3_stop, 1);
+        WaitForSingleObject(s_hidpad_thread, 400);
+    }
+}
 #else
+void cellPad_stop_rumble(void)
+{
+}
 int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton)
 {
     (void)buttons; (void)stickLeftX; (void)stickLeftY; (void)psButton;
@@ -1559,6 +1719,17 @@ static void pad_shutdown_backend(void)
 }
 
 #endif /* PAD_BACKEND_XINPUT */
+
+#if !PAD_BACKEND_XINPUT
+/* No controller thread to stop here: the SDL backend gives each rumble a
+ * duration of its own (cellPadSetActDirect). */
+void cellPad_stop_rumble(void)
+{
+    s_rumble_small = 0;
+    s_rumble_large = 0;
+    s_rumble_generation++;
+}
+#endif
 
 /* ---------------------------------------------------------------------------
  * SDL2 backend
@@ -2432,12 +2603,26 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
 
     param = GUEST_PTR(param, CellPadActParam*);
 
+    /* motor[0] is the DS3's small motor, which is only on (any non-zero
+     * value) or off; motor[1] the large one, 0..255. The small motor used to
+     * be sent as value * 257, so "on" (1) came out as 257 of 65535 -- too
+     * little to feel. */
+    const int smallMotor = param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] ? 1 : 0;
+    const int largeMotor = param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE];
+    if (port_no == 0 && (smallMotor != s_rumble_small || largeMotor != s_rumble_large))
+    {
+        s_rumble_small = smallMotor;
+        s_rumble_large = largeMotor;
+        s_rumble_generation++;     /* the HID controller thread sends it */
+    }
+
 #if PAD_BACKEND_XINPUT
-    /* Map to XInput vibration */
+    /* Map to XInput vibration: the large motor to the left (low-frequency)
+     * one, the small motor to the right one at full speed. */
     if (port_no < PAD_MAX_HOST_PORTS && s_host_state[port_no].connected) {
         XINPUT_VIBRATION vib;
-        vib.wLeftMotorSpeed  = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257);
-        vib.wRightMotorSpeed = (WORD)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257);
+        vib.wLeftMotorSpeed  = (WORD)(largeMotor * 257);
+        vib.wRightMotorSpeed = (WORD)(smallMotor ? 0xFFFF : 0);
         XInputSetState((DWORD)port_no, &vib);
     }
 #endif
@@ -2446,8 +2631,8 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
     if (port_no < PAD_MAX_HOST_PORTS && s_sdl_controllers[port_no]) {
         SDL_GameControllerRumble(
             s_sdl_controllers[port_no],
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_LARGE] * 257),
-            (Uint16)(param->motor[CELL_PAD_ACTUATOR_PARAM_SMALL] * 257),
+            (Uint16)(largeMotor * 257),
+            (Uint16)(smallMotor ? 0xFFFF : 0),
             100 /* duration ms */
         );
     }

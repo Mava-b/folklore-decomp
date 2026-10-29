@@ -10,14 +10,26 @@
  * folder above PS3_GAME; trailing separators go. */
 std::string engineNormaliseGameFolder(const std::string& folder);
 
-/* True when `folder` holds PS3_GAME\USRDIR\EBOOT.elf, decrypted, from the
- * North American release this port was built from. Otherwise false, with a
+/* True when `folder` is a dump of the release this port was built from: its
+ * PS3_GAME, and for a v1.00 build the decrypted PS3_GAME\USRDIR\EBOOT.elf
+ * (a 1.10 build runs the update's EBOOT instead). Otherwise false, with a
  * sentence for the user in *problem. */
 bool engineCheckGameFolder(const std::string& folder, std::string* problem);
 
+/* 1.10 builds: the installed 1.10 update (RPCS3's or a PS3's
+ * dev_hdd0\game\<title id>). A picked USRDIR folder becomes the folder above
+ * it; trailing separators go. */
+std::string engineNormaliseUpdateFolder(const std::string& folder);
+
+/* True when `folder` holds the 1.10 update of this build's release: its
+ * PARAM.SFO and the decrypted USRDIR\EBOOT.elf this build was made from.
+ * Otherwise false, with a sentence for the user in *problem. */
+bool engineCheckUpdateFolder(const std::string& folder, std::string* problem);
+
 /* Show a folder picker (blocking; any thread). Returns the normalised folder,
- * or an empty string when cancelled. */
-std::string enginePickGameFolder(const std::string& startFolder);
+ * or an empty string when cancelled. forUpdate: the 1.10 update folder
+ * rather than the disc dump. */
+std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate = false);
 
 /* Where hdd0, hdd1 and logs live: the data_dir setting, else beside the exe. */
 std::string engineDataDirectory();

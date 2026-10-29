@@ -273,6 +273,18 @@ namespace
         returnValue(context, kNpCommunityNotInitialized);
     }
 
+    /* ---- sysPrxForUser: exit-spawn hook (1.10 executables) -----------------
+     * The 1.10 update was built with a newer SDK whose start-up code registers
+     * a function to run when the game spawns another program on exit
+     * (_sys_process_atexitspawn, NID 0x2C847572, checked against the NID
+     * hash). Folklore never exits into another program here, so there is
+     * nothing to record. */
+    void hleProcessAtExitSpawn(ppu_context* context)
+    {
+        logOnce("_sys_process_atexitspawn (nothing to do: the game never spawns on exit)");
+        returnValue(context, 0);
+    }
+
     /* ---- cellRtc --------------------------------------------------------- */
     void hleRtcFormatRfc3339LocalTime(ppu_context* context)
     {
@@ -388,6 +400,7 @@ namespace
         { 0xDB2E4DC2u, "sceNpScoreGetGameDataAsync",         hleNpScoreGameData },
         { 0xF76847C2u, "sceNpScoreRecordGameDataAsync",      hleNpScoreGameData },
         { 0x1324948Au, "cellRtcFormatRfc3339LocalTime",      hleRtcFormatRfc3339LocalTime },
+        { 0x2C847572u, "_sys_process_atexitspawn",           hleProcessAtExitSpawn },
         { 0x64F66D35u, "connect",                            hleNetRefuse },
         { 0x28E208BBu, "listen",                             hleNetRefuse },
         { 0xC94F6939u, "accept",                             hleNetRefuse },
@@ -420,9 +433,13 @@ namespace
  * a value this function wrote before. */
 extern "C" void folklore_apply_aspect(float aspect)
 {
-    /* TOC-relative; the EU executable's TOC is laid out a few entries
-     * differently (folklore/docs/REGIONS.md). */
-#if defined(FOLKLORE_REGION_EU)
+    /* TOC-relative; each executable's TOC is laid out a little differently
+     * (folklore/docs/REGIONS.md). */
+#if FOLKLORE_GAME_VERSION == 110 && defined(FOLKLORE_REGION_EU)
+    static const int32_t kAspectSlots[] = { -28180, -16084, -13396, -13224, -6524, 484, 4528 };
+#elif FOLKLORE_GAME_VERSION == 110
+    static const int32_t kAspectSlots[] = { -28180, -16084, -13392, -13220, -6516, 508, 4552 };
+#elif defined(FOLKLORE_REGION_EU)
     static const int32_t kAspectSlots[] = { -28188, -16232, -13544, -13372, -6692, 284, 4328 };
 #else
     static const int32_t kAspectSlots[] = { -28188, -16228, -13536, -13364, -6676, 316, 4360 };

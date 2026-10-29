@@ -10,13 +10,13 @@ the lifted game code, so this file can be shared with the project.
 tools/relift.sh runs this after ppu_lifter.py. Running it twice is harmless:
 a function that already carries its FOLKLORE PATCH marker is skipped.
 
-  game_patches.py src/recomp [--region US|EU]
+  game_patches.py src/recomp [--region US|EU|US-1.10|EU-1.10]
 
-The same fixes apply to both releases this port supports: BCUS98147 (US,
-the default) and BCES00050 (EU). Their executables are the same code shifted
-by a few bytes in places, with a handful of functions changed; REGIONS below
-holds each one's function names, addresses, call anchors and TOC offsets
-(found by aligning the two executables function by function,
+The same fixes apply to every executable this port supports: BCUS98147 (US,
+the default) and BCES00050 (EU), each as the v1.00 disc and the 1.10 update.
+They are the same code shifted in places, with some functions changed;
+REGIONS below holds each one's function names, addresses, call anchors and
+TOC offsets (found by aligning the executables function by function,
 folklore/docs/REGIONS.md). The text of every fix is shared.
 """
 import pathlib
@@ -43,6 +43,27 @@ REGIONS = {
         "physics": ("func_003C90F4", 0x003C90F4,
                     {"loop": "003C913C", "back": "003C9128", "exit": "003C9158"}),
         "toc": {"workTop": 0x20E0, "allocator": 0x265C},
+    },
+    # The 1.10 update's executables. Every function these fixes touch is the
+    # same code as in 1.00 (aligned function by function, docs/REGIONS.md),
+    # only moved; the TOC entries moved by 0xA0 / 0xA8.
+    "US-1.10": {
+        "movieHold": ("func_001A59CC", 0x001A5B10),
+        "movieTable": ("func_001A3AE8", [(0x001A4370, "0x001A4374", "0x001A4398"),
+                                         (0x001A4640, "0x001A4644", "0x001A4668")]),
+        "playerAlloc": ("func_001A4DC4", 0x001A4DF0),
+        "physics": ("func_003CD8C4", 0x003CD8C4,
+                    {"loop": "003CD90C", "back": "003CD8F8", "exit": "003CD928"}),
+        "toc": {"workTop": 0x2020, "allocator": 0x259C},
+    },
+    "EU-1.10": {
+        "movieHold": ("func_001A59EC", 0x001A5B30),
+        "movieTable": ("func_001A38CC", [(0x001A4348, "0x001A434C", "0x001A4370"),
+                                         (0x001A4660, "0x001A4664", "0x001A4688")]),
+        "playerAlloc": ("func_001A4DE4", 0x001A4E10),
+        "physics": ("func_003CD89C", 0x003CD89C,
+                    {"loop": "003CD8E4", "back": "003CD8D0", "exit": "003CD900"}),
+        "toc": {"workTop": 0x2038, "allocator": 0x25B4},
     },
 }
 
@@ -270,7 +291,7 @@ def main():
             if regionName in arguments:
                 arguments.remove(regionName)
     if regionName not in REGIONS:
-        print("unknown region %r (US or EU)" % regionName)
+        print("unknown region %r (US, EU, US-1.10 or EU-1.10)" % regionName)
         sys.exit(2)
     recompDirectory = pathlib.Path(arguments[0] if arguments else "src/recomp")
     sources = sorted(recompDirectory.glob("*.cpp"))

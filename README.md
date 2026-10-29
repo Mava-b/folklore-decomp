@@ -30,12 +30,17 @@ sharpening, borderless fullscreen, save backups.
 You need **both** of these. Neither is in this repository and neither can be
 downloaded from it.
 
-### 1. Your own Folklore disc: North American or European release, v1.00
+### 1. Your own Folklore disc: North American or European release
 
 - **Title ID BCUS98147 (North America) or BCES00050 (Europe), disc version
   1.00.** The code is translated from those exact executables; the Japanese
-  release and the 1.10 update will not work. A build is made from one of the
-  two and runs that one ([`folklore/docs/REGIONS.md`](folklore/docs/REGIONS.md)).
+  release will not work. A build is made from one of them and runs that one
+  ([`folklore/docs/REGIONS.md`](folklore/docs/REGIONS.md)).
+- **Optionally, the 1.10 update** for your release. A build can be made from
+  the update's executable instead (it adds rumble, the game's own Vibration
+  option, and the newer table of Folks that later downloadable content uses);
+  it still reads everything else from your disc dump. See *The 1.10 update*
+  below.
 - Dumped from your disc to a **folder** (the "JB folder" format RPCS3 uses): a
   folder that contains `PS3_GAME\`, with `PS3_GAME\PARAM.SFO` and
   `PS3_GAME\USRDIR\EBOOT.BIN` in it. Your dump is only ever read, never
@@ -49,6 +54,28 @@ The dumped `PS3_GAME\USRDIR\EBOOT.BIN` is encrypted. Decrypt it with
 
 The decrypted file must be **6,518,936 bytes** (BCUS98147) or **6,518,912
 bytes** (BCES00050); setup checks this.
+
+### The 1.10 update (optional)
+
+Install the update in RPCS3 (**File → Install Packages/Raps/Edats**, choose
+the update's `.pkg`). RPCS3 puts it in `dev_hdd0\game\BCUS98147` (or
+`BCES00050`) inside its own folder — not in your disc dump, even though
+RPCS3's game list shows the game as 1.10 and *Open game folder* opens the
+dump. Decrypt **that** folder's `USRDIR\EBOOT.BIN` the same way; the
+decrypted update EBOOT is **6,520,504 bytes** (BCUS98147) or **6,520,480
+bytes** (BCES00050). Then give setup both folders:
+
+```powershell
+.\setup.ps1 -GameDir D:\Games\BCUS98147 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147
+```
+
+setup lifts the update's executable instead of the disc's and saves both
+folders; `build.ps1` and `run.ps1` work as before. On each start the game
+copies the update's three data files (`LMonS2.bi5_`, a corrected Spanish
+text file, and their list) from the update folder into `hdd0\` here and
+records them as installed, as the game itself would; neither folder is
+written to. `.\setup.ps1 -GameDir <dump>` without `-UpdateDir` goes back to
+the disc version. Saves are the same files in both versions.
 
 ### Also needed
 
@@ -100,6 +127,8 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
 With both releases (an EU copy of this folder beside it, see *Sharing what
 you built*), `.\build_all.ps1` builds this folder, brings the EU copy up to
 date and builds that too; then `run.bat` in either folder runs its build.
+Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
+*Sharing what you built*) it builds those as well.
 
 ### If something fails
 
@@ -112,8 +141,12 @@ date and builds that too; then `run.bat` in either folder runs its build.
 - **"EBOOT.BIN is still encrypted"**: decrypt it with RPCS3 as described
   above.
 - **"not a v1.00 EBOOT of a supported release"**: your disc is the Japanese
-  release, or the EBOOT is from the 1.10 update. Only the v1.00 discs
-  BCUS98147 and BCES00050 work.
+  release, or you gave `-GameDir` the 1.10 update's EBOOT (give the update
+  folder as `-UpdateDir`, with `-GameDir` your disc dump). Only BCUS98147 and
+  BCES00050 work.
+- **"not the 1.10 update of a supported release"**: the `-UpdateDir` folder's
+  `USRDIR\EBOOT.elf` is not a decrypted 1.10 update EBOOT — most often the
+  disc's EBOOT was decrypted instead of the update's (see *The 1.10 update*).
 - **Both releases:** a build follows the dump setup lifted. `.\setup.ps1
   -GameDir <dump of the other release>` switches it (setup lifts the game code
   again, then `build.ps1` rebuilds everything). To keep one of each, use two
@@ -177,6 +210,10 @@ directly — buttons, sticks and the motion sensors — and take controller port
 | Switch Pro Controller | USB or Bluetooth | buttons by position: B = Cross, A = Circle, Y = Square, X = Triangle |
 | DualShock 3 | USB or Bluetooth | needs [DsHidMini](https://github.com/nefarius/DsHidMini) in **SXS** mode (set in DSHMC); also gives pressure-sensitive buttons |
 
+Rumble (1.10 builds, the game's Vibration option) goes to an XInput pad, a
+DualShock 4 or a DualSense. The Switch Pro Controller and a DualShock 3 read
+through DsHidMini do not rumble yet.
+
 A controller presented as an XInput pad by another program (DS4Windows,
 Steam Input, DsHidMini in XInput mode) has no motion data. If DS4Windows hides
 the real controller (HidHide), the game cannot see it either; close it or let
@@ -187,6 +224,7 @@ is used, otherwise the first one found.
 
 ```powershell
 .\run.ps1 -GameDir D:\other\BCUS98147     # a different dump (otherwise the saved one)
+.\run.ps1 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147   # 1.10 builds: a different update folder
 .\run.ps1 -DevFlash D:\RPCS3\dev_flash    # firmware fonts (optional; or dev_flash= in the ini)
 .\run.ps1 -ResetInstall                   # wipe hdd0/hdd1 and redo the first-boot install
 .\run.ps1 -Verbose                        # very detailed logging (slow)
@@ -205,7 +243,8 @@ package (`package.ps1`) includes them, with run.ps1 finding `folklore.exe`
 beside itself.
 
 `folklore.exe` can also start without them (double-click it or a shortcut).
-It asks once for the game folder and remembers it, then does what run.ps1
+It asks once for the game folder (a 1.10 build also for the update folder)
+and remembers it, then does what run.ps1
 does: it sets the same environment and starts the game as a second
 `folklore.exe` process, with its output going to `logs\run-<date-time>.log`.
 `hdd0\`, `hdd1\`, `gamedata\` (saves), the shader cache and `logs\` go beside
@@ -245,6 +284,9 @@ checking the port's version against it:
 .\package_all.ps1 -EuGameDir D:\Games\BCES00050
                                  # both releases: builds this folder (US) and an EU copy beside it
                                  # (Folklore-EU), then dist\Folklore-<date>.zip and Folklore-<date>_eu.zip
+.\package_all.ps1 -UsUpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147 -EuUpdateDir D:\RPCS3\dev_hdd0\game\BCES00050
+                                 # also the 1.10 builds, in copies Folklore-1.10 and Folklore-EU-1.10
+                                 # (update folders needed once): ..._1.10.zip and ..._eu_1.10.zip
 ```
 
 The build kit contains nothing from the game or the firmware — the same as

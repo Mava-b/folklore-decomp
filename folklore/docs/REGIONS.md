@@ -4,12 +4,17 @@
 |---|---|---|---|---|---|
 | North America | BCUS98147 | 1.00 | 6,518,936 bytes | `0x56EB00` | `0x4EEB84` (167 imports) |
 | Europe | BCES00050 | 1.00 | 6,518,912 bytes | `0x56EAF8` | `0x4EEB1C` (166 imports) |
+| North America | BCUS98147 | 1.10 update | 6,520,504 bytes | `0x56EC48` | `0x4F32B4` (170 imports) |
+| Europe | BCES00050 | 1.10 update | 6,520,480 bytes | `0x56EC48` | `0x4F326C` (169 imports) |
 
-A build is lifted from one release and runs only that release. `tools/relift.sh`
-recognises the EBOOT by its size and writes `src/recomp/folklore_region.h`. The
-engine code reads that header (`src/engine/engine_region.h`), and lifted code
-from before it existed counts as US. `setup.ps1 -GameDir <dump of the other
-release>` lifts that release instead, and `build.ps1` then rebuilds everything.
+A build is lifted from one executable and runs only that one. `tools/relift.sh`
+recognises the EBOOT by its size and writes `src/recomp/folklore_region.h`
+(region, title ID, version, size, TOC). The engine code reads that header
+(`src/engine/engine_region.h`); lifted code from before it existed counts as
+the US disc, and a header without a version as v1.00. `setup.ps1 -GameDir
+<dump of the other release>` lifts that release instead, `setup.ps1 -GameDir
+<dump> -UpdateDir <installed 1.10 update>` lifts the update, and `build.ps1`
+then rebuilds everything.
 
 ## How the two executables differ
 
@@ -50,6 +55,74 @@ displacements and 16-bit immediates.
 | Havok step by frame time | `func_003C913C` (labels `3C9184` / `3C9170`, exit `3C91A0`) | `func_003C90F4` (`3C913C` / `3C9128`, exit `3C9158`) |
 | Switch-table hint (`relift.sh`) | `34D3C8:34D3CC:19` | `34D380:34D384:19` |
 | Frame limiter (`patch_limiter.py`) | 10 sites, found by pattern | the same 10 |
+
+## The 1.10 update
+
+Folklore's 1.10 update replaces the executable; RPCS3 (like a PS3) installs
+it in `dev_hdd0/game/<title id>/` and starts that EBOOT, which reads the rest
+of the game from the disc. The comparison below was made on 2026-10-29 from
+both regions' updates, decrypted with RPCS3 from the user's own installs.
+
+**What changed.** Aligned against v1.00 the same way (13,336 functions in US
+1.10, 13,335 in EU 1.10):
+
+- 12,359 functions are the same code. About 230 of the game's own functions
+  changed and 14 are new; most of the rest of the difference (~600
+  functions above `0x480000`) is the SDK libraries linked into the
+  executable, rebuilt with a newer SDK.
+- **Rumble**: a *Vibration* on/off option in the options menu (texts in all
+  five languages) and two new imports, `cellPadSetActDirect` and
+  `cellPadGetCapabilityInfo`. patches/0054 passes the motors on (XInput,
+  DualShock 4, DualSense).
+- **The table of Folks** is `LMonS2.bi5_` instead of `LMonS.bi5_`. It comes
+  with the update as data (below); the later downloadable packs ship their
+  own copy.
+- The "game data is corrupt" messages print the title from PARAM.SFO
+  instead of a fixed "Folklore".
+- `sysPrxForUser` `_sys_process_atexitspawn` (NID `0x2C847572`, checked
+  against the NID hash) is a new import from the newer SDK's start-up code;
+  `folklore_hle.cpp` answers it.
+- US 1.10 and EU 1.10 differ from each other in 11 functions, as the two
+  v1.00 discs do, and EU 1.10 again leaves out `sceNp` NID `0x29DD45DC`.
+- The nine SPURS job binaries are the same bytes at the same addresses and
+  file offsets as in v1.00.
+
+**The update's data.** Besides the EBOOT the update brings three files,
+delivered the way the downloadable packs are: in `USRDIR/bin/17/` with a list
+`download.dat_` (a big-endian count, then per file a pack-number byte and a
+NUL-terminated path under `bin/`). On its next start the game copies them
+into `USRDIR/bin/` and adds them to `install.dat_` (the same format). Both
+regions' updates carry the same three: `LMonS2.bi5_`, `cmc/sp/LCmc301_sp.bi5_`
+(Spanish) and `download.dat_`. The game opens `LMonS2.bi5_` before it looks
+for packs to install, so `engine_portable.cpp` (installUpdateData) puts the
+files where the game's installer would and records them in `install.dat_`,
+from the update folder as installed (`bin/`) or not yet (`bin/17/`), on every
+start; it leaves a file alone when `install.dat_` says a later pack replaced
+it. The update folder itself is only read.
+
+**Running it.** A 1.10 build needs the disc dump (game data, PARAM.SFO) and the
+update folder (its decrypted `USRDIR/EBOOT.elf` is what is loaded). The
+`update_dir` setting, `run.ps1 -UpdateDir` and a second folder picker supply
+it; the disc's own EBOOT is not used.
+
+| Fix | US 1.10 | EU 1.10 |
+|---|---|---|
+| Movie hold wait | `func_001A59CC` @ `0x1A5B10` | `func_001A59EC` @ `0x1A5B30` |
+| Movie AU size table, two sites | `func_001A3AE8` @ `0x1A4370`, `0x1A4640` (returns `0x1A4374`..`0x1A4398`, `0x1A4644`..`0x1A4668`) | `func_001A38CC` @ `0x1A4348`, `0x1A4660` (returns `0x1A434C`..`0x1A4370`, `0x1A4664`..`0x1A4688`) |
+| Room for the table after the player | `func_001A4DC4` @ `0x1A4DF0` | `func_001A4DE4` @ `0x1A4E10` |
+| Havok step by frame time | `func_003CD8C4` (labels `3CD90C` / `3CD8F8`, exit `3CD928`) | `func_003CD89C` (`3CD8E4` / `3CD8D0`, exit `3CD900`) |
+| Switch-table hint | `351B50:351B54:19` | `351B28:351B2C:19` |
+| Movie-table TOC entries | -0x2020, -0x259C | -0x2038, -0x25B4 |
+| Camera aspect constants (TOC) | -28180, -16084, -13392, -13220, -6516, 508, 4552 | -28180, -16084, -13396, -13224, -6524, 484, 4528 |
+| Language query | `func_0020D8B4` | `func_0020D8D4` |
+| Frame limiter | 10 sites, found by pattern | the same 10 |
+
+Every function these fixes touch is unchanged from v1.00, only moved. The
+addresses come from mapping each v1.00 site through the function alignment
+(US 1.00 → US 1.10, EU 1.00 → EU 1.10); the TOC offsets from pairing every
+TOC-relative load in the unchanged functions, which gave one answer for each
+(the seven camera slots hold 16:9 in both updates). Both updates were lifted
+with these and all five game patches applied, with 10 limiter sites each.
 
 ## Languages
 
