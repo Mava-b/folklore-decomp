@@ -969,6 +969,15 @@ What 0006 fixes in ps3recomp to make that run:
     packs and licences: all installed, sizes match, a missing or wrong
     licence leaves the pack out, re-import is a no-op. Not yet played with
     the packs in the port.
+71. 1.10 captured every Folk at once, with motion controls on and a DS3's
+    sensors live (user report, first 1.10 run). 1.10 calls the new import
+    cellPadGetCapabilityInfo every pad update, with its CellPadCapabilityInfo
+    at sp+180 and the CellPadData it has just read at sp+308
+    (func_001CE17C). ps3recomp sized that struct by CELL_PAD_MAX_CODES (64
+    words) instead of the PS3's CELL_PAD_MAX_CAPABILITY_INFO (32) and zeroed
+    all of it: 128 bytes too many, over the pad data. The sensor words
+    (sp+352..358, read right after) came out 0, which is full scale -- an
+    instant pull. patches/0055 sizes it right. 1.00 never makes the call.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

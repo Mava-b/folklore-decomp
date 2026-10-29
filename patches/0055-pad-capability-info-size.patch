@@ -1,0 +1,33 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -2580,7 +2580,7 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
+         return CELL_PAD_ERROR_INVALID_PARAMETER;
+ 
+     u32 info_ea = (u32)(uintptr_t)info;
+-    for (u32 i = 0; i < CELL_PAD_MAX_CODES; i++)
++    for (u32 i = 0; i < CELL_PAD_MAX_CAPABILITY_INFO; i++)
+         vm_write32(info_ea + i * 4, 0);
+ 
+     /* Report standard DualShock 3 capabilities */
+diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
+--- a/libs/input/cellPad.h
++++ b/libs/input/cellPad.h
+@@ -156,9 +156,15 @@ typedef struct CellPadPeriphInfo {
+ /* Peripheral class types (SDK pad_codes.h) */
+ #define CELL_PAD_PCLASS_TYPE_STANDARD   0
+ 
+-/* Capability info for a specific port */
++/* Capability info for a specific port. 32 words on the PS3
++ * (CELL_PAD_MAX_CAPABILITY_INFO), not CELL_PAD_MAX_CODES (64): sized by the
++ * latter, cellPadGetCapabilityInfo wrote 128 bytes past the guest's struct.
++ * Folklore 1.10 keeps it on the stack just below the CellPadData it has just
++ * read, so the overrun zeroed the pad data -- sensor words of 0 read as full
++ * scale, and every Folk was captured at once. */
++#define CELL_PAD_MAX_CAPABILITY_INFO    32
+ typedef struct CellPadCapabilityInfo {
+-    u32 info[CELL_PAD_MAX_CODES];
++    u32 info[CELL_PAD_MAX_CAPABILITY_INFO];
+ } CellPadCapabilityInfo;
+ 
+ /* Actuator (vibration) parameter */

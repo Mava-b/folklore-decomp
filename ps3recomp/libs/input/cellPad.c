@@ -2580,7 +2580,7 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
         return CELL_PAD_ERROR_INVALID_PARAMETER;
 
     u32 info_ea = (u32)(uintptr_t)info;
-    for (u32 i = 0; i < CELL_PAD_MAX_CODES; i++)
+    for (u32 i = 0; i < CELL_PAD_MAX_CAPABILITY_INFO; i++)
         vm_write32(info_ea + i * 4, 0);
 
     /* Report standard DualShock 3 capabilities */
