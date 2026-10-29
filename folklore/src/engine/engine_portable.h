@@ -31,5 +31,9 @@ bool engineCheckUpdateFolder(const std::string& folder, std::string* problem);
  * rather than the disc dump. */
 std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate = false);
 
+/* The same picker with any title; the folder as picked (trailing separators
+ * removed), or an empty string when cancelled. */
+std::string enginePickFolder(const std::string& startFolder, const std::string& title);
+
 /* Where hdd0, hdd1 and logs live: the data_dir setting, else beside the exe. */
 std::string engineDataDirectory();

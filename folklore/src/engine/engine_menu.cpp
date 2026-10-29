@@ -17,6 +17,7 @@
 #include "engine_settings.h"
 #include "engine_saves.h"
 #include "engine_portable.h"
+#include "engine_dlc.h"
 #include "engine_region.h"
 
 #ifdef _WIN32
@@ -184,6 +185,155 @@ namespace
             folderPick.running = false;
             folderPick.done = true;
         }).detach();
+    }
+
+    /* Downloadable content (engine_dlc.cpp): the user picks RPCS3's folder
+     * (or a PS3 copy of the game's HDD folder); the packs it holds are
+     * decrypted with the user's own licences and installed into hdd0 on a
+     * thread of their own, with progress shown here. */
+    struct DlcImportState
+    {
+        std::mutex lock;
+        bool running = false;
+        int filesDone = 0;
+        int filesTotal = 0;
+        std::string currentFile;
+        std::string report;
+        std::vector<int> installed;
+        double installedCheckedAt = -100.0;
+    };
+
+    DlcImportState dlcImport;
+
+    void startDlcImport(const std::string& startFolder)
+    {
+        {
+            std::lock_guard<std::mutex> guard(dlcImport.lock);
+            if (dlcImport.running)
+            {
+                return;
+            }
+            dlcImport.running = true;
+            dlcImport.filesDone = 0;
+            dlcImport.filesTotal = 0;
+            dlcImport.currentFile = "Choosing a folder...";
+            dlcImport.report.clear();
+        }
+        const bool wasFullscreen = rsx_null_backend_is_fullscreen() != 0;
+        std::thread([startFolder, wasFullscreen]() {
+            if (wasFullscreen)
+            {
+                rsx_null_backend_set_fullscreen(0);
+            }
+            const std::string picked = enginePickFolder(
+                startFolder, "Folklore: choose RPCS3's folder (the one with dev_hdd0 in it) to add the DLC from");
+            if (wasFullscreen)
+            {
+                rsx_null_backend_set_fullscreen(1);
+            }
+            std::string report;
+            if (!picked.empty())
+            {
+                DlcSource source;
+                std::string problem;
+                if (!engineDlcScan(picked, &source, &problem))
+                {
+                    report = problem;
+                }
+                else
+                {
+                    report = engineDlcInstall(source, [](int done, int total, const std::string& file) {
+                        std::lock_guard<std::mutex> guard(dlcImport.lock);
+                        dlcImport.filesDone = done;
+                        dlcImport.filesTotal = total;
+                        dlcImport.currentFile = file;
+                    });
+                }
+            }
+            std::lock_guard<std::mutex> guard(dlcImport.lock);
+            dlcImport.report = report;
+            dlcImport.running = false;
+            dlcImport.installedCheckedAt = -100.0;     /* look again */
+        }).detach();
+    }
+
+    /* The folder the picker opens in: RPCS3's dev_hdd0\game, when the 1.10
+     * update folder is known (it is in RPCS3), else the game folder. */
+    std::string dlcStartFolder()
+    {
+        const EngineSettings& settings = engineSettings();
+        if (!settings.updateDir.empty())
+        {
+            const size_t separator = settings.updateDir.find_last_of("\\/");
+            if (separator != std::string::npos)
+            {
+                return settings.updateDir.substr(0, separator);
+            }
+        }
+        return settings.gameDir;
+    }
+
+    void drawDownloadableContent()
+    {
+        ImGui::SeparatorText("Downloadable content");
+        bool running = false;
+        int filesDone = 0;
+        int filesTotal = 0;
+        std::string currentFile;
+        std::string report;
+        std::vector<int> installed;
+        {
+            std::lock_guard<std::mutex> guard(dlcImport.lock);
+            if (!dlcImport.running && ImGui::GetTime() - dlcImport.installedCheckedAt > 2.0)
+            {
+                dlcImport.installed = engineDlcInstalledPacks();
+                dlcImport.installedCheckedAt = ImGui::GetTime();
+            }
+            running = dlcImport.running;
+            filesDone = dlcImport.filesDone;
+            filesTotal = dlcImport.filesTotal;
+            currentFile = dlcImport.currentFile;
+            report = dlcImport.report;
+            installed = dlcImport.installed;
+        }
+        if (installed.empty())
+        {
+            ImGui::TextDisabled("No packs installed.");
+        }
+        else
+        {
+            std::string names;
+            for (const int pack : installed)
+            {
+                names += (names.empty() ? "" : ", ") + engineDlcPackNameByNumber(pack);
+            }
+            ImGui::TextWrapped("Installed: %s", names.c_str());
+        }
+        ImGui::TextDisabled("Your own add-on packs: install each pack's .pkg and its .rap licence in RPCS3 (File >");
+        ImGui::TextDisabled("Install Packages/Raps/Edats), then add them here from RPCS3's folder.");
+        bool startImport = false;
+        ImGui::BeginDisabled(running);
+        if (ImGui::Button(running ? "Adding DLC..." : "Add DLC from RPCS3..."))
+        {
+            startImport = true;
+        }
+        ImGui::EndDisabled();
+        if (running)
+        {
+            const float fraction = filesTotal > 0 ? (float)filesDone / (float)filesTotal : 0.0f;
+            char overlay[64];
+            std::snprintf(overlay, sizeof(overlay), "%d / %d files", filesDone, filesTotal);
+            ImGui::ProgressBar(fraction, ImVec2(420.0f, 0.0f), filesTotal > 0 ? overlay : "");
+            ImGui::TextDisabled("%s", currentFile.c_str());
+        }
+        else if (!report.empty())
+        {
+            ImGui::TextWrapped("%s", report.c_str());
+        }
+        if (startImport)
+        {
+            startDlcImport(dlcStartFolder());
+        }
     }
 
     /* Where the game is read from and where its installed data goes. A new
@@ -809,6 +959,7 @@ namespace
             changed |= drawLanguage();
             changed |= drawGraphics();
             changed |= drawGameFiles();
+            drawDownloadableContent();
 
             ImGui::SeparatorText("Display");
             changed |= ImGui::Checkbox("Performance overlay", &settings.showPerformanceOverlay);

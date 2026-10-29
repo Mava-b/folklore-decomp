@@ -190,12 +190,25 @@ saved to `folklore_settings.ini`.
     appears).
 - **Game files**: the game folder in use (change it here; it applies on the
   next start) and where the installed data and saves are.
+- **Downloadable content**: the add-on packs installed, and **Add DLC from
+  RPCS3...** to bring in your own (below).
 - **Performance overlay**: fps, frame time and where the time goes.
 - **Save data snapshots**: copy the game's saves to `save_snapshots\` and put
   any snapshot back later, then load it from the game's own Load menu.
 
 Escape closes the menu; it does not quit the game (use the window's close
 button or Alt+F4).
+
+### Downloadable content
+
+Folklore's add-on packs from your own purchase: install each pack's `.pkg`
+and its `.rap` licence in RPCS3 (**File → Install Packages/Raps/Edats**), then
+in the engine menu press **Add DLC from RPCS3...** and choose RPCS3's folder
+(the one with `dev_hdd0` in it). The packs are decrypted with your licences
+and installed into `hdd0\` here — about half a minute for all six, with a
+progress bar — and the game has them from its next start. A pack without its
+licence is left out and the menu says which. Nothing in RPCS3's folder is
+changed. Details: [`folklore/docs/DLC.md`](folklore/docs/DLC.md).
 
 ### Motion controllers
 

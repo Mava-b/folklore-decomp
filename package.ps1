@@ -283,8 +283,9 @@ $gettingStarted
 
 In the game
   F1 or L3+R3     engine menu: frame rate, resolution, aspect ratio, fullscreen,
-                  motion controls, game folder, save backups, and on the
-                  European release the language (applies on the next start)
+                  motion controls, game folder, downloadable content, save
+                  backups, and on the European release the language
+                  (applies on the next start)
   Alt+Enter       fullscreen on/off
   Controller      any XInput pad. For motion controls (capturing Folks by
                   moving the controller): a DualShock 4, DualSense or Switch
@@ -293,6 +294,10 @@ In the game
                   and captures complete by themselves.
   Rumble          1.10 builds (the game's Vibration option): Xbox pads,
                   DualShock 4 and DualSense.
+
+Downloadable content: install your packs (.pkg and .rap) in RPCS3 with
+File > Install Packages/Raps/Edats, then in the engine menu press "Add DLC
+from RPCS3..." and choose RPCS3's folder. Restart the game afterwards.
 
 Optional: system fonts. Copy a dev_flash folder (RPCS3's, from its firmware
 install) here, or set dev_flash in folklore_settings.ini.

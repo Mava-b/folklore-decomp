@@ -552,6 +552,18 @@ bool engineCheckUpdateFolder(const std::string& folder, std::string* problem)
 
 std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate)
 {
+    const std::string picked = enginePickFolder(
+        startFolder, forUpdate ? "Folklore: choose the installed 1.10 update (the folder that contains PARAM.SFO and USRDIR)"
+                               : "Folklore: choose your game folder (the one that contains PS3_GAME)");
+    if (picked.empty())
+    {
+        return picked;
+    }
+    return forUpdate ? engineNormaliseUpdateFolder(picked) : engineNormaliseGameFolder(picked);
+}
+
+std::string enginePickFolder(const std::string& startFolder, const std::string& title)
+{
     const HRESULT initialised = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
     std::string chosen;
     IFileOpenDialog* dialog = nullptr;
@@ -560,9 +572,7 @@ std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate)
         DWORD options = 0;
         dialog->GetOptions(&options);
         dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
-        dialog->SetTitle(forUpdate ? L"Folklore: choose the installed 1.10 update (the folder that contains "
-                                     L"PARAM.SFO and USRDIR)"
-                                   : L"Folklore: choose your game folder (the one that contains PS3_GAME)");
+        dialog->SetTitle(narrowToWide(title).c_str());
         if (!startFolder.empty() && directoryExists(startFolder))
         {
             IShellItem* startItem = nullptr;
@@ -581,8 +591,11 @@ std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate)
                 PWSTR widePath = nullptr;
                 if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &widePath)))
                 {
-                    chosen = forUpdate ? engineNormaliseUpdateFolder(wideToNarrow(widePath))
-                                       : engineNormaliseGameFolder(wideToNarrow(widePath));
+                    chosen = wideToNarrow(widePath);
+                    while (chosen.size() > 3 && (chosen.back() == '\\' || chosen.back() == '/'))
+                    {
+                        chosen.pop_back();
+                    }
                     CoTaskMemFree(widePath);
                 }
                 result->Release();

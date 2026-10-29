@@ -957,6 +957,18 @@ What 0006 fixes in ps3recomp to make that run:
     option), goes to XInput pads, DualShock 4 and DualSense
     (patches/0054); the DS3's on/off small motor had been sent to XInput as
     257 of 65535. Lifted and patched here; not yet built or run on Windows.
+70. Downloadable content (folklore/docs/DLC.md). The engine menu's "Add DLC
+    from RPCS3..." imports the packs from RPCS3's folder (or a PS3 copy of the
+    game's HDD folder) into hdd0, installed as the game's own installer would
+    (install.dat_). The six paid packs' 259 files are licence-type-2 EDATs:
+    each .rap becomes the RIF key (src/engine/engine_dlc.cpp, AES through
+    BCrypt) and ps3recomp's edat_decrypt_file decrypts with it, checking
+    every block; the files keep their .edat names and the runtime opens them
+    as they are once decrypted. All of a pack or none of it. Tested off
+    Windows with tools/test_dlc_import.cpp on a sample of the user's real
+    packs and licences: all installed, sizes match, a missing or wrong
+    licence leaves the pack out, re-import is a no-op. Not yet played with
+    the packs in the port.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
