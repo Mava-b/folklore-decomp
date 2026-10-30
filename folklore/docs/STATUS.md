@@ -1024,17 +1024,26 @@ What 0006 fixes in ps3recomp to make that run:
     only queues a wait for the RSX. Other [hitch]es: the game's own 100 ms
     usleeps while loading, and single 40-60 ms renderer frames uploading
     10-20 MB of new textures when an area first appears.
-76. Skipping the opening logos (tools/game_patches.py, logoSkip). The
-    full-screen movie player (v1.00 US func_0021FC6C, called with 995 by
-    the boot sequence at 0x1ACACC) reads the pad twice per loop; Start
-    (bit 0x8 of the pad word at +4), after the movie's first 40 frames,
-    skips any movie except 995 -- the Sony / Game Republic / middleware
-    logos, about 30 s. With the engine setting skip_logos (menu: Movies,
-    on by default) the compare against 995 never matches, so Start skips
-    them too. Sites: US 0x22045C, EU 0x220454, US-1.10 0x2219F0, EU-1.10
-    0x221A04 (both pad checks in each). build.ps1 now runs game_patches.py
-    on the lifted code before every build, so code lifted before a fix was
-    added picks it up without a relift. Not yet tried on Windows.
+76. Skipping the opening logos (tools/game_patches.py: logoSkip,
+    logoAlways, logoStills). The boot sequence (v1.00 US func_001ACACC)
+    plays movie 995 (the logo movie) through the full-screen movie player
+    (func_0021FC6C), then shows six still logos, textures Logo0-Logo5,
+    through func_001AC750 (fade in / hold / fade out, no pad check; the
+    lifter splits it, the loop is in func_001AC7BC). The movie loop reads
+    the pad twice per pass; Start (bit 0x8 of the pad word at +4), after the
+    movie's first 40 frames, skips any movie except 995. Engine setting
+    skip_logos = off / start / always (menu: Opening logos; start by
+    default): with start or always the 995 exception is gone; the Start bit
+    goes through folklore_logo_movie_start_bit, which notes a Start press
+    during the logo movie and reports Start held for 995 with always; the
+    still logos' loop leaves through its own exit when Start was pressed
+    during the logos (the movie's pad read, or the engine menu's controller
+    and Enter key poll) or with always. Sites per release in REGIONS. The
+    legal notice after the logos (tk_titlelegal) is not touched. build.ps1
+    now runs game_patches.py on the lifted code before every build, so code
+    lifted before a fix was added picks it up without a relift. Tested
+    here: all four lifts take the patches, also on top of the first
+    version, and the patched files compile. Not yet tried on Windows.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

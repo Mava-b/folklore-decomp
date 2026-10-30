@@ -68,9 +68,21 @@ struct EngineSettings
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
     bool physicsFrameStep = true;
-    /* Start skips the opening logos (movie 995) as it skips every other
-     * movie, after the first 40 frames (folklore_logo_movie_skippable). */
-    bool skipLogos = true;
+    /* The opening logos: the logo movie (995) and the six still logos after
+     * it (tools/game_patches.py, logoSkip / logoStills / logoAlways).
+     *   Off     as on the PS3: they all play.
+     *   Start   Start skips them: the movie as it skips the game's other
+     *           movies (after its first 40 frames), and once Start has been
+     *           pressed during them, the still logos that are left.
+     *   Always  never shown: the movie ends after its first 40 frames (a
+     *           blank 2/3 s) and the still logos are passed over. */
+    enum class LogoSkip
+    {
+        Off,
+        Start,
+        Always,
+    };
+    LogoSkip logoSkip = LogoSkip::Start;
     /* Motion controls for capturing Folks, whatever the controller: on, the
      * gestures come from its motion sensors (DualShock 3 or 4, DualSense,
      * Switch Pro) and a controller without them still captures by itself;
@@ -121,6 +133,12 @@ bool engineSettingsLanguageSelectable();
 GameLanguage engineSettingsActiveLanguage();
 const char* engineSettingsLanguageName(GameLanguage language);
 
+/* Start was pressed during the opening logos: the remaining still logos are
+ * skipped (EngineSettings::LogoSkip::Start). Noted by the movie player's pad
+ * read and by the engine menu's controller and keyboard poll each frame. */
+void engineNoteLogoStart();
+bool engineLogoStartPressed();
+
 extern "C"
 {
     /* Called from the lifted main loops (see tools/patch_limiter.py). */
@@ -136,4 +154,9 @@ extern "C"
     /* Called from the lifted movie player (tools/game_patches.py, the
      * logoSkip patch): 1 when Start may skip the opening logos. */
     int folklore_logo_movie_skippable(void);
+    /* The movie loop's Start test (the pad bit it read, 0 or 8): 8 for the
+     * logo movie when the logos are never shown. */
+    int folklore_logo_movie_start_bit(int startBit, int movieNumber);
+    /* Each frame of a still logo: 1 to end the logos now. */
+    int folklore_logo_stills_skip(void);
 }

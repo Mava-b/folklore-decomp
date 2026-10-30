@@ -1066,9 +1066,20 @@ namespace
                 }
             }
 
-            ImGui::SeparatorText("Movies");
-            changed |= ImGui::Checkbox("Start skips the opening logos (as it skips the other movies)",
-                                       &settings.skipLogos);
+            ImGui::SeparatorText("Opening logos");
+            {
+                int logoSkipIndex = (int)settings.logoSkip;
+                bool logoSkipChanged = ImGui::RadioButton("Play them##logos", &logoSkipIndex, 0);
+                ImGui::SameLine();
+                logoSkipChanged |= ImGui::RadioButton("Start skips them##logos", &logoSkipIndex, 1);
+                ImGui::SameLine();
+                logoSkipChanged |= ImGui::RadioButton("Never show them##logos", &logoSkipIndex, 2);
+                if (logoSkipChanged)
+                {
+                    settings.logoSkip = (EngineSettings::LogoSkip)logoSkipIndex;
+                    changed = true;
+                }
+            }
 
             ImGui::SeparatorText("Physics");
             changed |= ImGui::Checkbox("Step physics by the frame time (fixes cloth and hair above 30 fps)",
@@ -1125,6 +1136,12 @@ namespace
         const bool toggleKey = focused && keyDown(VK_F1);
         const bool escapeKey = focused && keyDown(VK_ESCAPE);
         const WORD pressed = (WORD)(controller.buttons & ~menu.previousButtons);
+        /* Start (or Enter, the key mapped to it) during the opening logos
+         * skips the still logos that are left (EngineSettings::LogoSkip). */
+        if (!menu.menuOpen && ((pressed & XINPUT_GAMEPAD_START) || (focused && keyDown(VK_RETURN))))
+        {
+            engineNoteLogoStart();
+        }
         bool toggle = (chordNow && !chordBefore) || (toggleKey && !menu.previousToggleKey);
         if (menu.menuOpen && !toggle)
         {

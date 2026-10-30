@@ -35,6 +35,8 @@ REGIONS = {
                     {"loop": "003C9184", "back": "003C9170", "exit": "003C91A0"}),
         "toc": {"workTop": 0x20C0, "allocator": 0x263C},
         "logoSkip": ("func_0021FC6C", 0x0022045C),
+        "logoAlways": 0x00220444,
+        "logoStills": ("func_001AC7BC", 0x001AC750),
     },
     "EU": {
         "movieHold": ("func_001A4784", 0x001A48C8),
@@ -45,6 +47,8 @@ REGIONS = {
                     {"loop": "003C913C", "back": "003C9128", "exit": "003C9158"}),
         "toc": {"workTop": 0x20E0, "allocator": 0x265C},
         "logoSkip": ("func_0021FC64", 0x00220454),
+        "logoAlways": 0x0022043C,
+        "logoStills": ("func_001AC7C0", 0x001AC754),
     },
     # The 1.10 update's executables. Every function these fixes touch is the
     # same code as in 1.00 (aligned function by function, docs/REGIONS.md),
@@ -58,6 +62,8 @@ REGIONS = {
                     {"loop": "003CD90C", "back": "003CD8F8", "exit": "003CD928"}),
         "toc": {"workTop": 0x2020, "allocator": 0x259C},
         "logoSkip": ("func_00221200", 0x002219F0),
+        "logoAlways": 0x002219D8,
+        "logoStills": ("func_001ADA08", 0x001AD99C),
     },
     "EU-1.10": {
         "movieHold": ("func_001A59EC", 0x001A5B30),
@@ -68,6 +74,8 @@ REGIONS = {
                     {"loop": "003CD8E4", "back": "003CD8D0", "exit": "003CD900"}),
         "toc": {"workTop": 0x2038, "allocator": 0x25B4},
         "logoSkip": ("func_00221214", 0x00221A04),
+        "logoAlways": 0x002219EC,
+        "logoStills": ("func_001ADA28", 0x001AD9BC),
     },
 }
 
@@ -127,6 +135,7 @@ PHYSICS_PLAN = (
 #   ("before_line", pattern, text)     text goes in front of the line matching pattern
 #   ("after_line", pattern, text)      text goes after the line matching pattern
 #   ("replace", pattern, replacement)  re.sub of the one match of pattern
+#   ("replace_all", pattern, replacement, count)  re.sub of all `count` matches
 # Every pattern must match exactly once in the function.
 def buildPatches(regionName):
     region = REGIONS[regionName]
@@ -241,6 +250,51 @@ def buildPatches(regionName):
             ("replace", logoCompare % r"\(\(", logoReplacement),
         ],
     })
+    alwaysAddress = region["logoAlways"]
+    patches.append({
+        "address": alwaysAddress,
+        "function": logoFunction,
+        "why": (
+            "The same two pad reads: the Start bit the movie loop tests goes through "
+            "folklore_logo_movie_start_bit, which notes a Start press during the logo movie "
+            "(so the still logos after it are skipped too) and, with skip_logos = always, "
+            "reports Start held for movie 995, which then ends after its first 40 frames."
+        ),
+        "edits": [
+            ("before_function",
+             'extern "C" int folklore_logo_movie_start_bit(int, int); /* FOLKLORE PATCH 0x%X */\n' % alwaysAddress),
+            ("replace_all", r"^(\s*)ctx->gpr\[0\] = (ppc_rlw64\(ctx->gpr\[0\], 0, 28, 28, 0, 0\));$",
+             r"\g<1>ctx->gpr[0] = (uint64_t)folklore_logo_movie_start_bit((int)\g<2>, "
+             r"(int)vm_read32(ctx->gpr[30] + 0x108)); /* FOLKLORE PATCH 0x%X: Start and the opening logos "
+             r"(tools/game_patches.py) */" % alwaysAddress, 2),
+        ],
+    })
+    # The lifter splits the logo function after its prologue: the loop is in
+    # the second part (stillsFunction, at +0x6C); the marker keeps the entry.
+    stillsFunction, stillsAddress = region["logoStills"]
+    loopLabel = "%08X" % (stillsAddress + 0x128)
+    exitLabel = "%08X" % (stillsAddress + 0x300)
+    patches.append({
+        "address": stillsAddress,
+        "function": stillsFunction,
+        "why": (
+            "After the logo movie the boot sequence shows six still logos (textures Logo0 to "
+            "Logo5) through this function, a fade in / hold / fade out loop with no pad check: "
+            "about 30 s more. Each frame of the loop now asks folklore_logo_stills_skip, and "
+            "leaves through the function's own exit when Start was pressed during the logos "
+            "(skip_logos = start) or the logos are never shown (always)."
+        ),
+        "edits": [
+            ("before_function",
+             'extern "C" int folklore_logo_stills_skip(void); /* FOLKLORE PATCH 0x%X */\n' % stillsAddress),
+            ("after_line", r"^loc_%s:" % loopLabel,
+             "        /* FOLKLORE PATCH 0x%X: skip the still logos (tools/game_patches.py) */\n"
+             "        if (folklore_logo_stills_skip())\n"
+             "        {\n"
+             "            goto loc_%s;\n"
+             "        }\n" % (stillsAddress, exitLabel)),
+        ],
+    })
     return patches
 
 
@@ -270,6 +324,11 @@ def applyEdits(prefix, body, edits):
         elif kind == "after_line":
             _, lineEnd = findLine(body, edit[1])
             body = body[:lineEnd] + edit[2] + body[lineEnd:]
+        elif kind == "replace_all":
+            matchCount = len(re.findall(edit[1], body, re.MULTILINE))
+            if matchCount != edit[3]:
+                raise PatchError("pattern %r matches %d times, not %d" % (edit[1], matchCount, edit[3]))
+            body = re.sub(edit[1], edit[2], body, flags=re.MULTILINE)
         elif kind == "replace":
             matchCount = len(re.findall(edit[1], body, re.MULTILINE))
             if matchCount != 1:

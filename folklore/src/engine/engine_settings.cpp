@@ -14,6 +14,7 @@
 #include <windows.h>
 #include <cstdlib>
 #include <cstring>
+#include <atomic>
 #include <mutex>
 
 namespace
@@ -233,7 +234,20 @@ void engineSettingsLoad()
         }
         else if (std::strcmp(key, "skip_logos") == 0)
         {
-            settingsInstance.skipLogos = parseBool(value);
+            /* off / start / always; 0 and 1 from the first version. */
+            if (std::strcmp(value, "always") == 0)
+            {
+                settingsInstance.logoSkip = EngineSettings::LogoSkip::Always;
+            }
+            else if (std::strcmp(value, "start") == 0)
+            {
+                settingsInstance.logoSkip = EngineSettings::LogoSkip::Start;
+            }
+            else
+            {
+                settingsInstance.logoSkip = parseBool(value) ? EngineSettings::LogoSkip::Start
+                                                             : EngineSettings::LogoSkip::Off;
+            }
         }
         else if (std::strcmp(key, "fullscreen") == 0)
         {
@@ -293,8 +307,11 @@ void engineSettingsSave()
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
     std::fprintf(file, "physics_frame_step = %d\n", current.physicsFrameStep ? 1 : 0);
-    std::fprintf(file, "# 1: Start skips the opening logos, as it skips the game's other movies\n");
-    std::fprintf(file, "skip_logos = %d\n", current.skipLogos ? 1 : 0);
+    std::fprintf(file, "# opening logos: off (they all play), start (Start skips them) or always (never shown)\n");
+    const char* logoSkipText = current.logoSkip == EngineSettings::LogoSkip::Always  ? "always"
+                               : current.logoSkip == EngineSettings::LogoSkip::Start ? "start"
+                                                                                     : "off";
+    std::fprintf(file, "skip_logos = %s\n", logoSkipText);
     std::fprintf(file, "# on: capture Folks by moving the controller (DualShock 3/4, DualSense, Switch Pro); off: captures complete by themselves\n");
     std::fprintf(file, "motion_controls = %s\n", current.motionControls ? "on" : "off");
     const char* aspectText = current.aspectRatio == AspectRatio::MatchDisplay ? "display"
@@ -493,9 +510,54 @@ extern "C" int folklore_limiter_sleep_us(int originalSleepMicroseconds)
  * Returns the number of steps to take (0 = none) and the step size, or -1 to
  * run the game's original loop.
  */
+namespace
+{
+    /* Start pressed while the opening logos play (the movie loop's own pad
+     * read, or the engine menu's controller and keyboard poll). */
+    std::atomic<bool> logoStartPressed{false};
+}
+
+void engineNoteLogoStart()
+{
+    logoStartPressed.store(true, std::memory_order_relaxed);
+}
+
+bool engineLogoStartPressed()
+{
+    return logoStartPressed.load(std::memory_order_relaxed);
+}
+
 extern "C" int folklore_logo_movie_skippable(void)
 {
-    return engineSettings().skipLogos ? 1 : 0;
+    return engineSettings().logoSkip != EngineSettings::LogoSkip::Off ? 1 : 0;
+}
+
+extern "C" int folklore_logo_movie_start_bit(int startBit, int movieNumber)
+{
+    constexpr int kLogoMovie = 995;
+    constexpr int kStartBit = 0x8;
+    if (movieNumber == kLogoMovie)
+    {
+        if (startBit != 0)
+        {
+            engineNoteLogoStart();
+        }
+        if (engineSettings().logoSkip == EngineSettings::LogoSkip::Always)
+        {
+            return kStartBit;
+        }
+    }
+    return startBit;
+}
+
+extern "C" int folklore_logo_stills_skip(void)
+{
+    const EngineSettings::LogoSkip mode = engineSettings().logoSkip;
+    if (mode == EngineSettings::LogoSkip::Always)
+    {
+        return 1;
+    }
+    return mode == EngineSettings::LogoSkip::Start && engineLogoStartPressed() ? 1 : 0;
 }
 
 extern "C" int folklore_physics_plan_steps(float currentTime, float simulatedTime, float markerTime,
