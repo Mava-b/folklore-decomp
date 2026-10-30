@@ -1010,6 +1010,20 @@ What 0006 fixes in ps3recomp to make that run:
     (0 turns it off). Candidates from the averages: the comic panels' 2 MB
     of synchronous reads from etc.bin_ on the disc dump (LCmc*/LCmcTex are
     not in the hdd1 cache), a new 2560x720 surface, and new pipelines.
+75. Dialogue stutter (patches/0057). The [hitch] lines of the pub
+    (run-20261030-173204) showed it: as each dialogue opened, five to eight
+    frames in a row of about 220 ms, each one the game thread in WaitFlip
+    (two 100 ms caps) while the present thread sat idle with 60 draws to
+    do; "[gcm] WaitFlip: no flip shown in 100 ms (issued=N+2 drained=N
+    shown=N)". The dialogue path flips twice before flushing, so the newer
+    flip's marker is in the ring but behind `put`: the drain has done all it
+    was given and nothing can show the flip until the guest, blocked in
+    WaitFlip, flushes. WaitFlip now returns as soon as every flip the drain
+    has reached is shown and get == put (logged once as "the flips not
+    shown are not flushed yet"), as the PPU would on a PS3, where the call
+    only queues a wait for the RSX. Other [hitch]es: the game's own 100 ms
+    usleeps while loading, and single 40-60 ms renderer frames uploading
+    10-20 MB of new textures when an area first appears.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

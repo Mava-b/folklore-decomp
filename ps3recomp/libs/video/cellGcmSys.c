@@ -677,6 +677,26 @@ void cellGcmSetFlipMode(u32 mode)
     s_flip_mode = mode;
 }
 
+static u32 s_fifo_getoff;   /* tentative: defined below */
+
+/* True when every flip the drain could still reach is already on screen and
+ * the drain has executed everything the guest has published (get == put):
+ * the flips still not shown have markers the guest wrote but has not flushed
+ * yet. Waiting for them cannot help -- only the guest, blocked in WaitFlip,
+ * would publish them -- so it used to end in the 100 ms cap, two of them per
+ * frame. Folklore's dialogue scenes flip twice before flushing, and played
+ * at four or five frames a second for a second or more as each one opened. On
+ * a PS3 the call only queues a wait for the RSX, and the PPU never blocks. */
+static int gcm_waitflip_only_unsubmitted(int depth)
+{
+    if ((int)(s_flips_drained - s_flips_shown) > depth)
+    {
+        return 0;
+    }
+    const u32 put = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+    return s_fifo_getoff == put;
+}
+
 /* NID: 0xC44D8F34 */
 void cellGcmSetWaitFlip(void)
 {
@@ -726,12 +746,29 @@ void cellGcmSetWaitFlip(void)
           {
               const u64 waitBegin = gcm_perf_now_ns();
               int waited = 0;
+              int unsubmitted = 0;
               while (waited < 100 && (int)(s_flips_issued - s_flips_shown) > depth)
               {
+                  if (gcm_waitflip_only_unsubmitted(depth))
+                  {
+                      unsubmitted = 1;
+                      break;
+                  }
                   Sleep(1);
                   waited++;
               }
               g_gcm_perf_waitflip_ns += gcm_perf_now_ns() - waitBegin;
+              if (unsubmitted)
+              {
+                  static int unsubmittedReports = 0;
+                  if (unsubmittedReports < 8)
+                  {
+                      unsubmittedReports++;
+                      fprintf(stderr, "[gcm] WaitFlip: the flips not shown are not flushed yet (issued=%u drained=%u shown=%u) -- not waiting\n",
+                              s_flips_issued, s_flips_drained, s_flips_shown);
+                  }
+                  return;
+              }
               /* 100 ms with no flip reaching the screen: the renderer is
                * stalled. Let the game go on, and count it ([fps] line). The
                * flip counters cannot drift apart any more (the markers are
