@@ -208,6 +208,22 @@ s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
     return (s32)CELL_VDEC_ERROR_BUSY;
 }
 
+/* Decoders open right now: a movie is playing. The flip pacing keeps one
+ * flip per vblank while one is, whatever the frame-rate setting
+ * (cellGcm_set_flip_per_present), as the game paces its movies by flips. */
+int cellVdec_open_count(void)
+{
+    int openCount = 0;
+    for (int slotIndex = 0; slotIndex < MAX_VDEC; slotIndex++)
+    {
+        if (s_vdec[slotIndex].in_use)
+        {
+            openCount++;
+        }
+    }
+    return openCount;
+}
+
 s32 cellVdecClose(CellVdecHandle handle)
 {
     printf("[cellVdec] Close(handle=%u)\n", handle);

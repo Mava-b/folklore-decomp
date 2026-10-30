@@ -449,6 +449,10 @@ extern "C" int folklore_system_language(void)
     return activeLanguageCode;
 }
 
+/* patches/0058: retire a flip at every present (the display's refresh)
+ * rather than once per 59.94 Hz vblank, except while a movie plays. */
+extern "C" void cellGcm_set_flip_per_present(int enabled);
+
 extern "C" int folklore_limiter_target(int originalTarget)
 {
     /* The first frame end: the renderer is up, so widen the game's
@@ -463,7 +467,9 @@ extern "C" int folklore_limiter_target(int originalTarget)
             folklore_apply_aspect(activeAspect);
         }
     }
-    switch (engineSettings().frameRateCap)
+    const FrameRateCap frameRateCap = engineSettings().frameRateCap;
+    cellGcm_set_flip_per_present(frameRateCap == FrameRateCap::Unlimited ? 1 : 0);
+    switch (frameRateCap)
     {
     case FrameRateCap::Sixty:
         /* 30 fps -> 60 fps; the 47 ms mode scaled by the same factor. The

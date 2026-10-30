@@ -14,7 +14,7 @@ enum class FrameRateCap : int
 {
     Original = 0,       /* the game's own limiter: 30 fps (21 in its heavy mode) */
     Sixty = 1,          /* the limiter's targets scaled to 60 fps */
-    Unlimited = 2,      /* limiter off; still paced by the 59.94 Hz flip */
+    Unlimited = 2,      /* limiter off; up to the display refresh (patches/0058) */
 };
 
 enum class AspectRatio : int

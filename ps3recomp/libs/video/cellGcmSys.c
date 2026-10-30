@@ -972,6 +972,22 @@ static void gcm_retire_one_flip(u64 now)
  * frame to the next -- the game waits in cellGcmSetWaitFlip for exactly
  * this. Still one flip per vblank. GCM_FLIP_SHOWN_AT_PRESENT=0 leaves it to
  * the tick alone. */
+/* Retire a flip at every present instead of at most one per 59.94 Hz
+ * vblank: the frame rate is then held only by the display (the present
+ * waits for its refresh, 120 or 144 Hz on a high-refresh monitor) and the
+ * renderer. For a title that times its frames by the clock -- Folklore
+ * reads the time base each frame -- this is an uncapped frame rate; the
+ * guest's own vblank count and handlers stay at 59.94 Hz. While a video
+ * decoder is open the old rule holds: movies are paced by flips, and played
+ * 2.4 times too fast at 144 Hz without it. Off by default. */
+static volatile int s_flip_per_present = 0;
+extern int cellVdec_open_count(void);
+
+void cellGcm_set_flip_per_present(int enabled)
+{
+    s_flip_per_present = enabled ? 1 : 0;
+}
+
 void cellGcm_note_frame_presented(void)
 {
     static int enabled = -1;
@@ -984,7 +1000,7 @@ void cellGcm_note_frame_presented(void)
     {
         return;
     }
-    if (s_tick_of_last_retire == s_vblank_ticks)
+    if (s_tick_of_last_retire == s_vblank_ticks && !(s_flip_per_present && cellVdec_open_count() == 0))
     {
         return;
     }

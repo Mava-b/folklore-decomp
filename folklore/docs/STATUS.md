@@ -1044,6 +1044,21 @@ What 0006 fixes in ps3recomp to make that run:
     lifted before a fix was added picks it up without a relift. Tested
     here: all four lifts take the patches, also on top of the first
     version, and the patched files compile. Not yet tried on Windows.
+77. Unlimited frame rate above 60 (patches/0058). Reported: unlimited was
+    "a mess" on a 120/144 Hz monitor. It could never pass 60: since 0034 a
+    flip is retired at most once per 59.94 Hz vblank tick (movies are paced
+    by flips and ran fast otherwise), and WaitFlip holds the game to that.
+    So unlimited only took the game's limiter away, the game ran a frame
+    ahead and blocked, and the frames reached a 144 Hz present unevenly.
+    The game times its frames by the time base (mftb, func_0021CCB4 in the
+    main loops), not the vblank count, so it can run faster: with
+    cellGcm_set_flip_per_present(1), set by folklore_limiter_target when
+    the cap is Unlimited, a flip is retired at every present -- which waits
+    for the display's own refresh (Present(1, 0)) -- except while a video
+    decoder is open (cellVdec_open_count), so movies keep one flip per
+    vblank. The guest's vblank count and handlers stay at 59.94 Hz. Not yet
+    tried on Windows; things to watch above 60: game speed and timers,
+    animation, and the renderer keeping up (the pub drained in 9-11 ms).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

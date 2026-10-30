@@ -170,7 +170,9 @@ closes. The game ignores the controller while the menu is open. Settings are
 saved to `folklore_settings.ini`.
 
 - **Frame rate**: 30 fps (the game's own limiter), 60 fps or unlimited.
-  Above 30 is experimental — the game was built for 30.
+  Unlimited runs as fast as your display refreshes (120 or 144 fps on a
+  high-refresh monitor, if your PC keeps up); movies still play at their own
+  speed. Above 30 is experimental — the game was built for 30.
 - **Precise frame limiter**: wakes every 1 ms instead of every 10 ms, so
   frames end on time (on by default).
 - **Motion controls** (on by default): capture Folks by moving the controller,

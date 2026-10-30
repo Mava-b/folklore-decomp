@@ -1034,7 +1034,7 @@ namespace
             ImGui::SeparatorText("Frame rate");
             changed |= radioCap("30 fps (original)", FrameRateCap::Original);
             changed |= radioCap("60 fps (experimental)", FrameRateCap::Sixty);
-            changed |= radioCap("Unlimited (experimental, paced by the 60 Hz flip)", FrameRateCap::Unlimited);
+            changed |= radioCap("Unlimited (up to your display's refresh rate, e.g. 120 or 144 Hz)", FrameRateCap::Unlimited);
             ImGui::TextDisabled("Above 30 fps the game logic may run differently (timing).");
 
             ImGui::SeparatorText("Controls");
