@@ -1223,6 +1223,8 @@ static u64 g_ld_shader_disk_hits[2] = {0, 0};
 static u64 g_ld_shader_disk_misses[2] = {0, 0};
 static u64 g_ld_shader_disk_writes[2] = {0, 0};
 static u64 g_ld_shader_disk_rejects = 0;
+/* Texture bytes copied to the GPU, for the [hitch] line. */
+static u64 g_ld_texture_upload_bytes = 0;
 
 /*
  * Profile-lane-only renderer accounting.  These counters deliberately live
@@ -2089,6 +2091,8 @@ static D3D12_GPU_DESCRIPTOR_HANDLE sampler_table(const u32 slots[SMP_TABLE_SIZE]
 /* ---------------------------------------------------------------------------
  * command list submit/wait (simple synchronous model, like the harness)
  * -----------------------------------------------------------------------*/
+u64 ps3_fs_read_ns(void);      /* [hitch] line, runtime/ppu/ppu_fs.cpp */
+u64 ps3_fs_read_bytes(void);
 extern volatile u64 g_gcm_perf_gpu_wait_ns;   /* [fps] breakdown, cellGcmSys.c */
 extern volatile u64 g_gcm_perf_swap_ns;
 extern volatile u64 g_gcm_perf_waitflip_ns;
@@ -2541,6 +2545,7 @@ static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t*
         dst.SubresourceIndex = m;
         g.list->lpVtbl->CopyTextureRegion(g.list, &dst, 0, 0, 0, &src, NULL);
         g.upload_used = start + pitch * lv[m].rows;
+        g_ld_texture_upload_bytes += (u64)pitch * lv[m].rows;
 #if defined(YZ_PERF_PROFILE)
         g_ld_profile.total.texture_upload_bytes +=
             (u64)pitch * lv[m].rows;
@@ -2601,6 +2606,7 @@ static ID3D12Resource* create_texture_cube(
             g.list->lpVtbl->CopyTextureRegion(
                 g.list, &dst, 0, 0, 0, &src, NULL);
             g.upload_used = start + pitch * level->rows;
+            g_ld_texture_upload_bytes += (u64)pitch * level->rows;
 #if defined(YZ_PERF_PROFILE)
             g_ld_profile.total.texture_upload_bytes +=
                 (u64)pitch * level->rows;
@@ -12226,6 +12232,86 @@ void rsx_live_draw_present(u32 buffer_id)
                     g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
                 g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
                 g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf);
+    /* [hitch]: one line for each frame that took much longer than a vblank,
+     * with where that frame's time went. The [fps] lines average over five
+     * seconds, so a single 150 ms stall (a dialogue box opening, say) only
+     * shows there as 57 fps. PS3_HITCH_MS sets the threshold (default 50,
+     * 0 turns it off); at most 400 lines a run. */
+    { static int hitchThresholdMs = -1;
+      static u64 previousTicks = 0;
+      static u32 hitchLines = 0;
+      static u64 lastWaitFlip = 0, lastUsleep = 0, lastSyscall = 0, lastHle = 0;
+      static u64 lastDrain = 0, lastPresent = 0, lastGpu = 0, lastSwap = 0, lastRingWait = 0;
+      static u64 lastFileNs = 0, lastFileBytes = 0, lastUploadBytes = 0;
+      static u64 lastCompiles = 0, lastGeomMisses = 0;
+      static LONG lastPsoJobs = 0, lastPsoSkipped = 0;
+      static u32 lastSurfaces = 0;
+      static ld_draw_perf lastPerf;
+      if (hitchThresholdMs < 0)
+      {
+          const char* thresholdText = getenv("PS3_HITCH_MS");
+          hitchThresholdMs = thresholdText ? atoi(thresholdText) : 50;
+          if (hitchThresholdMs < 0)
+          {
+              hitchThresholdMs = 0;
+          }
+      }
+      const u64 nowTicks = ld_perf_ticks();
+      const u64 fileNs = ps3_fs_read_ns();
+      const u64 fileBytes = ps3_fs_read_bytes();
+      const u64 compiles = g_ld_shader_disk_misses[0] + g_ld_shader_disk_misses[1];
+      const LONG psoJobs = InterlockedCompareExchange(&g_ld_pso_jobs_pending, 0, 0);
+      const LONG psoSkipped = InterlockedCompareExchange(&g_ld_pso_draws_skipped, 0, 0);
+      const ld_draw_perf nowPerf = g_ld_draw_perf;
+      if (hitchThresholdMs > 0 && previousTicks != 0)
+      {
+          const double frameMs = ld_perf_ticks_to_ms(nowTicks - previousTicks);
+          if (frameMs >= (double)hitchThresholdMs && hitchLines < 400u)
+          {
+              hitchLines++;
+              fprintf(stderr,
+                      "[hitch] frame %u: %.0f ms. game thread: waitflip %.1f, usleep %.1f, syscalls %.1f, HLE %.1f ms; "
+                      "file reads %.1f ms (%llu KB, all threads); present thread: drain %.1f, execute+present %.1f, "
+                      "gpu wait %.1f, swap %.1f ms, ring held %.1f ms; renderer %.1f ms (%llu draws: fetch %.1f, "
+                      "shaders %.1f, textures %.1f); new shaders compiled %llu, shader jobs queued %ld, draws waiting "
+                      "for shaders %ld; textures uploaded %llu KB; new surfaces %u; geometry misses %llu\n",
+                      g_ld_frames, frameMs,
+                      (double)(g_gcm_perf_waitflip_ns - lastWaitFlip) / 1e6,
+                      (double)(g_gcm_perf_main_usleep_ns - lastUsleep) / 1e6,
+                      (double)(g_gcm_perf_main_syscall_ns - lastSyscall) / 1e6,
+                      (double)(g_gcm_perf_main_hle_ns - lastHle) / 1e6,
+                      (double)(fileNs - lastFileNs) / 1e6,
+                      (unsigned long long)((fileBytes - lastFileBytes) / 1024u),
+                      (double)(g_gcm_perf_drain_ns - lastDrain) / 1e6,
+                      (double)(g_gcm_perf_present_ns - lastPresent) / 1e6,
+                      (double)(g_gcm_perf_gpu_wait_ns - lastGpu) / 1e6,
+                      (double)(g_gcm_perf_swap_ns - lastSwap) / 1e6,
+                      (double)(g_gcm_perf_ring_wait_ns - lastRingWait) / 1e6,
+                      ld_perf_ticks_to_ms(nowPerf.totalTicks - lastPerf.totalTicks),
+                      (unsigned long long)(nowPerf.draws - lastPerf.draws),
+                      ld_perf_ticks_to_ms(nowPerf.fetchTicks - lastPerf.fetchTicks),
+                      ld_perf_ticks_to_ms(nowPerf.shaderTicks - lastPerf.shaderTicks),
+                      ld_perf_ticks_to_ms(nowPerf.bindTicks - lastPerf.bindTicks),
+                      (unsigned long long)(compiles - lastCompiles),
+                      (long)(psoJobs - lastPsoJobs),
+                      (long)(psoSkipped - lastPsoSkipped),
+                      (unsigned long long)((g_ld_texture_upload_bytes - lastUploadBytes) / 1024u),
+                      g.n_surfaces - lastSurfaces,
+                      (unsigned long long)(g_ld_geom_misses - lastGeomMisses));
+          }
+      }
+      previousTicks = nowTicks;
+      lastWaitFlip = g_gcm_perf_waitflip_ns; lastUsleep = g_gcm_perf_main_usleep_ns;
+      lastSyscall = g_gcm_perf_main_syscall_ns; lastHle = g_gcm_perf_main_hle_ns;
+      lastDrain = g_gcm_perf_drain_ns; lastPresent = g_gcm_perf_present_ns;
+      lastGpu = g_gcm_perf_gpu_wait_ns; lastSwap = g_gcm_perf_swap_ns;
+      lastRingWait = g_gcm_perf_ring_wait_ns;
+      lastFileNs = fileNs; lastFileBytes = fileBytes;
+      lastUploadBytes = g_ld_texture_upload_bytes;
+      lastCompiles = compiles; lastGeomMisses = g_ld_geom_misses;
+      lastPsoJobs = psoJobs; lastPsoSkipped = psoSkipped;
+      lastSurfaces = g.n_surfaces;
+      lastPerf = nowPerf; }
     /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
      * Exists because pace repeatedly had to be inferred from frame-counter
      * arithmetic and log ordering, and two such inferences were wrong in one

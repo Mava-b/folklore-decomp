@@ -429,6 +429,15 @@ static inline void fs_prefault(uint32_t buf, uint64_t len)
     p[len - 1] = p[len - 1];
 }
 
+/* Time and bytes spent in cellFsRead, for the renderer's [hitch] line: a
+ * frame that stalls on a file read shows it there. */
+extern "C" {
+std::atomic<uint64_t> g_fs_read_ns_atomic{0};
+std::atomic<uint64_t> g_fs_read_bytes_atomic{0};
+uint64_t ps3_fs_read_ns(void) { return g_fs_read_ns_atomic.load(std::memory_order_relaxed); }
+uint64_t ps3_fs_read_bytes(void) { return g_fs_read_bytes_atomic.load(std::memory_order_relaxed); }
+}
+
 static void cellFsRead(ppu_context* ctx)
 {
     int fd          = (int)(uint32_t)ctx->gpr[3];
@@ -440,7 +449,12 @@ static void cellFsRead(ppu_context* ctx)
     long fpos_before = ftell(g_files[fd]);
     if (ppu_vm_size && (uint64_t)buf + nbytes > ppu_vm_size) nbytes = ppu_vm_size - buf;
     fs_prefault(buf, nbytes);
+    const auto readBegin = std::chrono::steady_clock::now();
     size_t n = fread(vm_base + buf, 1, (size_t)nbytes, g_files[fd]);   /* raw bytes, no swap */
+    g_fs_read_ns_atomic.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                      std::chrono::steady_clock::now() - readBegin).count(),
+                                  std::memory_order_relaxed);
+    g_fs_read_bytes_atomic.fetch_add(n, std::memory_order_relaxed);
     if (getenv("PS3_FS_AIO_LOG"))
     {
         const char* slash = strrchr(g_fd_host_path[fd], '/');

@@ -997,6 +997,19 @@ What 0006 fixes in ps3recomp to make that run:
     never removed. Tested off Windows with tools/test_dlc_import.cpp
     --remove on the European test install: pack files, copies and records
     go, pack 17 is refused, re-import restores everything.
+74. Short stalls (patches/0056): the [fps] lines average five seconds, so a
+    single 150 ms stall -- reported as lag when the first dialogue in the
+    Doolin pub opens -- only shows as 57-58 fps there (about 10-15 frames
+    lost around each comic panel and room change in run-20261030-160602).
+    Each frame that takes 50 ms or more now gets a [hitch] line with its
+    time split between the game thread (waitflip, usleep, HLE, cellFsRead
+    time and bytes on all threads) and the present thread (drain, renderer
+    with its fetch/shader/texture split, GPU wait, swap), plus the shaders
+    compiled, draws waiting for background shaders, texture KB uploaded and
+    render surfaces created in that frame. PS3_HITCH_MS sets the threshold
+    (0 turns it off). Candidates from the averages: the comic panels' 2 MB
+    of synchronous reads from etc.bin_ on the disc dump (LCmc*/LCmcTex are
+    not in the hdd1 cache), a new 2560x720 surface, and new pipelines.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
