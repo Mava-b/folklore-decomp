@@ -1,19 +1,6 @@
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -99,9 +99,9 @@
- #if defined(YZ_PERF_CLEAN)
- #define LD_DIAG_ENABLED(name) 0
- #else
--/* Cached per call site: several of these sit on per-draw paths. */
--#define LD_DIAG_ENABLED(name) ({ static int _ld_diag = -1; \
--    if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
-+/* Cached per call site: several of these sit on per-draw paths. */
-+#define LD_DIAG_ENABLED(name) ({ static int _ld_diag = -1; \
-+    if (_ld_diag < 0) _ld_diag = getenv(name) != NULL; _ld_diag; })
- #endif
- #include <string.h>
- 
 @@ -1223,6 +1223,8 @@
  static u64 g_ld_shader_disk_misses[2] = {0, 0};
  static u64 g_ld_shader_disk_writes[2] = {0, 0};
@@ -48,15 +35,6 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  #if defined(YZ_PERF_PROFILE)
              g_ld_profile.total.texture_upload_bytes +=
                  (u64)pitch * level->rows;
-@@ -9270,7 +9276,7 @@
-                   }
-               }
-           } }
--        if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
-+        if (sampled < 0 && LD_DIAG_ENABLED("LD_ALIAS_DBG")) {
-             static u32 n_dbg = 0;
-             if (n_dbg++ < 24) {
-                 fprintf(stderr, "[alias-miss] tex %u:0x%08X fmt=0x%02X %ux%u target=%u surf:",
 @@ -12226,6 +12232,86 @@
                      g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
                  g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
