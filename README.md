@@ -23,6 +23,11 @@ Extras over the PS3: 60 fps or unlimited frame rate (with physics stepped to
 match), up to 3x resolution, ultrawide, FXAA, anisotropic filtering,
 sharpening, borderless fullscreen, save backups.
 
+Builds can be made from the v1.00 disc or from the game's **1.10 update**
+(rumble, and the newer Folk data), and the **downloadable content** you bought
+can be added from the in-game menu — see
+[*1.10 with the DLC, step by step*](#110-with-the-dlc-step-by-step).
+
 ---
 
 ## Requirements — read this first
@@ -199,6 +204,61 @@ saved to `folklore_settings.ini`.
 Escape closes the menu; it does not quit the game (use the window's close
 button or Alt+F4).
 
+### 1.10 with the DLC, step by step
+
+What you need, all your own: the Folklore disc dump (as above), the 1.10
+update `.pkg` for your release, and each add-on pack's `.pkg` with its `.rap`
+licence. RPCS3 is used only to install and decrypt them.
+
+1. **Install the update and the packs in RPCS3.** **File → Install
+   Packages/Raps/Edats**, then select the update's `.pkg`, every pack's `.pkg`
+   and every `.rap` (several at once is fine). They go into RPCS3's own
+   `dev_hdd0`: the update and packs into `dev_hdd0\game\BCUS98147` (or
+   `BCES00050`), the licences into `dev_hdd0\home\00000001\exdata`. You do
+   not need to start the game in RPCS3.
+2. **Decrypt the update's EBOOT.** **Utilities → Decrypt PS3 Binaries**, and
+   choose `<RPCS3>\dev_hdd0\game\BCUS98147\USRDIR\EBOOT.BIN` — the update's,
+   not the one in your disc dump (RPCS3's *Open game folder* opens the dump).
+   RPCS3 writes `EBOOT.elf` beside it: 6,520,504 bytes (US) or 6,520,480
+   bytes (EU).
+3. **Build the 1.10 version.** In this folder:
+
+   ```powershell
+   .\setup.ps1 -GameDir D:\Games\BCUS98147 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147
+   .\build.ps1
+   ```
+
+   `-GameDir` is your disc dump, `-UpdateDir` the update folder from step 1.
+   To keep the disc version too, leave this folder as it is and use
+   `.\build_all.ps1 -UsUpdateDir <RPCS3>\dev_hdd0\game\BCUS98147` (and/or
+   `-EuUpdateDir ...\BCES00050`): it builds the 1.10 versions in copies
+   beside this folder (`Folklore-1.10`, `Folklore-EU-1.10`).
+
+   With a ready-made **1.10 package** instead (`Folklore-<date>_1.10.zip`):
+   skip this step; the first time you start it, it asks for the disc dump
+   and then for the update folder.
+4. **Start the game** with `run.bat` (in the 1.10 copy, if you used
+   `build_all.ps1`). The game's options now have a *Vibration* setting.
+5. **Add the DLC.** Press **F1** (or L3+R3), go to **Downloadable content**
+   and press **Add DLC from RPCS3...**. Choose RPCS3's folder — the one with
+   `dev_hdd0` in it. A progress bar runs for about half a minute, then the
+   menu lists the packs it installed (and any it could not, with the reason:
+   usually a missing `.rap`).
+6. **Restart the game.** F1 now shows *Installed: Add-on pack 1, ...*, and the
+   new quests and Folks are in the game as they were on a PS3.
+
+Good to know:
+
+- Each project copy (and each package folder) has its own `hdd0\`, so add the
+  DLC once in each one you play. `run.bat -ResetInstall` empties `hdd0\`, DLC
+  included; press *Add DLC* again afterwards.
+- European packs need their own European licences; North American ones do not
+  work in a European build.
+- Saves work in both versions; copy them across with the menu's save
+  snapshots, or `gamedata\` between folders.
+- Nothing in your disc dump or in RPCS3's folder is ever changed.
+
+### Downloadable content
 ### Downloadable content
 
 Folklore's add-on packs from your own purchase: install each pack's `.pkg`
