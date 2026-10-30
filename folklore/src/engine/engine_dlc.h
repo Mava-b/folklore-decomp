@@ -61,6 +61,23 @@ std::string engineDlcInstall(const DlcSource& source,
 /* The packs this port's hdd0 has installed (from install.dat_), in order. */
 std::vector<int> engineDlcInstalledPacks();
 
+/* Removing packs. A removal is only asked for while the game runs (it may
+ * have the pack's files open, or their data loaded) and is carried out at
+ * the next start, before the game opens anything: the files recorded under
+ * the pack in install.dat_ are deleted and their lines taken out. Pack 17,
+ * the 1.10 update's own data, is never removed. */
+void engineDlcScheduleRemoval(const std::vector<int>& packs);
+void engineDlcCancelRemoval(int pack);
+std::vector<int> engineDlcPendingRemovals();
+
+/* At start (engine_portable.cpp): carry out the pending removals. Returns
+ * what was done, for the log; empty when nothing was pending. The same text
+ * is kept for the engine menu (engineDlcTakeRemovalReport). */
+std::string engineDlcApplyPendingRemovals();
+
+/* The report of the removals done at this start, once; empty after. */
+std::string engineDlcTakeRemovalReport();
+
 /* "Add-on pack 3" for a paid pack (numbered by its content ID), "Free pack
  * (19)" for the others. */
 std::string engineDlcPackName(const DlcPackInfo& pack);

@@ -37,6 +37,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <set>
 #include <system_error>
@@ -930,6 +931,7 @@ std::string engineDlcInstall(const DlcSource& source,
         }
         installedPacks++;
         report += name + ": installed (" + std::to_string(plan.info.fileCount) + " files).\n";
+        engineDlcCancelRemoval(plan.info.pack);     /* added again: no longer to be removed */
     }
     if (installedPacks > 0 && source.otherRegion)
     {
@@ -965,4 +967,168 @@ std::vector<int> engineDlcInstalledPacks()
         }
     }
     return std::vector<int>(packs.begin(), packs.end());
+}
+
+/* ---- Removal ---------------------------------------------------------------
+ * port_dlc_remove.txt (beside install.dat_) holds the pack numbers to remove
+ * at the next start; port_dlc_removed.txt the report of the last removal,
+ * for the engine menu to show once. */
+namespace
+{
+    fs::path pendingRemovalPath()
+    {
+        return targetBin() / "port_dlc_remove.txt";
+    }
+
+    fs::path removalReportPath()
+    {
+        return targetBin() / "port_dlc_removed.txt";
+    }
+
+    void writePendingRemovals(const std::set<int>& packs)
+    {
+        std::error_code error;
+        if (packs.empty())
+        {
+            fs::remove(pendingRemovalPath(), error);
+            return;
+        }
+        std::ofstream file(pendingRemovalPath(), std::ios::trunc);
+        file << "# Folklore port: DLC packs to remove at the next start (engine_dlc.cpp)\n";
+        for (const int pack : packs)
+        {
+            file << pack << "\n";
+        }
+    }
+
+    /* Empty folders a removal left behind, up to (not including) bin. */
+    void removeEmptyFolders(const fs::path& bin, fs::path folder)
+    {
+        std::error_code error;
+        while (!folder.empty() && folder != bin && folder.string().size() > bin.string().size())
+        {
+            if (!fs::is_empty(folder, error) || error)
+            {
+                return;
+            }
+            fs::remove(folder, error);
+            folder = folder.parent_path();
+        }
+    }
+}
+
+std::vector<int> engineDlcPendingRemovals()
+{
+    std::set<int> packs;
+    std::ifstream file(pendingRemovalPath());
+    std::string line;
+    while (std::getline(file, line))
+    {
+        if (line.empty() || line[0] == '#')
+        {
+            continue;
+        }
+        const int pack = std::atoi(line.c_str());
+        if (pack >= 10 && pack != kUpdatePack)
+        {
+            packs.insert(pack);
+        }
+    }
+    return std::vector<int>(packs.begin(), packs.end());
+}
+
+void engineDlcScheduleRemoval(const std::vector<int>& packs)
+{
+    const std::vector<int> pending = engineDlcPendingRemovals();
+    std::set<int> merged(pending.begin(), pending.end());
+    for (const int pack : packs)
+    {
+        if (pack >= 10 && pack != kUpdatePack)
+        {
+            merged.insert(pack);
+        }
+    }
+    writePendingRemovals(merged);
+}
+
+void engineDlcCancelRemoval(int pack)
+{
+    const std::vector<int> pending = engineDlcPendingRemovals();
+    std::set<int> remaining(pending.begin(), pending.end());
+    remaining.erase(pack);
+    writePendingRemovals(remaining);
+}
+
+std::string engineDlcApplyPendingRemovals()
+{
+    const std::vector<int> pending = engineDlcPendingRemovals();
+    if (pending.empty())
+    {
+        return std::string();
+    }
+    const fs::path bin = targetBin();
+    const std::set<int> toRemove(pending.begin(), pending.end());
+    std::vector<ListEntry> installed;
+    readList(bin / "install.dat_", &installed);
+
+    std::map<int, std::string> packNames = readPackNames();
+    std::vector<ListEntry> kept;
+    std::map<int, int> removedFiles;
+    std::set<int> failedPacks;
+    std::error_code error;
+    for (const ListEntry& entry : installed)
+    {
+        if (!toRemove.count(entry.pack))
+        {
+            kept.push_back(entry);
+            continue;
+        }
+        const fs::path file = bin / relativeToPath(entry.path);
+        if (isFile(file) && !fs::remove(file, error))
+        {
+            /* Still open somewhere: keep it recorded and try again next start. */
+            failedPacks.insert(entry.pack);
+            kept.push_back(entry);
+            continue;
+        }
+        removedFiles[entry.pack]++;
+        removeEmptyFolders(bin, file.parent_path());
+    }
+    writeList(bin / "install.dat_", kept);
+
+    std::string report;
+    for (const int pack : pending)
+    {
+        const std::string name = engineDlcPackNameByNumber(pack);
+        if (failedPacks.count(pack))
+        {
+            report += name + ": some files could not be deleted; trying again at the next start.\n";
+            continue;
+        }
+        report += name + ": removed (" + std::to_string(removedFiles[pack]) + " files).\n";
+        packNames.erase(pack);
+    }
+    writePackNames(packNames);
+    writePendingRemovals(failedPacks);
+    {
+        std::ofstream file(removalReportPath(), std::ios::trunc);
+        file << report;
+    }
+    std::fprintf(stderr, "[engine] DLC removal:\n%s", report.c_str());
+    return report;
+}
+
+std::string engineDlcTakeRemovalReport()
+{
+    const fs::path path = removalReportPath();
+    if (!isFile(path))
+    {
+        return std::string();
+    }
+    std::ifstream file(path);
+    std::string report((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+    file.close();
+    std::error_code error;
+    fs::remove(path, error);
+    return report;
 }

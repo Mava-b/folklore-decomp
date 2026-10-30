@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <ctime>
+#include <cctype>
 #include <filesystem>
 #include <system_error>
 
@@ -51,6 +52,12 @@ int saveDataCount()
 
 bool saveSnapshotTake(std::string& message)
 {
+    std::string name;
+    return saveSnapshotTakeLabelled(std::string(), message, name);
+}
+
+bool saveSnapshotTakeLabelled(const std::string& label, std::string& message, std::string& snapshotName)
+{
     if (saveDataCount() == 0)
     {
         message = "The game has no save data yet: save in the game first.";
@@ -58,6 +65,22 @@ bool saveSnapshotTake(std::string& message)
     }
     std::error_code error;
     std::string name = timestampName();
+    std::string cleanLabel;
+    for (const char character : label)
+    {
+        if (std::isalnum((unsigned char)character) || character == '-')
+        {
+            cleanLabel.push_back(character);
+        }
+        else if (character == ' ' && !cleanLabel.empty() && cleanLabel.back() != '-')
+        {
+            cleanLabel.push_back('-');
+        }
+    }
+    if (!cleanLabel.empty())
+    {
+        name += "-" + cleanLabel;
+    }
     fs::path target = kSnapshotRoot / name;
     for (int suffix = 2; fs::exists(target, error); suffix++)
     {
@@ -76,6 +99,7 @@ bool saveSnapshotTake(std::string& message)
         return false;
     }
     message = "Saved snapshot " + target.filename().string();
+    snapshotName = target.filename().string();
     return true;
 }
 

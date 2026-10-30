@@ -28,6 +28,7 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <cstdio>
@@ -200,7 +201,13 @@ namespace
         std::string currentFile;
         std::string report;
         std::vector<int> installed;
+        std::vector<int> pendingRemovals;
         double installedCheckedAt = -100.0;
+        /* Removal: the pack whose Remove was pressed once (0: Remove all),
+         * waiting for the confirming press; -1 none. */
+        int confirmingRemoval = -1;
+        std::string removalMessage;
+        bool removalReportTaken = false;
     };
 
     DlcImportState dlcImport;
@@ -273,6 +280,32 @@ namespace
         return settings.gameDir;
     }
 
+    /* Ask for packs to be removed at the next start, after copying the
+     * saves to a snapshot named for it (a save that uses a removed pack's
+     * Folks or items may not load without it). */
+    void requestDlcRemoval(const std::vector<int>& packs, const std::string& what)
+    {
+        std::string snapshotMessage;
+        std::string snapshotName;
+        const bool snapshotTaken = saveSnapshotTakeLabelled("before removing DLC", snapshotMessage, snapshotName);
+        engineDlcScheduleRemoval(packs);
+        std::string message = what + " will be removed when you next start the game.";
+        if (snapshotTaken)
+        {
+            message += " Your saves were copied first, to the snapshot " + snapshotName +
+                       " (Save data snapshots, below): if a save that uses this DLC's Folks or items will not load "
+                       "without it, restore that snapshot or add the DLC again.";
+        }
+        else
+        {
+            message += " (No saves to copy yet.)";
+        }
+        std::lock_guard<std::mutex> guard(dlcImport.lock);
+        dlcImport.removalMessage = message;
+        dlcImport.confirmingRemoval = -1;
+        dlcImport.installedCheckedAt = -100.0;
+    }
+
     void drawDownloadableContent()
     {
         ImGui::SeparatorText("Downloadable content");
@@ -282,12 +315,26 @@ namespace
         std::string currentFile;
         std::string report;
         std::vector<int> installed;
+        std::vector<int> pendingRemovals;
+        int confirmingRemoval = -1;
+        std::string removalMessage;
         {
             std::lock_guard<std::mutex> guard(dlcImport.lock);
             if (!dlcImport.running && ImGui::GetTime() - dlcImport.installedCheckedAt > 2.0)
             {
                 dlcImport.installed = engineDlcInstalledPacks();
+                dlcImport.pendingRemovals = engineDlcPendingRemovals();
                 dlcImport.installedCheckedAt = ImGui::GetTime();
+            }
+            if (!dlcImport.removalReportTaken)
+            {
+                /* What the last start removed, shown once. */
+                const std::string removed = engineDlcTakeRemovalReport();
+                if (!removed.empty())
+                {
+                    dlcImport.removalMessage = "Removed at this start:\n" + removed;
+                }
+                dlcImport.removalReportTaken = true;
             }
             running = dlcImport.running;
             filesDone = dlcImport.filesDone;
@@ -295,19 +342,60 @@ namespace
             currentFile = dlcImport.currentFile;
             report = dlcImport.report;
             installed = dlcImport.installed;
+            pendingRemovals = dlcImport.pendingRemovals;
+            confirmingRemoval = dlcImport.confirmingRemoval;
+            removalMessage = dlcImport.removalMessage;
         }
+
+        int pressedRemove = -2;     /* -2 nothing; 0 Remove all; else a pack */
+        int pressedKeep = -1;
         if (installed.empty())
         {
             ImGui::TextDisabled("No packs installed.");
         }
         else
         {
-            std::string names;
+            ImGui::BeginDisabled(running);
             for (const int pack : installed)
             {
-                names += (names.empty() ? "" : ", ") + engineDlcPackNameByNumber(pack);
+                ImGui::PushID(pack);
+                const bool pending =
+                    std::find(pendingRemovals.begin(), pendingRemovals.end(), pack) != pendingRemovals.end();
+                if (pending)
+                {
+                    if (ImGui::SmallButton("Keep"))
+                    {
+                        pressedKeep = pack;
+                    }
+                    ImGui::SameLine();
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "%s  (removed at the next start)",
+                                       engineDlcPackNameByNumber(pack).c_str());
+                }
+                else
+                {
+                    if (ImGui::SmallButton(confirmingRemoval == pack ? "Confirm remove" : "Remove"))
+                    {
+                        pressedRemove = pack;
+                    }
+                    ImGui::SameLine();
+                    ImGui::Text("%s", engineDlcPackNameByNumber(pack).c_str());
+                }
+                ImGui::PopID();
             }
-            ImGui::TextWrapped("Installed: %s", names.c_str());
+            if (installed.size() > 1 && pendingRemovals.size() < installed.size())
+            {
+                if (ImGui::Button(confirmingRemoval == 0 ? "Confirm: remove all DLC" : "Remove all DLC"))
+                {
+                    pressedRemove = 0;
+                }
+            }
+            ImGui::EndDisabled();
+            if (confirmingRemoval >= 0)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                   "Press again to confirm. Saves that use this DLC's Folks or items may not load "
+                                   "without it; your saves are copied to a snapshot first.");
+            }
         }
         ImGui::TextDisabled("Your own add-on packs: install each pack's .pkg and its .rap licence in RPCS3 (File >");
         ImGui::TextDisabled("Install Packages/Raps/Edats), then add them here from RPCS3's folder. The other");
@@ -330,6 +418,34 @@ namespace
         else if (!report.empty())
         {
             ImGui::TextWrapped("%s", report.c_str());
+        }
+        if (!removalMessage.empty())
+        {
+            ImGui::TextWrapped("%s", removalMessage.c_str());
+        }
+
+        if (pressedKeep > 0)
+        {
+            engineDlcCancelRemoval(pressedKeep);
+            std::lock_guard<std::mutex> guard(dlcImport.lock);
+            dlcImport.removalMessage = engineDlcPackNameByNumber(pressedKeep) + " will be kept.";
+            dlcImport.installedCheckedAt = -100.0;
+        }
+        if (pressedRemove != -2)
+        {
+            if (pressedRemove != confirmingRemoval)
+            {
+                std::lock_guard<std::mutex> guard(dlcImport.lock);
+                dlcImport.confirmingRemoval = pressedRemove;     /* first press: ask again */
+            }
+            else if (pressedRemove == 0)
+            {
+                requestDlcRemoval(installed, "All DLC");
+            }
+            else
+            {
+                requestDlcRemoval({pressedRemove}, engineDlcPackNameByNumber(pressedRemove));
+            }
         }
         if (startImport)
         {

@@ -28,6 +28,11 @@ int saveDataCount();
  * reason in `message` when there is nothing to copy or the copy fails. */
 bool saveSnapshotTake(std::string& message);
 
+/* The same, with a few words appended to the snapshot's name (letters,
+ * digits and '-' kept; e.g. "before-removing-DLC"), so it can be found
+ * later. `name` receives the snapshot's folder name. */
+bool saveSnapshotTakeLabelled(const std::string& label, std::string& message, std::string& name);
+
 /* Snapshots, newest first. */
 std::vector<SaveSnapshot> saveSnapshotList();
 

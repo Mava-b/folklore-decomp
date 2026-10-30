@@ -28,6 +28,39 @@ port's `hdd0`, and in the folder you picked. A pack whose licence is missing
 — or belongs to another account — is left out whole, with a line saying so;
 the others still go in.
 
+## Removing packs
+
+Each installed pack has a **Remove** button in the menu's *Downloadable
+content* section (press it twice to confirm), and there is **Remove all
+DLC**. A pack waiting to be removed shows *(removed at the next start)* and a
+**Keep** button that cancels it; adding the pack again cancels it too.
+
+- Before asking, the menu copies your saves to a snapshot named
+  `<date-time>-before-removing-DLC` (*Save data snapshots*). A save that uses
+  a removed pack's Folks, items or quests may not load without it — Folklore
+  was never meant to lose DLC it had — so if one does not, restore that
+  snapshot or add the pack again.
+- The removal happens at the **next start**, before the game opens any file
+  (`engineDlcApplyPendingRemovals`, called from `ps3_host_bootstrap`): while
+  the game runs it may hold the pack's files open, or have their data
+  loaded. The files recorded under the pack in `install.dat_` are deleted —
+  the `_uk`/`_en` copies of a cross-release import with them — their lines
+  taken out, and folders left empty removed. The menu then shows what was
+  removed, once. A file that cannot be deleted stays recorded and is tried
+  again at the following start.
+- Only files the DLC added are touched: the game's own first-boot files on
+  the HDD have other names (`LCm4030.bi5_~`, ...), and pack 17, the 1.10
+  update's data, is never offered. If a removed pack had replaced the 1.10
+  update's `LMonS2.bi5_` (North American free pack 19 does), the 1.10
+  build's start-up puts the update's own copy back, as the record no longer
+  says a later pack replaced it.
+- When two packs shipped the same file, the record only keeps the later
+  pack; removing that one takes the file from the earlier pack too, as on a
+  PS3. **Add DLC** again puts back whatever is missing.
+
+The pending list is `port_dlc_remove.txt` beside `install.dat_`, the last
+report `port_dlc_removed.txt`.
+
 ## Packs from the other release
 
 North American packs work in the European build, and European packs in the
@@ -130,4 +163,7 @@ copy of an RPCS3 install with all six paid packs and the free ones (a sample
 of each pack's files): every pack installed, the decrypted files matched
 their EDAT headers' sizes, a missing licence left that pack out, a licence
 for the wrong pack was refused with nothing written, and a second import
-changed nothing. Decrypting ran at about 3 MB/s.
+changed nothing. Decrypting ran at about 3 MB/s. Removal was tested the same
+way (`--remove`): a pack's files, its `_uk` copies and its record lines go,
+emptied folders with them, pack 17 is refused, and adding the DLC again
+restores everything.

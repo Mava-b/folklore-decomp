@@ -195,8 +195,8 @@ saved to `folklore_settings.ini`.
     appears).
 - **Game files**: the game folder in use (change it here; it applies on the
   next start) and where the installed data and saves are.
-- **Downloadable content**: the add-on packs installed, and **Add DLC from
-  RPCS3...** to bring in your own (below).
+- **Downloadable content**: the add-on packs installed, **Add DLC from
+  RPCS3...** to bring in your own, and **Remove** per pack (below).
 - **Performance overlay**: fps, frame time and where the time goes.
 - **Save data snapshots**: copy the game's saves to `save_snapshots\` and put
   any snapshot back later, then load it from the game's own Load menu.
@@ -273,7 +273,13 @@ and installed into `hdd0\` here — about half a minute for all six, with a
 progress bar — and the game has them from its next start. A pack without its
 licence is left out and the menu says which. North American packs work in the
 European build too (and the other way round). Nothing in RPCS3's folder is
-changed. Details: [`folklore/docs/DLC.md`](folklore/docs/DLC.md).
+changed.
+
+To take a pack out again, press its **Remove** button (twice, to confirm) or
+**Remove all DLC**. Your saves are copied to a snapshot first (a save that
+uses that pack's Folks or items may not load without it), and the pack is
+removed the next time you start the game; **Keep** cancels it before then.
+Details: [`folklore/docs/DLC.md`](folklore/docs/DLC.md).
 
 ### Motion controllers
 

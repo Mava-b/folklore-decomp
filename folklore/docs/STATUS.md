@@ -988,6 +988,15 @@ What 0006 fixes in ps3recomp to make that run:
     Tested off Windows: US packs into a European build install with their
     _uk copies (identical content, in install.dat_), a US build of the same
     folder is unchanged, re-import is a no-op. Not yet played.
+73. Removing DLC (folklore/docs/DLC.md, "Removing packs"): Remove per pack
+    and Remove all DLC in the menu, confirmed by a second press, after a
+    save snapshot named before-removing-DLC. Carried out at the next start
+    in ps3_host_bootstrap, before the game opens any file: the files
+    install.dat_ records under the pack are deleted (with the cross-release
+    _uk/_en copies), their lines removed, emptied folders tidied; pack 17 is
+    never removed. Tested off Windows with tools/test_dlc_import.cpp
+    --remove on the European test install: pack files, copies and records
+    go, pack 17 is refused, re-import restores everything.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

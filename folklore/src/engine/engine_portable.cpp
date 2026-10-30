@@ -27,6 +27,7 @@
 #include "engine_portable.h"
 #include "engine_settings.h"
 #include "engine_region.h"
+#include "engine_dlc.h"
 
 #ifdef _WIN32
 
@@ -879,6 +880,9 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     applyEnvironmentDefaults(baseDirectory, dataDirectory);
     std::fprintf(stderr, "[engine] this build: %s (%s) v%s\n", FOLKLORE_TITLE_ID, FOLKLORE_REGION_NAME,
                  FOLKLORE_VERSION_NAME);
+    /* DLC packs the engine menu was asked to remove: now, before the game
+     * opens any of their files (engine_dlc.cpp). */
+    engineDlcApplyPendingRemovals();
 
     if (elfFromCommandLine && *elfFromCommandLine)
     {

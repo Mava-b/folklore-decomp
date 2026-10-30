@@ -15,6 +15,9 @@
 #include <openssl/evp.h>
 
 #include <cstdio>
+#include <cstdlib>
+#include <string>
+#include <vector>
 
 extern "C" bool dlcAesDecryptBlock(const unsigned char key[16], const unsigned char input[16],
                                    unsigned char output[16])
@@ -34,8 +37,33 @@ int main(int argumentCount, char** arguments)
 {
     if (argumentCount < 2)
     {
-        std::fprintf(stderr, "usage: %s <folder to import from>\n", arguments[0]);
+        std::fprintf(stderr, "usage: %s <folder to import from> | --remove <pack>...\n", arguments[0]);
         return 2;
+    }
+    if (std::string(arguments[1]) == "--remove")
+    {
+        /* Schedule the packs' removal, then do what the next start does. */
+        std::vector<int> packs;
+        for (int index = 2; index < argumentCount; index++)
+        {
+            packs.push_back(std::atoi(arguments[index]));
+        }
+        engineDlcScheduleRemoval(packs);
+        std::printf("pending:");
+        for (const int pack : engineDlcPendingRemovals())
+        {
+            std::printf(" %d", pack);
+        }
+        std::printf("\nremoval report:\n%s", engineDlcApplyPendingRemovals().c_str());
+        std::printf("report for the menu (once): %s\n", engineDlcTakeRemovalReport().empty() ? "missing" : "present");
+        std::printf("report again: %s\n", engineDlcTakeRemovalReport().empty() ? "gone" : "still there");
+        std::printf("installed packs:");
+        for (const int pack : engineDlcInstalledPacks())
+        {
+            std::printf(" %d", pack);
+        }
+        std::printf("\n");
+        return 0;
     }
     DlcSource source;
     std::string problem;
