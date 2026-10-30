@@ -1055,8 +1055,10 @@ What 0006 fixes in ps3recomp to make that run:
     cellGcm_set_flip_per_present(1), set by folklore_limiter_target when
     the cap is Unlimited, a flip is retired at every present -- which waits
     for the display's own refresh (Present(1, 0)) -- except while a video
-    decoder is open (cellVdec_open_count), so movies keep one flip per
-    vblank. The guest's vblank count and handlers stay at 59.94 Hz. Not yet
+    decoder is inside a sequence (StartSeq..EndSeq, cellVdec_open_count),
+    so movies keep one flip per vblank. (The first version checked for an
+    open decoder, and stayed at 60: the game keeps the logo movie's decoder
+    open all session, run-20261030-184043.) The guest's vblank count and handlers stay at 59.94 Hz. Not yet
     tried on Windows; things to watch above 60: game speed and timers,
     animation, and the renderer keeping up (the pub drained in 9-11 ms).
 

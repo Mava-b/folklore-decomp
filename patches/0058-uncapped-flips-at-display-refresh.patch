@@ -1,24 +1,26 @@
 diff --git a/libs/codec/cellVdec.c b/libs/codec/cellVdec.c
 --- a/libs/codec/cellVdec.c
 +++ b/libs/codec/cellVdec.c
-@@ -208,6 +208,22 @@
+@@ -208,6 +208,24 @@
      return (s32)CELL_VDEC_ERROR_BUSY;
  }
  
-+/* Decoders open right now: a movie is playing. The flip pacing keeps one
-+ * flip per vblank while one is, whatever the frame-rate setting
-+ * (cellGcm_set_flip_per_present), as the game paces its movies by flips. */
++/* Decoders inside a sequence (StartSeq .. EndSeq): a movie is playing. The
++ * flip pacing keeps one flip per vblank while one is, whatever the
++ * frame-rate setting (cellGcm_set_flip_per_present), as the game paces its
++ * movies by flips. Open decoders are not enough: Folklore keeps the logo
++ * movie's decoder open for the whole session. */
 +int cellVdec_open_count(void)
 +{
-+    int openCount = 0;
++    int playingCount = 0;
 +    for (int slotIndex = 0; slotIndex < MAX_VDEC; slotIndex++)
 +    {
-+        if (s_vdec[slotIndex].in_use)
++        if (s_vdec[slotIndex].in_use && s_vdec[slotIndex].seqStarted)
 +        {
-+            openCount++;
++            playingCount++;
 +        }
 +    }
-+    return openCount;
++    return playingCount;
 +}
 +
  s32 cellVdecClose(CellVdecHandle handle)
