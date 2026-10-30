@@ -310,7 +310,8 @@ namespace
             ImGui::TextWrapped("Installed: %s", names.c_str());
         }
         ImGui::TextDisabled("Your own add-on packs: install each pack's .pkg and its .rap licence in RPCS3 (File >");
-        ImGui::TextDisabled("Install Packages/Raps/Edats), then add them here from RPCS3's folder.");
+        ImGui::TextDisabled("Install Packages/Raps/Edats), then add them here from RPCS3's folder. The other");
+        ImGui::TextDisabled("release's packs work too (North American packs in the European build, and back).");
         bool startImport = false;
         ImGui::BeginDisabled(running);
         if (ImGui::Button(running ? "Adding DLC..." : "Add DLC from RPCS3..."))

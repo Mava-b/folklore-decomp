@@ -38,6 +38,13 @@ struct DlcSource
     std::string gameFolder;                    /* ...\dev_hdd0\game\<title id> */
     std::vector<std::string> licenceFolders;   /* where .rap files are looked for */
     std::vector<DlcPackInfo> packs;
+    /* The packs belong to the other release (North American packs for the
+     * European build, or the other way round): used when the picked folder
+     * has none of this build's own. The two releases name English
+     * differently (_en / _uk, folders en / uk), so the English files are
+     * installed under both names; the other languages are named alike. */
+    bool otherRegion = false;
+    std::string sourceTitleId;
 };
 
 /* The folder the user picked: RPCS3's own folder (holding dev_hdd0),

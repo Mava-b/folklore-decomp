@@ -628,76 +628,158 @@ std::string engineDlcPackName(const DlcPackInfo& pack)
     return "Free pack (" + std::to_string(pack.pack) + ")";
 }
 
+namespace
+{
+    /* The game's folder for `titleId` at or below the picked folder: the
+     * game's folder itself, or a folder above it on the way down from
+     * RPCS3's own folder. Empty when there is none. */
+    fs::path findGameFolder(const fs::path& picked, const std::string& titleId)
+    {
+        const fs::path candidates[] = {picked, picked / titleId, picked / "game" / titleId,
+                                       picked / "dev_hdd0" / "game" / titleId};
+        for (const fs::path& candidate : candidates)
+        {
+            if (!isDirectory(candidate / "USRDIR" / "bin"))
+            {
+                continue;
+            }
+            const std::vector<unsigned char> sfo = readBytes(candidate / "PARAM.SFO", 64 * 1024);
+            if (sfo.empty() || std::search(sfo.begin(), sfo.end(), titleId.begin(), titleId.end()) != sfo.end())
+            {
+                return candidate;
+            }
+        }
+        return fs::path();
+    }
+
+    std::vector<std::string> licenceFoldersFor(const fs::path& picked, const fs::path& gameFolder)
+    {
+        /* RPCS3 keeps licences in dev_hdd0\home\<user>\exdata, two folders up
+         * from the game's; also a "licences" folder beside the data (or the
+         * exe), and the picked folder itself. */
+        std::vector<std::string> folders;
+        std::error_code error;
+        const fs::path dev_hdd0 = gameFolder.parent_path().parent_path();
+        for (const fs::directory_entry& user : fs::directory_iterator(dev_hdd0 / "home", error))
+        {
+            if (user.is_directory(error) && isDirectory(user.path() / "exdata"))
+            {
+                folders.push_back((user.path() / "exdata").string());
+            }
+        }
+        const fs::path ownLicences = fs::path(hdd0Directory()).parent_path() / "licences";
+        for (const fs::path& folder : {ownLicences, picked, picked / "exdata"})
+        {
+            if (isDirectory(folder))
+            {
+                folders.push_back(folder.string());
+            }
+        }
+        return folders;
+    }
+
+    std::string releaseName(const std::string& titleId)
+    {
+        return titleId == FOLKLORE_EU_TITLE_ID ? "European" : "North American";
+    }
+}
+
 bool engineDlcScan(const std::string& pickedFolder, DlcSource* source, std::string* problem)
 {
     *source = DlcSource();
     const fs::path picked(pickedFolder);
-    const std::string titleId = FOLKLORE_TITLE_ID;
-    /* Whichever of these the user picked: the game's folder itself, or a
-     * folder above it on the way down from RPCS3's own folder. */
-    const fs::path candidates[] = {picked, picked / titleId, picked / "game" / titleId,
-                                   picked / "dev_hdd0" / "game" / titleId};
-    fs::path gameFolder;
-    for (const fs::path& candidate : candidates)
+    const std::string ownTitleId = FOLKLORE_TITLE_ID;
+    const std::string otherTitleId =
+        ownTitleId == FOLKLORE_EU_TITLE_ID ? FOLKLORE_US_TITLE_ID : FOLKLORE_EU_TITLE_ID;
+
+    /* This build's own release first; the other release's packs only when
+     * the folder has none of this one's (an RPCS3 with the European update
+     * but only North American packs, say). */
+    bool foundAnyGameFolder = false;
+    for (const std::string& titleId : {ownTitleId, otherTitleId})
     {
-        if (isDirectory(candidate / "USRDIR" / "bin"))
+        const fs::path gameFolder = findGameFolder(picked, titleId);
+        if (gameFolder.empty())
         {
-            gameFolder = candidate;
-            break;
+            continue;
+        }
+        foundAnyGameFolder = true;
+        DlcSource candidate;
+        candidate.gameFolder = gameFolder.string();
+        candidate.sourceTitleId = titleId;
+        candidate.otherRegion = titleId != ownTitleId;
+        candidate.licenceFolders = licenceFoldersFor(picked, gameFolder);
+        std::string planProblem;
+        for (const PackPlan& plan : planPacks(candidate, &planProblem))
+        {
+            candidate.packs.push_back(plan.info);
+        }
+        if (!planProblem.empty())
+        {
+            *problem = planProblem;
+            return false;
+        }
+        if (!candidate.packs.empty())
+        {
+            *source = candidate;
+            return true;
         }
     }
-    if (gameFolder.empty())
+    if (!foundAnyGameFolder)
     {
-        *problem = "No Folklore (" + titleId + ") game data in \"" + pickedFolder +
-                   "\". Choose RPCS3's folder (the one with dev_hdd0 in it), or its dev_hdd0\\game\\" + titleId +
+        *problem = "No Folklore game data in \"" + pickedFolder +
+                   "\". Choose RPCS3's folder (the one with dev_hdd0 in it), or its dev_hdd0\\game\\" + ownTitleId +
                    " folder.";
         return false;
     }
-    const std::vector<unsigned char> sfo = readBytes(gameFolder / "PARAM.SFO", 64 * 1024);
-    if (!sfo.empty() && std::search(sfo.begin(), sfo.end(), titleId.begin(), titleId.end()) == sfo.end())
-    {
-        *problem = "\"" + gameFolder.string() + "\" is not " + titleId + ", the release this build plays.";
-        return false;
-    }
-    source->gameFolder = gameFolder.string();
+    *problem = "No downloadable content in \"" + pickedFolder +
+               "\". In RPCS3, install the packs first: File > Install Packages/Raps/Edats, choose each pack's "
+               ".pkg and its .rap licence.";
+    return false;
+}
 
-    /* Licences: RPCS3 keeps them in dev_hdd0\home\<user>\exdata, two folders
-     * up from the game's; also a "licences" folder beside the data (or the
-     * exe), and the picked folder itself. */
-    std::error_code error;
-    const fs::path dev_hdd0 = gameFolder.parent_path().parent_path();
-    for (const fs::directory_entry& user : fs::directory_iterator(dev_hdd0 / "home", error))
+namespace
+{
+    /* A path under bin with its English renamed for the other release:
+     * North American English is "_en" (files) and "en" (folders), European
+     * English "_uk" / "uk" -- the same table in both executables, entry 12
+     * for the North American release's English and 1 for the European one's
+     * (folklore/docs/DLC.md). Empty when the path has no English part. */
+    std::string englishForOtherRelease(const std::string& relative, const std::string& from, const std::string& to)
     {
-        if (user.is_directory(error) && isDirectory(user.path() / "exdata"))
+        std::string result;
+        bool changed = false;
+        size_t start = 0;
+        while (start <= relative.size())
         {
-            source->licenceFolders.push_back((user.path() / "exdata").string());
+            const size_t slash = relative.find('/', start);
+            const bool last = slash == std::string::npos;
+            std::string part = relative.substr(start, last ? std::string::npos : slash - start);
+            if (!last && part == from)
+            {
+                part = to;
+                changed = true;
+            }
+            else if (last)
+            {
+                const std::string suffix = "_" + from + ".";
+                const size_t at = part.rfind(suffix);
+                if (at != std::string::npos)
+                {
+                    part = part.substr(0, at) + "_" + to + "." + part.substr(at + suffix.size());
+                    changed = true;
+                }
+            }
+            result += part;
+            if (last)
+            {
+                break;
+            }
+            result += "/";
+            start = slash + 1;
         }
+        return changed ? result : std::string();
     }
-    const fs::path ownLicences = fs::path(hdd0Directory()).parent_path() / "licences";
-    for (const fs::path& folder : {ownLicences, picked, picked / "exdata"})
-    {
-        if (isDirectory(folder))
-        {
-            source->licenceFolders.push_back(folder.string());
-        }
-    }
-
-    for (const PackPlan& plan : planPacks(*source, problem))
-    {
-        source->packs.push_back(plan.info);
-    }
-    if (!problem->empty())
-    {
-        return false;
-    }
-    if (source->packs.empty())
-    {
-        *problem = "No downloadable content in \"" + gameFolder.string() +
-                   "\". In RPCS3, install the packs first: File > Install Packages/Raps/Edats, choose each pack's "
-                   ".pkg and its .rap licence.";
-        return false;
-    }
-    return true;
 }
 
 std::string engineDlcInstall(const DlcSource& source,
@@ -728,6 +810,35 @@ std::string engineDlcInstall(const DlcSource& source,
         installed.clear();
     }
     std::map<int, std::string> packNames = readPackNames();
+    /* The other release's packs: English goes in under this build's name too. */
+    const bool thisIsEuropean = std::string(FOLKLORE_TITLE_ID) == FOLKLORE_EU_TITLE_ID;
+    const std::string englishFrom = thisIsEuropean ? "en" : "uk";
+    const std::string englishTo = thisIsEuropean ? "uk" : "en";
+    for (PackPlan& plan : plans)
+    {
+        if (!source.otherRegion)
+        {
+            break;
+        }
+        const size_t originalCount = plan.entries.size();
+        for (size_t index = 0; index < originalCount; index++)
+        {
+            const std::string renamed = englishForOtherRelease(plan.entries[index].path, englishFrom, englishTo);
+            if (renamed.empty())
+            {
+                continue;
+            }
+            bool present = false;
+            for (const ListEntry& entry : plan.entries)
+            {
+                present = present || sameText(entry.path, renamed);
+            }
+            if (!present)
+            {
+                plan.entries.push_back({plan.entries[index].pack, renamed});
+            }
+        }
+    }
     std::string report;
     int done = 0;
     int installedPacks = 0;
@@ -747,21 +858,38 @@ std::string engineDlcInstall(const DlcSource& source,
         {
             const fs::path target = bin / relativeToPath(file.relative);
             progress(done, totalFiles, name + ": " + file.relative);
-            if (alreadyInPlace(file, target))
+            bool fileDone = true;
+            if (!alreadyInPlace(file, target))     /* imported before: not written now, so never taken back */
             {
-                done++;
-                continue;     /* imported before: not written now, so never taken back */
+                if (file.contentId.empty())
+                {
+                    fileDone = copyFileOver(file.source, target);
+                }
+                else
+                {
+                    unsigned char rifKey[16];
+                    fileDone = findLicence(source.licenceFolders, file.contentId, rifKey) &&
+                               decryptInto(file.source, target, rifKey);
+                }
+                if (fileDone)
+                {
+                    written.push_back(target);
+                }
             }
-            bool fileDone = false;
-            if (file.contentId.empty())
+            /* The other release's English, under this build's name as well. */
+            const std::string renamed =
+                source.otherRegion ? englishForOtherRelease(file.relative, englishFrom, englishTo) : std::string();
+            if (fileDone && !renamed.empty())
             {
-                fileDone = copyFileOver(file.source, target);
-            }
-            else
-            {
-                unsigned char rifKey[16];
-                fileDone = findLicence(source.licenceFolders, file.contentId, rifKey) &&
-                           decryptInto(file.source, target, rifKey);
+                const fs::path renamedTarget = bin / relativeToPath(renamed);
+                if (!alreadyInPlace(file, renamedTarget))
+                {
+                    fileDone = copyFileOver(target, renamedTarget);
+                    if (fileDone)
+                    {
+                        written.push_back(renamedTarget);
+                    }
+                }
             }
             done++;
             if (!fileDone)
@@ -769,7 +897,6 @@ std::string engineDlcInstall(const DlcSource& source,
                 failure = file.relative;
                 break;
             }
-            written.push_back(target);
         }
         if (!failure.empty())
         {
@@ -803,6 +930,11 @@ std::string engineDlcInstall(const DlcSource& source,
         }
         installedPacks++;
         report += name + ": installed (" + std::to_string(plan.info.fileCount) + " files).\n";
+    }
+    if (installedPacks > 0 && source.otherRegion)
+    {
+        report += "These are the " + releaseName(source.sourceTitleId) + " release's packs (" + source.sourceTitleId +
+                  "): their English text was also installed under this release's names.\n";
     }
     if (installedPacks > 0)
     {

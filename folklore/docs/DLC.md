@@ -28,6 +28,37 @@ port's `hdd0`, and in the folder you picked. A pack whose licence is missing
 — or belongs to another account — is left out whole, with a line saying so;
 the others still go in.
 
+## Packs from the other release
+
+North American packs work in the European build, and European packs in the
+North American one. The importer looks for this build's own release in the
+picked folder first (`dev_hdd0\game\BCES00050` for a European build) and
+uses the other release's folder only when its own has no packs — an RPCS3
+with the European update installed but the North American packs, say. The
+menu's report then says whose packs they were.
+
+Why it works: the two executables are the same game code (10 functions
+differ, none of them in the pack code), with the same pack format, the same
+file layout and the same language table. The packs' licences are only needed
+to decrypt them, which happens at import; the game itself never checks a
+pack's content ID (`sceNpDrmIsAvailable`, which the port answers OK, then
+`cellFsOpen` on the already-decrypted file).
+
+The one difference is English. Both executables pick their text files with
+the language table at `0x530A44` (`_jp, _uk, _fr, _sp, _ge, _it, -, -, -,
+_kr/_ko, _tr, _si, _en`), and the matching folder names (`cmc/<lang>/`,
+`talk/<lang>/`). The European release's English is entry 1, `_uk`; the North
+American one's is entry 12, `_en`. The North American packs carry all five
+languages — `_en`, `_fr`, `_sp`, `_ge`, `_it` — so French, Spanish, German and
+Italian need nothing, and the importer installs each English file a second
+time under the European name (`lsubm/LSubm50_en.edat` also as
+`LSubm50_uk.edat`, `cmc/en/...` also as `cmc/uk/...`), recorded in
+`install.dat_` like the rest; European packs get `_en` copies the same way.
+
+Not yet tried in play. One thing to watch: North American free pack 19 brings
+its own `LMonS2.bi5_` (the 1.10 table of Folks), replacing the European 1.10
+update's; the two differ in 54 bytes, which look like pack 19's added Folk.
+
 ## What the packs are
 
 On the North American release (BCUS98147) the game's HDD folder holds these
@@ -42,7 +73,8 @@ packs, each in its own numbered folder under `USRDIR\bin`:
 Each paid pack adds four quests, a Folk and a costume (PlayStation Blog,
 December 2007: pack 1 "The Kidnapped Folk", pack 2 "Bottom of the Sea"). The
 European release's packs have their own content IDs; the importer reads them
-from the files, so the same steps apply.
+from the files, so the same steps apply (and either release's packs work in
+either build, below).
 
 ## How it works
 

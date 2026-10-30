@@ -252,8 +252,12 @@ Good to know:
 - Each project copy (and each package folder) has its own `hdd0\`, so add the
   DLC once in each one you play. `run.bat -ResetInstall` empties `hdd0\`, DLC
   included; press *Add DLC* again afterwards.
-- European packs need their own European licences; North American ones do not
-  work in a European build.
+- The packs of either release work in either build: North American packs
+  (with their North American licences) in a European build, and the other
+  way round. The importer takes this build's own release's packs when RPCS3
+  has them, and otherwise the other release's, installing their English text
+  under both releases' names (`_en` / `_uk`). The other four languages are in
+  both releases' packs already.
 - Saves work in both versions; copy them across with the menu's save
   snapshots, or `gamedata\` between folders.
 - Nothing in your disc dump or in RPCS3's folder is ever changed.
@@ -267,7 +271,8 @@ in the engine menu press **Add DLC from RPCS3...** and choose RPCS3's folder
 (the one with `dev_hdd0` in it). The packs are decrypted with your licences
 and installed into `hdd0\` here — about half a minute for all six, with a
 progress bar — and the game has them from its next start. A pack without its
-licence is left out and the menu says which. Nothing in RPCS3's folder is
+licence is left out and the menu says which. North American packs work in the
+European build too (and the other way round). Nothing in RPCS3's folder is
 changed. Details: [`folklore/docs/DLC.md`](folklore/docs/DLC.md).
 
 ### Motion controllers

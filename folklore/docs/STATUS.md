@@ -978,6 +978,16 @@ What 0006 fixes in ps3recomp to make that run:
     all of it: 128 bytes too many, over the pad data. The sensor words
     (sp+352..358, read right after) came out 0, which is full scale -- an
     instant pull. patches/0055 sizes it right. 1.00 never makes the call.
+72. Either release's DLC in either build (folklore/docs/DLC.md, "Packs from
+    the other release"). The importer falls back to the other release's game
+    folder when the picked folder has none of this build's own packs, and
+    installs every English file a second time under this build's English
+    name: the European executable reads English as "_uk" / "uk\" (language
+    table entry 1), the North American one as "_en" / "en\" (entry 12); the
+    other languages are named alike and both releases' packs carry all five.
+    Tested off Windows: US packs into a European build install with their
+    _uk copies (identical content, in install.dat_), a US build of the same
+    folder is unchanged, re-import is a no-op. Not yet played.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
