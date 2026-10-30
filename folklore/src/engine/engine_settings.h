@@ -68,6 +68,9 @@ struct EngineSettings
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
     bool physicsFrameStep = true;
+    /* Start skips the opening logos (movie 995) as it skips every other
+     * movie, after the first 40 frames (folklore_logo_movie_skippable). */
+    bool skipLogos = true;
     /* Motion controls for capturing Folks, whatever the controller: on, the
      * gestures come from its motion sensors (DualShock 3 or 4, DualSense,
      * Switch Pro) and a controller without them still captures by itself;
@@ -130,4 +133,7 @@ extern "C"
     /* The CELL_SYSUTIL_LANG_* value for the game's language query
      * (src/hle/folklore_hle.cpp). The first call fixes it for the run. */
     int folklore_system_language(void);
+    /* Called from the lifted movie player (tools/game_patches.py, the
+     * logoSkip patch): 1 when Start may skip the opening logos. */
+    int folklore_logo_movie_skippable(void);
 }

@@ -34,6 +34,7 @@ REGIONS = {
         "physics": ("func_003C913C", 0x003C913C,
                     {"loop": "003C9184", "back": "003C9170", "exit": "003C91A0"}),
         "toc": {"workTop": 0x20C0, "allocator": 0x263C},
+        "logoSkip": ("func_0021FC6C", 0x0022045C),
     },
     "EU": {
         "movieHold": ("func_001A4784", 0x001A48C8),
@@ -43,6 +44,7 @@ REGIONS = {
         "physics": ("func_003C90F4", 0x003C90F4,
                     {"loop": "003C913C", "back": "003C9128", "exit": "003C9158"}),
         "toc": {"workTop": 0x20E0, "allocator": 0x265C},
+        "logoSkip": ("func_0021FC64", 0x00220454),
     },
     # The 1.10 update's executables. Every function these fixes touch is the
     # same code as in 1.00 (aligned function by function, docs/REGIONS.md),
@@ -55,6 +57,7 @@ REGIONS = {
         "physics": ("func_003CD8C4", 0x003CD8C4,
                     {"loop": "003CD90C", "back": "003CD8F8", "exit": "003CD928"}),
         "toc": {"workTop": 0x2020, "allocator": 0x259C},
+        "logoSkip": ("func_00221200", 0x002219F0),
     },
     "EU-1.10": {
         "movieHold": ("func_001A59EC", 0x001A5B30),
@@ -64,6 +67,7 @@ REGIONS = {
         "physics": ("func_003CD89C", 0x003CD89C,
                     {"loop": "003CD8E4", "back": "003CD8D0", "exit": "003CD900"}),
         "toc": {"workTop": 0x2038, "allocator": 0x25B4},
+        "logoSkip": ("func_00221214", 0x00221A04),
     },
 }
 
@@ -208,6 +212,33 @@ def buildPatches(regionName):
              "            goto loc_%s;\n"
              "        }\n" % labels["exit"]),
             ("after_line", r"goto loc_%s;" % labels["back"], "loc_%s:\n" % labels["exit"]),
+        ],
+    })
+    logoFunction, logoAddress = region["logoSkip"]
+    # The two places the movie loop reads the pad: Start (game pad word bit 0x8)
+    # after the first 40 frames skips the movie unless it is movie 995. The
+    # compare against 995 is the one after the 40-frame check (0x27); the first
+    # site branches away when it differs, the second when it is equal.
+    logoCompare = (r"(0x27; [^\n]*\n[^\n]*\n\s*ctx->gpr\[0\] = vm_read32\(ctx->gpr\[30\] \+ 0x108\);\n"
+                   r"\s*\{ int64_t a = \(int32_t\)ctx->gpr\[0\]; int64_t b = )\(int64_t\)0x3E3;"
+                   r"(?=[^\n]*\n\s*if \(%s)")
+    logoReplacement = (r"\g<1>(folklore_logo_movie_skippable() ? (int64_t)-1 : (int64_t)0x3E3); "
+                       r"/* FOLKLORE PATCH 0x%X: Start skips the logos too (tools/game_patches.py) */" % logoAddress)
+    patches.append({
+        "address": logoAddress,
+        "function": logoFunction,
+        "why": (
+            "The full-screen movie player lets Start skip a movie after its first 40 frames, "
+            "except movie 995: the Sony, Game Republic and other logos at boot, about 30 "
+            "seconds before the title screen. With the engine setting skip_logos (on by "
+            "default) the check for 995 never matches, so Start skips the logos the way it "
+            "skips every other movie."
+        ),
+        "edits": [
+            ("before_function",
+             'extern "C" int folklore_logo_movie_skippable(void); /* FOLKLORE PATCH 0x%X */\n' % logoAddress),
+            ("replace", logoCompare % r"\(!", logoReplacement),
+            ("replace", logoCompare % r"\(\(", logoReplacement),
         ],
     })
     return patches

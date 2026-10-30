@@ -25,6 +25,30 @@ if ($Clean -and (Test-Path $buildDir))
 $buildLog = Join-Path $LogDir 'build.log'
 Set-Content -Path $buildLog -Value ''
 
+# The game fixes in tools\game_patches.py, on the lifted code. Setup applies
+# them when it lifts; running them here as well brings code lifted before a
+# fix was added up to date (a fix already in place is skipped, so this is a
+# second or two).
+$recompSourceDir = Join-Path $PortDir 'src\recomp'
+if (Get-ChildItem -Path $recompSourceDir -Filter '*.cpp' -ErrorAction SilentlyContinue | Select-Object -First 1)
+{
+    $release = Get-BuildRelease
+    $patchRegion = $release.Region
+    if ($release.Version -eq '1.10')
+    {
+        $patchRegion = "$patchRegion-1.10"
+    }
+    Write-Step "Game fixes (tools\game_patches.py, $patchRegion)"
+    Invoke-Native {
+        & $PythonExe -I (Join-Path $PortDir 'tools\game_patches.py') $recompSourceDir --region $patchRegion 2>&1 |
+            ForEach-Object { "$_" } | Tee-Object -FilePath $buildLog -Append
+    }
+    if ($LASTEXITCODE -ne 0)
+    {
+        throw 'the game fixes did not apply -- see logs\build.log'
+    }
+}
+
 # Keep guest registers in C locals inside each lifted function (a copy of
 # src\recomp in build\recomp_promoted; only files whose source changed are
 # rewritten, so this is quick after the first time).

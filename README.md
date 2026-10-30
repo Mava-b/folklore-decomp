@@ -178,6 +178,10 @@ saved to `folklore_settings.ini`.
   controller without them still captures by itself. Turn it off and every
   capture completes by itself, whatever the controller. The menu shows which
   controller is connected and whether its sensors are live.
+- **Start skips the opening logos** (on by default): press **Start** (or
+  the key mapped to it) once the logos have played for a moment to go straight
+  to the title screen. The game already lets Start skip its other movies; on
+  the PS3 the boot logos were the exception.
 - **Physics**: step physics by the frame time, which keeps cloth and hair
   stable above 30 fps (on by default).
 - **Language** (European build only): English, French, Spanish, German or

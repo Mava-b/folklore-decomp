@@ -231,6 +231,10 @@ void engineSettingsLoad()
         {
             settingsInstance.physicsFrameStep = parseBool(value);
         }
+        else if (std::strcmp(key, "skip_logos") == 0)
+        {
+            settingsInstance.skipLogos = parseBool(value);
+        }
         else if (std::strcmp(key, "fullscreen") == 0)
         {
             settingsInstance.fullscreen = parseBool(value);
@@ -289,6 +293,8 @@ void engineSettingsSave()
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
     std::fprintf(file, "physics_frame_step = %d\n", current.physicsFrameStep ? 1 : 0);
+    std::fprintf(file, "# 1: Start skips the opening logos, as it skips the game's other movies\n");
+    std::fprintf(file, "skip_logos = %d\n", current.skipLogos ? 1 : 0);
     std::fprintf(file, "# on: capture Folks by moving the controller (DualShock 3/4, DualSense, Switch Pro); off: captures complete by themselves\n");
     std::fprintf(file, "motion_controls = %s\n", current.motionControls ? "on" : "off");
     const char* aspectText = current.aspectRatio == AspectRatio::MatchDisplay ? "display"
@@ -487,6 +493,11 @@ extern "C" int folklore_limiter_sleep_us(int originalSleepMicroseconds)
  * Returns the number of steps to take (0 = none) and the step size, or -1 to
  * run the game's original loop.
  */
+extern "C" int folklore_logo_movie_skippable(void)
+{
+    return engineSettings().skipLogos ? 1 : 0;
+}
+
 extern "C" int folklore_physics_plan_steps(float currentTime, float simulatedTime, float markerTime,
                                            float fixedStep, float* stepSize)
 {

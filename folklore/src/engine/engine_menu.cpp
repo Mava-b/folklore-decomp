@@ -1066,6 +1066,10 @@ namespace
                 }
             }
 
+            ImGui::SeparatorText("Movies");
+            changed |= ImGui::Checkbox("Start skips the opening logos (as it skips the other movies)",
+                                       &settings.skipLogos);
+
             ImGui::SeparatorText("Physics");
             changed |= ImGui::Checkbox("Step physics by the frame time (fixes cloth and hair above 30 fps)",
                                        &settings.physicsFrameStep);

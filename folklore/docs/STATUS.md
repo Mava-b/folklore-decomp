@@ -1024,6 +1024,17 @@ What 0006 fixes in ps3recomp to make that run:
     only queues a wait for the RSX. Other [hitch]es: the game's own 100 ms
     usleeps while loading, and single 40-60 ms renderer frames uploading
     10-20 MB of new textures when an area first appears.
+76. Skipping the opening logos (tools/game_patches.py, logoSkip). The
+    full-screen movie player (v1.00 US func_0021FC6C, called with 995 by
+    the boot sequence at 0x1ACACC) reads the pad twice per loop; Start
+    (bit 0x8 of the pad word at +4), after the movie's first 40 frames,
+    skips any movie except 995 -- the Sony / Game Republic / middleware
+    logos, about 30 s. With the engine setting skip_logos (menu: Movies,
+    on by default) the compare against 995 never matches, so Start skips
+    them too. Sites: US 0x22045C, EU 0x220454, US-1.10 0x2219F0, EU-1.10
+    0x221A04 (both pad checks in each). build.ps1 now runs game_patches.py
+    on the lifted code before every build, so code lifted before a fix was
+    added picks it up without a relift. Not yet tried on Windows.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
