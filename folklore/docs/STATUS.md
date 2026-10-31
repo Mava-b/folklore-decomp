@@ -1223,6 +1223,18 @@ What 0006 fixes in ps3recomp to make that run:
     before). Simulated on the three captures: every bubble letter stays
     with its bubble, the skip prompt (icons and text) still goes right,
     the gameplay HUD is unchanged.
+88. Menus with the "edges" HUD (patches/0066). The folk / character
+    select (capture-20261031-163543) is a window of 9-slice pieces
+    (208-808 x 192-544, its middle 504x288) with lines of text across it,
+    drawn over gameplay (the map is still drawn): the zones split it
+    between left and right. A HUD-candidate draw at least 30% of the
+    screen wide and 25% high, wholly on screen, marks a menu; while one
+    was drawn this frame or the last, "edges" draws everything centred.
+    The gameplay HUD never has such a draw (the map's turning background
+    always starts above the top edge; the folk diamond is 20% wide).
+    Simulated on all six captures: the menu frames all centred (bar the
+    seven pieces before the panel, which the previous frame covers in
+    play), every gameplay frame unchanged.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

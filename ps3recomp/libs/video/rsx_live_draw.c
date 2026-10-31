@@ -7225,6 +7225,20 @@ typedef struct {
 } ld_hud_panel_list;
 static ld_hud_panel_list g_ld_hud_panels;
 
+/* Menus (the folk / character select, capture-20261031-163543): a window
+ * built from pieces -- one of them a large on-screen panel -- with lines of
+ * text across it. Split between the left and right zones it tears apart, so
+ * while a frame has (or the one before it had) such a panel, the "edges"
+ * layout draws everything centred instead. The gameplay HUD has no draw that
+ * large wholly on screen: the map's turning background always starts above
+ * the top edge. */
+typedef struct {
+    u32 frame;
+    int panelThisFrame;
+    int panelLastFrame;
+} ld_hud_menu_state;
+static ld_hud_menu_state g_ld_hud_menu;
+
 typedef struct {
     u32 frame;
     u32 target;
@@ -7352,6 +7366,18 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
         }
         return 0;
     }
+    if (g_ld_hud_menu.frame != g_ld_frames)
+    {
+        g_ld_hud_menu.panelLastFrame = g_ld_hud_menu.frame + 1u == g_ld_frames ? g_ld_hud_menu.panelThisFrame : 0;
+        g_ld_hud_menu.panelThisFrame = 0;
+        g_ld_hud_menu.frame = g_ld_frames;
+    }
+    if (right - left >= 0.30f && bottom - top >= 0.25f && left >= 0.0f && top >= 0.0f && right <= 1.0f &&
+        bottom <= 1.0f)
+    {
+        g_ld_hud_menu.panelThisFrame = 1;
+    }
+    const int menuShown = g_ld_hud_menu.panelThisFrame || g_ld_hud_menu.panelLastFrame;
     int place = LD_HUD_CENTRE;
     const float middleX = (left + right) * 0.5f;
     const float middleY = (top + bottom) * 0.5f;
@@ -7373,9 +7399,9 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     {
         place = previous->place;
     }
-    else if (place == LD_HUD_IN_PICTURE || layout != 2)
+    else if (place == LD_HUD_IN_PICTURE || layout != 2 || menuShown)
     {
-        /* As decided above: with its bubble, or centred. */
+        /* As decided above: with its bubble, or centred (also while a menu is up). */
     }
     else
     {
