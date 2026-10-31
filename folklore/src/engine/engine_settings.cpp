@@ -201,6 +201,21 @@ void engineSettingsLoad()
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
                                                                           : EngineSettings::Bloom::Smooth;
         }
+        else if (std::strcmp(key, "ambient_occlusion") == 0)
+        {
+            if (std::strcmp(value, "off") == 0)
+            {
+                settingsInstance.ambientOcclusion = EngineSettings::AmbientOcclusion::Off;
+            }
+            else if (std::strcmp(value, "strong") == 0)
+            {
+                settingsInstance.ambientOcclusion = EngineSettings::AmbientOcclusion::Strong;
+            }
+            else
+            {
+                settingsInstance.ambientOcclusion = EngineSettings::AmbientOcclusion::Subtle;
+            }
+        }
         else if (std::strcmp(key, "depth_of_field") == 0)
         {
             settingsInstance.depthOfField = std::strcmp(value, "original") == 0
@@ -322,6 +337,11 @@ void engineSettingsSave()
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
     std::fprintf(file, "# original (the game's, flickers) or smooth (next start)\n");
     std::fprintf(file, "bloom = %s\n", current.bloom == EngineSettings::Bloom::Original ? "original" : "smooth");
+    std::fprintf(file, "# off, subtle or strong (next start)\n");
+    std::fprintf(file, "ambient_occlusion = %s\n",
+                 current.ambientOcclusion == EngineSettings::AmbientOcclusion::Off      ? "off"
+                 : current.ambientOcclusion == EngineSettings::AmbientOcclusion::Strong ? "strong"
+                                                                                        : "subtle");
     std::fprintf(file, "physics_frame_step = %d\n", current.physicsFrameStep ? 1 : 0);
     std::fprintf(file, "# opening logos: off (they all play), start (Start skips them) or always (never shown)\n");
     const char* logoSkipText = current.logoSkip == EngineSettings::LogoSkip::Always  ? "always"

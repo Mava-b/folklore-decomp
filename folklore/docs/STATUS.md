@@ -1127,6 +1127,19 @@ What 0006 fixes in ps3recomp to make that run:
     when the decrypter is first needed, which can be before setup's own
     compiler step; the download helpers moved up for that. game_dir and
     update_dir are saved from the folders, not derived from the ELF's path.
+81. Ambient occlusion (engine setting ambient_occlusion: off / subtle /
+    strong, default subtle; engine_dof.cpp kAmbient). Added to the depth of
+    field resolve-pass replacements, which run before the HUD with the depth
+    buffer on unit 1. Depth only: 1/(1-z) as distance (up to a scale; far
+    plane >> near), an assumed 60 degree field of view, normals from the
+    nearer neighbour on each axis, 16 taps in a disc 3% of the screen high
+    turned by a 4x4 pattern, occlusion from how far each tap rises above
+    the surface's plane (bias 0.1), fading for taps beyond 6% of the
+    distance, into the distance (depth 0.999-0.99995) and as the blur grows.
+    Multiplied in at 0.6 (subtle) or 1.0 (strong). With the original depth
+    of field it keeps the game's two taps. Not in the four-tap depth of
+    field scenes. Every shader combination is built once and kept (the
+    renderer keeps the pointer). Values to be tuned from a capture.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

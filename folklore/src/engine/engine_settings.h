@@ -81,6 +81,16 @@ struct EngineSettings
         Smooth,
     };
     Bloom bloom = Bloom::Smooth;
+    /* Ambient occlusion: soft shading where surfaces meet, worked out from
+     * the depth buffer in the depth of field pass (engine_dof.cpp). Applies
+     * at the next start. */
+    enum class AmbientOcclusion
+    {
+        Off,
+        Subtle,
+        Strong,
+    };
+    AmbientOcclusion ambientOcclusion = AmbientOcclusion::Subtle;
     /* Physics: step Havok by the real frame time instead of the game's fixed
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */

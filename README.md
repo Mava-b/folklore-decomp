@@ -209,6 +209,9 @@ saved to `folklore_settings.ini`.
   - *Bloom*: *Smooth* (the default: steady glow, without the flicker and
     shimmer of the original's low-resolution sampling) or *Original*. Next
     start.
+  - *Ambient occlusion*: *Subtle* (the default), *Strong* or *Off* — soft
+    shading where surfaces meet (corners, under ledges, where characters
+    stand), worked out from the depth buffer. Next start.
   - *Build new shaders in the background* (no hitch when an effect first
     appears).
 - **Game files**: the game folder in use (change it here; it applies on the

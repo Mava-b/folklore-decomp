@@ -91,6 +91,7 @@ namespace
         /* The depth of field the game's shaders were built with this run. */
         EngineSettings::DepthOfField startDepthOfField = EngineSettings::DepthOfField::Smooth;
         EngineSettings::Bloom startBloom = EngineSettings::Bloom::Smooth;
+        EngineSettings::AmbientOcclusion startAmbientOcclusion = EngineSettings::AmbientOcclusion::Subtle;
         bool menuOpen = false;
         bool focusRequested = false;
         ID3D12DescriptorHeap* srvHeap = nullptr;
@@ -988,6 +989,25 @@ namespace
                 ImGui::TextDisabled("(applies when you next start the game)");
             }
         }
+        ImGui::TextUnformatted("Ambient occlusion (soft shading where surfaces meet)");
+        {
+            int ambientIndex = (int)settings.ambientOcclusion;
+            bool ambientChanged = ImGui::RadioButton("Off##ao", &ambientIndex, 0);
+            ImGui::SameLine();
+            ambientChanged |= ImGui::RadioButton("Subtle##ao", &ambientIndex, 1);
+            ImGui::SameLine();
+            ambientChanged |= ImGui::RadioButton("Strong##ao", &ambientIndex, 2);
+            if (ambientChanged)
+            {
+                settings.ambientOcclusion = (EngineSettings::AmbientOcclusion)ambientIndex;
+                changed = true;
+            }
+            if (settings.ambientOcclusion != menu.startAmbientOcclusion)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(applies when you next start the game)");
+            }
+        }
         changed |= ImGui::Checkbox("Build new shaders in the background (no hitch when an effect first appears)",
                                    &settings.backgroundShaders);
         if (changed)
@@ -1276,6 +1296,7 @@ namespace
             menu.initialized = true;
             menu.startDepthOfField = engineSettings().depthOfField;
             menu.startBloom = engineSettings().bloom;
+            menu.startAmbientOcclusion = engineSettings().ambientOcclusion;
             if (!initialize((ID3D12Device*)device, (ID3D12CommandQueue*)queue, (DXGI_FORMAT)format, height))
             {
                 menu.failed = true;

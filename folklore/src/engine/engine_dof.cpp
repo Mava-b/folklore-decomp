@@ -22,10 +22,17 @@
  * text from "cbuffer PSConstants" on, rsx_tex[N] read as rsx_texN). The
  * first version hashed the whole text, which changes when the scene has a
  * cube map bound on another unit -- and then the pass was not replaced.
+ *
+ * The same pass also adds ambient occlusion (engine setting
+ * ambient_occlusion): it runs before the HUD is drawn and already has the
+ * depth buffer bound, so soft shading where surfaces meet can be worked out
+ * from depth alone and multiplied in (kAmbient below). With the original
+ * depth of field and occlusion on, the pass keeps the game's two taps.
  */
 #include "engine_settings.h"
 
 #include <cstdint>
+#include <cstdio>
 #include <string>
 
 extern "C" void rsx_live_draw_set_ps_replacement(uint64_t sourceHash, const char* hlsl);
@@ -98,6 +105,88 @@ float folkloreSharpFactor() { return fp_constants[8].x; }
 float2 folkloreAxisScale() { return float2(fp_constants[9].x, fp_constants[10].y); }
 )HLSL";
 
+    /* Ambient occlusion from the depth buffer alone. The game's projection
+     * is not known here, so positions are rebuilt up to a scale: with the far
+     * plane much further than the near one, 1 / (1 - depth) is proportional
+     * to the distance from the camera, and an assumed 60 degree field of view
+     * spreads it across the screen. Everything the occlusion uses is a ratio
+     * of those positions (directions, and distances relative to the depth),
+     * so the unknown scale drops out. Sixteen taps in a disc of fixed size on
+     * screen, turned per pixel by a 4x4 pattern so their gaps do not line up
+     * into rings; a tap occludes by how far it rises above the surface's
+     * plane, and fades out when it is much nearer or further than the pixel
+     * (so a character does not cast a halo on the far background). The sky
+     * (depth at the far plane) gets none. */
+    const char* const kAmbient = R"HLSL(
+static const float folkloreTanHalfFov = 0.57735;
+float folkloreViewDistance(int2 texel, int2 depthSize) {
+    float depth = rsx_tex[1].Load(int3(clamp(texel, int2(0, 0), depthSize - 1), 0)).x;
+    return 1.0 / max(1.0 - saturate(depth), 1.0e-7);
+}
+float3 folkloreViewPosition(float2 coordinate, float viewDistance, float aspect) {
+    float2 ndc = float2(coordinate.x * 2.0 - 1.0, 1.0 - coordinate.y * 2.0);
+    return float3(ndc.x * aspect * folkloreTanHalfFov * viewDistance,
+                  ndc.y * folkloreTanHalfFov * viewDistance, viewDistance);
+}
+float folkloreAmbient(float2 coordinate, float2 screenPosition) {
+    uint depthWidth, depthHeight;
+    rsx_tex[1].GetDimensions(depthWidth, depthHeight);
+    const int2 depthSize = int2(max(depthWidth, 1u), max(depthHeight, 1u));
+    // The scene is supersampled twice across, so its picture is half as wide.
+    const float aspect = 0.5 * (float)depthSize.x / (float)depthSize.y;
+    const int2 centreTexel = int2(coordinate * (float2)depthSize);
+    const float centreDepth = saturate(rsx_tex[1].Load(int3(clamp(centreTexel, int2(0, 0), depthSize - 1), 0)).x);
+    if (centreDepth >= folkloreAmbientSkyDepth) {
+        return 1.0;
+    }
+    const float2 texelSize = 1.0 / (float2)depthSize;
+    const float centreDistance = folkloreViewDistance(centreTexel, depthSize);
+    const float3 centre = folkloreViewPosition(coordinate, centreDistance, aspect);
+    // The surface normal from whichever neighbour on each axis is on the
+    // same surface (the smaller step), so edges do not get a bent normal.
+    const float3 right = folkloreViewPosition(coordinate + float2(texelSize.x, 0.0),
+                                              folkloreViewDistance(centreTexel + int2(1, 0), depthSize), aspect);
+    const float3 left = folkloreViewPosition(coordinate - float2(texelSize.x, 0.0),
+                                             folkloreViewDistance(centreTexel - int2(1, 0), depthSize), aspect);
+    const float3 below = folkloreViewPosition(coordinate + float2(0.0, texelSize.y),
+                                              folkloreViewDistance(centreTexel + int2(0, 1), depthSize), aspect);
+    const float3 above = folkloreViewPosition(coordinate - float2(0.0, texelSize.y),
+                                              folkloreViewDistance(centreTexel - int2(0, 1), depthSize), aspect);
+    const float3 acrossStep = abs(right.z - centre.z) < abs(centre.z - left.z) ? right - centre : centre - left;
+    const float3 downStep = abs(below.z - centre.z) < abs(centre.z - above.z) ? below - centre : centre - above;
+    float3 normal = normalize(cross(acrossStep, downStep));
+    if (dot(normal, centre) > 0.0) {
+        normal = -normal;
+    }
+    const float2 discRadius = float2(folkloreAmbientRadius / aspect, folkloreAmbientRadius);
+    const float reach = folkloreAmbientRange * centreDistance;
+    const uint2 patternCell = (uint2)screenPosition & 3u;
+    const float patternTurn = (float)((patternCell.x * 4u + patternCell.y * 9u) & 15u) / 16.0;
+    const int tapCount = 16;
+    const float goldenAngle = 2.39996323;
+    float occlusion = 0.0;
+    [unroll] for (int tapIndex = 0; tapIndex < tapCount; tapIndex++) {
+        const float distanceFraction = sqrt(((float)tapIndex + 0.5) / (float)tapCount);
+        const float angle = ((float)tapIndex + patternTurn) * goldenAngle;
+        const float2 tapCoordinate = coordinate + discRadius * distanceFraction * float2(cos(angle), sin(angle));
+        const int2 tapTexel = int2(tapCoordinate * (float2)depthSize);
+        const float3 tapPosition = folkloreViewPosition(tapCoordinate, folkloreViewDistance(tapTexel, depthSize), aspect);
+        const float3 toTap = tapPosition - centre;
+        const float tapDistance = length(toTap);
+        const float rise = dot(normal, toTap) / max(tapDistance, 1.0e-6);
+        const float nearness = saturate(1.0 - (tapDistance * tapDistance) / (reach * reach));
+        occlusion += max(rise - folkloreAmbientBias, 0.0) * nearness;
+    }
+    const float ambient = saturate(1.0 - folkloreAmbientIntensity * occlusion / (float)tapCount);
+    // Fade out into the distance, where the depth buffer has little precision.
+    const float distanceFade = saturate((folkloreAmbientSkyDepth - centreDepth) / (folkloreAmbientSkyDepth - folkloreAmbientFadeDepth));
+    return lerp(1.0, ambient, distanceFade);
+}
+)HLSL";
+
+    /* The pass itself: the game's two taps; where something is out of focus
+     * a round 24-tap disc instead when the smooth depth of field is on; and
+     * the ambient occlusion multiplied in, fading out as the blur grows. */
     const char* const kBody = R"HLSL(
 float4 main(PSInput input) : SV_TARGET {
     const float2 coordinate = input.tc0.xy;
@@ -109,15 +198,22 @@ float4 main(PSInput input) : SV_TARGET {
                              rsx_tex[0].Sample(rsx_samp[0], coordinate + pairOffset).xyz);
     const float alpha = rsx_tex[0].Sample(rsx_samp[0], coordinate).w;
     const float blurAmount = factor - sharpFactor;
-    if (!(blurAmount > 0.0)) {
-        return float4(original, alpha);
-    }
     // A round disc on screen (the scene is twice as wide as the screen),
     // reaching as far as each of the game's two copies was pushed.
     uint sceneWidth, sceneHeight;
     rsx_tex[0].GetDimensions(sceneWidth, sceneHeight);
     const float2 screenPixels = float2(0.5 * (float)max(sceneWidth, 1u), (float)max(sceneHeight, 1u));
     const float radiusPixels = length(pairOffset * screenPixels);
+    float ambient = 1.0;
+    if (folkloreAmbientStrength > 0.0) {
+        const float blurFade = blurAmount > 0.0 ? saturate(radiusPixels / 4.0) : 0.0;
+        if (blurFade < 1.0) {
+            ambient = lerp(1.0, folkloreAmbient(coordinate, input.position.xy), folkloreAmbientStrength * (1.0 - blurFade));
+        }
+    }
+    if (!folkloreSmoothBlur || !(blurAmount > 0.0)) {
+        return float4(original * ambient, alpha);
+    }
     const float2 discRadius = radiusPixels / screenPixels;
     const int tapCount = 24;
     const float goldenAngle = 2.39996323;
@@ -135,26 +231,50 @@ float4 main(PSInput input) : SV_TARGET {
         colourSum += rsx_tex[0].SampleLevel(rsx_samp[0], tapCoordinate, 0).xyz * weight;
         weightSum += weight;
     }
-    return float4(colourSum / weightSum, alpha);
+    return float4(colourSum / weightSum * ambient, alpha);
 }
 )HLSL";
 
-    const std::string& farOnlyShader()
+    /* The tuning, ahead of everything else in the text: whether the disc
+     * blur is on, and the occlusion's strength (0 = off) and shape. */
+    std::string optionsText(bool smoothBlur, float ambientStrength)
     {
-        static const std::string text = std::string(kCommon) + kFarOnly + kBody;
-        return text;
+        char options[640];
+        std::snprintf(options, sizeof(options),
+                      "\nstatic const bool folkloreSmoothBlur = %s;\n"
+                      "static const float folkloreAmbientStrength = %.3f;\n"
+                      "static const float folkloreAmbientRadius = 0.030;\n"
+                      "static const float folkloreAmbientRange = 0.060;\n"
+                      "static const float folkloreAmbientBias = 0.10;\n"
+                      "static const float folkloreAmbientIntensity = 1.6;\n"
+                      "static const float folkloreAmbientFadeDepth = 0.9990;\n"
+                      "static const float folkloreAmbientSkyDepth = 0.99995;\n",
+                      smoothBlur ? "true" : "false", ambientStrength);
+        return options;
     }
 
-    const std::string& twoSidedShader()
+    /* Every combination is built once and kept: the renderer holds on to
+     * the pointer it is given. Index: version (2) x blur (2) x occlusion (3). */
+    const char* passShader(int versionIndex, bool smoothBlur, int ambientIndex)
     {
-        static const std::string text = std::string(kCommon) + kTwoSided + kBody;
-        return text;
+        static std::string texts[2][2][3];
+        static const float ambientStrengths[3] = {0.0f, 0.6f, 1.0f};
+        std::string& text = texts[versionIndex][smoothBlur ? 1 : 0][ambientIndex];
+        if (text.empty())
+        {
+            text = std::string(kCommon) + optionsText(smoothBlur, ambientStrengths[ambientIndex]) +
+                   (versionIndex == 0 ? kFarOnly : kTwoSided) + kAmbient + kBody;
+        }
+        return text.c_str();
     }
 }
 
 void engineDepthOfFieldApply()
 {
-    const bool smooth = engineSettings().depthOfField == EngineSettings::DepthOfField::Smooth;
-    rsx_live_draw_set_ps_replacement(kFarOnlyHash, smooth ? farOnlyShader().c_str() : nullptr);
-    rsx_live_draw_set_ps_replacement(kTwoSidedHash, smooth ? twoSidedShader().c_str() : nullptr);
+    const EngineSettings& settings = engineSettings();
+    const bool smoothBlur = settings.depthOfField == EngineSettings::DepthOfField::Smooth;
+    const int ambientIndex = (int)settings.ambientOcclusion;
+    const bool replace = smoothBlur || ambientIndex != 0;
+    rsx_live_draw_set_ps_replacement(kFarOnlyHash, replace ? passShader(0, smoothBlur, ambientIndex) : nullptr);
+    rsx_live_draw_set_ps_replacement(kTwoSidedHash, replace ? passShader(1, smoothBlur, ambientIndex) : nullptr);
 }
