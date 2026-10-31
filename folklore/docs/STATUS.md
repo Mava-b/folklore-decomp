@@ -1079,7 +1079,18 @@ What 0006 fixes in ps3recomp to make that run:
     out of focus a 24-tap golden-angle disc as wide as the two copies' span,
     each tap weighted by whether its own blur reaches the pixel (no sharp
     edges bleeding into the blur). Both shaders compile (glslang's HLSL
-    front end). Not yet seen on Windows.
+    front end). First seen on Windows in capture-20261031-111758 (3x render
+    scale, 21:9): [ps-replace] for every build of the pass, the background
+    softly blurred with no doubling, the character's outline clean; but the
+    ground showed horizontal streaks -- the disc had been scaled per axis by
+    the game's (c8.x, c9.y), and the pair is mostly horizontal (the resolve
+    is a 2x horizontal one). The disc is now round on screen, its radius the
+    length of the pair's offset in screen pixels. The same run met a second
+    version of the pass that blurs both sides of the focus (pso
+    98dbb71efb61695f, text hash 0xBC72CEB2C64A1E3F: abs(depth*c2.x - c1.x)
+    - c4.y, constants one slot later), now replaced the same way, and a
+    four-tap one (0x857B42FDBCA02AF1, scaled by the scene's own colour) left
+    as it is.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

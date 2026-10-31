@@ -3,41 +3,38 @@
  * depth_of_field; patches/0059 adds the renderer's shader replacement hook).
  *
  * Folklore draws its depth of field in the pass that resolves the 2560x720
- * scene to the 1280x720 screen (pso key 4fb2ef46cbd180a0 in the 1.10 US
- * captures; one draw a frame, right after the scene). The pass reads the
- * depth buffer, works out a blur factor from it with the game's focus
- * constants, and takes two taps of the scene pushed apart along a diagonal by
- * that factor. In focus the two taps are the 2x resolve; out of focus they
- * become two offset copies of the picture -- the doubled, harsh look.
+ * scene to the screen, one draw a frame. The pass reads the depth buffer,
+ * works out a blur factor from it with the game's focus constants, and takes
+ * two taps of the scene pushed apart by that factor. In focus the two taps
+ * are the 2x resolve; out of focus they become two offset copies of the
+ * picture -- the doubled, harsh look. Two versions of the pass turn up: one
+ * that blurs only what is behind the focus (most of the game), and one that
+ * blurs both sides of it. (A third, four-tap version seen once is left as it
+ * is.)
  *
- * kSmoothDepthOfField below keeps the game's factor, its arithmetic and its
- * constants (so the focus distance and strength are the game's), returns the
- * original two taps wherever the image is in focus, and out of focus takes a
- * 24-tap disc spanning the same distance as the two copies. Each tap's own
- * depth decides whether it may contribute, so a sharp object does not bleed
- * into the blurred background around it. kOriginalShaderHash is the 64-bit
- * FNV-1a of the shader as the renderer translates it (its LD_HLSL_DUMP text).
+ * The replacements keep each version's factor, arithmetic and constants (so
+ * focus distance and strength are the game's), return the original two taps
+ * wherever the image is in focus, and out of focus take a round 24-tap disc
+ * as wide as the two copies were apart. Each tap's own depth decides whether
+ * it may contribute, so a sharp object does not bleed into the blur around
+ * it. The hashes are the 64-bit FNV-1a of each shader as the renderer
+ * translates it (its LD_HLSL_DUMP text).
  */
 #include "engine_settings.h"
 
 #include <cstdint>
+#include <string>
 
 extern "C" void rsx_live_draw_set_ps_replacement(uint64_t sourceHash, const char* hlsl);
 
 namespace
 {
-    constexpr uint64_t kOriginalShaderHash = 0xBF822F2AE9CE0473ull;
+    /* Behind the focus only: pso 4fb2ef46cbd180a0 / 76bf6e099e2e0a4f. */
+    constexpr uint64_t kFarOnlyHash = 0xBF822F2AE9CE0473ull;
+    /* Both sides of the focus: pso 98dbb71efb61695f. */
+    constexpr uint64_t kTwoSidedHash = 0xBC72CEB2C64A1E3Full;
 
-    const char* const kSmoothDepthOfField = R"HLSL(// Folklore's depth of field, smooth version (engine_dof.cpp).
-//
-// The game's own pass (one per frame) resolves the 2560x720 scene to the
-// 1280x720 screen with two taps, pushed apart along a diagonal by a factor
-// worked out from the depth: in focus they are the 2x resolve, out of focus
-// they become two offset copies of the image. This keeps the game's factor
-// and its constants, so the focus distance and strength are the artists',
-// and replaces the two taps out of focus with a 24-tap disc of the same
-// extent. Each tap's own depth decides whether it may contribute, so a
-// sharp object does not smear into the blur around it.
+    const char* const kCommon = R"HLSL(
 float4 _rsx_zeta_argb(Texture2D depthTexture, SamplerState depthSampler, float2 coordinate) {
     float depth = saturate(depthTexture.SampleLevel(depthSampler, coordinate, 0).x);
     uint depthBits = (uint)round(depth * 16777215.0);
@@ -52,11 +49,15 @@ struct PSInput {
 };
 Texture2D    rsx_tex[16] : register(t0);
 SamplerState rsx_samp[16] : register(s0);
+)HLSL";
+
+    /* The game's blur factor at one point, its own arithmetic in order; the
+     * in-focus value it is clamped to; and the pair's offset per unit. */
+    const char* const kFarOnly = R"HLSL(
 cbuffer PSConstants : register(b1) {
     float4 fp_constants[10];
     float4 fp_alpha;
 };
-// The game's blur factor at one point (its own arithmetic, in order).
 float folkloreBlurFactor(float2 coordinate) {
     float4 depthBytes = _rsx_zeta_argb(rsx_tex[1], rsx_samp[1], coordinate);
     float factor = dot(depthBytes.wxy, fp_constants[0].xyz);
@@ -69,13 +70,38 @@ float folkloreBlurFactor(float2 coordinate) {
     factor = factor * fp_constants[6].w;
     return max(factor, fp_constants[7].x);
 }
+float folkloreSharpFactor() { return fp_constants[7].x; }
+float2 folkloreAxisScale() { return float2(fp_constants[8].x, fp_constants[9].y); }
+)HLSL";
+
+    const char* const kTwoSided = R"HLSL(
+cbuffer PSConstants : register(b1) {
+    float4 fp_constants[11];
+    float4 fp_alpha;
+};
+float folkloreBlurFactor(float2 coordinate) {
+    float4 depthBytes = _rsx_zeta_argb(rsx_tex[1], rsx_samp[1], coordinate);
+    float factor = dot(depthBytes.ywx, fp_constants[0].yzw);
+    factor = factor * fp_constants[2].x - fp_constants[1].x;
+    float range = fp_constants[3].z - fp_constants[3].y;
+    factor = abs(factor) - fp_constants[4].y;
+    factor = max(factor, fp_constants[5].x);
+    factor = factor / range;
+    factor = min(factor, fp_constants[6].x);
+    factor = factor * fp_constants[7].w;
+    return max(factor, fp_constants[8].x);
+}
+float folkloreSharpFactor() { return fp_constants[8].x; }
+float2 folkloreAxisScale() { return float2(fp_constants[9].x, fp_constants[10].y); }
+)HLSL";
+
+    const char* const kBody = R"HLSL(
 float4 main(PSInput input) : SV_TARGET {
     const float2 coordinate = input.tc0.xy;
-    const float2 axisScale = float2(fp_constants[8].x, fp_constants[9].y);
-    const float sharpFactor = fp_constants[7].x;
+    const float sharpFactor = folkloreSharpFactor();
     const float factor = folkloreBlurFactor(coordinate);
     // The game's two taps: exactly the original image where it is sharp.
-    const float2 pairOffset = factor * axisScale;
+    const float2 pairOffset = factor * folkloreAxisScale();
     float3 original = 0.5 * (rsx_tex[0].Sample(rsx_samp[0], coordinate - pairOffset).xyz +
                              rsx_tex[0].Sample(rsx_samp[0], coordinate + pairOffset).xyz);
     const float alpha = rsx_tex[0].Sample(rsx_samp[0], coordinate).w;
@@ -83,10 +109,15 @@ float4 main(PSInput input) : SV_TARGET {
     if (!(blurAmount > 0.0)) {
         return float4(original, alpha);
     }
-    // A disc reaching as far as the game's two copies (the pair's diagonal).
+    // A round disc on screen (the scene is twice as wide as the screen),
+    // reaching as far as each of the game's two copies was pushed.
+    uint sceneWidth, sceneHeight;
+    rsx_tex[0].GetDimensions(sceneWidth, sceneHeight);
+    const float2 screenPixels = float2(0.5 * (float)max(sceneWidth, 1u), (float)max(sceneHeight, 1u));
+    const float radiusPixels = length(pairOffset * screenPixels);
+    const float2 discRadius = radiusPixels / screenPixels;
     const int tapCount = 24;
     const float goldenAngle = 2.39996323;
-    const float2 discRadius = pairOffset * 1.41421356;
     float3 colourSum = original * 2.0;
     float weightSum = 2.0;
     [unroll] for (int tapIndex = 0; tapIndex < tapCount; tapIndex++) {
@@ -104,10 +135,23 @@ float4 main(PSInput input) : SV_TARGET {
     return float4(colourSum / weightSum, alpha);
 }
 )HLSL";
+
+    const std::string& farOnlyShader()
+    {
+        static const std::string text = std::string(kCommon) + kFarOnly + kBody;
+        return text;
+    }
+
+    const std::string& twoSidedShader()
+    {
+        static const std::string text = std::string(kCommon) + kTwoSided + kBody;
+        return text;
+    }
 }
 
 void engineDepthOfFieldApply()
 {
     const bool smooth = engineSettings().depthOfField == EngineSettings::DepthOfField::Smooth;
-    rsx_live_draw_set_ps_replacement(kOriginalShaderHash, smooth ? kSmoothDepthOfField : nullptr);
+    rsx_live_draw_set_ps_replacement(kFarOnlyHash, smooth ? farOnlyShader().c_str() : nullptr);
+    rsx_live_draw_set_ps_replacement(kTwoSidedHash, smooth ? twoSidedShader().c_str() : nullptr);
 }
