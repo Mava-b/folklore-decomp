@@ -250,6 +250,21 @@ void engineSettingsLoad()
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
                                                                           : EngineSettings::Bloom::Smooth;
         }
+        else if (std::strcmp(key, "id_souls") == 0)
+        {
+            if (std::strcmp(value, "original") == 0)
+            {
+                settingsInstance.idSouls = EngineSettings::IdSouls::Original;
+            }
+            else if (std::strcmp(value, "clear") == 0)
+            {
+                settingsInstance.idSouls = EngineSettings::IdSouls::Clear;
+            }
+            else
+            {
+                settingsInstance.idSouls = EngineSettings::IdSouls::Smooth;
+            }
+        }
         else if (std::strcmp(key, "shadows") == 0)
         {
             if (std::strcmp(value, "original") == 0)
@@ -418,6 +433,11 @@ void engineSettingsSave()
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
     std::fprintf(file, "# original (the game's, flickers) or smooth (next start)\n");
     std::fprintf(file, "bloom = %s\n", current.bloom == EngineSettings::Bloom::Original ? "original" : "smooth");
+    std::fprintf(file, "# Ids' souls: original (the game's static), smooth or clear (next start)\n");
+    std::fprintf(file, "id_souls = %s\n",
+                 current.idSouls == EngineSettings::IdSouls::Original ? "original"
+                 : current.idSouls == EngineSettings::IdSouls::Clear  ? "clear"
+                                                                      : "smooth");
     std::fprintf(file, "# original (hard edges), soft or softer\n");
     std::fprintf(file, "shadows = %s\n",
                  current.shadows == EngineSettings::Shadows::Original ? "original"
@@ -490,6 +510,7 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
     engineDepthOfFieldApply();
     engineBloomApply();
+    engineIdSoulsApply();
     rsx_live_draw_set_aspect(engineSettingsAspectValue(current.aspectRatio));
     rsx_null_backend_set_fullscreen(current.fullscreen ? 1 : 0);
 }

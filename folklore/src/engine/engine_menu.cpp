@@ -91,6 +91,7 @@ namespace
         /* The depth of field the game's shaders were built with this run. */
         EngineSettings::DepthOfField startDepthOfField = EngineSettings::DepthOfField::Smooth;
         EngineSettings::Bloom startBloom = EngineSettings::Bloom::Smooth;
+        EngineSettings::IdSouls startIdSouls = EngineSettings::IdSouls::Smooth;
         EngineSettings::AmbientOcclusion startAmbientOcclusion = EngineSettings::AmbientOcclusion::Subtle;
         bool menuOpen = false;
         bool focusRequested = false;
@@ -1023,6 +1024,25 @@ namespace
                 ImGui::TextDisabled("(applies when you next start the game)");
             }
         }
+        ImGui::TextUnformatted("Id souls");
+        {
+            int soulIndex = (int)settings.idSouls;
+            bool soulChanged = ImGui::RadioButton("Original (static)##idsouls", &soulIndex, 0);
+            ImGui::SameLine();
+            soulChanged |= ImGui::RadioButton("Smooth (soft shimmer)##idsouls", &soulIndex, 1);
+            ImGui::SameLine();
+            soulChanged |= ImGui::RadioButton("Clear (no pattern)##idsouls", &soulIndex, 2);
+            if (soulChanged)
+            {
+                settings.idSouls = (EngineSettings::IdSouls)soulIndex;
+                changed = true;
+            }
+            if (settings.idSouls != menu.startIdSouls)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(applies when you next start the game)");
+            }
+        }
         ImGui::TextUnformatted("Shadows (characters' shadow edges)");
         {
             int shadowIndex = (int)settings.shadows;
@@ -1346,6 +1366,7 @@ namespace
             menu.initialized = true;
             menu.startDepthOfField = engineSettings().depthOfField;
             menu.startBloom = engineSettings().bloom;
+            menu.startIdSouls = engineSettings().idSouls;
             menu.startAmbientOcclusion = engineSettings().ambientOcclusion;
             if (!initialize((ID3D12Device*)device, (ID3D12CommandQueue*)queue, (DXGI_FORMAT)format, height))
             {

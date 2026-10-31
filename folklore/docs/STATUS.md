@@ -1284,6 +1284,16 @@ What 0006 fixes in ps3recomp to make that run:
     a large area -- enough to look like a menu window, so the whole HUD
     went centred for those frames. Only plain 2D draws (the program menus
     use) can mark a menu now.
+92. Id souls (engine setting id_souls, engine_ids.cpp, the 0059 hook;
+    capture-20261031-222947). The soul shader (normalised hash
+    19F0164E8EE06E0E, VS 3f0077e9, one 512x512 texture) adds the texture's
+    channels together and feeds that through cos(shade * c1.x + time *
+    c0.x) / 4 with a large c1.x, so neighbouring texels give unrelated
+    values: static, several times finer than a pixel at the PC's render
+    scale. Smooth takes the shade from a blurred copy, at a third of the
+    frequency, and filters the cosine to the pixel (fades to its average
+    where it would alias); Clear uses the average only. Colour, glow,
+    alpha, alpha test and the second target are the game's.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

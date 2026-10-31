@@ -41,6 +41,8 @@ be turned back to the original.
 - **Smooth depth of field**: a soft, round blur using the game's own focus,
   without the original's doubled image.
 - **Smooth bloom**: a steady glow, without the original's flicker.
+- **Cleaner Id souls**: the enemies' souls as a soft shimmer (or a clear
+  translucent shape) instead of pixel static.
 - **Faster busy scenes**: objects drawn again and again (Doolin's streets)
   reuse work instead of being redrawn from scratch.
 - **Quality of life**: skip the opening logos with Start, save backups and

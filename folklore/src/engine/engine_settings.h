@@ -108,6 +108,17 @@ struct EngineSettings
         Smooth,
     };
     Bloom bloom = Bloom::Smooth;
+    /* The Ids' souls: the game's shader (a cosine of the texture that turns
+     * into pixel static at PC resolutions), smooth (a soft shimmer filtered
+     * to the screen) or clear (no pattern; engine_ids.cpp). Applies at the
+     * next start. */
+    enum class IdSouls
+    {
+        Original,
+        Smooth,
+        Clear,
+    };
+    IdSouls idSouls = IdSouls::Smooth;
     /* Ambient occlusion: soft shading where surfaces meet, worked out from
      * the depth buffer in the depth of field pass (engine_dof.cpp). Applies
      * at the next start. */
@@ -190,6 +201,8 @@ void engineSettingsApplyGraphics();
 void engineDepthOfFieldApply();
 /* engine_bloom.cpp: the same for the bloom. */
 void engineBloomApply();
+/* engine_ids.cpp: the same for the Ids' souls. */
+void engineIdSoulsApply();
 /* Hand the input settings to the pad runtime (startup and every change). */
 void engineSettingsApplyInput();
 /* The aspect ratio a setting asks for (16:9 for Original). */
