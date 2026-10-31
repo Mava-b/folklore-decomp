@@ -202,7 +202,11 @@ saved to `folklore_settings.ini`.
   - *Render resolution*: 1x (1280×720, the PS3's), 2x or 3x. Applies on the
     next start.
   - *Aspect ratio*: 16:9, match display, 21:9 or 32:9 — a wider field of view,
-    not a stretched picture (menus and HUD are stretched). Next start.
+    not a stretched picture. Next start.
+  - *Menus and HUD* (when wider than 16:9): *Centred* (the default: drawn
+    at their own shape in the middle 16:9, with full-screen fades and
+    backdrops still covering the whole screen) or *Stretched to fit* (as
+    before). Applies at once.
   - *Anti-aliasing*: *SMAA* (the default for new settings: smooth edges
     that stay sharp, text and texture detail kept), *FXAA* (softer) or
     *Off*. Applies at once. *Anisotropic filtering* (up to 16x),

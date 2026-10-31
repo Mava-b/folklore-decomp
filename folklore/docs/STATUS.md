@@ -1166,6 +1166,20 @@ What 0006 fixes in ps3recomp to make that run:
     weights pass runs over every pixel (cheap at this size). Inflated
     data and the embedded wrapper checked against the reference; all
     entry points compiled with glslang's HLSL front end.
+84. Ultrawide HUD centred (patches/0062, hud_layout = centred / stretched,
+    default centred, live). From capture-20261031-143200 (21:9): every
+    draw into the display buffer -- the resolve, the bloom composite and
+    the HUD -- uses one vertex program (efe6d52fedb092ae) whose clip
+    position is dp4(v0, c256..c259); the HUD's quads are in screen
+    pixels, the full-screen passes 0..1. At PSO creation
+    ld_vs_position_rows reads that pattern from the decompiled HLSL (one
+    write per component of o[0], v[0] = attribute 0); per draw,
+    ld_hud_centred_draw takes draws into a display buffer, depth test
+    off, on a widened surface, works out their x extent on screen from
+    the vertices, and if it is under 95% of the width draws them into the
+    middle 16:9 (viewport and scissor narrowed by the widening). Full-
+    screen passes keep the whole width. Not handled: HUD drawn with a
+    depth test, or by image blits.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

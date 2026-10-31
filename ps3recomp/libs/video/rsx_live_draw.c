@@ -60,6 +60,7 @@ float rsx_live_draw_get_aspect(void) { return 16.0f / 9.0f; }
 void rsx_live_draw_set_async_shaders(int e) { (void)e; }
 void rsx_live_draw_set_anisotropy(u32 l) { (void)l; }
 void rsx_live_draw_set_texture_lod_bias(int h) { (void)h; }
+void rsx_live_draw_set_hud_layout(int m) { (void)m; }
 void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
 void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
 void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
@@ -302,6 +303,8 @@ typedef struct {
     ID3D12PipelineState* volatile pso;
     volatile LONG pending;
     u32 ps_unit_mask;   /* texture units the fragment program samples */
+    s16 hud_row_x;      /* constants giving clip x and w from attribute 0 (ld_vs_position_rows), or -1 */
+    s16 hud_row_w;
 } psocache_t;
 typedef struct {
     u64 hash;
@@ -488,6 +491,7 @@ static u32 s_ld_sampler_anisotropy = 1;         /* what the cached samplers were
 static volatile LONG g_ld_texture_lod_bias = 0;  /* requested mip bias in hundredths (0 = the game's choice) */
 static LONG s_ld_sampler_lod_bias = 0;           /* what the cached samplers were built with (render thread) */
 static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
+static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 1 centred 16:9 */
 static volatile LONG g_ld_pso_jobs_pending = 0;
 static volatile LONG g_ld_pso_jobs_done = 0;
 static volatile LONG g_ld_pso_draws_skipped = 0;
@@ -669,6 +673,7 @@ typedef struct {
     u32 input_mask, input_stride;
     u32 packed_offsets;
     u32 ps_unit_mask;
+    s16 hud_row_x, hud_row_w;
 } ld_pso_metadata;
 
 static ld_pso_metadata g_ld_current_pso;
@@ -2489,6 +2494,11 @@ static int ld_apply_ps_replacement(char* hlsl, size_t capacity)
         }
     }
     return replaced;
+}
+
+void rsx_live_draw_set_hud_layout(int mode)
+{
+    InterlockedExchange(&g_ld_hud_layout, mode == 0 ? 0 : 1);
 }
 
 void rsx_live_draw_set_sharpening(u32 percent)
@@ -5337,6 +5347,73 @@ static void ld_pso_jobs_wait(void)
 /* WPOS is the fragment's window position; at a render scale above 1 the
  * host pixel grid is finer than the guest's, so bring it back to guest
  * pixels before a shader uses it (screen-space effects, texel lookups). */
+/* Ultrawide HUD: which constants a vertex program's clip position comes
+ * from, when it is the plain "o[0].c = dp4(v[0], c[n])" a 2D overlay uses
+ * (one write per component, attribute 0 read as it is). Then the draw's
+ * extent on screen can be worked out on the CPU from its vertices
+ * (ld_hud_region). Anything else gives -1 and the draw is left alone. */
+static int ld_vs_position_row(const char* hlsl, const char* write)
+{
+    const char* found = strstr(hlsl, write);
+    if (!found || strstr(found + 1, write))
+    {
+        return -1;
+    }
+    /* The block that writes it: "{ float4 _v = (float4)(vp_dot4(((v[0]).xyzw),((vp_c[N]).xyzw)));" */
+    const char* blockStart = NULL;
+    for (const char* cursor = found; cursor > hlsl; cursor--)
+    {
+        if (cursor[0] == '{' && cursor[1] == ' ')
+        {
+            blockStart = cursor;
+            break;
+        }
+    }
+    if (!blockStart)
+    {
+        return -1;
+    }
+    static const char prefix[] = "{ float4 _v = (float4)(vp_dot4(((v[0]).xyzw),((vp_c[";
+    if (strncmp(blockStart, prefix, sizeof(prefix) - 1u) != 0)
+    {
+        return -1;
+    }
+    char* numberEnd = NULL;
+    const long row = strtol(blockStart + sizeof(prefix) - 1u, &numberEnd, 10);
+    if (!numberEnd || strncmp(numberEnd, "]).xyzw)));", 11) != 0 || row < 0 || row >= RSX_DSP_NUM_CONSTANTS)
+    {
+        return -1;
+    }
+    return (int)row;
+}
+
+static void ld_vs_position_rows(const char* hlsl, s16* rowX, s16* rowW)
+{
+    *rowX = -1;
+    *rowW = -1;
+    if (!strstr(hlsl, "v[0]=input.a0;"))
+    {
+        return;
+    }
+    /* Exactly the four single-component writes, nothing else to o[0]. */
+    u32 writes = 0;
+    for (const char* cursor = strstr(hlsl, "o[0]."); cursor; cursor = strstr(cursor + 1, "o[0]."))
+    {
+        writes++;
+    }
+    if (writes != 4)
+    {
+        return;
+    }
+    const int xRow = ld_vs_position_row(hlsl, "o[0].x = _v.x;");
+    const int wRow = ld_vs_position_row(hlsl, "o[0].w = _v.w;");
+    if (xRow >= 0 && wRow >= 0)
+    {
+        *rowX = (s16)xRow;
+        *rowW = (s16)wRow;
+    }
+}
+
 static int ld_scale_wpos(char* hlsl, u32 capacity, u32 drawScale, float drawScaleX)
 {
     if (drawScale <= 1u && drawScaleX <= 1.0f)
@@ -6018,6 +6095,8 @@ static ID3D12PipelineState* get_pso(
             g_ld_profile.total.pso_hits++;
 #endif
             g_ld_current_pso.ps_unit_mask = g.psos[found].ps_unit_mask;
+            g_ld_current_pso.hud_row_x = g.psos[found].hud_row_x;
+            g_ld_current_pso.hud_row_w = g.psos[found].hud_row_w;
             if (InterlockedCompareExchange(&g.psos[found].pending, 0, 0)) {
                 InterlockedIncrement(&g_ld_pso_draws_skipped);
                 return NULL;             /* still compiling (ld_pso_job) */
@@ -6185,6 +6264,14 @@ static ID3D12PipelineState* get_pso(
     g.psos[entryIndex].pending = 0;
     g.psos[entryIndex].ps_unit_mask = rsx_fp_texture_units(fp_uc, fp_size);
     g_ld_current_pso.ps_unit_mask = g.psos[entryIndex].ps_unit_mask;
+    g.psos[entryIndex].hud_row_x = -1;
+    g.psos[entryIndex].hud_row_w = -1;
+    if (vi > 0)
+    {
+        ld_vs_position_rows(vs_hlsl, &g.psos[entryIndex].hud_row_x, &g.psos[entryIndex].hud_row_w);
+    }
+    g_ld_current_pso.hud_row_x = g.psos[entryIndex].hud_row_x;
+    g_ld_current_pso.hud_row_w = g.psos[entryIndex].hud_row_w;
     if (vi > 0 && fi > 0) {
         if (ld_pso_job_submit(entryIndex, vs_hlsl, ps_hlsl, &rs, masked_layout,
                               packed_payload)) {
@@ -6308,6 +6395,7 @@ typedef struct {
 } draw_ctx;
 
 static draw_ctx dc;
+static const float* dc_vertex_attr_canonical(u32 vertex, u32 attr, float fallback[4]);
 
 static void dc_reset(void)
 {
@@ -7011,6 +7099,85 @@ static const float* dc_vertex_attr_canonical(
     }
     memcpy(fallback, fetch->default_value, 16);
     return fallback;
+}
+
+/* Ultrawide HUD: is this draw part of the 2D overlay, to be drawn into the
+ * middle 16:9 of the widened picture instead of stretched across it? Yes
+ * when the layout is "centred", the surface is widened, the draw goes into
+ * a display buffer without a depth test, its vertex program is the plain 2D
+ * kind (ld_vs_position_rows), and its vertices do not span the screen --
+ * full-screen passes (the resolve, bloom, fades, menu backdrops) keep
+ * covering all of it. `viewportTransform` is the draw's xf (x scale at 0, x
+ * offset at 4). */
+static int ld_hud_centred_draw(const surface_t* surface, const float viewportTransform[8])
+{
+    if (InterlockedCompareExchange(&g_ld_hud_layout, 0, 0) != 1)
+    {
+        return 0;
+    }
+    const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
+    if (!(surface->scale_x > verticalScale * 1.01f))
+    {
+        return 0;
+    }
+    if (g_ld_current_pso.hud_row_x < 0 || g_ld_current_pso.hud_row_w < 0)
+    {
+        return 0;
+    }
+    if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u)
+    {
+        return 0;
+    }
+    int scanout = 0;
+    for (u32 bufferIndex = 0; bufferIndex < 8; bufferIndex++)
+    {
+        const display_buffer_t* display = &g.display_buffers[bufferIndex];
+        if (display->valid && display->location == surface->location && display->offset == surface->offset)
+        {
+            scanout = 1;
+            break;
+        }
+    }
+    if (!scanout)
+    {
+        return 0;
+    }
+    const u32 vertexCount = dc.n_source_refs ? dc.n_source_refs : dc.n_verts;
+    if (!vertexCount || !dc.fetch_plan.attr[0].desc.type)
+    {
+        return 0;
+    }
+    float rowX[4];
+    float rowW[4];
+    memcpy(rowX, g.rsx.constants[g_ld_current_pso.hud_row_x], sizeof(rowX));
+    memcpy(rowW, g.rsx.constants[g_ld_current_pso.hud_row_w], sizeof(rowW));
+    float lowest = 1e30f;
+    float highest = -1e30f;
+    for (u32 occurrence = 0; occurrence < vertexCount; occurrence++)
+    {
+        const u32 vertex = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, occurrence) : occurrence;
+        float fallback[4];
+        const float* position = dc_vertex_attr_canonical(vertex, 0, fallback);
+        const float clipX = position[0] * rowX[0] + position[1] * rowX[1] + position[2] * rowX[2] +
+                            position[3] * rowX[3];
+        const float clipW = position[0] * rowW[0] + position[1] * rowW[1] + position[2] * rowW[2] +
+                            position[3] * rowW[3];
+        if (!(clipW > 1e-6f) || !(clipX == clipX))
+        {
+            return 0;
+        }
+        const float screenX = clipX / clipW * viewportTransform[0] + viewportTransform[4];
+        if (screenX < lowest)
+        {
+            lowest = screenX;
+        }
+        if (screenX > highest)
+        {
+            highest = screenX;
+        }
+    }
+    /* Clip space runs -1..1: a draw 95% of the width or more is full-screen. */
+    return highest - lowest < 1.9f;
 }
 
 /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
@@ -9646,6 +9813,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
 
     /* Guest pixels; scaled to the host surface just before they are set. */
     const surface_t* drawSurface = &g.surfaces[target];
+    const int hudCentred = ld_hud_centred_draw(drawSurface, xf);
     const float renderScale = (float)(drawSurface->scale ? drawSurface->scale : 1u);
     const float renderScaleX = drawSurface->scale_x > 0.0f ? drawSurface->scale_x : 1.0f;
     /* A 1x post-effect target with a canvas-sized (scaled) zeta bound: fine
@@ -9696,6 +9864,18 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     sc.top = (LONG)ld_surface_scaled(drawSurface, (u32)sc.top);
     sc.right = (LONG)ld_surface_x(drawSurface, (u32)sc.right);
     sc.bottom = (LONG)ld_surface_scaled(drawSurface, (u32)sc.bottom);
+    if (hudCentred)
+    {
+        /* Ultrawide HUD, centred: the draw goes into the middle 16:9 of the
+         * widened surface at its own proportions; the scissor follows. */
+        const float hudWidth = dvp.Width / drawSurface->scale_x * renderScale;
+        const float hudLeft = (float)(LONG)((dvp.Width - hudWidth) * 0.5f);
+        const float hudShrink = hudWidth / dvp.Width;
+        dvp.TopLeftX = hudLeft;
+        dvp.Width = hudWidth;
+        sc.left = (LONG)(hudLeft + (float)sc.left * hudShrink);
+        sc.right = (LONG)(hudLeft + (float)sc.right * hudShrink + 0.999f);
+    }
     g.list->lpVtbl->RSSetViewports(g.list, 1, &dvp);
     g.list->lpVtbl->RSSetScissorRects(g.list, 1, &sc);
     /* Dynamic stencil reference (kept out of the PSO key on purpose). */

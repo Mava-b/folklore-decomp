@@ -929,9 +929,17 @@ namespace
                 ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
                                    "Now %.2f:1; %.2f:1 applies when you next start the game.", activeAspect, wantedAspect);
             }
-            else if (activeAspect > 16.0f / 9.0f + 0.01f)
+        }
+        ImGui::TextUnformatted("Menus and HUD (when wider than 16:9)");
+        {
+            int layoutIndex = (int)settings.hudLayout;
+            bool layoutChanged = ImGui::RadioButton("Centred (their own shape)##hud", &layoutIndex, 1);
+            ImGui::SameLine();
+            layoutChanged |= ImGui::RadioButton("Stretched to fit##hud", &layoutIndex, 0);
+            if (layoutChanged)
             {
-                ImGui::TextDisabled("Wider than 16:9: menus and the HUD are stretched to fit.");
+                settings.hudLayout = (EngineSettings::HudLayout)layoutIndex;
+                changed = true;
             }
         }
         ImGui::TextUnformatted("Anti-aliasing");

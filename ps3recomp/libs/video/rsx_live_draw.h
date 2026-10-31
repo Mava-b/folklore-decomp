@@ -153,6 +153,10 @@ void rsx_live_draw_set_sharpening(u32 percent);
  * (live, like it). Negative picks finer mip levels: sharper surfaces in the
  * distance. */
 void rsx_live_draw_set_texture_lod_bias(int hundredths);
+/* Ultrawide HUD layout: 0 stretched across the widened picture (as the game
+ * draws it), 1 centred -- the 2D overlay drawn at its own proportions in the
+ * middle 16:9, full-screen passes still covering everything (live). */
+void rsx_live_draw_set_hud_layout(int mode);
 /* Pixel shader replacements: a fragment program whose translated HLSL (as
  * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
  * -- a title's own better version of one of its effects. The hash is the
