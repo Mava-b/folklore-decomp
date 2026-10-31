@@ -64,6 +64,14 @@ struct EngineSettings
      * contrast-adaptive sharpening of the final image. Both apply at once. */
     int anisotropy = 16;
     int sharpening = 0;
+    /* Depth of field: the game's own two-tap blur, or a smooth 24-tap disc
+     * using the game's focus (engine_dof.cpp). Applies at the next start. */
+    enum class DepthOfField
+    {
+        Original,
+        Smooth,
+    };
+    DepthOfField depthOfField = DepthOfField::Smooth;
     /* Physics: step Havok by the real frame time instead of the game's fixed
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
@@ -122,6 +130,8 @@ const char* engineSettingsPath();
 std::string engineExecutableDirectory();
 /* Hand the graphics settings to the renderer (startup and every change). */
 void engineSettingsApplyGraphics();
+/* engine_dof.cpp: register the smooth depth of field shader, or remove it. */
+void engineDepthOfFieldApply();
 /* Hand the input settings to the pad runtime (startup and every change). */
 void engineSettingsApplyInput();
 /* The aspect ratio a setting asks for (16:9 for Original). */

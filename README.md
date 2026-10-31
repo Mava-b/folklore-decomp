@@ -199,6 +199,8 @@ saved to `folklore_settings.ini`.
   - *Aspect ratio*: 16:9, match display, 21:9 or 32:9 — a wider field of view,
     not a stretched picture (menus and HUD are stretched). Next start.
   - *Anti-aliasing* (FXAA), *Anisotropic filtering* (up to 16x), *Sharpening*.
+  - *Depth of field*: *Smooth* (the default: a soft blur using the game's own
+    focus, without the doubled edges) or *Original* (the PS3's). Next start.
   - *Build new shaders in the background* (no hitch when an effect first
     appears).
 - **Game files**: the game folder in use (change it here; it applies on the

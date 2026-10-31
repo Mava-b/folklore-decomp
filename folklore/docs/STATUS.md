@@ -1061,6 +1061,25 @@ What 0006 fixes in ps3recomp to make that run:
     open all session, run-20261030-184043.) The guest's vblank count and handlers stay at 59.94 Hz. Not yet
     tried on Windows; things to watch above 60: game speed and timers,
     animation, and the renderer keeping up (the pub drained in 9-11 ms).
+78. Depth of field (patches/0059, src/engine/engine_dof.cpp). The capture
+    capture-20261031-095951 shows the game's depth of field is the pass that
+    resolves the 2560x720 scene (0x1B40000) to the 1280x720 display buffer,
+    one draw a frame (pso 4fb2ef46cbd180a0, after the scene and its
+    distortion passes): it reads depth through the ARGB8 alias, works a blur
+    factor out of it (constants c0-c7, clamped below by c7.x, the in-focus
+    value), and averages two taps pushed apart along a diagonal by
+    factor x (c8.x, c9.y). In focus that is the 2x resolve; out of focus,
+    two offset copies of the picture. 0059 adds a general hook,
+    rsx_live_draw_set_ps_replacement(hash, hlsl): a translated pixel shader
+    whose text (as LD_HLSL_DUMP writes it) hashes to `hash` (FNV-1a 64) is
+    built from the title's HLSL instead ([ps-replace] in the log). Folklore
+    registers a replacement for 0xBF822F2AE9CE0473 (engine setting
+    depth_of_field = smooth, the default): the same factor and constants,
+    the original two taps where the factor is at its in-focus value, and
+    out of focus a 24-tap golden-angle disc as wide as the two copies' span,
+    each tap weighted by whether its own blur reaches the pixel (no sharp
+    edges bleeding into the blur). Both shaders compile (glslang's HLSL
+    front end). Not yet seen on Windows.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

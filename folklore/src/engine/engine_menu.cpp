@@ -88,6 +88,8 @@ namespace
     {
         bool initialized = false;
         bool failed = false;
+        /* The depth of field the game's shaders were built with this run. */
+        EngineSettings::DepthOfField startDepthOfField = EngineSettings::DepthOfField::Smooth;
         bool menuOpen = false;
         bool focusRequested = false;
         ID3D12DescriptorHeap* srvHeap = nullptr;
@@ -951,6 +953,23 @@ namespace
         changed |= radioSharpening("Medium", 60);
         ImGui::SameLine();
         changed |= radioSharpening("High", 100);
+        ImGui::TextUnformatted("Depth of field");
+        {
+            int depthOfFieldIndex = (int)settings.depthOfField;
+            bool depthOfFieldChanged = ImGui::RadioButton("Original (the PS3's)##dof", &depthOfFieldIndex, 0);
+            ImGui::SameLine();
+            depthOfFieldChanged |= ImGui::RadioButton("Smooth##dof", &depthOfFieldIndex, 1);
+            if (depthOfFieldChanged)
+            {
+                settings.depthOfField = (EngineSettings::DepthOfField)depthOfFieldIndex;
+                changed = true;
+            }
+            if (settings.depthOfField != menu.startDepthOfField)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(applies when you next start the game)");
+            }
+        }
         changed |= ImGui::Checkbox("Build new shaders in the background (no hitch when an effect first appears)",
                                    &settings.backgroundShaders);
         if (changed)
@@ -1237,6 +1256,7 @@ namespace
         if (!menu.initialized)
         {
             menu.initialized = true;
+            menu.startDepthOfField = engineSettings().depthOfField;
             if (!initialize((ID3D12Device*)device, (ID3D12CommandQueue*)queue, (DXGI_FORMAT)format, height))
             {
                 menu.failed = true;

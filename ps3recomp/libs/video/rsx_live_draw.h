@@ -147,6 +147,12 @@ void rsx_live_draw_set_async_shaders(int enabled);
  * sharpening of the presented game image (live; movies are not sharpened). */
 void rsx_live_draw_set_anisotropy(u32 level);
 void rsx_live_draw_set_sharpening(u32 percent);
+/* Pixel shader replacements: a fragment program whose translated HLSL (as
+ * LD_HLSL_DUMP writes it) hashes to `sourceHash` (64-bit FNV-1a of the text)
+ * is built from `hlsl` instead -- a title's own better version of one of its
+ * effects. `hlsl` must stay valid; NULL removes the entry. Applies to shaders
+ * built after the call, so set it before the first frame. Up to 16. */
+void rsx_live_draw_set_ps_replacement(u64 sourceHash, const char* hlsl);
 /* Background shader builds queued now, built so far, and draws skipped while
  * waiting for one (for a performance overlay). */
 void rsx_live_draw_get_shader_stats(u32* pending, u32* built, u32* skipped_draws);
