@@ -76,14 +76,17 @@ struct EngineSettings
     };
     TextureDetail textureDetail = TextureDetail::Sharper;
     /* Menus and HUD wider than 16:9: stretched across the screen (as the
-     * game draws them), or centred at their own proportions. Applies at
-     * once. */
+     * game draws them), centred at their own proportions, or centred with
+     * the map, gauges and hints moved out towards the edges (hudEdge: 0-100
+     * % of the way). Applies at once. */
     enum class HudLayout
     {
         Stretched,
         Centred,
+        Edges,
     };
-    HudLayout hudLayout = HudLayout::Centred;
+    HudLayout hudLayout = HudLayout::Edges;
+    int hudEdge = 100;
     /* Depth of field: the game's own two-tap blur, or a smooth 24-tap disc
      * using the game's focus (engine_dof.cpp). Applies at the next start. */
     enum class DepthOfField

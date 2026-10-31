@@ -1,0 +1,339 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -61,6 +61,7 @@
+ void rsx_live_draw_set_anisotropy(u32 l) { (void)l; }
+ void rsx_live_draw_set_texture_lod_bias(int h) { (void)h; }
+ void rsx_live_draw_set_hud_layout(int m) { (void)m; }
++void rsx_live_draw_set_hud_edge(int p) { (void)p; }
+ void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
+ void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
+ void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
+@@ -303,7 +304,8 @@
+     ID3D12PipelineState* volatile pso;
+     volatile LONG pending;
+     u32 ps_unit_mask;   /* texture units the fragment program samples */
+-    s16 hud_row_x;      /* constants giving clip x and w from attribute 0 (ld_vs_position_rows), or -1 */
++    s16 hud_row_x;      /* constants giving clip x, y and w from attribute 0 (ld_vs_position_rows), or -1 */
++    s16 hud_row_y;
+     s16 hud_row_w;
+ } psocache_t;
+ typedef struct {
+@@ -491,7 +493,8 @@
+ static volatile LONG g_ld_texture_lod_bias = 0;  /* requested mip bias in hundredths (0 = the game's choice) */
+ static LONG s_ld_sampler_lod_bias = 0;           /* what the cached samplers were built with (render thread) */
+ static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
+-static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 1 centred 16:9 */
++static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 1 centred 16:9, 2 edges */
++static volatile LONG g_ld_hud_edge = 100;        /* edges: how far out, 0 (centred) - 100 (screen edge) % */
+ static volatile LONG g_ld_pso_jobs_pending = 0;
+ static volatile LONG g_ld_pso_jobs_done = 0;
+ static volatile LONG g_ld_pso_draws_skipped = 0;
+@@ -673,7 +676,7 @@
+     u32 input_mask, input_stride;
+     u32 packed_offsets;
+     u32 ps_unit_mask;
+-    s16 hud_row_x, hud_row_w;
++    s16 hud_row_x, hud_row_y, hud_row_w;
+ } ld_pso_metadata;
+ 
+ static ld_pso_metadata g_ld_current_pso;
+@@ -2498,7 +2501,12 @@
+ 
+ void rsx_live_draw_set_hud_layout(int mode)
+ {
+-    InterlockedExchange(&g_ld_hud_layout, mode == 0 ? 0 : 1);
++    InterlockedExchange(&g_ld_hud_layout, (mode == 0 || mode == 2) ? mode : 1);
++}
++
++void rsx_live_draw_set_hud_edge(int percent)
++{
++    InterlockedExchange(&g_ld_hud_edge, percent < 0 ? 0 : (percent > 100 ? 100 : percent));
+ }
+ 
+ void rsx_live_draw_set_sharpening(u32 percent)
+@@ -5387,9 +5395,10 @@
+     return (int)row;
+ }
+ 
+-static void ld_vs_position_rows(const char* hlsl, s16* rowX, s16* rowW)
++static void ld_vs_position_rows(const char* hlsl, s16* rowX, s16* rowY, s16* rowW)
+ {
+     *rowX = -1;
++    *rowY = -1;
+     *rowW = -1;
+     if (!strstr(hlsl, "v[0]=input.a0;"))
+     {
+@@ -5406,10 +5415,12 @@
+         return;
+     }
+     const int xRow = ld_vs_position_row(hlsl, "o[0].x = _v.x;");
++    const int yRow = ld_vs_position_row(hlsl, "o[0].y = _v.y;");
+     const int wRow = ld_vs_position_row(hlsl, "o[0].w = _v.w;");
+-    if (xRow >= 0 && wRow >= 0)
++    if (xRow >= 0 && yRow >= 0 && wRow >= 0)
+     {
+         *rowX = (s16)xRow;
++        *rowY = (s16)yRow;
+         *rowW = (s16)wRow;
+     }
+ }
+@@ -6096,6 +6107,7 @@
+ #endif
+             g_ld_current_pso.ps_unit_mask = g.psos[found].ps_unit_mask;
+             g_ld_current_pso.hud_row_x = g.psos[found].hud_row_x;
++            g_ld_current_pso.hud_row_y = g.psos[found].hud_row_y;
+             g_ld_current_pso.hud_row_w = g.psos[found].hud_row_w;
+             if (InterlockedCompareExchange(&g.psos[found].pending, 0, 0)) {
+                 InterlockedIncrement(&g_ld_pso_draws_skipped);
+@@ -6265,12 +6277,15 @@
+     g.psos[entryIndex].ps_unit_mask = rsx_fp_texture_units(fp_uc, fp_size);
+     g_ld_current_pso.ps_unit_mask = g.psos[entryIndex].ps_unit_mask;
+     g.psos[entryIndex].hud_row_x = -1;
++    g.psos[entryIndex].hud_row_y = -1;
+     g.psos[entryIndex].hud_row_w = -1;
+     if (vi > 0)
+     {
+-        ld_vs_position_rows(vs_hlsl, &g.psos[entryIndex].hud_row_x, &g.psos[entryIndex].hud_row_w);
++        ld_vs_position_rows(vs_hlsl, &g.psos[entryIndex].hud_row_x, &g.psos[entryIndex].hud_row_y,
++                            &g.psos[entryIndex].hud_row_w);
+     }
+     g_ld_current_pso.hud_row_x = g.psos[entryIndex].hud_row_x;
++    g_ld_current_pso.hud_row_y = g.psos[entryIndex].hud_row_y;
+     g_ld_current_pso.hud_row_w = g.psos[entryIndex].hud_row_w;
+     if (vi > 0 && fi > 0) {
+         if (ld_pso_job_submit(entryIndex, vs_hlsl, ps_hlsl, &rs, masked_layout,
+@@ -7101,17 +7116,46 @@
+     return fallback;
+ }
+ 
+-/* Ultrawide HUD: is this draw part of the 2D overlay, to be drawn into the
+- * middle 16:9 of the widened picture instead of stretched across it? Yes
+- * when the layout is "centred", the surface is widened, the draw goes into
+- * a display buffer without a depth test, its vertex program is the plain 2D
+- * kind (ld_vs_position_rows), and its vertices do not span the screen --
+- * full-screen passes (the resolve, bloom, fades, menu backdrops) keep
+- * covering all of it. `viewportTransform` is the draw's xf (x scale at 0, x
+- * offset at 4). */
+-static int ld_hud_centred_draw(const surface_t* surface, const float viewportTransform[8])
++/* Ultrawide HUD: is this draw part of the 2D overlay, to be drawn at its own
++ * proportions instead of stretched across the widened picture? Yes when the
++ * layout is not "stretched", the surface is widened, the draw goes into a
++ * display buffer without a depth test, its vertex program is the plain 2D
++ * kind (ld_vs_position_rows) with an orthographic w (overlays fixed to the
++ * world, like enemies' gauges, have a perspective one and stay with the
++ * picture), and its vertices do not span the screen -- full-screen passes
++ * (the resolve, bloom, fades, menu backdrops) keep covering all of it.
++ * `viewportTransform` is the draw's xf (x scale and offset at 0 and 4, y at
++ * 1 and 5).
++ *
++ * Returns 0 for "leave it", else where it goes: LD_HUD_CENTRE into the middle
++ * 16:9, LD_HUD_LEFT / LD_HUD_RIGHT pushed out towards that edge (the
++ * "edges" layout). Folklore's HUD (capture-20261031-111758): the map and its
++ * icons centred around x 80-500, y 0-330 of the 1280x720 screen; the health
++ * and ID gauges and the folk diamond inside x 744-1200, y 60-300; the button
++ * hint text at x 1020-1130, y 614-650. So: a draw centred in the top-left
++ * (x <= 560, y <= 432) goes left, one centred in the top-right (x >= 700) or
++ * the bottom-right corner (x >= 960, y >= 560) goes right, everything else
++ * stays centred. Text comes one letter per draw: a letter
++ * that carries on the line of the previous one (same pipeline, overlapping
++ * it vertically, starting just after it) goes where that one went, so a
++ * line of text is never split between two places. */
++#define LD_HUD_CENTRE 1
++#define LD_HUD_LEFT   2
++#define LD_HUD_RIGHT  3
++
++typedef struct {
++    u32 frame;
++    u32 target;
++    u64 key;
++    float left, right, top, bottom;   /* screen fractions, 0-1 from the top left */
++    int place;
++} ld_hud_previous;
++static ld_hud_previous g_ld_hud_previous;
++
++static int ld_hud_draw_place(const surface_t* surface, u32 target, const float viewportTransform[8])
+ {
+-    if (InterlockedCompareExchange(&g_ld_hud_layout, 0, 0) != 1)
++    const LONG layout = InterlockedCompareExchange(&g_ld_hud_layout, 0, 0);
++    if (layout == 0)
+     {
+         return 0;
+     }
+@@ -7120,7 +7164,7 @@
+     {
+         return 0;
+     }
+-    if (g_ld_current_pso.hud_row_x < 0 || g_ld_current_pso.hud_row_w < 0)
++    if (g_ld_current_pso.hud_row_x < 0 || g_ld_current_pso.hud_row_y < 0 || g_ld_current_pso.hud_row_w < 0)
+     {
+         return 0;
+     }
+@@ -7148,11 +7192,20 @@
+         return 0;
+     }
+     float rowX[4];
++    float rowY[4];
+     float rowW[4];
+     memcpy(rowX, g.rsx.constants[g_ld_current_pso.hud_row_x], sizeof(rowX));
++    memcpy(rowY, g.rsx.constants[g_ld_current_pso.hud_row_y], sizeof(rowY));
+     memcpy(rowW, g.rsx.constants[g_ld_current_pso.hud_row_w], sizeof(rowW));
+-    float lowest = 1e30f;
+-    float highest = -1e30f;
++    /* Orthographic: w does not depend on the position. */
++    if (rowW[0] != 0.0f || rowW[1] != 0.0f || rowW[2] != 0.0f || !(rowW[3] > 1e-6f))
++    {
++        return 0;
++    }
++    float lowestX = 1e30f;
++    float highestX = -1e30f;
++    float lowestY = 1e30f;
++    float highestY = -1e30f;
+     for (u32 occurrence = 0; occurrence < vertexCount; occurrence++)
+     {
+         const u32 vertex = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, occurrence) : occurrence;
+@@ -7160,24 +7213,80 @@
+         const float* position = dc_vertex_attr_canonical(vertex, 0, fallback);
+         const float clipX = position[0] * rowX[0] + position[1] * rowX[1] + position[2] * rowX[2] +
+                             position[3] * rowX[3];
+-        const float clipW = position[0] * rowW[0] + position[1] * rowW[1] + position[2] * rowW[2] +
+-                            position[3] * rowW[3];
+-        if (!(clipW > 1e-6f) || !(clipX == clipX))
++        const float clipY = position[0] * rowY[0] + position[1] * rowY[1] + position[2] * rowY[2] +
++                            position[3] * rowY[3];
++        const float clipW = position[3] * rowW[3];
++        if (!(clipW > 1e-6f) || !(clipX == clipX) || !(clipY == clipY))
+         {
+             return 0;
+         }
+         const float screenX = clipX / clipW * viewportTransform[0] + viewportTransform[4];
+-        if (screenX < lowest)
++        const float screenY = clipY / clipW * viewportTransform[1] + viewportTransform[5];
++        if (screenX < lowestX)
+         {
+-            lowest = screenX;
++            lowestX = screenX;
+         }
+-        if (screenX > highest)
++        if (screenX > highestX)
+         {
+-            highest = screenX;
++            highestX = screenX;
++        }
++        if (screenY < lowestY)
++        {
++            lowestY = screenY;
++        }
++        if (screenY > highestY)
++        {
++            highestY = screenY;
+         }
+     }
+     /* Clip space runs -1..1: a draw 95% of the width or more is full-screen. */
+-    return highest - lowest < 1.9f;
++    if (!(highestX - lowestX < 1.9f))
++    {
++        return 0;
++    }
++    if (layout != 2)
++    {
++        return LD_HUD_CENTRE;
++    }
++    /* Screen fractions from the top left (clip y points up). */
++    const float left = (lowestX + 1.0f) * 0.5f;
++    const float right = (highestX + 1.0f) * 0.5f;
++    const float top = (1.0f - highestY) * 0.5f;
++    const float bottom = (1.0f - lowestY) * 0.5f;
++    int place = LD_HUD_CENTRE;
++    const ld_hud_previous* previous = &g_ld_hud_previous;
++    const int continuesLine = previous->frame == g_ld_frames && previous->target == target &&
++                              previous->key == g_ld_current_pso.key && top < previous->bottom &&
++                              bottom > previous->top && left >= previous->left - 0.004f &&
++                              left <= previous->right + 0.04f;
++    if (continuesLine)
++    {
++        place = previous->place;
++    }
++    else
++    {
++        /* By the centre, not the extent: the map's background is a turning
++         * square whose corners reach well past the map. */
++        const float centreX = (left + right) * 0.5f * 1280.0f;
++        const float centreY = (top + bottom) * 0.5f * 720.0f;
++        if (centreX <= 560.0f && centreY <= 432.0f)
++        {
++            place = LD_HUD_LEFT;
++        }
++        else if ((centreX >= 700.0f && centreY <= 432.0f) || (centreX >= 960.0f && centreY >= 560.0f))
++        {
++            place = LD_HUD_RIGHT;
++        }
++    }
++    g_ld_hud_previous.frame = g_ld_frames;
++    g_ld_hud_previous.target = target;
++    g_ld_hud_previous.key = g_ld_current_pso.key;
++    g_ld_hud_previous.left = left;
++    g_ld_hud_previous.right = right;
++    g_ld_hud_previous.top = top;
++    g_ld_hud_previous.bottom = bottom;
++    g_ld_hud_previous.place = place;
++    return place;
+ }
+ 
+ /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
+@@ -9813,7 +9922,7 @@
+ 
+     /* Guest pixels; scaled to the host surface just before they are set. */
+     const surface_t* drawSurface = &g.surfaces[target];
+-    const int hudCentred = ld_hud_centred_draw(drawSurface, xf);
++    const int hudPlace = ld_hud_draw_place(drawSurface, target, xf);
+     const float renderScale = (float)(drawSurface->scale ? drawSurface->scale : 1u);
+     const float renderScaleX = drawSurface->scale_x > 0.0f ? drawSurface->scale_x : 1.0f;
+     /* A 1x post-effect target with a canvas-sized (scaled) zeta bound: fine
+@@ -9864,12 +9973,25 @@
+     sc.top = (LONG)ld_surface_scaled(drawSurface, (u32)sc.top);
+     sc.right = (LONG)ld_surface_x(drawSurface, (u32)sc.right);
+     sc.bottom = (LONG)ld_surface_scaled(drawSurface, (u32)sc.bottom);
+-    if (hudCentred)
++    if (hudPlace)
+     {
+-        /* Ultrawide HUD, centred: the draw goes into the middle 16:9 of the
+-         * widened surface at its own proportions; the scissor follows. */
++        /* Ultrawide HUD: the draw goes into a 16:9-wide strip of the widened
++         * surface at its own proportions -- the middle one, or moved out
++         * towards the left or right edge by the edge setting; the scissor
++         * follows. */
+         const float hudWidth = dvp.Width / drawSurface->scale_x * renderScale;
+-        const float hudLeft = (float)(LONG)((dvp.Width - hudWidth) * 0.5f);
++        const float centredLeft = (dvp.Width - hudWidth) * 0.5f;
++        const float edgeAmount = (float)InterlockedCompareExchange(&g_ld_hud_edge, 0, 0) / 100.0f;
++        float placedLeft = centredLeft;
++        if (hudPlace == LD_HUD_LEFT)
++        {
++            placedLeft = centredLeft * (1.0f - edgeAmount);
++        }
++        else if (hudPlace == LD_HUD_RIGHT)
++        {
++            placedLeft = centredLeft * (1.0f + edgeAmount);
++        }
++        const float hudLeft = (float)(LONG)placedLeft;
+         const float hudShrink = hudWidth / dvp.Width;
+         dvp.TopLeftX = hudLeft;
+         dvp.Width = hudWidth;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -155,8 +155,12 @@
+ void rsx_live_draw_set_texture_lod_bias(int hundredths);
+ /* Ultrawide HUD layout: 0 stretched across the widened picture (as the game
+  * draws it), 1 centred -- the 2D overlay drawn at its own proportions in the
+- * middle 16:9, full-screen passes still covering everything (live). */
++ * middle 16:9, full-screen passes still covering everything -- or 2 edges:
++ * as centred, but the corner groups (Folklore's map, gauges and hints) moved
++ * out towards the screen's edges, by 0-100 % of the way (_set_hud_edge).
++ * Both live. */
+ void rsx_live_draw_set_hud_layout(int mode);
++void rsx_live_draw_set_hud_edge(int percent);
+ /* Pixel shader replacements: a fragment program whose translated HLSL (as
+  * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
+  * -- a title's own better version of one of its effects. The hash is the

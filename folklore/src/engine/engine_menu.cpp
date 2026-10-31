@@ -933,13 +933,23 @@ namespace
         ImGui::TextUnformatted("Menus and HUD (when wider than 16:9)");
         {
             int layoutIndex = (int)settings.hudLayout;
-            bool layoutChanged = ImGui::RadioButton("Centred (their own shape)##hud", &layoutIndex, 1);
+            bool layoutChanged = ImGui::RadioButton("Map and gauges at the edges##hud", &layoutIndex, 2);
+            ImGui::SameLine();
+            layoutChanged |= ImGui::RadioButton("Centred##hud", &layoutIndex, 1);
             ImGui::SameLine();
             layoutChanged |= ImGui::RadioButton("Stretched to fit##hud", &layoutIndex, 0);
             if (layoutChanged)
             {
                 settings.hudLayout = (EngineSettings::HudLayout)layoutIndex;
                 changed = true;
+            }
+            if (settings.hudLayout == EngineSettings::HudLayout::Edges)
+            {
+                ImGui::SetNextItemWidth(240.0f);
+                if (ImGui::SliderInt("How far out##hudedge", &settings.hudEdge, 0, 100, "%d%%"))
+                {
+                    changed = true;
+                }
             }
         }
         ImGui::TextUnformatted("Anti-aliasing");

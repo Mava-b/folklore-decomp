@@ -208,8 +208,23 @@ void engineSettingsLoad()
         }
         else if (std::strcmp(key, "hud_layout") == 0)
         {
-            settingsInstance.hudLayout = std::strcmp(value, "stretched") == 0 ? EngineSettings::HudLayout::Stretched
-                                                                             : EngineSettings::HudLayout::Centred;
+            if (std::strcmp(value, "stretched") == 0)
+            {
+                settingsInstance.hudLayout = EngineSettings::HudLayout::Stretched;
+            }
+            else if (std::strcmp(value, "centred") == 0)
+            {
+                settingsInstance.hudLayout = EngineSettings::HudLayout::Centred;
+            }
+            else
+            {
+                settingsInstance.hudLayout = EngineSettings::HudLayout::Edges;
+            }
+        }
+        else if (std::strcmp(key, "hud_edge") == 0)
+        {
+            const int percent = std::atoi(value);
+            settingsInstance.hudEdge = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
         }
         else if (std::strcmp(key, "texture_detail") == 0)
         {
@@ -365,9 +380,13 @@ void engineSettingsSave()
                                                               : "off");
     std::fprintf(file, "background_shaders = %d\n", current.backgroundShaders ? 1 : 0);
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
-    std::fprintf(file, "# wider than 16:9: menus and HUD stretched or centred (at their own proportions)\n");
+    std::fprintf(file, "# wider than 16:9: menus and HUD stretched, centred (at their own proportions) or edges\n");
+    std::fprintf(file, "# (centred, with the map, gauges and hints moved hud_edge %% of the way to the edges)\n");
     std::fprintf(file, "hud_layout = %s\n",
-                 current.hudLayout == EngineSettings::HudLayout::Stretched ? "stretched" : "centred");
+                 current.hudLayout == EngineSettings::HudLayout::Stretched ? "stretched"
+                 : current.hudLayout == EngineSettings::HudLayout::Centred ? "centred"
+                                                                           : "edges");
+    std::fprintf(file, "hud_edge = %d\n", current.hudEdge);
     std::fprintf(file, "# original (the game's mip levels), sharper or sharpest\n");
     std::fprintf(file, "texture_detail = %s\n",
                  current.textureDetail == EngineSettings::TextureDetail::Original   ? "original"
@@ -419,6 +438,7 @@ extern "C"
     void rsx_live_draw_set_anisotropy(uint32_t level);
     void rsx_live_draw_set_texture_lod_bias(int hundredths);
     void rsx_live_draw_set_hud_layout(int mode);
+    void rsx_live_draw_set_hud_edge(int percent);
     void rsx_live_draw_set_sharpening(uint32_t percent);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
@@ -436,7 +456,8 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_anisotropy((uint32_t)current.anisotropy);
     static const int kTextureLodBias[3] = {0, -50, -100};
     rsx_live_draw_set_texture_lod_bias(kTextureLodBias[(int)current.textureDetail]);
-    rsx_live_draw_set_hud_layout(current.hudLayout == EngineSettings::HudLayout::Stretched ? 0 : 1);
+    rsx_live_draw_set_hud_layout((int)current.hudLayout);
+    rsx_live_draw_set_hud_edge(current.hudEdge);
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
     engineDepthOfFieldApply();
     engineBloomApply();

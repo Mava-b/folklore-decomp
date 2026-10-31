@@ -1180,6 +1180,23 @@ What 0006 fixes in ps3recomp to make that run:
     middle 16:9 (viewport and scissor narrowed by the widening). Full-
     screen passes keep the whole width. Not handled: HUD drawn with a
     depth test, or by image blits.
+85. Ultrawide HUD at the edges (patches/0063, hud_layout = edges, the new
+    default, hud_edge = 0-100 %, both live). From capture-20261031-111758
+    (a fight, the full HUD): map and icons centred within x 80-500, y
+    0-330; health/ID gauges and the folk diamond x 744-1200, y 60-300;
+    button hint text x 1020-1130, y 614-650. A HUD draw centred in the
+    top-left (x <= 560, y <= 432 of 1280x720) is drawn hud_edge % of the
+    way from the centred strip to the left edge; centred in the top-right
+    (x >= 700, y <= 432) or the bottom-right (x >= 960, y >= 560), to the
+    right; anything else stays centred. By centre, because the map's
+    background is a turning square. Text is a draw per letter: one that
+    continues the previous draw's line (same PSO, overlapping vertically,
+    starting within 4% of the screen after it) goes the same way, so a line
+    is never split. Also now required for any HUD placement: an
+    orthographic w row (0,0,0,w) -- the enemies' gauges have their own
+    vertex programs and follow the world. Checked against the three
+    captures' HUD draws: every map draw goes left, every gauge, folk and
+    hint draw right.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
