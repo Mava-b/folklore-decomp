@@ -232,15 +232,15 @@ dumped to a folder (it contains PS3_GAME), AND the 1.10 update for it
 installed (in RPCS3: File > Install Packages, then it is in
 <RPCS3>\dev_hdd0\game\$titleId). No PS3 firmware is needed.
 
-1. Decrypt the update's EBOOT once with RPCS3: Utilities > Decrypt PS3
-   Binaries, choose <RPCS3>\dev_hdd0\game\$titleId\USRDIR\EBOOT.BIN (the
-   update's, not the disc's). RPCS3 writes EBOOT.elf beside it.
-2. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
+1. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
    for the disc dump folder (the one that contains PS3_GAME), then for the
    update folder (the one that contains PARAM.SFO and USRDIR), and
-   remembers both in folklore_settings.ini. It copies the update's few data
-   files into hdd0 here; nothing in either folder is changed. The game
-   writes logs\run-<date-time>.log. run.bat takes options, e.g.
+   remembers both in folklore_settings.ini. It decrypts the update's
+   EBOOT.BIN into decrypted\ here (the North American update needs its .rap,
+   which RPCS3 installs with it into dev_hdd0\home\<user>\exdata) and copies
+   the update's few data files into hdd0; nothing in either folder is
+   changed. The game writes logs\run-<date-time>.log. run.bat takes
+   options, e.g.
        run.bat -ResetInstall      (wipe hdd0/hdd1 and redo the first-boot install)
        run.bat -GameDir D:\Games\$titleId -UpdateDir D:\RPCS3\dev_hdd0\game\$titleId
 "@
@@ -252,12 +252,12 @@ You need your own copy of Folklore on the disc this build was made from:
 $releaseLine,
 dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
-1. Decrypt the game's EBOOT once with RPCS3: Utilities > Decrypt PS3 Binaries,
-   choose <your dump>\PS3_GAME\USRDIR\EBOOT.BIN. RPCS3 writes EBOOT.elf beside it.
-2. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
-   for the dump folder (the one that contains PS3_GAME) and remembers it in
-   folklore_settings.ini. Either way the game starts with the same settings
-   and writes logs\run-<date-time>.log. run.bat takes options, e.g.
+1. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
+   for the dump folder (the one that contains PS3_GAME), remembers it in
+   folklore_settings.ini and decrypts its EBOOT.BIN into decrypted\ here
+   (nothing in the dump is changed). Either way the game starts with the
+   same settings and writes logs\run-<date-time>.log. run.bat takes
+   options, e.g.
        run.bat -ResetInstall      (wipe hdd0/hdd1 and redo the first-boot install)
        run.bat -GameDir D:\Games\$titleId
 "@
@@ -360,9 +360,8 @@ else
 Folklore (PS3) recompilation -- build kit, $(Get-Date -Format 'yyyy-MM-dd')
 
 This kit has no game code and no firmware in it. You need your own Folklore
-dump: v1.00 disc BCUS98147 (North America) or BCES00050 (Europe) (a folder that contains PS3_GAME),
-with PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf (RPCS3: Utilities >
-Decrypt PS3 Binaries). No PS3 firmware is needed.
+dump: v1.00 disc BCUS98147 (North America) or BCES00050 (Europe) (a folder that contains PS3_GAME);
+setup decrypts its EBOOT.BIN itself. No PS3 firmware is needed.
 
 Unzip somewhere with ~30 GB free (tools, build, installed game data), then in
 PowerShell from that folder:

@@ -22,6 +22,53 @@ $NinjaDir  = Join-Path $Tools 'ninja'
 $PythonExe = Join-Path $Tools 'python\tools\python.exe'
 $FfmpegDir = Join-Path $Tools 'ffmpeg'
 $VsBuildToolsDir = Join-Path $Tools 'VSBuildTools'
+# tools\unself.exe (setup.ps1 builds it): EBOOT.BIN -> EBOOT.elf, and where
+# the ELFs it writes go (one folder per EBOOT.BIN, named by its hash).
+$UnselfExe     = Join-Path $Tools 'unself.exe'
+$DecryptedDir  = Join-Path $Root 'decrypted'
+
+function Get-LicenceFolders([string]$updateFolder)
+{
+    # Where a .rap is looked for when decrypting an update's EBOOT.BIN:
+    # RPCS3's dev_hdd0\home\<user>\exdata (two folders above
+    # dev_hdd0\game\<title id>), a licences folder here, and the folder itself.
+    $folders = @()
+    $homeFolder = Join-Path (Split-Path (Split-Path $updateFolder)) 'home'
+    if (Test-Path -LiteralPath $homeFolder)
+    {
+        foreach ($user in Get-ChildItem -LiteralPath $homeFolder -Directory -ErrorAction SilentlyContinue)
+        {
+            $folders += (Join-Path $user.FullName 'exdata')
+        }
+    }
+    $folders += (Join-Path $Root 'licences')
+    $folders += $updateFolder
+    return $folders
+}
+
+function Get-DecryptedEboot([string]$self, [string[]]$licenceFolders)
+{
+    # EBOOT.BIN decrypted with tools\unself.exe into decrypted\<hash>\EBOOT.elf
+    # (once; the copy is reused). Throws with the tool's sentence when it
+    # cannot. Nothing is written beside the EBOOT.BIN.
+    $hash = (Get-FileHash -LiteralPath $self -Algorithm SHA256).Hash.Substring(0, 16)
+    $elf = Join-Path (Join-Path $DecryptedDir $hash) 'EBOOT.elf'
+    if (Test-Path -LiteralPath $elf)
+    {
+        return $elf
+    }
+    if (-not (Test-Path -LiteralPath $UnselfExe))
+    {
+        throw "$self is encrypted and tools\unself.exe is not built yet -- run setup.ps1"
+    }
+    $output = Invoke-Native { & $UnselfExe $self $elf @licenceFolders 2>&1 | ForEach-Object { "$_" } }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path -LiteralPath $elf))
+    {
+        throw "Could not decrypt $self -- $($output -join ' ')"
+    }
+    Write-Host "    decrypted $self"
+    return $elf
+}
 
 function Invoke-Native([scriptblock]$command)
 {

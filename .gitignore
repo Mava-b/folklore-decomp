@@ -32,3 +32,6 @@ PARAM.SFO
 
 __pycache__/
 *.pyc
+
+# EBOOT.BIN decrypted by setup / run.ps1 (the game's own code).
+/decrypted/

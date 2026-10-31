@@ -28,6 +28,7 @@
 #include "engine_settings.h"
 #include "engine_region.h"
 #include "engine_dlc.h"
+#include "engine_self.h"
 
 #ifdef _WIN32
 
@@ -424,11 +425,74 @@ std::string engineNormaliseGameFolder(const std::string& folder)
     return normalised;
 }
 
-bool engineCheckGameFolder(const std::string& folder, std::string* problem)
+namespace
+{
+    /* Licence folders for a decrypted update EBOOT: RPCS3's
+     * dev_hdd0\home\<user>\exdata (two folders above dev_hdd0\game\<id>),
+     * a "licences" folder beside the port's data, and the folder itself. */
+    std::vector<std::string> licenceFoldersFor(const std::string& folder)
+    {
+        std::vector<std::string> folders;
+        const std::string home = parentFolder(parentFolder(folder)) + "\\home";
+        WIN32_FIND_DATAA found;
+        HANDLE search = FindFirstFileA((home + "\\*").c_str(), &found);
+        if (search != INVALID_HANDLE_VALUE)
+        {
+            do
+            {
+                if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) && found.cFileName[0] != '.')
+                {
+                    folders.push_back(home + "\\" + found.cFileName + "\\exdata");
+                }
+            } while (FindNextFileA(search, &found));
+            FindClose(search);
+        }
+        folders.push_back(engineDataDirectory() + "\\licences");
+        folders.push_back(folder);
+        return folders;
+    }
+
+    /* The ELF in `usrdir`: EBOOT.elf when there is one, otherwise EBOOT.BIN
+     * decrypted to <data>\decrypted\<title id>-<version>.elf -- once; a copy
+     * of the right size is reused. Empty, with a sentence in *reason, when
+     * neither works. */
+    std::string usableEboot(const std::string& usrdir, const std::string& licenceSource, std::string* reason)
+    {
+        const std::string elf = usrdir + "\\EBOOT.elf";
+        if (fileExists(elf))
+        {
+            return elf;
+        }
+        const std::string self = usrdir + "\\EBOOT.BIN";
+        if (!fileExists(self))
+        {
+            *reason = "There is no EBOOT.BIN in \"" + usrdir + "\".";
+            return std::string();
+        }
+        const std::string decryptedFolder = engineDataDirectory() + "\\decrypted";
+        const std::string decrypted =
+            decryptedFolder + "\\" + kTitleId + "-" + FOLKLORE_VERSION_NAME + ".elf";
+        if (fileExists(decrypted) && fileSize(decrypted) == kEbootSize)
+        {
+            return decrypted;
+        }
+        makeDirectory(decryptedFolder);
+        std::string problem;
+        if (!selfDecryptFile(self, decrypted, licenceFoldersFor(licenceSource), &problem))
+        {
+            *reason = "Could not decrypt \"" + self + "\": " + problem;
+            return std::string();
+        }
+        std::fprintf(stderr, "[engine] decrypted %s -> %s\n", self.c_str(), decrypted.c_str());
+        return decrypted;
+    }
+}
+
+bool engineCheckGameFolder(const std::string& folder, std::string* problem, std::string* ebootPath)
 {
     std::string reason;
     const std::string usrdir = folder + "\\PS3_GAME\\USRDIR";
-    const std::string eboot = usrdir + "\\EBOOT.elf";
+    std::string eboot;
     if (folder.empty())
     {
         reason = "No game folder is set.";
@@ -450,23 +514,10 @@ bool engineCheckGameFolder(const std::string& folder, std::string* problem)
                      "disc dump of the same release as your 1.10 update.";
         }
     }
-    else if (!fileExists(eboot))
-    {
-        reason = fileExists(usrdir + "\\EBOOT.BIN")
-                     ? "This dump's EBOOT.BIN is still encrypted. Decrypt it with RPCS3 (Utilities > Decrypt PS3 "
-                       "Binaries, choose PS3_GAME\\USRDIR\\EBOOT.BIN), which writes EBOOT.elf beside it, then try again."
-                     : "There is no PS3_GAME\\USRDIR\\EBOOT.elf in \"" + folder + "\".";
-    }
     else
     {
-        const std::vector<unsigned char> header = readFile(eboot, 4);
         const std::vector<unsigned char> sfo = readFile(folder + "\\PS3_GAME\\PARAM.SFO", 64 * 1024);
-        if (header.size() < 4 || header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
-        {
-            reason = "PS3_GAME\\USRDIR\\EBOOT.elf is not a decrypted ELF. Decrypt EBOOT.BIN with RPCS3 "
-                     "(Utilities > Decrypt PS3 Binaries) and try again.";
-        }
-        else if (!sfo.empty() && !containsText(sfo, kTitleId))
+        if (!sfo.empty() && !containsText(sfo, kTitleId))
         {
             const bool otherSupported = containsText(sfo, FOLKLORE_US_TITLE_ID) || containsText(sfo, FOLKLORE_EU_TITLE_ID);
             reason = std::string("This build of the port was made from the ") + FOLKLORE_RELEASE_NAME +
@@ -475,16 +526,34 @@ bool engineCheckGameFolder(const std::string& folder, std::string* problem)
                                        "release, or build one from this dump (setup.ps1)."
                                      : ". Other versions will not run.");
         }
-        else if (fileSize(eboot) != kEbootSize)
+        else
         {
-            reason = std::string("This EBOOT.elf is not the v1.00 disc version this build was made from (the "
-                                 "decrypted ") + kTitleId + " EBOOT.elf is " + std::to_string(kEbootSize) +
-                     " bytes).";
+            eboot = usableEboot(usrdir, folder, &reason);
+            const std::vector<unsigned char> header = eboot.empty() ? std::vector<unsigned char>() : readFile(eboot, 4);
+            if (eboot.empty())
+            {
+                /* reason says why */
+            }
+            else if (header.size() < 4 || header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
+            {
+                reason = "\"" + eboot + "\" is not a decrypted ELF. Delete it, and the game decrypts EBOOT.BIN "
+                         "itself.";
+            }
+            else if (fileSize(eboot) != kEbootSize)
+            {
+                reason = std::string("This EBOOT is not the v1.00 disc version this build was made from (the "
+                                     "decrypted ") + kTitleId + " EBOOT is " + std::to_string(kEbootSize) +
+                         " bytes).";
+            }
         }
     }
     if (problem)
     {
         *problem = reason;
+    }
+    if (ebootPath && reason.empty())
+    {
+        *ebootPath = eboot;
     }
     return reason.empty();
 }
@@ -503,10 +572,10 @@ std::string engineNormaliseUpdateFolder(const std::string& folder)
     return normalised;
 }
 
-bool engineCheckUpdateFolder(const std::string& folder, std::string* problem)
+bool engineCheckUpdateFolder(const std::string& folder, std::string* problem, std::string* ebootPath)
 {
     std::string reason;
-    const std::string eboot = folder + "\\USRDIR\\EBOOT.elf";
+    std::string eboot;
     const std::vector<unsigned char> sfo = readFile(folder + "\\PARAM.SFO", 64 * 1024);
     if (folder.empty())
     {
@@ -522,31 +591,31 @@ bool engineCheckUpdateFolder(const std::string& folder, std::string* problem)
         reason = std::string("This build of the port was made from the ") + FOLKLORE_RELEASE_NAME +
                  " 1.10 update (" + kTitleId + "), and \"" + folder + "\" holds another game or release.";
     }
-    else if (!fileExists(eboot))
-    {
-        reason = fileExists(folder + "\\USRDIR\\EBOOT.BIN")
-                     ? "The update's EBOOT.BIN is still encrypted. Decrypt it with RPCS3 (Utilities > Decrypt PS3 "
-                       "Binaries, choose USRDIR\\EBOOT.BIN in this folder), which writes EBOOT.elf beside it, then "
-                       "try again."
-                     : "There is no USRDIR\\EBOOT.elf in \"" + folder + "\".";
-    }
     else
     {
-        const std::vector<unsigned char> header = readFile(eboot, 4);
-        if (header.size() < 4 || header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
+        eboot = usableEboot(folder + "\\USRDIR", folder, &reason);
+        const std::vector<unsigned char> header = eboot.empty() ? std::vector<unsigned char>() : readFile(eboot, 4);
+        if (eboot.empty())
         {
-            reason = "USRDIR\\EBOOT.elf is not a decrypted ELF. Decrypt EBOOT.BIN with RPCS3 (Utilities > Decrypt "
-                     "PS3 Binaries) and try again.";
+            /* reason says why */
+        }
+        else if (header.size() < 4 || header[0] != 0x7F || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
+        {
+            reason = "\"" + eboot + "\" is not a decrypted ELF. Delete it, and the game decrypts EBOOT.BIN itself.";
         }
         else if (fileSize(eboot) != kEbootSize)
         {
-            reason = std::string("This EBOOT.elf is not the 1.10 update this build was made from (the decrypted ") +
-                     kTitleId + " 1.10 EBOOT.elf is " + std::to_string(kEbootSize) + " bytes).";
+            reason = std::string("This EBOOT is not the 1.10 update this build was made from (the decrypted ") +
+                     kTitleId + " 1.10 EBOOT is " + std::to_string(kEbootSize) + " bytes).";
         }
     }
     if (problem)
     {
         *problem = reason;
+    }
+    if (ebootPath && reason.empty())
+    {
+        *ebootPath = eboot;
     }
     return reason.empty();
 }
@@ -902,9 +971,16 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
             const DWORD vfsLength = GetEnvironmentVariableA("PS3_VFS_ROOT", vfsRoot, (DWORD)sizeof(vfsRoot));
             gameFolder = (vfsLength > 0 && vfsLength < sizeof(vfsRoot)) ? std::string(vfsRoot, vfsLength)
                                                                          : engineNormaliseGameFolder(settings.gameDir);
-            const std::string updateFolder = parentFolder(parentFolder(ebootPath));
+            /* The update folder is two folders above its EBOOT -- unless the
+             * EBOOT is a decrypted copy (setup's decrypted\ folder), and then
+             * it is the update_dir setting. */
+            std::string updateFolder = parentFolder(parentFolder(ebootPath));
+            if (!fileExists(updateFolder + "\\PARAM.SFO"))
+            {
+                updateFolder = engineNormaliseUpdateFolder(settings.updateDir);
+            }
             std::string problem;
-            if (engineCheckUpdateFolder(updateFolder, &problem) &&
+            if (!updateFolder.empty() && fileExists(updateFolder + "\\PARAM.SFO") &&
                 !installUpdateData(updateFolder, hdd0Root(dataDirectory), &problem))
             {
                 showError(problem);
@@ -914,6 +990,10 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         else
         {
             gameFolder = parentFolder(parentFolder(parentFolder(ebootPath)));
+            if (!directoryExists(gameFolder + "\\PS3_GAME"))
+            {
+                gameFolder = engineNormaliseGameFolder(settings.gameDir);     /* a decrypted copy */
+            }
         }
         if (standalone)
         {
@@ -925,7 +1005,8 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     std::string gameFolder = engineNormaliseGameFolder(settings.gameDir);
     std::string problem;
     bool firstAttempt = true;
-    while (!engineCheckGameFolder(gameFolder, &problem))
+    std::string gameEboot;
+    while (!engineCheckGameFolder(gameFolder, &problem, &gameEboot))
     {
         if (!firstAttempt || !settings.gameDir.empty())
         {
@@ -936,8 +1017,7 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
             MessageBoxA(nullptr,
                         "This is the " FOLKLORE_VERSION_NAME " build of Folklore (" FOLKLORE_TITLE_ID "). It needs two "
                         "folders:\n\n1. Your disc dump: the folder that contains PS3_GAME.\n2. The installed 1.10 "
-                        "update, with its USRDIR\\EBOOT.BIN decrypted to EBOOT.elf with RPCS3 (in RPCS3 it is "
-                        "dev_hdd0\\game\\" FOLKLORE_TITLE_ID ").\n\nChoose the disc dump first. The game remembers "
+                        "update (in RPCS3 it is dev_hdd0\\game\\" FOLKLORE_TITLE_ID ").\n\nChoose the disc dump first. The game remembers "
                         "both; change them later in the engine menu (F1).",
                         "Folklore", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
         }
@@ -945,8 +1025,7 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         {
             MessageBoxA(nullptr,
                         "Choose the folder of your Folklore (" FOLKLORE_TITLE_ID ") disc dump: the folder that contains "
-                        "PS3_GAME. Its PS3_GAME\\USRDIR\\EBOOT.BIN must be decrypted to EBOOT.elf with RPCS3 "
-                        "first.\n\nThe game remembers the folder; change it later in the engine menu (F1).",
+                        "PS3_GAME.\n\nThe game remembers the folder; change it later in the engine menu (F1).",
                         "Folklore", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
         }
         firstAttempt = false;
@@ -964,7 +1043,7 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
         engineSettingsSave();
     }
     defaultEnvironment("PS3_VFS_ROOT", gameFolder);
-    ebootPath = gameFolder + "\\PS3_GAME\\USRDIR\\EBOOT.elf";
+    ebootPath = gameEboot;
     std::fprintf(stderr, "[engine] game folder: %s\n", gameFolder.c_str());
 
     if (FOLKLORE_USES_UPDATE)
@@ -973,7 +1052,8 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
          * the installed game data (installUpdateData). */
         std::string updateFolder = engineNormaliseUpdateFolder(settings.updateDir);
         bool firstUpdateAttempt = true;
-        while (!engineCheckUpdateFolder(updateFolder, &problem))
+        std::string updateEboot;
+        while (!engineCheckUpdateFolder(updateFolder, &problem, &updateEboot))
         {
             if (!firstUpdateAttempt || !settings.updateDir.empty())
             {
@@ -983,8 +1063,7 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
             {
                 MessageBoxA(nullptr,
                             "Now choose the installed 1.10 update: the folder that contains PARAM.SFO and USRDIR (in "
-                            "RPCS3: dev_hdd0\\game\\" FOLKLORE_TITLE_ID "). Its USRDIR\\EBOOT.BIN must be decrypted "
-                            "to EBOOT.elf with RPCS3 first. Nothing in that folder is changed.",
+                            "RPCS3: dev_hdd0\\game\\" FOLKLORE_TITLE_ID "). Nothing in that folder is changed.",
                             "Folklore", MB_OK | MB_ICONINFORMATION | MB_SETFOREGROUND);
             }
             firstUpdateAttempt = false;
@@ -1006,7 +1085,7 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
             showError(problem);
             return nullptr;
         }
-        ebootPath = updateFolder + "\\USRDIR\\EBOOT.elf";
+        ebootPath = updateEboot;
         std::fprintf(stderr, "[engine] 1.10 update folder: %s\n", updateFolder.c_str());
     }
     if (standalone)

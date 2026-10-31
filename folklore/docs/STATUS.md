@@ -1113,6 +1113,20 @@ What 0006 fixes in ps3recomp to make that run:
     as rsx_texN); the depth of field hashes are 0x7E1621B76F8AF72E (behind
     the focus) and 0x1F15BEB3C708B830 (both sides), the bloom's
     0xD5315C03A3656365 and 0x5619049F34E0928F.
+80. EBOOT.BIN decrypted by the port (folklore/docs/SELF.md,
+    src/engine/engine_self.cpp). No more RPCS3 "Decrypt PS3 Binaries":
+    setup builds tools\unself.exe (tools/unself_main.cpp + engine_self.cpp,
+    clang-cl) and decrypts into decrypted\<hash>\EBOOT.elf; folklore.exe
+    decrypts a folder's EBOOT.BIN into <data>\decrypted\<title>-<version>.elf;
+    an RPCS3 EBOOT.elf beside it is still used first. Discs are application
+    SELFs, the updates NPDRM (EU free licence, US local licence
+    UP9000-BCUS98147_00-FOLKLORE20000003.rap, looked for in RPCS3's
+    dev_hdd0\home\*\exdata). Own AES-128/256 (CBC, CTR), published keys,
+    stb_image's inflate. All four outputs byte-identical to RPCS3's.
+    setup.ps1: the compiler step is a function (Install-Compiler), also run
+    when the decrypter is first needed, which can be before setup's own
+    compiler step; the download helpers moved up for that. game_dir and
+    update_dir are saved from the folders, not derived from the ELF's path.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

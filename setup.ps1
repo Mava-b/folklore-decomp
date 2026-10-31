@@ -20,7 +20,7 @@
 # that one instead.
 #
 # The 1.10 update instead of the disc version: add the installed update
-# (RPCS3: dev_hdd0\game\<title id>, with USRDIR\EBOOT.BIN decrypted):
+# (RPCS3: dev_hdd0\game\<title id>):
 #     setup.ps1 -GameDir D:\Games\BCUS98147 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147
 # -GameDir on its own (without -UpdateDir) goes back to the disc version.
 #
@@ -32,13 +32,13 @@
 
 param(
     # Your Folklore dump: the folder that contains PS3_GAME, with
-    # PS3_GAME\USRDIR\EBOOT.BIN decrypted to EBOOT.elf (RPCS3: Utilities >
-    # Decrypt PS3 Binaries). Only needed when folklore\src\recomp is empty.
+    # PS3_GAME\USRDIR\EBOOT.BIN (setup decrypts it; an EBOOT.elf RPCS3 wrote
+    # is used as it is). Only needed when folklore\src\recomp is empty.
     [string]$GameDir = '',
     # The installed 1.10 update, to build that instead of the disc version:
-    # the folder holding its PARAM.SFO and USRDIR, with USRDIR\EBOOT.BIN
-    # decrypted to EBOOT.elf (RPCS3: Utilities > Decrypt PS3 Binaries).
-    # RPCS3 installs it in dev_hdd0\game\BCUS98147 (or BCES00050).
+    # the folder holding its PARAM.SFO and USRDIR (its EBOOT.BIN is decrypted
+    # here; the North American one needs its .rap, which RPCS3 installs with
+    # the update). RPCS3 installs it in dev_hdd0\game\BCUS98147 (or BCES00050).
     [string]$UpdateDir = '',
     # Optional, for comparison runs (run.ps1 -Libsre): your decrypted
     # libsre.prx -- dev_flash\sys\external\libsre.sprx from RPCS3's firmware
@@ -87,6 +87,140 @@ function Select-WithDialog([string]$kind, [string]$title, [string]$filter)
     }
 }
 
+function Get-LatestGitHubAsset([string]$repository, [string]$namePattern)
+{
+    $headers = @{ 'User-Agent' = 'folklore-recomp-setup' }
+    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" -Headers $headers
+    $asset = $release.assets | Where-Object { $_.name -like $namePattern } | Select-Object -First 1
+    if (-not $asset)
+    {
+        throw "No asset matching '$namePattern' in the latest $repository release"
+    }
+    return $asset
+}
+
+function Save-Download([string]$url, [string]$fileName)
+{
+    $target = Join-Path $Downloads $fileName
+    if (-not (Test-Path $target))
+    {
+        Write-Host "    downloading $fileName"
+        Invoke-WebRequest -Uri $url -OutFile $target -UseBasicParsing
+    }
+    return $target
+}
+
+function Expand-Into([string]$archive, [string]$destination)
+{
+    # Extract to a temp folder, then move the single top-level folder (if the
+    # archive has one) so tools\<name>\bin is predictable.
+    $staging = "$destination._extract"
+    if (Test-Path $staging)
+    {
+        Remove-Item -Recurse -Force $staging
+    }
+    Expand-Archive -Path $archive -DestinationPath $staging
+    $children = @(Get-ChildItem $staging)
+    if ($children.Count -eq 1 -and $children[0].PSIsContainer)
+    {
+        Move-Item $children[0].FullName $destination
+        Remove-Item -Recurse -Force $staging
+    }
+    else
+    {
+        Move-Item $staging $destination
+    }
+}
+
+function Install-Compiler
+{
+    # Visual Studio (or its Build Tools) with clang-cl: the one found, or
+    # VS 2022 Build Tools installed into tools\VSBuildTools. Returns its path.
+    $vsPath = Find-VsInstall
+    if (-not $vsPath)
+    {
+        Write-Host '    No Visual Studio with clang-cl found -- installing VS 2022 Build Tools into tools\VSBuildTools.'
+        Write-Host '    This is a ~6 GB download and asks for administrator rights (UAC prompt).'
+        Write-Host '    (The Visual Studio Installer itself and some shared SDK files always go on C:.)'
+        $bootstrapper = Save-Download 'https://aka.ms/vs/17/release/vs_BuildTools.exe' 'vs_BuildTools.exe'
+        $installArguments = @(
+            '--installPath', "`"$VsBuildToolsDir`"",
+            '--add', 'Microsoft.VisualStudio.Workload.VCTools',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
+            '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
+            '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset',
+            '--passive', '--wait', '--norestart'
+        )
+        $process = Start-Process -Wait -PassThru -Verb RunAs -FilePath $bootstrapper -ArgumentList $installArguments
+        # 3010 = success, reboot recommended
+        if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010)
+        {
+            throw "Build Tools installer failed with exit code $($process.ExitCode)"
+        }
+        $vsPath = Find-VsInstall
+        if (-not $vsPath)
+        {
+            throw 'Build Tools installed but clang-cl was not found -- see the README troubleshooting section.'
+        }
+    }
+    return $vsPath
+}
+
+function Install-UnselfTool
+{
+    # tools\unself.exe: decrypts EBOOT.BIN to EBOOT.elf (folklore\tools\unself_main.cpp
+    # with the engine's src\engine\engine_self.cpp), so no RPCS3 is needed for
+    # it. Built with clang-cl the first time it is needed, and again when its
+    # sources change.
+    $sources = @((Join-Path $PortDir 'tools\unself_main.cpp'),
+                 (Join-Path $PortDir 'src\engine\engine_self.cpp'),
+                 (Join-Path $PortDir 'src\engine\engine_self.h'))
+    if (Test-Path $UnselfExe)
+    {
+        $built = (Get-Item -LiteralPath $UnselfExe).LastWriteTimeUtc
+        $newer = @($sources | Where-Object { (Get-Item -LiteralPath $_).LastWriteTimeUtc -gt $built })
+        if ($newer.Count -eq 0)
+        {
+            return
+        }
+    }
+    Write-Host '    building tools\unself.exe (decrypts EBOOT.BIN; a few seconds)'
+    $null = Install-Compiler
+    Import-BuildEnvironment
+    $objects = Join-Path $Tools '_unself'
+    New-Item -ItemType Directory -Force -Path $objects | Out-Null
+    $unselfLog = Join-Path $LogDir 'setup-unself-build.log'
+    Invoke-Native {
+        & clang-cl /nologo /O2 /EHsc /std:c++17 /W0 "/I$(Join-Path $PortDir 'src\engine')" "/Fo$objects\\" "/Fe$UnselfExe" `
+            (Join-Path $PortDir 'tools\unself_main.cpp') (Join-Path $PortDir 'src\engine\engine_self.cpp') 2>&1 |
+            ForEach-Object { "$_" } | Tee-Object -FilePath $unselfLog
+    }
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $UnselfExe))
+    {
+        throw 'Building tools\unself.exe failed -- see logs\setup-unself-build.log'
+    }
+}
+
+function Resolve-Eboot([string]$usrdir, [string[]]$licenceFolders)
+{
+    # The ELF to lift from a USRDIR: EBOOT.elf when there is one (RPCS3's),
+    # otherwise EBOOT.BIN decrypted with tools\unself.exe into decrypted\. Empty
+    # when the folder has neither.
+    $elf = Join-Path $usrdir 'EBOOT.elf'
+    if (Test-Path -LiteralPath $elf)
+    {
+        return $elf
+    }
+    $self = Join-Path $usrdir 'EBOOT.BIN'
+    if (-not (Test-Path -LiteralPath $self))
+    {
+        return ''
+    }
+    Install-UnselfTool
+    return (Get-DecryptedEboot $self $licenceFolders)
+}
+
 # The executables this project supports, by decrypted EBOOT.elf size
 # (folklore/docs/REGIONS.md): each release's v1.00 disc and 1.10 update.
 $SupportedEboots = @{ 6518936 = 'US'; 6518912 = 'EU'; 6520504 = 'US-1.10'; 6520480 = 'EU-1.10' }
@@ -125,20 +259,21 @@ function Resolve-GameEboot([string]$folder)
     if ((Split-Path -Leaf $folder) -eq 'USRDIR') { $folder = Split-Path (Split-Path $folder) }
     if ((Split-Path -Leaf $folder) -eq 'PS3_GAME') { $folder = Split-Path $folder }
     $usrdir = Join-Path $folder 'PS3_GAME\USRDIR'
-    $eboot = Join-Path $usrdir 'EBOOT.elf'
     if (-not (Test-Path (Join-Path $folder 'PS3_GAME')))
     {
         throw "$folder has no PS3_GAME folder -- choose the folder of your Folklore dump (the one that contains PS3_GAME)"
     }
-    if (-not (Test-Path $eboot))
+    $eboot = Resolve-Eboot $usrdir @()
+    if (-not $eboot)
     {
-        throw "No decrypted EBOOT.elf in $usrdir -- decrypt EBOOT.BIN there with RPCS3 (Utilities > Decrypt PS3 Binaries) first"
+        throw "No EBOOT.BIN in $usrdir -- choose the folder of your Folklore dump (the one that contains PS3_GAME)"
     }
     $release = Get-EbootRegion $eboot
     if (-not $release -or $release.EndsWith('-1.10'))
     {
         throw "$eboot is not a v1.00 EBOOT of a supported release -- BCUS98147 (6,518,936 bytes decrypted) or BCES00050 (6,518,912 bytes)"
     }
+    $script:ResolvedGameFolder = $folder
     return $eboot
 }
 
@@ -148,20 +283,21 @@ function Resolve-UpdateEboot([string]$folder)
     # folder (or its USRDIR). Throws with what is wrong.
     $folder = $folder.Trim().Trim('"').TrimEnd('\')
     if ((Split-Path -Leaf $folder) -eq 'USRDIR') { $folder = Split-Path $folder }
-    $eboot = Join-Path $folder 'USRDIR\EBOOT.elf'
     if (-not (Test-Path (Join-Path $folder 'PARAM.SFO')) -or -not (Test-Path (Join-Path $folder 'USRDIR')))
     {
         throw "$folder is not an installed game update (no PARAM.SFO and USRDIR) -- in RPCS3 the update is dev_hdd0\game\BCUS98147 or BCES00050"
     }
-    if (-not (Test-Path $eboot))
+    $eboot = Resolve-Eboot (Join-Path $folder 'USRDIR') (Get-LicenceFolders $folder)
+    if (-not $eboot)
     {
-        throw "No decrypted EBOOT.elf in $folder\USRDIR -- decrypt EBOOT.BIN there with RPCS3 (Utilities > Decrypt PS3 Binaries) first"
+        throw "No EBOOT.BIN in $folder\USRDIR -- in RPCS3 the update is dev_hdd0\game\BCUS98147 or BCES00050"
     }
     $release = Get-EbootRegion $eboot
     if (-not $release -or -not $release.EndsWith('-1.10'))
     {
         throw "$eboot is not the 1.10 update of a supported release -- BCUS98147 (6,520,504 bytes decrypted) or BCES00050 (6,520,480 bytes)"
     }
+    $script:ResolvedUpdateFolder = $folder
     return $eboot
 }
 
@@ -250,7 +386,7 @@ if ($UpdateDir)
     $givenEboot = Resolve-UpdateEboot $UpdateDir
     $givenRegion = Get-EbootRegion $givenEboot
     Write-Host "    1.10 update: $givenEboot -- $($ReleaseNames[$givenRegion])"
-    Set-SavedSetting 'update_dir' (Split-Path (Split-Path $givenEboot))
+    Set-SavedSetting 'update_dir' $script:ResolvedUpdateFolder
     if ($GameDir)
     {
         $discFolder = $GameDir.Trim().Trim('"').TrimEnd('\')
@@ -289,7 +425,7 @@ elseif (-not $needGameCode -and $GameDir)
             Write-Host '    The game code will be lifted again from this dump, and build.ps1 then rebuilds everything.'
             $needGameCode = $true
             $sourceEboot = $givenEboot
-            Set-SavedSetting 'game_dir' (Split-Path (Split-Path (Split-Path $givenEboot)))
+            Set-SavedSetting 'game_dir' $script:ResolvedGameFolder
         }
     }
     catch
@@ -303,8 +439,8 @@ if ($needGameCode -and -not $sourceEboot)
     Write-Step 'Your Folklore dump'
     Write-Host '    This build kit has none of the game''s code: setup translates it from your own copy.'
     Write-Host '    Needed: the folder of your Folklore dump (v1.00 disc: BCUS98147, North America, or'
-    Write-Host '    BCES00050, Europe) -- the one that contains PS3_GAME -- with PS3_GAME\USRDIR\EBOOT.BIN'
-    Write-Host '    decrypted to EBOOT.elf (RPCS3: Utilities > Decrypt PS3 Binaries).'
+    Write-Host '    BCES00050, Europe) -- the one that contains PS3_GAME. Its EBOOT.BIN is decrypted here'
+    Write-Host '    (no RPCS3 needed); an EBOOT.elf RPCS3 already wrote beside it is used as it is.'
     while (-not $sourceEboot)
     {
         if (-not $GameDir)
@@ -320,7 +456,7 @@ if ($needGameCode -and -not $sourceEboot)
             $sourceEboot = Resolve-GameEboot $GameDir
             Write-Host "    $sourceEboot -- $($ReleaseNames[(Get-EbootRegion $sourceEboot)])"
             # run.ps1 and folklore.exe start from this folder from now on.
-            Set-SavedSetting 'game_dir' (Split-Path (Split-Path (Split-Path $sourceEboot)))
+            Set-SavedSetting 'game_dir' $script:ResolvedGameFolder
         }
         catch
         {
@@ -355,51 +491,6 @@ if ($needLibsre)
             Write-Host "    $($_.Exception.Message)" -ForegroundColor Yellow
             $LibsrePrx = ''
         }
-    }
-}
-
-function Get-LatestGitHubAsset([string]$repository, [string]$namePattern)
-{
-    $headers = @{ 'User-Agent' = 'folklore-recomp-setup' }
-    $release = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" -Headers $headers
-    $asset = $release.assets | Where-Object { $_.name -like $namePattern } | Select-Object -First 1
-    if (-not $asset)
-    {
-        throw "No asset matching '$namePattern' in the latest $repository release"
-    }
-    return $asset
-}
-
-function Save-Download([string]$url, [string]$fileName)
-{
-    $target = Join-Path $Downloads $fileName
-    if (-not (Test-Path $target))
-    {
-        Write-Host "    downloading $fileName"
-        Invoke-WebRequest -Uri $url -OutFile $target -UseBasicParsing
-    }
-    return $target
-}
-
-function Expand-Into([string]$archive, [string]$destination)
-{
-    # Extract to a temp folder, then move the single top-level folder (if the
-    # archive has one) so tools\<name>\bin is predictable.
-    $staging = "$destination._extract"
-    if (Test-Path $staging)
-    {
-        Remove-Item -Recurse -Force $staging
-    }
-    Expand-Archive -Path $archive -DestinationPath $staging
-    $children = @(Get-ChildItem $staging)
-    if ($children.Count -eq 1 -and $children[0].PSIsContainer)
-    {
-        Move-Item $children[0].FullName $destination
-        Remove-Item -Recurse -Force $staging
-    }
-    else
-    {
-        Move-Item $staging $destination
     }
 }
 
@@ -458,34 +549,7 @@ Write-Host "    $FfmpegDir"
 
 # ---- Compiler: Visual Studio Build Tools + clang-cl ------------------------
 Write-Step 'C++ compiler (MSVC + clang-cl)'
-$vsPath = Find-VsInstall
-if (-not $vsPath)
-{
-    Write-Host '    No Visual Studio with clang-cl found -- installing VS 2022 Build Tools into tools\VSBuildTools.'
-    Write-Host '    This is a ~6 GB download and asks for administrator rights (UAC prompt).'
-    Write-Host '    (The Visual Studio Installer itself and some shared SDK files always go on C:.)'
-    $bootstrapper = Save-Download 'https://aka.ms/vs/17/release/vs_BuildTools.exe' 'vs_BuildTools.exe'
-    $installArguments = @(
-        '--installPath', "`"$VsBuildToolsDir`"",
-        '--add', 'Microsoft.VisualStudio.Workload.VCTools',
-        '--add', 'Microsoft.VisualStudio.Component.VC.Tools.x86.x64',
-        '--add', 'Microsoft.VisualStudio.Component.Windows11SDK.22621',
-        '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.Clang',
-        '--add', 'Microsoft.VisualStudio.Component.VC.Llvm.ClangToolset',
-        '--passive', '--wait', '--norestart'
-    )
-    $process = Start-Process -Wait -PassThru -Verb RunAs -FilePath $bootstrapper -ArgumentList $installArguments
-    # 3010 = success, reboot recommended
-    if ($process.ExitCode -ne 0 -and $process.ExitCode -ne 3010)
-    {
-        throw "Build Tools installer failed with exit code $($process.ExitCode)"
-    }
-    $vsPath = Find-VsInstall
-    if (-not $vsPath)
-    {
-        throw 'Build Tools installed but clang-cl was not found -- see the README troubleshooting section.'
-    }
-}
+$vsPath = Install-Compiler
 Write-Host "    $vsPath"
 
 # ---- ps3recomp ----------------------------------------------------------------

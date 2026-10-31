@@ -51,14 +51,16 @@ downloaded from it.
   `PS3_GAME\USRDIR\EBOOT.BIN` in it. Your dump is only ever read, never
   written to.
 
-### 2. The game's EBOOT, decrypted
+### 2. The game's EBOOT: nothing to do
 
-The dumped `PS3_GAME\USRDIR\EBOOT.BIN` is encrypted. Decrypt it with
-[RPCS3](https://rpcs3.net/): **Utilities → Decrypt PS3 Binaries**, choose that
-`EBOOT.BIN`. RPCS3 writes **`EBOOT.elf`** beside it — leave it there.
+The dumped `PS3_GAME\USRDIR\EBOOT.BIN` is encrypted; setup and the game
+decrypt it themselves (no RPCS3 needed) into a `decrypted\` folder here —
+nothing is written to your dump. An `EBOOT.elf` RPCS3 already wrote beside it
+(*Utilities → Decrypt PS3 Binaries*) is used as it is. The decrypted file is
+**6,518,936 bytes** (BCUS98147) or **6,518,912 bytes** (BCES00050); setup
+checks this. ([`folklore/docs/SELF.md`](folklore/docs/SELF.md) has how.)
 
-The decrypted file must be **6,518,936 bytes** (BCUS98147) or **6,518,912
-bytes** (BCES00050); setup checks this.
+`decrypted\` holds the game's own code: like `folklore.exe`, don't share it.
 
 ### The 1.10 update (optional)
 
@@ -66,9 +68,10 @@ Install the update in RPCS3 (**File → Install Packages/Raps/Edats**, choose
 the update's `.pkg`). RPCS3 puts it in `dev_hdd0\game\BCUS98147` (or
 `BCES00050`) inside its own folder — not in your disc dump, even though
 RPCS3's game list shows the game as 1.10 and *Open game folder* opens the
-dump. Decrypt **that** folder's `USRDIR\EBOOT.BIN` the same way; the
-decrypted update EBOOT is **6,520,504 bytes** (BCUS98147) or **6,520,480
-bytes** (BCES00050). Then give setup both folders:
+dump. Its `USRDIR\EBOOT.BIN` is decrypted here too: the European one needs
+nothing, the North American one its licence (`UP9000-BCUS98147_00-FOLKLORE20000003.rap`),
+which RPCS3 installs with the update into `dev_hdd0\home\<user>\exdata` —
+setup finds it there. Give setup both folders:
 
 ```powershell
 .\setup.ps1 -GameDir D:\Games\BCUS98147 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147
@@ -143,15 +146,17 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
   Studio Installer* → Modify → Individual components → tick *C++ Clang Compiler
   for Windows* and *MSBuild support for LLVM (clang-cl)*, then run setup.ps1
   again.
-- **"EBOOT.BIN is still encrypted"**: decrypt it with RPCS3 as described
-  above.
+- **"Could not decrypt ... needs its licence"** (North American 1.10 update):
+  install the update's `.rap` in RPCS3 (*File → Install Packages/Raps/Edats*),
+  or put it in a `licences` folder here.
 - **"not a v1.00 EBOOT of a supported release"**: your disc is the Japanese
   release, or you gave `-GameDir` the 1.10 update's EBOOT (give the update
   folder as `-UpdateDir`, with `-GameDir` your disc dump). Only BCUS98147 and
   BCES00050 work.
-- **"not the 1.10 update of a supported release"**: the `-UpdateDir` folder's
-  `USRDIR\EBOOT.elf` is not a decrypted 1.10 update EBOOT — most often the
-  disc's EBOOT was decrypted instead of the update's (see *The 1.10 update*).
+- **"not the 1.10 update of a supported release"**: the `-UpdateDir` folder
+  is not the 1.10 update — most often the disc dump was given instead of
+  RPCS3's `dev_hdd0\game\<title id>` (see *The 1.10 update*). An old
+  `USRDIR\EBOOT.elf` there made from the wrong EBOOT also causes it: delete it.
 - **Both releases:** a build follows the dump setup lifted. `.\setup.ps1
   -GameDir <dump of the other release>` switches it (setup lifts the game code
   again, then `build.ps1` rebuilds everything). To keep one of each, use two
@@ -221,7 +226,7 @@ button or Alt+F4).
 
 What you need, all your own: the Folklore disc dump (as above), the 1.10
 update `.pkg` for your release, and each add-on pack's `.pkg` with its `.rap`
-licence. RPCS3 is used only to install and decrypt them.
+licence. RPCS3 is used only to install them.
 
 1. **Install the update and the packs in RPCS3.** **File → Install
    Packages/Raps/Edats**, then select the update's `.pkg`, every pack's `.pkg`
@@ -229,12 +234,8 @@ licence. RPCS3 is used only to install and decrypt them.
    `dev_hdd0`: the update and packs into `dev_hdd0\game\BCUS98147` (or
    `BCES00050`), the licences into `dev_hdd0\home\00000001\exdata`. You do
    not need to start the game in RPCS3.
-2. **Decrypt the update's EBOOT.** **Utilities → Decrypt PS3 Binaries**, and
-   choose `<RPCS3>\dev_hdd0\game\BCUS98147\USRDIR\EBOOT.BIN` — the update's,
-   not the one in your disc dump (RPCS3's *Open game folder* opens the dump).
-   RPCS3 writes `EBOOT.elf` beside it: 6,520,504 bytes (US) or 6,520,480
-   bytes (EU).
-3. **Build the 1.10 version.** In this folder:
+2. **Build the 1.10 version** (the update's EBOOT is decrypted for you). In
+   this folder:
 
    ```powershell
    .\setup.ps1 -GameDir D:\Games\BCUS98147 -UpdateDir D:\RPCS3\dev_hdd0\game\BCUS98147
@@ -250,14 +251,14 @@ licence. RPCS3 is used only to install and decrypt them.
    With a ready-made **1.10 package** instead (`Folklore-<date>_1.10.zip`):
    skip this step; the first time you start it, it asks for the disc dump
    and then for the update folder.
-4. **Start the game** with `run.bat` (in the 1.10 copy, if you used
+3. **Start the game** with `run.bat` (in the 1.10 copy, if you used
    `build_all.ps1`). The game's options now have a *Vibration* setting.
-5. **Add the DLC.** Press **F1** (or L3+R3), go to **Downloadable content**
+4. **Add the DLC.** Press **F1** (or L3+R3), go to **Downloadable content**
    and press **Add DLC from RPCS3...**. Choose RPCS3's folder — the one with
    `dev_hdd0` in it. A progress bar runs for about half a minute, then the
    menu lists the packs it installed (and any it could not, with the reason:
    usually a missing `.rap`).
-6. **Restart the game.** F1 now shows *Installed: Add-on pack 1, ...*, and the
+5. **Restart the game.** F1 now shows *Installed: Add-on pack 1, ...*, and the
    new quests and Folks are in the game as they were on a PS3.
 
 Good to know:

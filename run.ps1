@@ -104,6 +104,31 @@ function Get-SavedSetting([string]$key)
     }
     return ''
 }
+function Find-RunnableEboot([string]$usrdir, [string[]]$licenceFolders)
+{
+    # EBOOT.elf when the folder has one (RPCS3's); otherwise EBOOT.BIN
+    # decrypted by setup's tools\unself.exe into decrypted\ (common.ps1). Empty
+    # when neither works -- folklore.exe then finds the folder from its
+    # settings and decrypts EBOOT.BIN itself.
+    $elf = Join-Path $usrdir 'EBOOT.elf'
+    if (Test-Path -LiteralPath $elf)
+    {
+        return $elf
+    }
+    $self = Join-Path $usrdir 'EBOOT.BIN'
+    if ((Test-Path -LiteralPath $self) -and (Test-Path -LiteralPath $UnselfExe))
+    {
+        try
+        {
+            return (Get-DecryptedEboot $self $licenceFolders)
+        }
+        catch
+        {
+            Write-Host $_.Exception.Message -ForegroundColor Yellow
+        }
+    }
+    return ''
+}
 $gameDirGiven = $PSBoundParameters.ContainsKey('GameDir')
 if (-not $GameDir)
 {
@@ -126,26 +151,26 @@ $exeArguments = @()
 if ($GameDir -and $usesUpdate)
 {
     # (Join-Path refuses an empty path, so the update folder is checked first.)
-    $eboot = if ($UpdateDir) { Join-Path $UpdateDir 'USRDIR\EBOOT.elf' } else { '' }
+    $eboot = if ($UpdateDir) { Find-RunnableEboot (Join-Path $UpdateDir 'USRDIR') (Get-LicenceFolders $UpdateDir) } else { '' }
     if ($eboot -and (Test-Path $eboot) -and (Test-Path (Join-Path $GameDir 'PS3_GAME')))
     {
         $exeArguments = @($eboot)
     }
     elseif ($gameDirGiven -or $updateDirGiven)
     {
-        throw "This is a 1.10 build: it needs -GameDir <your disc dump> and -UpdateDir <the installed 1.10 update, with USRDIR\EBOOT.elf decrypted>"
+        throw "This is a 1.10 build: it needs -GameDir <your disc dump> and -UpdateDir <the installed 1.10 update>"
     }
 }
 elseif ($GameDir)
 {
-    $eboot = Join-Path $GameDir 'PS3_GAME\USRDIR\EBOOT.elf'
-    if (Test-Path $eboot)
+    $eboot = Find-RunnableEboot (Join-Path $GameDir 'PS3_GAME\USRDIR') @()
+    if ($eboot -and (Test-Path $eboot))
     {
         $exeArguments = @($eboot)
     }
-    elseif ($gameDirGiven)
+    elseif ($gameDirGiven -and -not (Test-Path (Join-Path $GameDir 'PS3_GAME\USRDIR\EBOOT.BIN')))
     {
-        throw "Decrypted EBOOT.elf not found at $eboot"
+        throw "No EBOOT.BIN or EBOOT.elf in $(Join-Path $GameDir 'PS3_GAME\USRDIR')"
     }
 }
 if ($exeArguments.Count -eq 0)
