@@ -1277,6 +1277,13 @@ What 0006 fixes in ps3recomp to make that run:
     (at most 1024 vertices; every vertex must have the same w, so
     perspective overlays stay with the picture), then places them like
     any other HUD draw.
+91. HUD snapping back to centred while "EXP" shows (patches/0069,
+    capture-20261031-171300). With 0068 the CPU-evaluated draws also
+    counted towards the menu test (entry 88), and the EXP pick-up's
+    particles (one draw of ~900 vertices, vertex program 1b53627e) cover
+    a large area -- enough to look like a menu window, so the whole HUD
+    went centred for those frames. Only plain 2D draws (the program menus
+    use) can mark a menu now.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

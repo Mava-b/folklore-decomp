@@ -7500,8 +7500,12 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
         g_ld_hud_menu.panelThisFrame = 0;
         g_ld_hud_menu.frame = g_ld_frames;
     }
-    if (right - left >= 0.30f && bottom - top >= 0.25f && left >= 0.0f && top >= 0.0f && right <= 1.0f &&
-        bottom <= 1.0f)
+    /* Only the plain 2D program draws menu windows. The effects worked out on
+     * the CPU (the "EXP" pick-ups flying to the gauges, capture-20261031-171300)
+     * can cover a large area and would otherwise switch the whole HUD to
+     * centred while they are on screen. */
+    if (useRows && right - left >= 0.30f && bottom - top >= 0.25f && left >= 0.0f && top >= 0.0f &&
+        right <= 1.0f && bottom <= 1.0f)
     {
         g_ld_hud_menu.panelThisFrame = 1;
     }
