@@ -196,6 +196,21 @@ void engineSettingsLoad()
             const int level = std::atoi(value);
             settingsInstance.anisotropy = (level == 2 || level == 4 || level == 8 || level == 16) ? level : 1;
         }
+        else if (std::strcmp(key, "texture_detail") == 0)
+        {
+            if (std::strcmp(value, "original") == 0)
+            {
+                settingsInstance.textureDetail = EngineSettings::TextureDetail::Original;
+            }
+            else if (std::strcmp(value, "sharpest") == 0)
+            {
+                settingsInstance.textureDetail = EngineSettings::TextureDetail::Sharpest;
+            }
+            else
+            {
+                settingsInstance.textureDetail = EngineSettings::TextureDetail::Sharper;
+            }
+        }
         else if (std::strcmp(key, "bloom") == 0)
         {
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
@@ -331,6 +346,11 @@ void engineSettingsSave()
     std::fprintf(file, "anti_aliasing = %s\n", current.antiAliasing == AntiAliasing::Fxaa ? "fxaa" : "off");
     std::fprintf(file, "background_shaders = %d\n", current.backgroundShaders ? 1 : 0);
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
+    std::fprintf(file, "# original (the game's mip levels), sharper or sharpest\n");
+    std::fprintf(file, "texture_detail = %s\n",
+                 current.textureDetail == EngineSettings::TextureDetail::Original   ? "original"
+                 : current.textureDetail == EngineSettings::TextureDetail::Sharpest ? "sharpest"
+                                                                                    : "sharper");
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
     std::fprintf(file, "# original (the game's two-tap blur) or smooth (next start)\n");
     std::fprintf(file, "depth_of_field = %s\n",
@@ -375,6 +395,7 @@ extern "C"
     void rsx_live_draw_set_post_aa(int mode);
     void rsx_live_draw_set_async_shaders(int enabled);
     void rsx_live_draw_set_anisotropy(uint32_t level);
+    void rsx_live_draw_set_texture_lod_bias(int hundredths);
     void rsx_live_draw_set_sharpening(uint32_t percent);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
@@ -390,6 +411,8 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_post_aa(current.antiAliasing == AntiAliasing::Fxaa ? 1 : 0);
     rsx_live_draw_set_async_shaders(current.backgroundShaders ? 1 : 0);
     rsx_live_draw_set_anisotropy((uint32_t)current.anisotropy);
+    static const int kTextureLodBias[3] = {0, -50, -100};
+    rsx_live_draw_set_texture_lod_bias(kTextureLodBias[(int)current.textureDetail]);
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
     engineDepthOfFieldApply();
     engineBloomApply();

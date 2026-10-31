@@ -1140,6 +1140,18 @@ What 0006 fixes in ps3recomp to make that run:
     of field it keeps the game's two taps. Not in the four-tap depth of
     field scenes. Every shader combination is built once and kept (the
     renderer keeps the pointer). Values to be tuned from a capture.
+    Confirmed in capture-20261031-143200 (strong, 21:9): darkening where
+    wall meets floor, under and around the sofa, the suitcase and lamp
+    bases and the rock crevices; flat floor even, no halos, no visible
+    pattern.
+82. Texture detail (patches/0060, engine setting texture_detail: original /
+    sharper / sharpest, default sharper). A mip bias of 0 / -0.5 / -1.0
+    (rsx_live_draw_set_texture_lod_bias, hundredths, 0 to -200) on the
+    game's mip-mapped, linearly minified textures -- the ones anisotropic
+    filtering applies to; render targets and point-sampled lookups are
+    untouched. Live: a change rebuilds the sampler cache at the next frame
+    boundary, like anisotropy. The game's own bias field in the texture
+    filter register (bits 0-12) is still not read, as before.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

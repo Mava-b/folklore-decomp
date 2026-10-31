@@ -64,6 +64,16 @@ struct EngineSettings
      * contrast-adaptive sharpening of the final image. Both apply at once. */
     int anisotropy = 16;
     int sharpening = 0;
+    /* Texture detail: the game's mip levels, or a finer level chosen
+     * (mip bias -0.5 / -1.0) so surfaces keep their detail further away.
+     * Applies at once. */
+    enum class TextureDetail
+    {
+        Original,
+        Sharper,
+        Sharpest,
+    };
+    TextureDetail textureDetail = TextureDetail::Sharper;
     /* Depth of field: the game's own two-tap blur, or a smooth 24-tap disc
      * using the game's focus (engine_dof.cpp). Applies at the next start. */
     enum class DepthOfField

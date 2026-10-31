@@ -947,6 +947,20 @@ namespace
             ImGui::SameLine();
             changed |= radioAnisotropy(kAnisotropyLabels[levelIndex], kAnisotropyLevels[levelIndex]);
         }
+        ImGui::TextUnformatted("Texture detail (sharper surfaces in the distance)");
+        {
+            int detailIndex = (int)settings.textureDetail;
+            bool detailChanged = ImGui::RadioButton("Original (the PS3's)##detail", &detailIndex, 0);
+            ImGui::SameLine();
+            detailChanged |= ImGui::RadioButton("Sharper##detail", &detailIndex, 1);
+            ImGui::SameLine();
+            detailChanged |= ImGui::RadioButton("Sharpest##detail", &detailIndex, 2);
+            if (detailChanged)
+            {
+                settings.textureDetail = (EngineSettings::TextureDetail)detailIndex;
+                changed = true;
+            }
+        }
         ImGui::TextUnformatted("Sharpening");
         changed |= radioSharpening("Off##sharpen", 0);
         ImGui::SameLine();

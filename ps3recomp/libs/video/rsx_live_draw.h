@@ -147,6 +147,11 @@ void rsx_live_draw_set_async_shaders(int enabled);
  * sharpening of the presented game image (live; movies are not sharpened). */
 void rsx_live_draw_set_anisotropy(u32 level);
 void rsx_live_draw_set_sharpening(u32 percent);
+/* Texture detail: a mip bias in hundredths of a level, 0 (the game's
+ * choice) down to -200, for the same textures as anisotropic filtering
+ * (live, like it). Negative picks finer mip levels: sharper surfaces in the
+ * distance. */
+void rsx_live_draw_set_texture_lod_bias(int hundredths);
 /* Pixel shader replacements: a fragment program whose translated HLSL (as
  * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
  * -- a title's own better version of one of its effects. The hash is the

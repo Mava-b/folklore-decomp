@@ -59,6 +59,7 @@ void rsx_live_draw_set_aspect(float a) { (void)a; }
 float rsx_live_draw_get_aspect(void) { return 16.0f / 9.0f; }
 void rsx_live_draw_set_async_shaders(int e) { (void)e; }
 void rsx_live_draw_set_anisotropy(u32 l) { (void)l; }
+void rsx_live_draw_set_texture_lod_bias(int h) { (void)h; }
 void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
 void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
 void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
@@ -464,6 +465,8 @@ static volatile LONG g_ld_post_aa = 0;          /* 0 off, 1 FXAA */
 static volatile LONG g_ld_async_shaders = 1;    /* compile new shaders in the background */
 static volatile LONG g_ld_anisotropy = 1;       /* requested max anisotropy: 1 (off), 2, 4, 8, 16 */
 static u32 s_ld_sampler_anisotropy = 1;         /* what the cached samplers were built with (render thread) */
+static volatile LONG g_ld_texture_lod_bias = 0;  /* requested mip bias in hundredths (0 = the game's choice) */
+static LONG s_ld_sampler_lod_bias = 0;           /* what the cached samplers were built with (render thread) */
 static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
 static volatile LONG g_ld_pso_jobs_pending = 0;
 static volatile LONG g_ld_pso_jobs_done = 0;
@@ -1853,6 +1856,17 @@ static D3D12_SAMPLER_DESC decode_sampler(const rsx_dsp_texture* t)
         sd.Filter = D3D12_FILTER_ANISOTROPIC;
         sd.MaxAnisotropy = s_ld_sampler_anisotropy;
     }
+    /* Texture detail (engine setting): a negative mip bias for the same
+     * textures, so a finer mip level is chosen. The PS3 picked mips for a
+     * 720-line picture with no other filtering to keep the finer ones from
+     * shimmering; with supersampling, anisotropic filtering and
+     * anti-aliasing here they hold up, and surfaces keep their detail
+     * further away. Render targets and point-sampled lookups are left as
+     * they are. */
+    if (s_ld_sampler_lod_bias != 0 && mip_present && min_linear)
+    {
+        sd.MipLODBias = (float)s_ld_sampler_lod_bias / 100.0f;
+    }
     return sd;
 }
 
@@ -1867,16 +1881,23 @@ static void ld_refresh_sampler_settings(void)
     {
         requested = 1u;
     }
-    if (requested == s_ld_sampler_anisotropy)
+    LONG requestedBias = InterlockedCompareExchange(&g_ld_texture_lod_bias, 0, 0);
+    if (requestedBias < -200 || requestedBias > 0)
+    {
+        requestedBias = 0;
+    }
+    if (requested == s_ld_sampler_anisotropy && requestedBias == s_ld_sampler_lod_bias)
     {
         return;
     }
     ld_wait_idle();
     s_ld_sampler_anisotropy = requested;
+    s_ld_sampler_lod_bias = requestedBias;
     g.n_samplers = 0;
     g.smp_ring_used = 0;
     memset(g.smp_table_fence, 0, sizeof(g.smp_table_fence));
-    fprintf(stderr, "[live-draw] anisotropic filtering %ux\n", requested);
+    fprintf(stderr, "[live-draw] anisotropic filtering %ux, texture mip bias %.2f\n", requested,
+            (double)requestedBias / 100.0);
 }
 /* Cache key of a sampler: exactly the fields decode_sampler reads, so two states share a descriptor only when
  * they decode alike. The previous key kept wrap bits 0-11 (U and V, none of W at bits 16-19) and shifted the 21-bit
@@ -2341,6 +2362,11 @@ void rsx_live_draw_set_async_shaders(int enabled)
 void rsx_live_draw_set_anisotropy(u32 level)
 {
     InterlockedExchange(&g_ld_anisotropy, (LONG)level);
+}
+
+void rsx_live_draw_set_texture_lod_bias(int hundredths)
+{
+    InterlockedExchange(&g_ld_texture_lod_bias, (LONG)hundredths);
 }
 
 /* Pixel shader replacements (rsx_live_draw_set_ps_replacement). */
