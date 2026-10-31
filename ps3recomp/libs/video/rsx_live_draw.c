@@ -2395,9 +2395,27 @@ static int ld_apply_ps_replacement(char* hlsl, size_t capacity)
     {
         return 0;
     }
+    /* Normalised so one fragment program has one hash whatever is bound
+     * with it: from the constants block on (the texture declarations before
+     * it depend on which units hold cube maps), and with rsx_tex[N] read as
+     * rsx_texN (the form the translator uses when a cube map is bound). */
+    const char* start = strstr(hlsl, "cbuffer PSConstants");
     u64 sourceHash = 0xCBF29CE484222325ull;
-    for (const unsigned char* cursor = (const unsigned char*)hlsl; *cursor; cursor++)
+    for (const unsigned char* cursor = (const unsigned char*)(start ? start : hlsl); *cursor; cursor++)
     {
+        if (cursor[0] == '[' && cursor > (const unsigned char*)hlsl + 7 &&
+            memcmp(cursor - 7, "rsx_tex", 7) == 0 && cursor[1] >= '0' && cursor[1] <= '9')
+        {
+            const unsigned char* digit = cursor + 1;
+            while (*digit >= '0' && *digit <= '9')
+            {
+                sourceHash ^= *digit;
+                sourceHash *= 0x100000001B3ull;
+                digit++;
+            }
+            cursor = (*digit == ']') ? digit : digit - 1;
+            continue;
+        }
         sourceHash ^= *cursor;
         sourceHash *= 0x100000001B3ull;
     }

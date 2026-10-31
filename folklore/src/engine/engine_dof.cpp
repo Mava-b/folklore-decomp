@@ -17,8 +17,11 @@
  * wherever the image is in focus, and out of focus take a round 24-tap disc
  * as wide as the two copies were apart. Each tap's own depth decides whether
  * it may contribute, so a sharp object does not bleed into the blur around
- * it. The hashes are the 64-bit FNV-1a of each shader as the renderer
- * translates it (its LD_HLSL_DUMP text).
+ * it. The hashes are the renderer's normalised 64-bit FNV-1a of each shader
+ * as it translates it (rsx_live_draw_set_ps_replacement: the LD_HLSL_DUMP
+ * text from "cbuffer PSConstants" on, rsx_tex[N] read as rsx_texN). The
+ * first version hashed the whole text, which changes when the scene has a
+ * cube map bound on another unit -- and then the pass was not replaced.
  */
 #include "engine_settings.h"
 
@@ -30,9 +33,9 @@ extern "C" void rsx_live_draw_set_ps_replacement(uint64_t sourceHash, const char
 namespace
 {
     /* Behind the focus only: pso 4fb2ef46cbd180a0 / 76bf6e099e2e0a4f. */
-    constexpr uint64_t kFarOnlyHash = 0xBF822F2AE9CE0473ull;
+    constexpr uint64_t kFarOnlyHash = 0x7E1621B76F8AF72Eull;
     /* Both sides of the focus: pso 98dbb71efb61695f. */
-    constexpr uint64_t kTwoSidedHash = 0xBC72CEB2C64A1E3Full;
+    constexpr uint64_t kTwoSidedHash = 0x1F15BEB3C708B830ull;
 
     const char* const kCommon = R"HLSL(
 float4 _rsx_zeta_argb(Texture2D depthTexture, SamplerState depthSampler, float2 coordinate) {

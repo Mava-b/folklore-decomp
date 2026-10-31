@@ -72,6 +72,15 @@ struct EngineSettings
         Smooth,
     };
     DepthOfField depthOfField = DepthOfField::Smooth;
+    /* Bloom: the game's (one sample per pixel into 640x480, so it flickers),
+     * or smooth (every pixel averaged, bicubic composite; engine_bloom.cpp).
+     * Applies at the next start. */
+    enum class Bloom
+    {
+        Original,
+        Smooth,
+    };
+    Bloom bloom = Bloom::Smooth;
     /* Physics: step Havok by the real frame time instead of the game's fixed
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
@@ -132,6 +141,8 @@ std::string engineExecutableDirectory();
 void engineSettingsApplyGraphics();
 /* engine_dof.cpp: register the smooth depth of field shader, or remove it. */
 void engineDepthOfFieldApply();
+/* engine_bloom.cpp: the same for the bloom. */
+void engineBloomApply();
 /* Hand the input settings to the pad runtime (startup and every change). */
 void engineSettingsApplyInput();
 /* The aspect ratio a setting asks for (16:9 for Original). */

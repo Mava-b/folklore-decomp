@@ -201,6 +201,9 @@ saved to `folklore_settings.ini`.
   - *Anti-aliasing* (FXAA), *Anisotropic filtering* (up to 16x), *Sharpening*.
   - *Depth of field*: *Smooth* (the default: a soft blur using the game's own
     focus, without the doubled edges) or *Original* (the PS3's). Next start.
+  - *Bloom*: *Smooth* (the default: steady glow, without the flicker and
+    shimmer of the original's low-resolution sampling) or *Original*. Next
+    start.
   - *Build new shaders in the background* (no hitch when an effect first
     appears).
 - **Game files**: the game folder in use (change it here; it applies on the

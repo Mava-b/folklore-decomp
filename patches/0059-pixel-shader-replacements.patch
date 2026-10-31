@@ -9,7 +9,7 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
  { if (p) *p = 0; if (b) *b = 0; if (s) *s = 0; }
  u32  rsx_live_draw_get_frames(void) { return 0; }
-@@ -2342,6 +2343,90 @@
+@@ -2342,6 +2343,108 @@
      InterlockedExchange(&g_ld_anisotropy, (LONG)level);
  }
  
@@ -65,9 +65,27 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 +    {
 +        return 0;
 +    }
++    /* Normalised so one fragment program has one hash whatever is bound
++     * with it: from the constants block on (the texture declarations before
++     * it depend on which units hold cube maps), and with rsx_tex[N] read as
++     * rsx_texN (the form the translator uses when a cube map is bound). */
++    const char* start = strstr(hlsl, "cbuffer PSConstants");
 +    u64 sourceHash = 0xCBF29CE484222325ull;
-+    for (const unsigned char* cursor = (const unsigned char*)hlsl; *cursor; cursor++)
++    for (const unsigned char* cursor = (const unsigned char*)(start ? start : hlsl); *cursor; cursor++)
 +    {
++        if (cursor[0] == '[' && cursor > (const unsigned char*)hlsl + 7 &&
++            memcmp(cursor - 7, "rsx_tex", 7) == 0 && cursor[1] >= '0' && cursor[1] <= '9')
++        {
++            const unsigned char* digit = cursor + 1;
++            while (*digit >= '0' && *digit <= '9')
++            {
++                sourceHash ^= *digit;
++                sourceHash *= 0x100000001B3ull;
++                digit++;
++            }
++            cursor = (*digit == ']') ? digit : digit - 1;
++            continue;
++        }
 +        sourceHash ^= *cursor;
 +        sourceHash *= 0x100000001B3ull;
 +    }
@@ -100,7 +118,7 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
  void rsx_live_draw_set_sharpening(u32 percent)
  {
      InterlockedExchange(&g_ld_sharpen_percent, (LONG)(percent > 100u ? 100u : percent));
-@@ -6021,6 +6106,11 @@
+@@ -6021,6 +6124,11 @@
          snprintf(fn, sizeof fn, "%s/hlsl_%016llx.ps.txt", hd, (unsigned long long)live_legacy_pso_key());
          f = fopen(fn, "wb"); if (f) { fputs(fi > 0 ? ps_hlsl : "<fp fail>", f); fclose(f); }
        } }
@@ -115,14 +133,16 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
 --- a/libs/video/rsx_live_draw.h
 +++ b/libs/video/rsx_live_draw.h
-@@ -147,6 +147,12 @@
+@@ -147,6 +147,14 @@
   * sharpening of the presented game image (live; movies are not sharpened). */
  void rsx_live_draw_set_anisotropy(u32 level);
  void rsx_live_draw_set_sharpening(u32 percent);
 +/* Pixel shader replacements: a fragment program whose translated HLSL (as
-+ * LD_HLSL_DUMP writes it) hashes to `sourceHash` (64-bit FNV-1a of the text)
-+ * is built from `hlsl` instead -- a title's own better version of one of its
-+ * effects. `hlsl` must stay valid; NULL removes the entry. Applies to shaders
++ * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
++ * -- a title's own better version of one of its effects. The hash is the
++ * 64-bit FNV-1a of the text from "cbuffer PSConstants" on, with each
++ * "rsx_tex[N]" read as "rsx_texN", so it does not change with which texture
++ * units hold cube maps. `hlsl` must stay valid; NULL removes the entry. Applies to shaders
 + * built after the call, so set it before the first frame. Up to 16. */
 +void rsx_live_draw_set_ps_replacement(u64 sourceHash, const char* hlsl);
  /* Background shader builds queued now, built so far, and draws skipped while

@@ -196,6 +196,11 @@ void engineSettingsLoad()
             const int level = std::atoi(value);
             settingsInstance.anisotropy = (level == 2 || level == 4 || level == 8 || level == 16) ? level : 1;
         }
+        else if (std::strcmp(key, "bloom") == 0)
+        {
+            settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
+                                                                          : EngineSettings::Bloom::Smooth;
+        }
         else if (std::strcmp(key, "depth_of_field") == 0)
         {
             settingsInstance.depthOfField = std::strcmp(value, "original") == 0
@@ -315,6 +320,8 @@ void engineSettingsSave()
     std::fprintf(file, "# original (the game's two-tap blur) or smooth (next start)\n");
     std::fprintf(file, "depth_of_field = %s\n",
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
+    std::fprintf(file, "# original (the game's, flickers) or smooth (next start)\n");
+    std::fprintf(file, "bloom = %s\n", current.bloom == EngineSettings::Bloom::Original ? "original" : "smooth");
     std::fprintf(file, "physics_frame_step = %d\n", current.physicsFrameStep ? 1 : 0);
     std::fprintf(file, "# opening logos: off (they all play), start (Start skips them) or always (never shown)\n");
     const char* logoSkipText = current.logoSkip == EngineSettings::LogoSkip::Always  ? "always"
@@ -365,6 +372,7 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_anisotropy((uint32_t)current.anisotropy);
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
     engineDepthOfFieldApply();
+    engineBloomApply();
     rsx_live_draw_set_aspect(engineSettingsAspectValue(current.aspectRatio));
     rsx_null_backend_set_fullscreen(current.fullscreen ? 1 : 0);
 }

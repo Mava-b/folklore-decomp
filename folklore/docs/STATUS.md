@@ -1091,6 +1091,28 @@ What 0006 fixes in ps3recomp to make that run:
     - c4.y, constants one slot later), now replaced the same way, and a
     four-tap one (0x857B42FDBCA02AF1, scaled by the scene's own colour) left
     as it is.
+79. Bloom flicker (capture-20261031-115639, src/engine/engine_bloom.cpp).
+    The bloom: the scene copy 0x2A40000 (2560x720 times the render scale) is
+    reduced to 640x480 (0x31C0000) in one pass, pso 46f31d99b7711f43, which
+    takes ONE bilinear sample per pixel, times col0, minus a threshold
+    (c0.x); two 8-tap gaussian passes at 640x480 (4d9321e2..., 4ec95742...,
+    via 0x3300000); composite 181474cd2e468dbb (2x2 conv_gauss, times col0,
+    blended onto the screen). One sample per 4x1.5 source pixels (12x4.5
+    at 3x render scale) misses small bright details on one frame and hits
+    them the next: the reported flicker. Replacements (engine setting
+    bloom = smooth, the default): the reduction averages every source pixel
+    under each 640x480 pixel (footprint from ddx/ddy, up to 8x8 bilinear
+    taps, each thresholded like the game's one sample); the composite uses a
+    4-tap cubic B-spline when it enlarges (footprint under 0.75 texel) and
+    the original 2x2 filter otherwise -- the same shader is used for other
+    copies. The B-spline taps were checked against a direct 16-tap
+    evaluation. Also from this capture: the depth of field pass with a cube
+    map bound on unit 3 translates with rsx_texN declarations instead of
+    rsx_tex[16], so its text hash differed and it was not replaced. 0059's
+    hash is now normalised (from "cbuffer PSConstants" on, rsx_tex[N] read
+    as rsx_texN); the depth of field hashes are 0x7E1621B76F8AF72E (behind
+    the focus) and 0x1F15BEB3C708B830 (both sides), the bloom's
+    0xD5315C03A3656365 and 0x5619049F34E0928F.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

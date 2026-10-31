@@ -90,6 +90,7 @@ namespace
         bool failed = false;
         /* The depth of field the game's shaders were built with this run. */
         EngineSettings::DepthOfField startDepthOfField = EngineSettings::DepthOfField::Smooth;
+        EngineSettings::Bloom startBloom = EngineSettings::Bloom::Smooth;
         bool menuOpen = false;
         bool focusRequested = false;
         ID3D12DescriptorHeap* srvHeap = nullptr;
@@ -970,6 +971,23 @@ namespace
                 ImGui::TextDisabled("(applies when you next start the game)");
             }
         }
+        ImGui::TextUnformatted("Bloom");
+        {
+            int bloomIndex = (int)settings.bloom;
+            bool bloomChanged = ImGui::RadioButton("Original (the PS3's)##bloom", &bloomIndex, 0);
+            ImGui::SameLine();
+            bloomChanged |= ImGui::RadioButton("Smooth (no flicker)##bloom", &bloomIndex, 1);
+            if (bloomChanged)
+            {
+                settings.bloom = (EngineSettings::Bloom)bloomIndex;
+                changed = true;
+            }
+            if (settings.bloom != menu.startBloom)
+            {
+                ImGui::SameLine();
+                ImGui::TextDisabled("(applies when you next start the game)");
+            }
+        }
         changed |= ImGui::Checkbox("Build new shaders in the background (no hitch when an effect first appears)",
                                    &settings.backgroundShaders);
         if (changed)
@@ -1257,6 +1275,7 @@ namespace
         {
             menu.initialized = true;
             menu.startDepthOfField = engineSettings().depthOfField;
+            menu.startBloom = engineSettings().bloom;
             if (!initialize((ID3D12Device*)device, (ID3D12CommandQueue*)queue, (DXGI_FORMAT)format, height))
             {
                 menu.failed = true;

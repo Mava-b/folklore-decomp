@@ -148,9 +148,11 @@ void rsx_live_draw_set_async_shaders(int enabled);
 void rsx_live_draw_set_anisotropy(u32 level);
 void rsx_live_draw_set_sharpening(u32 percent);
 /* Pixel shader replacements: a fragment program whose translated HLSL (as
- * LD_HLSL_DUMP writes it) hashes to `sourceHash` (64-bit FNV-1a of the text)
- * is built from `hlsl` instead -- a title's own better version of one of its
- * effects. `hlsl` must stay valid; NULL removes the entry. Applies to shaders
+ * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
+ * -- a title's own better version of one of its effects. The hash is the
+ * 64-bit FNV-1a of the text from "cbuffer PSConstants" on, with each
+ * "rsx_tex[N]" read as "rsx_texN", so it does not change with which texture
+ * units hold cube maps. `hlsl` must stay valid; NULL removes the entry. Applies to shaders
  * built after the call, so set it before the first frame. Up to 16. */
 void rsx_live_draw_set_ps_replacement(u64 sourceHash, const char* hlsl);
 /* Background shader builds queued now, built so far, and draws skipped while
