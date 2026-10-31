@@ -203,7 +203,10 @@ saved to `folklore_settings.ini`.
     next start.
   - *Aspect ratio*: 16:9, match display, 21:9 or 32:9 — a wider field of view,
     not a stretched picture (menus and HUD are stretched). Next start.
-  - *Anti-aliasing* (FXAA), *Anisotropic filtering* (up to 16x), *Sharpening*.
+  - *Anti-aliasing*: *SMAA* (the default for new settings: smooth edges
+    that stay sharp, text and texture detail kept), *FXAA* (softer) or
+    *Off*. Applies at once. *Anisotropic filtering* (up to 16x),
+    *Sharpening*.
   - *Texture detail*: *Sharper* (the default), *Sharpest* or *Original* —
     finer texture levels, so walls, ground and clothing keep their detail
     further away. Applies at once.
@@ -424,6 +427,9 @@ lifted sources and `folklore_settings.ini`.
   [`LICENSE`](LICENSE).
 - **ps3recomp** © Ned Heller / sp00nznet, MIT licence (`ps3recomp/LICENSE`).
 - **Dear ImGui** © Omar Cornut, MIT licence (`folklore/src/third_party/imgui`).
+- **SMAA** © Jorge Jimenez, Jose I. Echevarria, Belen Masia, Fernando
+  Navarro and Diego Gutierrez, MIT licence (the shader and lookup textures,
+  packed in `ps3recomp/libs/video/rsx_smaa_data.h` with their licence).
 - **FFmpeg** (LGPL) is downloaded by setup for the cutscenes; it is not part
   of this repository.
 - Folklore is © Sony Interactive Entertainment / Game Republic. This project

@@ -1152,6 +1152,20 @@ What 0006 fixes in ps3recomp to make that run:
     untouched. Live: a change rebuilds the sampler cache at the next frame
     boundary, like anisotropy. The game's own bias field in the texture
     filter register (bits 0-12) is still not read, as before.
+83. SMAA 1x (patches/0061, anti_aliasing = smaa, the default for new
+    settings files; post AA mode 2). The reference SMAA.hlsl at its HIGH
+    preset with its AreaTex/SearchTex, zlib-packed into
+    libs/video/rsx_smaa_data.h (folklore/tools/make_smaa_data.py, from
+    github.com/iryoku/smaa) and inflated with stb_image's inflate. Runs in
+    ld_present_pass on the game's image only, at the image's own size
+    (edges R8G8, weights and result R8G8B8A8, remade when the size
+    changes), before the scale / box / sharpen pass; own root signature (4
+    constants, 3-SRV table, linear + point static samplers), three RTVs
+    after the surface cache's. Built on first use; on any failure it logs
+    "[smaa] unavailable" and presents without it. No stencil pass: the
+    weights pass runs over every pixel (cheap at this size). Inflated
+    data and the embedded wrapper checked against the reference; all
+    entry points compiled with glslang's HLSL front end.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

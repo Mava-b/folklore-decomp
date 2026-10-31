@@ -116,6 +116,9 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <d3d12sdklayers.h>
 #include <dxgi1_4.h>
 #include <d3dcompiler.h>
+#include "rsx_smaa_data.h"
+/* stb_image's inflate (libs/codec/cellPngDec.c owns the implementation). */
+int stbi_zlib_decode_buffer(char* outputBuffer, int outputLength, const char* inputBuffer, int inputLength);
 #include "rsx_vertex_formats.h"
 #include <sys/stat.h>
 
@@ -182,7 +185,14 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define SRV_CPU_HEAP_SLOTS (SRV_FEEDBACK_BASE + MAX_SURFACES)
 /* The host movie frame the present pass scales to the window. */
 #define SRV_PRESENT_MOVIE SRV_CPU_HEAP_SLOTS
-#define SRV_CPU_HEAP_TOTAL (SRV_CPU_HEAP_SLOTS + 1)
+/* SMAA (present pass): its edges, weights and result at the image's size,
+ * and the two lookup textures. */
+#define SRV_SMAA_EDGES    (SRV_CPU_HEAP_SLOTS + 1)
+#define SRV_SMAA_WEIGHTS  (SRV_CPU_HEAP_SLOTS + 2)
+#define SRV_SMAA_OUTPUT   (SRV_CPU_HEAP_SLOTS + 3)
+#define SRV_SMAA_AREA     (SRV_CPU_HEAP_SLOTS + 4)
+#define SRV_SMAA_SEARCH   (SRV_CPU_HEAP_SLOTS + 5)
+#define SRV_CPU_HEAP_TOTAL (SRV_CPU_HEAP_SLOTS + 6)
 #define SRV_TABLE_SIZE   16
 /* Both banks together; each frame gets SRV_BANK_TABLES. */
 #define SRV_RING_TABLES  8192
@@ -437,6 +447,16 @@ typedef struct {
     ID3D12PipelineState*       present_pso[3];   /* scale, FXAA, box downsample */
     ID3D12Resource*            present_movie;    /* host movie frame, SRV_PRESENT_MOVIE */
     u32                        present_movie_w, present_movie_h;
+    /* SMAA 1x before the present pass (ld_smaa_run). */
+    int                        smaa_state;       /* 0 not tried, 1 ready, -1 unavailable */
+    ID3D12RootSignature*       smaa_rootsig;
+    ID3D12PipelineState*       smaa_pso[3];      /* edges, weights, blend */
+    ID3D12Resource*            smaa_area;        /* lookup textures */
+    ID3D12Resource*            smaa_search;
+    ID3D12Resource*            smaa_table_upload;
+    int                        smaa_tables_copied;
+    ID3D12Resource*            smaa_targets[3];  /* edges, weights, output at the image's size */
+    u32                        smaa_w, smaa_h;
     rsx_live_guest_ptr_fn      guest_ptr;
     void*                      guest_user;
 
@@ -461,7 +481,7 @@ static ld_state g;
  * taken once, at init; the others are read every frame. */
 static u32 g_ld_requested_scale = 1;
 static float g_ld_requested_aspect = 0.0f;      /* 0 or <= 16:9: original */
-static volatile LONG g_ld_post_aa = 0;          /* 0 off, 1 FXAA */
+static volatile LONG g_ld_post_aa = 0;          /* 0 off, 1 FXAA, 2 SMAA */
 static volatile LONG g_ld_async_shaders = 1;    /* compile new shaders in the background */
 static volatile LONG g_ld_anisotropy = 1;       /* requested max anisotropy: 1 (off), 2, 4, 8, 16 */
 static u32 s_ld_sampler_anisotropy = 1;         /* what the cached samplers were built with (render thread) */
@@ -2351,7 +2371,7 @@ float rsx_live_draw_get_aspect(void)
 
 void rsx_live_draw_set_post_aa(int mode)
 {
-    InterlockedExchange(&g_ld_post_aa, mode == 1 ? 1 : 0);
+    InterlockedExchange(&g_ld_post_aa, (mode == 1 || mode == 2) ? mode : 0);
 }
 
 void rsx_live_draw_set_async_shaders(int enabled)
@@ -10333,6 +10353,501 @@ static void ld_sync_swapchain_size(void)
     fprintf(stderr, "[present] back buffer now %ux%u\n", g.bb_w, g.bb_h);
 }
 
+/* ---------------------------------------------------------------------------
+ * SMAA 1x (post AA mode 2): the reference implementation (rsx_smaa_data.h,
+ * https://github.com/iryoku/smaa) at its HIGH preset, run on the game's
+ * presented image at the image's own size before the present pass scales it
+ * to the window. Three passes: luma edges, blending weights (with the area
+ * and search lookup textures), and neighbourhood blending. Movies are not
+ * touched. Built on first use; if anything fails it stays off and the image
+ * is presented without it.
+ * -----------------------------------------------------------------------*/
+#define RTV_SMAA_BASE (LD_SWAP_BUFFERS + MAX_SURFACES)
+#define LD_SMAA_EDGES   0
+#define LD_SMAA_WEIGHTS 1
+#define LD_SMAA_BLEND   2
+
+static const char k_ld_smaa_prefix[] =
+    "#define SMAA_CUSTOM_SL 1\n"
+    "#define SMAA_PRESET_HIGH 1\n"
+    "#define SMAA_RT_METRICS smaaMetrics\n"
+    "cbuffer SmaaConstants : register(b0)\n"
+    "{\n"
+    "    float4 smaaMetrics;\n"
+    "};\n"
+    "SamplerState smaaLinear : register(s0);\n"
+    "SamplerState smaaPoint : register(s1);\n"
+    "#define SMAATexture2D(tex) Texture2D tex\n"
+    "#define SMAATexturePass2D(tex) tex\n"
+    "#define SMAASampleLevelZero(tex, coord) tex.SampleLevel(smaaLinear, coord, 0)\n"
+    "#define SMAASampleLevelZeroPoint(tex, coord) tex.SampleLevel(smaaPoint, coord, 0)\n"
+    "#define SMAASampleLevelZeroOffset(tex, coord, offset) tex.SampleLevel(smaaLinear, coord, 0, offset)\n"
+    "#define SMAASample(tex, coord) tex.Sample(smaaLinear, coord)\n"
+    "#define SMAASamplePoint(tex, coord) tex.Sample(smaaPoint, coord)\n"
+    "#define SMAASampleOffset(tex, coord, offset) tex.Sample(smaaLinear, coord, offset)\n"
+    "#define SMAA_FLATTEN [flatten]\n"
+    "#define SMAA_BRANCH [branch]\n"
+    "#define SMAATexture2DMS2(tex) Texture2DMS<float4, 2> tex\n"
+    "#define SMAALoad(tex, pos, sample) tex.Load(pos, sample)\n";
+
+static const char k_ld_smaa_suffix[] =
+    "\nTexture2D smaaFirst : register(t0);\n"
+    "Texture2D smaaSecond : register(t1);\n"
+    "Texture2D smaaThird : register(t2);\n"
+    "struct SmaaVertex\n"
+    "{\n"
+    "    float4 position : SV_Position;\n"
+    "    float2 texcoord : TEXCOORD0;\n"
+    "};\n"
+    "SmaaVertex smaaVs(uint vertexId : SV_VertexID)\n"
+    "{\n"
+    "    SmaaVertex result;\n"
+    "    float2 corner = float2((vertexId << 1) & 2, vertexId & 2);\n"
+    "    result.texcoord = corner;\n"
+    "    result.position = float4(corner * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+    "    return result;\n"
+    "}\n"
+    "float4 smaaEdgesPs(SmaaVertex input) : SV_Target\n"
+    "{\n"
+    "    float4 offsets[3];\n"
+    "    SMAAEdgeDetectionVS(input.texcoord, offsets);\n"
+    "    return float4(SMAALumaEdgeDetectionPS(input.texcoord, offsets, smaaFirst), 0.0, 0.0);\n"
+    "}\n"
+    "float4 smaaWeightsPs(SmaaVertex input) : SV_Target\n"
+    "{\n"
+    "    float2 pixelCoordinate;\n"
+    "    float4 offsets[3];\n"
+    "    SMAABlendingWeightCalculationVS(input.texcoord, pixelCoordinate, offsets);\n"
+    "    return SMAABlendingWeightCalculationPS(input.texcoord, pixelCoordinate, offsets, smaaFirst, smaaSecond,\n"
+    "                                           smaaThird, float4(0.0, 0.0, 0.0, 0.0));\n"
+    "}\n"
+    "float4 smaaBlendPs(SmaaVertex input) : SV_Target\n"
+    "{\n"
+    "    float4 offset;\n"
+    "    SMAANeighborhoodBlendingVS(input.texcoord, offset);\n"
+    "    return float4(SMAANeighborhoodBlendingPS(input.texcoord, offset, smaaFirst, smaaSecond).rgb, 1.0);\n"
+    "}\n";
+
+/* Inflates one of rsx_smaa_data.h's arrays into a new malloc'd buffer
+ * (one spare byte, zeroed, so text can be used as a string). */
+static char* ld_smaa_unpack(const unsigned char* packed, u32 packedSize, u32 size)
+{
+    char* output = (char*)malloc((size_t)size + 1u);
+    if (!output)
+    {
+        return NULL;
+    }
+    const int written = stbi_zlib_decode_buffer(output, (int)size, (const char*)packed, (int)packedSize);
+    if (written != (int)size)
+    {
+        free(output);
+        return NULL;
+    }
+    output[size] = 0;
+    return output;
+}
+
+static ID3DBlob* ld_smaa_compile(const char* source, size_t sourceLength, const char* entryPoint,
+                                 const char* profile)
+{
+    ID3DBlob* shader = NULL;
+    ID3DBlob* errors = NULL;
+    const HRESULT result = D3DCompile(source, sourceLength, "smaa", NULL, NULL, entryPoint, profile,
+                                      D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);
+    if (FAILED(result))
+    {
+        fprintf(stderr, "[smaa] %s compile failed hr=0x%08lX: %s\n", entryPoint, (unsigned long)result,
+                errors ? (const char*)errors->lpVtbl->GetBufferPointer(errors) : "<no diagnostics>");
+        shader = NULL;
+    }
+    if (errors)
+    {
+        errors->lpVtbl->Release(errors);
+    }
+    return shader;
+}
+
+/* Root signature: b0 = 4 root constants (SMAA_RT_METRICS), t0-t2 = one
+ * table, s0 linear clamp and s1 point clamp (static). */
+static int ld_smaa_make_pipelines(void)
+{
+    D3D12_DESCRIPTOR_RANGE sourceRange = {0};
+    sourceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    sourceRange.NumDescriptors = 3;
+    D3D12_ROOT_PARAMETER parameters[2] = {0};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 4;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &sourceRange;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC samplers[2] = {0};
+    for (u32 samplerIndex = 0; samplerIndex < 2; samplerIndex++)
+    {
+        samplers[samplerIndex].Filter = samplerIndex == 0 ? D3D12_FILTER_MIN_MAG_LINEAR_MIP_POINT
+                                                          : D3D12_FILTER_MIN_MAG_MIP_POINT;
+        samplers[samplerIndex].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[samplerIndex].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[samplerIndex].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+        samplers[samplerIndex].MaxLOD = D3D12_FLOAT32_MAX;
+        samplers[samplerIndex].ShaderRegister = samplerIndex;
+        samplers[samplerIndex].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    }
+    D3D12_ROOT_SIGNATURE_DESC description = {0};
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 2;
+    description.pStaticSamplers = samplers;
+    ID3DBlob* serialized = NULL;
+    ID3DBlob* errors = NULL;
+    const HRESULT serializeResult = D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                                &serialized, &errors);
+    if (errors)
+    {
+        errors->lpVtbl->Release(errors);
+    }
+    if (FAILED(serializeResult))
+    {
+        fprintf(stderr, "[smaa] root signature failed\n");
+        return -1;
+    }
+    const HRESULT rootResult = g.dev->lpVtbl->CreateRootSignature(
+        g.dev, 0, serialized->lpVtbl->GetBufferPointer(serialized),
+        serialized->lpVtbl->GetBufferSize(serialized), &IID_ID3D12RootSignature, (void**)&g.smaa_rootsig);
+    serialized->lpVtbl->Release(serialized);
+    if (FAILED(rootResult))
+    {
+        g.smaa_rootsig = NULL;
+        return -1;
+    }
+
+    char* reference = ld_smaa_unpack(k_smaa_hlsl_packed, k_smaa_hlsl_packed_size, k_smaa_hlsl_size);
+    if (!reference)
+    {
+        fprintf(stderr, "[smaa] could not unpack the shader source\n");
+        return -1;
+    }
+    const size_t prefixLength = sizeof(k_ld_smaa_prefix) - 1u;
+    const size_t suffixLength = sizeof(k_ld_smaa_suffix) - 1u;
+    const size_t sourceLength = prefixLength + k_smaa_hlsl_size + suffixLength;
+    char* source = (char*)malloc(sourceLength);
+    if (!source)
+    {
+        free(reference);
+        return -1;
+    }
+    memcpy(source, k_ld_smaa_prefix, prefixLength);
+    memcpy(source + prefixLength, reference, k_smaa_hlsl_size);
+    memcpy(source + prefixLength + k_smaa_hlsl_size, k_ld_smaa_suffix, suffixLength);
+    free(reference);
+
+    int status = 0;
+    ID3DBlob* vertexShader = ld_smaa_compile(source, sourceLength, "smaaVs", "vs_5_0");
+    static const char* const pixelEntries[3] = { "smaaEdgesPs", "smaaWeightsPs", "smaaBlendPs" };
+    static const DXGI_FORMAT targetFormats[3] = {
+        DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM
+    };
+    for (u32 passIndex = 0; passIndex < 3 && vertexShader && status == 0; passIndex++)
+    {
+        ID3DBlob* pixelShader = ld_smaa_compile(source, sourceLength, pixelEntries[passIndex], "ps_5_0");
+        if (!pixelShader)
+        {
+            status = -1;
+            break;
+        }
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline = {0};
+        pipeline.pRootSignature = g.smaa_rootsig;
+        pipeline.VS.pShaderBytecode = vertexShader->lpVtbl->GetBufferPointer(vertexShader);
+        pipeline.VS.BytecodeLength = vertexShader->lpVtbl->GetBufferSize(vertexShader);
+        pipeline.PS.pShaderBytecode = pixelShader->lpVtbl->GetBufferPointer(pixelShader);
+        pipeline.PS.BytecodeLength = pixelShader->lpVtbl->GetBufferSize(pixelShader);
+        pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pipeline.SampleMask = 0xFFFFFFFFu;
+        pipeline.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pipeline.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pipeline.RasterizerState.DepthClipEnable = TRUE;
+        pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pipeline.NumRenderTargets = 1;
+        pipeline.RTVFormats[0] = targetFormats[passIndex];
+        pipeline.SampleDesc.Count = 1;
+        const HRESULT pipelineResult = g.dev->lpVtbl->CreateGraphicsPipelineState(
+            g.dev, &pipeline, &IID_ID3D12PipelineState, (void**)&g.smaa_pso[passIndex]);
+        pixelShader->lpVtbl->Release(pixelShader);
+        if (FAILED(pipelineResult))
+        {
+            g.smaa_pso[passIndex] = NULL;
+            fprintf(stderr, "[smaa] %s pipeline failed hr=0x%08lX\n", pixelEntries[passIndex],
+                    (unsigned long)pipelineResult);
+            status = -1;
+        }
+    }
+    if (!vertexShader)
+    {
+        status = -1;
+    }
+    else
+    {
+        vertexShader->lpVtbl->Release(vertexShader);
+    }
+    free(source);
+    return status;
+}
+
+static ID3D12Resource* ld_smaa_texture(u32 width, u32 height, DXGI_FORMAT format, int renderTarget,
+                                       D3D12_RESOURCE_STATES initialState)
+{
+    D3D12_HEAP_PROPERTIES heap = {0};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC description = {0};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = width;
+    description.Height = height;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Format = format;
+    description.SampleDesc.Count = 1;
+    description.Flags = renderTarget ? D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET : D3D12_RESOURCE_FLAG_NONE;
+    ID3D12Resource* texture = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &heap, D3D12_HEAP_FLAG_NONE, &description,
+                                                      initialState, NULL, &IID_ID3D12Resource,
+                                                      (void**)&texture)))
+    {
+        return NULL;
+    }
+    return texture;
+}
+
+/* The two lookup textures, filled through one upload buffer: the area
+ * texture's rows at offset 0, the search texture's after them. The copy is
+ * recorded on the open command list the first time SMAA runs. */
+static int ld_smaa_make_tables(void)
+{
+    char* area = ld_smaa_unpack(k_smaa_area_packed, k_smaa_area_packed_size, k_smaa_area_size);
+    char* search = ld_smaa_unpack(k_smaa_search_packed, k_smaa_search_packed_size, k_smaa_search_size);
+    const u32 areaPitch = 512u;              /* 160 * 2 bytes, aligned to 256 */
+    const u32 searchPitch = 256u;            /* 64 bytes, aligned to 256 */
+    const u32 searchOffset = areaPitch * 560u;
+    const u32 uploadSize = searchOffset + searchPitch * 16u;
+    int status = -1;
+    if (area && search)
+    {
+        g.smaa_area = ld_smaa_texture(160u, 560u, DXGI_FORMAT_R8G8_UNORM, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+        g.smaa_search = ld_smaa_texture(64u, 16u, DXGI_FORMAT_R8_UNORM, 0, D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_HEAP_PROPERTIES uploadHeap = {0};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC uploadDescription = {0};
+        uploadDescription.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        uploadDescription.Width = uploadSize;
+        uploadDescription.Height = 1;
+        uploadDescription.DepthOrArraySize = 1;
+        uploadDescription.MipLevels = 1;
+        uploadDescription.SampleDesc.Count = 1;
+        uploadDescription.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        if (g.smaa_area && g.smaa_search &&
+            SUCCEEDED(g.dev->lpVtbl->CreateCommittedResource(
+                g.dev, &uploadHeap, D3D12_HEAP_FLAG_NONE, &uploadDescription,
+                D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.smaa_table_upload)))
+        {
+            u8* mapped = NULL;
+            D3D12_RANGE noRead = {0, 0};
+            if (SUCCEEDED(g.smaa_table_upload->lpVtbl->Map(g.smaa_table_upload, 0, &noRead, (void**)&mapped)))
+            {
+                for (u32 row = 0; row < 560u; row++)
+                {
+                    memcpy(mapped + row * areaPitch, area + row * 320u, 320u);
+                }
+                for (u32 row = 0; row < 16u; row++)
+                {
+                    memcpy(mapped + searchOffset + row * searchPitch, search + row * 64u, 64u);
+                }
+                g.smaa_table_upload->lpVtbl->Unmap(g.smaa_table_upload, 0, NULL);
+                srv_write(SRV_SMAA_AREA, g.smaa_area);
+                srv_write(SRV_SMAA_SEARCH, g.smaa_search);
+                status = 0;
+            }
+        }
+    }
+    free(area);
+    free(search);
+    return status;
+}
+
+static void ld_smaa_copy_tables(void)
+{
+    const u32 areaPitch = 512u;
+    const u32 searchPitch = 256u;
+    D3D12_TEXTURE_COPY_LOCATION destination = {0};
+    D3D12_TEXTURE_COPY_LOCATION source = {0};
+    destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+    source.pResource = g.smaa_table_upload;
+    source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+    source.PlacedFootprint.Footprint.Depth = 1;
+
+    destination.pResource = g.smaa_area;
+    source.PlacedFootprint.Offset = 0;
+    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8G8_UNORM;
+    source.PlacedFootprint.Footprint.Width = 160u;
+    source.PlacedFootprint.Footprint.Height = 560u;
+    source.PlacedFootprint.Footprint.RowPitch = areaPitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &destination, 0, 0, 0, &source, NULL);
+
+    destination.pResource = g.smaa_search;
+    source.PlacedFootprint.Offset = (u64)areaPitch * 560u;
+    source.PlacedFootprint.Footprint.Format = DXGI_FORMAT_R8_UNORM;
+    source.PlacedFootprint.Footprint.Width = 64u;
+    source.PlacedFootprint.Footprint.Height = 16u;
+    source.PlacedFootprint.Footprint.RowPitch = searchPitch;
+    g.list->lpVtbl->CopyTextureRegion(g.list, &destination, 0, 0, 0, &source, NULL);
+
+    D3D12_RESOURCE_BARRIER barriers[2] = {0};
+    for (u32 barrierIndex = 0; barrierIndex < 2; barrierIndex++)
+    {
+        barriers[barrierIndex].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[barrierIndex].Transition.pResource = barrierIndex == 0 ? g.smaa_area : g.smaa_search;
+        barriers[barrierIndex].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[barrierIndex].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+        barriers[barrierIndex].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    g.smaa_tables_copied = 1;
+}
+
+/* Edges, weights and output at the image's size; remade when it changes.
+ * They rest in PIXEL_SHADER_RESOURCE between frames. */
+static int ld_smaa_size_targets(u32 width, u32 height)
+{
+    if (g.smaa_targets[0] && g.smaa_w == width && g.smaa_h == height)
+    {
+        return 0;
+    }
+    static const DXGI_FORMAT targetFormats[3] = {
+        DXGI_FORMAT_R8G8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM
+    };
+    static const u32 targetSlots[3] = { SRV_SMAA_EDGES, SRV_SMAA_WEIGHTS, SRV_SMAA_OUTPUT };
+    for (u32 targetIndex = 0; targetIndex < 3; targetIndex++)
+    {
+        retire_texture(g.smaa_targets[targetIndex]);
+        g.smaa_targets[targetIndex] = NULL;
+    }
+    g.smaa_w = 0;
+    g.smaa_h = 0;
+    for (u32 targetIndex = 0; targetIndex < 3; targetIndex++)
+    {
+        g.smaa_targets[targetIndex] = ld_smaa_texture(width, height, targetFormats[targetIndex], 1,
+                                                      D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (!g.smaa_targets[targetIndex])
+        {
+            return -1;
+        }
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.smaa_targets[targetIndex], NULL,
+                                              rtv_handle(RTV_SMAA_BASE + targetIndex));
+        srv_write(targetSlots[targetIndex], g.smaa_targets[targetIndex]);
+    }
+    g.smaa_w = width;
+    g.smaa_h = height;
+    fprintf(stderr, "[smaa] targets %ux%u\n", width, height);
+    return 0;
+}
+
+/* One full-screen pass: `targetIndex` (in PIXEL_SHADER_RESOURCE, left
+ * there) cleared and drawn from three source slots. */
+static int ld_smaa_pass(u32 passIndex, u32 targetIndex, u32 firstSlot, u32 secondSlot, u32 thirdSlot)
+{
+    u32 slots[SRV_TABLE_SIZE];
+    for (u32 slotIndex = 0; slotIndex < SRV_TABLE_SIZE; slotIndex++)
+    {
+        slots[slotIndex] = SRV_WHITE;
+    }
+    slots[0] = firstSlot;
+    slots[1] = secondSlot;
+    slots[2] = thirdSlot;
+    if (g.srv_ring_used >= ld_srv_end())
+    {
+        ld_flush(LD_FLUSH_DESCRIPTOR_RING);
+        if (!g.ready)
+        {
+            return 0;
+        }
+        g.srv_ring_used = ld_srv_base();
+    }
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    if (!table.ptr)
+    {
+        return 0;
+    }
+    ID3D12Resource* target = g.smaa_targets[targetIndex];
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = target;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
+    const D3D12_CPU_DESCRIPTOR_HANDLE renderTarget = rtv_handle(RTV_SMAA_BASE + targetIndex);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &renderTarget, FALSE, NULL);
+    const float clearColour[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    g.list->lpVtbl->ClearRenderTargetView(g.list, renderTarget, clearColour, 0, NULL);
+    const D3D12_VIEWPORT viewport = {0.0f, 0.0f, (float)g.smaa_w, (float)g.smaa_h, 0.0f, 1.0f};
+    const D3D12_RECT scissor = {0, 0, (LONG)g.smaa_w, (LONG)g.smaa_h};
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &viewport);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &scissor);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.smaa_rootsig);
+    g.list->lpVtbl->SetPipelineState(g.list, g.smaa_pso[passIndex]);
+    const float metrics[4] = {
+        1.0f / (float)g.smaa_w, 1.0f / (float)g.smaa_h, (float)g.smaa_w, (float)g.smaa_h
+    };
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 4, metrics, 0);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
+    return 1;
+}
+
+/* SMAA over the image in `sourceSlot`; returns the slot to present (the
+ * result, or the source unchanged if SMAA is unavailable). */
+static u32 ld_smaa_run(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight)
+{
+    if (g.smaa_state == 0)
+    {
+        g.smaa_state = (ld_smaa_make_pipelines() == 0 && ld_smaa_make_tables() == 0) ? 1 : -1;
+        fprintf(stderr, g.smaa_state == 1 ? "[smaa] ready (SMAA 1x, high preset)\n"
+                                          : "[smaa] unavailable; presenting without it\n");
+    }
+    if (g.smaa_state != 1 || !sourceWidth || !sourceHeight || sourceWidth > 16384u || sourceHeight > 16384u)
+    {
+        return sourceSlot;
+    }
+    if (ld_smaa_size_targets(sourceWidth, sourceHeight) != 0)
+    {
+        fprintf(stderr, "[smaa] could not make %ux%u targets\n", sourceWidth, sourceHeight);
+        return sourceSlot;
+    }
+    if (!g.smaa_tables_copied)
+    {
+        ld_smaa_copy_tables();
+    }
+    if (!ld_smaa_pass(LD_SMAA_EDGES, 0, sourceSlot, SRV_WHITE, SRV_WHITE))
+    {
+        return sourceSlot;
+    }
+    if (!ld_smaa_pass(LD_SMAA_WEIGHTS, 1, SRV_SMAA_EDGES, SRV_SMAA_AREA, SRV_SMAA_SEARCH))
+    {
+        return sourceSlot;
+    }
+    if (!ld_smaa_pass(LD_SMAA_BLEND, 2, sourceSlot, SRV_SMAA_WEIGHTS, SRV_WHITE))
+    {
+        return sourceSlot;
+    }
+    return SRV_SMAA_OUTPUT;
+}
+
 /* Draw the image in SRV slot `sourceSlot` (sourceWidth x sourceHeight host
  * pixels, already in PIXEL_SHADER_RESOURCE) into back buffer `bufferIndex`,
  * which is in PRESENT and is left in RENDER_TARGET. */
@@ -10341,9 +10856,18 @@ static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
                            ID3D12Resource* backBuffer, u32 bufferIndex, int gameImage)
 {
     int mode = LD_PRESENT_SCALE;
-    if (InterlockedCompareExchange(&g_ld_post_aa, 0, 0) == 1 && g.present_pso[LD_PRESENT_FXAA])
+    const LONG postAa = InterlockedCompareExchange(&g_ld_post_aa, 0, 0);
+    if (postAa == 1 && g.present_pso[LD_PRESENT_FXAA])
     {
         mode = LD_PRESENT_FXAA;
+    }
+    if (postAa == 2 && gameImage)
+    {
+        sourceSlot = ld_smaa_run(sourceSlot, sourceWidth, sourceHeight);
+        if (!g.ready)
+        {
+            return 0;
+        }
     }
     if ((sourceWidth > g.bb_w + 1u || sourceHeight > g.bb_h + 1u) && g.present_pso[LD_PRESENT_BOX])
     {
@@ -10783,7 +11307,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES;
+    hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES + 3; /* + SMAA's three targets */
     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.rtv_heap);
     g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {

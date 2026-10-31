@@ -127,7 +127,8 @@ void rsx_live_draw_set_overlay(rsx_live_overlay_fn fn);
  * Render scale: colour and depth surfaces are created this many times their
  * guest size (1-4, 1 = the PS3's own resolution). Read once, at init: call
  * before rsx_live_draw_init; the active value comes back from _get.
- * Post AA: 0 off, 1 FXAA over the presented image (live).
+ * Post AA: 0 off, 1 FXAA, 2 SMAA 1x over the presented image (live; SMAA
+ * runs on the game's image only, not on movies).
  * Async shaders: 1 builds new shaders/PSOs on worker threads and skips the
  * draws that need them until they are ready (no hitch the first time an
  * effect appears); 0 builds them on the present thread (live). */

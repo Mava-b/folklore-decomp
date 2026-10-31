@@ -184,8 +184,18 @@ void engineSettingsLoad()
         }
         else if (std::strcmp(key, "anti_aliasing") == 0)
         {
-            settingsInstance.antiAliasing = std::strcmp(value, "fxaa") == 0 ? AntiAliasing::Fxaa
-                                                                          : AntiAliasing::Off;
+            if (std::strcmp(value, "fxaa") == 0)
+            {
+                settingsInstance.antiAliasing = AntiAliasing::Fxaa;
+            }
+            else if (std::strcmp(value, "smaa") == 0)
+            {
+                settingsInstance.antiAliasing = AntiAliasing::Smaa;
+            }
+            else
+            {
+                settingsInstance.antiAliasing = AntiAliasing::Off;
+            }
         }
         else if (std::strcmp(key, "background_shaders") == 0)
         {
@@ -343,7 +353,11 @@ void engineSettingsSave()
     std::fprintf(file, "fine_limiter_sleep = %d\n", current.fineLimiterSleep ? 1 : 0);
     std::fprintf(file, "show_performance_overlay = %d\n", current.showPerformanceOverlay ? 1 : 0);
     std::fprintf(file, "render_scale = %d\n", current.renderScale);
-    std::fprintf(file, "anti_aliasing = %s\n", current.antiAliasing == AntiAliasing::Fxaa ? "fxaa" : "off");
+    std::fprintf(file, "# off, fxaa or smaa\n");
+    std::fprintf(file, "anti_aliasing = %s\n",
+                 current.antiAliasing == AntiAliasing::Fxaa   ? "fxaa"
+                 : current.antiAliasing == AntiAliasing::Smaa ? "smaa"
+                                                              : "off");
     std::fprintf(file, "background_shaders = %d\n", current.backgroundShaders ? 1 : 0);
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
     std::fprintf(file, "# original (the game's mip levels), sharper or sharpest\n");
@@ -408,7 +422,7 @@ void engineSettingsApplyGraphics()
 {
     const EngineSettings& current = engineSettings();
     rsx_live_draw_set_render_scale((uint32_t)current.renderScale);
-    rsx_live_draw_set_post_aa(current.antiAliasing == AntiAliasing::Fxaa ? 1 : 0);
+    rsx_live_draw_set_post_aa((int)current.antiAliasing);
     rsx_live_draw_set_async_shaders(current.backgroundShaders ? 1 : 0);
     rsx_live_draw_set_anisotropy((uint32_t)current.anisotropy);
     static const int kTextureLodBias[3] = {0, -50, -100};

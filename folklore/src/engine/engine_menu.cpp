@@ -938,6 +938,8 @@ namespace
         changed |= radioAntiAliasing("Off", AntiAliasing::Off);
         ImGui::SameLine();
         changed |= radioAntiAliasing("FXAA", AntiAliasing::Fxaa);
+        ImGui::SameLine();
+        changed |= radioAntiAliasing("SMAA (sharper)", AntiAliasing::Smaa);
         ImGui::TextUnformatted("Anisotropic filtering (textures at an angle)");
         changed |= radioAnisotropy("Off##aniso", 1);
         static const int kAnisotropyLevels[4] = {2, 4, 8, 16};

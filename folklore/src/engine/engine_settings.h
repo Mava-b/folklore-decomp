@@ -29,6 +29,7 @@ enum class AntiAliasing : int
 {
     Off = 0,
     Fxaa = 1,           /* FXAA over the presented image */
+    Smaa = 2,           /* SMAA 1x over the game's image (not movies) */
 };
 
 /* The console language the game is told (cellSysutilGetSystemParamInt,
@@ -57,7 +58,7 @@ struct EngineSettings
      * 1280x720; read when the renderer starts, so a change applies on the
      * next launch. The other two apply at once. */
     int renderScale = 1;
-    AntiAliasing antiAliasing = AntiAliasing::Off;
+    AntiAliasing antiAliasing = AntiAliasing::Smaa;
     bool backgroundShaders = true;
     /* Anisotropic filtering: 1 (off), 2, 4, 8 or 16 -- sharper textures on
      * surfaces seen at an angle (floors, roads, walls). Sharpening: 0-100 %
