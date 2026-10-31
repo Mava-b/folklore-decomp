@@ -7190,7 +7190,8 @@ static const float* dc_vertex_attr_canonical(
 /* Ultrawide HUD: is this draw part of the 2D overlay, to be drawn at its own
  * proportions instead of stretched across the widened picture? Yes when the
  * layout is not "stretched", the surface is widened, the draw goes into a
- * display buffer without a depth test, its vertex program is the plain 2D
+ * display buffer without a depth test (2D draws with one are the story
+ * scenes' speech bubbles, see below), its vertex program is the plain 2D
  * kind (ld_vs_position_rows) with an orthographic w (overlays fixed to the
  * world, like enemies' gauges, have a perspective one and stay with the
  * picture), and its vertices do not span the screen -- full-screen passes
@@ -7213,6 +7214,16 @@ static const float* dc_vertex_attr_canonical(
 #define LD_HUD_CENTRE 1
 #define LD_HUD_LEFT   2
 #define LD_HUD_RIGHT  3
+#define LD_HUD_IN_PICTURE 4               /* inside a speech bubble: left as the game draws it */
+#define LD_HUD_MAX_PANELS 32
+
+typedef struct {
+    u32 frame;
+    u32 target;
+    u32 count;
+    float rects[LD_HUD_MAX_PANELS][4];    /* left, right, top, bottom (screen fractions) */
+} ld_hud_panel_list;
+static ld_hud_panel_list g_ld_hud_panels;
 
 typedef struct {
     u32 frame;
@@ -7239,10 +7250,7 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     {
         return 0;
     }
-    if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u)
-    {
-        return 0;
-    }
+    const int depthTested = (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
     int scanout = 0;
     for (u32 bufferIndex = 0; bufferIndex < 8; bufferIndex++)
     {
@@ -7315,16 +7323,47 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     {
         return 0;
     }
-    if (layout != 2)
-    {
-        return LD_HUD_CENTRE;
-    }
     /* Screen fractions from the top left (clip y points up). */
     const float left = (lowestX + 1.0f) * 0.5f;
     const float right = (highestX + 1.0f) * 0.5f;
     const float top = (1.0f - highestY) * 0.5f;
     const float bottom = (1.0f - lowestY) * 0.5f;
+    /* Speech bubbles in the story scenes (capture-20261031-161917): the
+     * bubble and its tail are 2D draws WITH a depth test, placed next to the
+     * speaker -- they belong to the picture and stay where the game puts
+     * them. Their text has no depth test; any letter centred inside a bubble
+     * drawn earlier this frame stays with the bubble (and the rest of its
+     * line follows, below). */
+    if (g_ld_hud_panels.frame != g_ld_frames || g_ld_hud_panels.target != target)
+    {
+        g_ld_hud_panels.frame = g_ld_frames;
+        g_ld_hud_panels.target = target;
+        g_ld_hud_panels.count = 0;
+    }
+    if (depthTested)
+    {
+        if (g_ld_hud_panels.count < LD_HUD_MAX_PANELS)
+        {
+            float* panel = g_ld_hud_panels.rects[g_ld_hud_panels.count++];
+            panel[0] = left;
+            panel[1] = right;
+            panel[2] = top;
+            panel[3] = bottom;
+        }
+        return 0;
+    }
     int place = LD_HUD_CENTRE;
+    const float middleX = (left + right) * 0.5f;
+    const float middleY = (top + bottom) * 0.5f;
+    for (u32 panelIndex = 0; panelIndex < g_ld_hud_panels.count; panelIndex++)
+    {
+        const float* panel = g_ld_hud_panels.rects[panelIndex];
+        if (middleX >= panel[0] && middleX <= panel[1] && middleY >= panel[2] && middleY <= panel[3])
+        {
+            place = LD_HUD_IN_PICTURE;
+            break;
+        }
+    }
     const ld_hud_previous* previous = &g_ld_hud_previous;
     const int continuesLine = previous->frame == g_ld_frames && previous->target == target &&
                               previous->key == g_ld_current_pso.key && top < previous->bottom &&
@@ -7333,6 +7372,10 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     if (continuesLine)
     {
         place = previous->place;
+    }
+    else if (place == LD_HUD_IN_PICTURE || layout != 2)
+    {
+        /* As decided above: with its bubble, or centred. */
     }
     else
     {
@@ -7357,7 +7400,7 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     g_ld_hud_previous.top = top;
     g_ld_hud_previous.bottom = bottom;
     g_ld_hud_previous.place = place;
-    return place;
+    return place == LD_HUD_IN_PICTURE ? 0 : place;
 }
 
 /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;

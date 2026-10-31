@@ -1212,6 +1212,17 @@ What 0006 fixes in ps3recomp to make that run:
     mask. Where the mask is 1 the result is the game's. Masks are at the
     target's host size, remade when it changes. The 2048x2048 shadow map
     seen in some areas is not touched (no capture yet shows its use).
+87. Speech bubbles with the ultrawide HUD (patches/0065). In the story
+    scenes (capture-20261031-161917) each bubble is drawn next to its
+    speaker as 2D draws WITH a depth test (background d5f35b69, tail
+    3be499b1), then its text one letter per draw without one -- so the
+    text was moved (edges) or centred while the bubble stayed put.
+    ld_hud_draw_place now records the rectangles of depth-tested 2D draws
+    into the display buffer each frame and leaves any HUD-candidate draw
+    centred inside one where the game draws it (lines carry on as
+    before). Simulated on the three captures: every bubble letter stays
+    with its bubble, the skip prompt (icons and text) still goes right,
+    the gameplay HUD is unchanged.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
