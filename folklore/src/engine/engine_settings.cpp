@@ -246,6 +246,21 @@ void engineSettingsLoad()
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
                                                                           : EngineSettings::Bloom::Smooth;
         }
+        else if (std::strcmp(key, "shadows") == 0)
+        {
+            if (std::strcmp(value, "original") == 0)
+            {
+                settingsInstance.shadows = EngineSettings::Shadows::Original;
+            }
+            else if (std::strcmp(value, "softer") == 0)
+            {
+                settingsInstance.shadows = EngineSettings::Shadows::Softer;
+            }
+            else
+            {
+                settingsInstance.shadows = EngineSettings::Shadows::Soft;
+            }
+        }
         else if (std::strcmp(key, "ambient_occlusion") == 0)
         {
             if (std::strcmp(value, "off") == 0)
@@ -398,6 +413,11 @@ void engineSettingsSave()
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
     std::fprintf(file, "# original (the game's, flickers) or smooth (next start)\n");
     std::fprintf(file, "bloom = %s\n", current.bloom == EngineSettings::Bloom::Original ? "original" : "smooth");
+    std::fprintf(file, "# original (hard edges), soft or softer\n");
+    std::fprintf(file, "shadows = %s\n",
+                 current.shadows == EngineSettings::Shadows::Original ? "original"
+                 : current.shadows == EngineSettings::Shadows::Softer ? "softer"
+                                                                      : "soft");
     std::fprintf(file, "# off, subtle or strong (next start)\n");
     std::fprintf(file, "ambient_occlusion = %s\n",
                  current.ambientOcclusion == EngineSettings::AmbientOcclusion::Off      ? "off"
@@ -439,6 +459,7 @@ extern "C"
     void rsx_live_draw_set_texture_lod_bias(int hundredths);
     void rsx_live_draw_set_hud_layout(int mode);
     void rsx_live_draw_set_hud_edge(int percent);
+    void rsx_live_draw_set_shadow_softness(int level);
     void rsx_live_draw_set_sharpening(uint32_t percent);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
@@ -458,6 +479,7 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_texture_lod_bias(kTextureLodBias[(int)current.textureDetail]);
     rsx_live_draw_set_hud_layout((int)current.hudLayout);
     rsx_live_draw_set_hud_edge(current.hudEdge);
+    rsx_live_draw_set_shadow_softness((int)current.shadows);
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
     engineDepthOfFieldApply();
     engineBloomApply();

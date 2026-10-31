@@ -1023,6 +1023,20 @@ namespace
                 ImGui::TextDisabled("(applies when you next start the game)");
             }
         }
+        ImGui::TextUnformatted("Shadows (characters' shadow edges)");
+        {
+            int shadowIndex = (int)settings.shadows;
+            bool shadowChanged = ImGui::RadioButton("Original (hard)##shadows", &shadowIndex, 0);
+            ImGui::SameLine();
+            shadowChanged |= ImGui::RadioButton("Soft##shadows", &shadowIndex, 1);
+            ImGui::SameLine();
+            shadowChanged |= ImGui::RadioButton("Softer##shadows", &shadowIndex, 2);
+            if (shadowChanged)
+            {
+                settings.shadows = (EngineSettings::Shadows)shadowIndex;
+                changed = true;
+            }
+        }
         ImGui::TextUnformatted("Ambient occlusion (soft shading where surfaces meet)");
         {
             int ambientIndex = (int)settings.ambientOcclusion;

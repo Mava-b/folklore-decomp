@@ -161,6 +161,9 @@ void rsx_live_draw_set_texture_lod_bias(int hundredths);
  * Both live. */
 void rsx_live_draw_set_hud_layout(int mode);
 void rsx_live_draw_set_hud_edge(int percent);
+/* Soft shadows: 0 the game's stencil shadow edges, 1 soft, 2 softer (the
+ * shadow quad's stencil test made into a mask and blurred; live). */
+void rsx_live_draw_set_shadow_softness(int level);
 /* Pixel shader replacements: a fragment program whose translated HLSL (as
  * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
  * -- a title's own better version of one of its effects. The hash is the

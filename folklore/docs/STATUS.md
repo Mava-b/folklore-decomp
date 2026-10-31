@@ -1197,6 +1197,21 @@ What 0006 fixes in ps3recomp to make that run:
     vertex programs and follow the world. Checked against the three
     captures' HUD draws: every map draw goes left, every gauge, folk and
     hint draw right.
+86. Soft shadows (patches/0064, shadows = original / soft / softer,
+    default soft, live). The characters' shadows are stencil volumes
+    (entries 24-29); the shadow itself is one full-screen quad
+    (capture-20261031-115639 draw 112: stencil GREATER ref 0x80, masks
+    0xFF, blend SRC_ALPHA / ONE_MINUS_SRC_ALPHA, RGB only, no depth test,
+    PS = COLOR0, VS copying COLOR0 from v3). ld_soft_shadow_draw takes
+    exactly that draw (2D VS covering the target, one colour on every
+    vertex) and instead: draws a mask (R8, 1 where the same stencil test
+    passes, through the same depth-stencil buffer), blurs it across then
+    down (13 Gaussian taps, sigma 2 taps, spaced 0.5 or 1 screen pixel,
+    in host pixels, so AA targets and render scale are allowed for), and
+    blends the vertex colour over the scene with alpha = colour alpha x
+    mask. Where the mask is 1 the result is the game's. Masks are at the
+    target's host size, remade when it changes. The 2048x2048 shadow map
+    seen in some areas is not touched (no capture yet shows its use).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

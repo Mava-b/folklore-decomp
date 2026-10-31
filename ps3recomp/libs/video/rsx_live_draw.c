@@ -62,6 +62,7 @@ void rsx_live_draw_set_anisotropy(u32 l) { (void)l; }
 void rsx_live_draw_set_texture_lod_bias(int h) { (void)h; }
 void rsx_live_draw_set_hud_layout(int m) { (void)m; }
 void rsx_live_draw_set_hud_edge(int p) { (void)p; }
+void rsx_live_draw_set_shadow_softness(int l) { (void)l; }
 void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
 void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
 void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
@@ -194,7 +195,10 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 #define SRV_SMAA_OUTPUT   (SRV_CPU_HEAP_SLOTS + 3)
 #define SRV_SMAA_AREA     (SRV_CPU_HEAP_SLOTS + 4)
 #define SRV_SMAA_SEARCH   (SRV_CPU_HEAP_SLOTS + 5)
-#define SRV_CPU_HEAP_TOTAL (SRV_CPU_HEAP_SLOTS + 6)
+/* Soft shadows: the stencil shadow mask and its blur (ld_soft_shadow_draw). */
+#define SRV_SHADOW_MASK0  (SRV_CPU_HEAP_SLOTS + 6)
+#define SRV_SHADOW_MASK1  (SRV_CPU_HEAP_SLOTS + 7)
+#define SRV_CPU_HEAP_TOTAL (SRV_CPU_HEAP_SLOTS + 8)
 #define SRV_TABLE_SIZE   16
 /* Both banks together; each frame gets SRV_BANK_TABLES. */
 #define SRV_RING_TABLES  8192
@@ -304,6 +308,7 @@ typedef struct {
     ID3D12PipelineState* volatile pso;
     volatile LONG pending;
     u32 ps_unit_mask;   /* texture units the fragment program samples */
+    s16 colour_attr;    /* the attribute COLOR0 is copied from unchanged (ld_vs_colour_attr), or -1 */
     s16 hud_row_x;      /* constants giving clip x, y and w from attribute 0 (ld_vs_position_rows), or -1 */
     s16 hud_row_y;
     s16 hud_row_w;
@@ -462,6 +467,14 @@ typedef struct {
     int                        smaa_tables_copied;
     ID3D12Resource*            smaa_targets[3];  /* edges, weights, output at the image's size */
     u32                        smaa_w, smaa_h;
+    /* Soft stencil shadows (ld_soft_shadow_draw). */
+    int                        shadow_state;     /* 0 not tried, 1 ready, -1 unavailable */
+    ID3D12RootSignature*       shadow_rootsig;
+    ID3D12PipelineState*       shadow_pso_mask;
+    ID3D12PipelineState*       shadow_pso_blur;
+    ID3D12PipelineState*       shadow_pso_composite[2]; /* R8G8B8A8 and R16G16B16A16F targets */
+    ID3D12Resource*            shadow_masks[2];
+    u32                        shadow_w, shadow_h;
     rsx_live_guest_ptr_fn      guest_ptr;
     void*                      guest_user;
 
@@ -495,6 +508,7 @@ static LONG s_ld_sampler_lod_bias = 0;           /* what the cached samplers wer
 static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
 static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 1 centred 16:9, 2 edges */
 static volatile LONG g_ld_hud_edge = 100;        /* edges: how far out, 0 (centred) - 100 (screen edge) % */
+static volatile LONG g_ld_shadow_softness = 0;   /* stencil shadow edges: 0 the game's, 1 soft, 2 softer */
 static volatile LONG g_ld_pso_jobs_pending = 0;
 static volatile LONG g_ld_pso_jobs_done = 0;
 static volatile LONG g_ld_pso_draws_skipped = 0;
@@ -677,6 +691,7 @@ typedef struct {
     u32 packed_offsets;
     u32 ps_unit_mask;
     s16 hud_row_x, hud_row_y, hud_row_w;
+    s16 colour_attr;
 } ld_pso_metadata;
 
 static ld_pso_metadata g_ld_current_pso;
@@ -2502,6 +2517,11 @@ static int ld_apply_ps_replacement(char* hlsl, size_t capacity)
 void rsx_live_draw_set_hud_layout(int mode)
 {
     InterlockedExchange(&g_ld_hud_layout, (mode == 0 || mode == 2) ? mode : 1);
+}
+
+void rsx_live_draw_set_shadow_softness(int level)
+{
+    InterlockedExchange(&g_ld_shadow_softness, (level == 1 || level == 2) ? level : 0);
 }
 
 void rsx_live_draw_set_hud_edge(int percent)
@@ -5395,6 +5415,50 @@ static int ld_vs_position_row(const char* hlsl, const char* write)
     return (int)row;
 }
 
+/* Soft shadows: the attribute a vertex program copies to COLOR0 unchanged
+ * ("{ float4 _v = (float4)((v[N]).xyzw); o[1].xyzw = _v.xyzw;" and no
+ * other write to o[1]), or -1. */
+static int ld_vs_colour_attr(const char* hlsl)
+{
+    const char* found = strstr(hlsl, "o[1].xyzw = _v.xyzw;");
+    if (!found || strstr(found + 1, "o[1]."))
+    {
+        return -1;
+    }
+    u32 writes = 0;
+    for (const char* cursor = strstr(hlsl, "o[1]."); cursor; cursor = strstr(cursor + 1, "o[1]."))
+    {
+        writes++;
+    }
+    if (writes != 1)
+    {
+        return -1;
+    }
+    const char* blockStart = NULL;
+    for (const char* cursor = found; cursor > hlsl; cursor--)
+    {
+        if (cursor[0] == '{' && cursor[1] == ' ')
+        {
+            blockStart = cursor;
+            break;
+        }
+    }
+    static const char prefix[] = "{ float4 _v = (float4)((v[";
+    if (!blockStart || strncmp(blockStart, prefix, sizeof(prefix) - 1u) != 0)
+    {
+        return -1;
+    }
+    char* numberEnd = NULL;
+    const long attribute = strtol(blockStart + sizeof(prefix) - 1u, &numberEnd, 10);
+    if (!numberEnd || strncmp(numberEnd, "]).xyzw);", 9) != 0 || attribute < 0 || attribute > 15)
+    {
+        return -1;
+    }
+    char inputLine[32];
+    snprintf(inputLine, sizeof(inputLine), "v[%ld]=input.a%ld;", attribute, attribute);
+    return strstr(hlsl, inputLine) ? (int)attribute : -1;
+}
+
 static void ld_vs_position_rows(const char* hlsl, s16* rowX, s16* rowY, s16* rowW)
 {
     *rowX = -1;
@@ -6109,6 +6173,7 @@ static ID3D12PipelineState* get_pso(
             g_ld_current_pso.hud_row_x = g.psos[found].hud_row_x;
             g_ld_current_pso.hud_row_y = g.psos[found].hud_row_y;
             g_ld_current_pso.hud_row_w = g.psos[found].hud_row_w;
+            g_ld_current_pso.colour_attr = g.psos[found].colour_attr;
             if (InterlockedCompareExchange(&g.psos[found].pending, 0, 0)) {
                 InterlockedIncrement(&g_ld_pso_draws_skipped);
                 return NULL;             /* still compiling (ld_pso_job) */
@@ -6287,6 +6352,8 @@ static ID3D12PipelineState* get_pso(
     g_ld_current_pso.hud_row_x = g.psos[entryIndex].hud_row_x;
     g_ld_current_pso.hud_row_y = g.psos[entryIndex].hud_row_y;
     g_ld_current_pso.hud_row_w = g.psos[entryIndex].hud_row_w;
+    g.psos[entryIndex].colour_attr = vi > 0 ? (s16)ld_vs_colour_attr(vs_hlsl) : (s16)-1;
+    g_ld_current_pso.colour_attr = g.psos[entryIndex].colour_attr;
     if (vi > 0 && fi > 0) {
         if (ld_pso_job_submit(entryIndex, vs_hlsl, ps_hlsl, &rs, masked_layout,
                               packed_payload)) {
@@ -6411,6 +6478,10 @@ typedef struct {
 
 static draw_ctx dc;
 static const float* dc_vertex_attr_canonical(u32 vertex, u32 attr, float fallback[4]);
+static int ld_soft_shadow_draw(const surface_t* surface, D3D12_CPU_DESCRIPTOR_HANDLE renderTarget,
+                               D3D12_CPU_DESCRIPTOR_HANDLE depthStencil, const D3D12_VIEWPORT* viewport,
+                               const D3D12_RECT* scissor, float guestWidth, float guestHeight,
+                               const float viewportTransform[8]);
 
 static void dc_reset(void)
 {
@@ -10044,7 +10115,10 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         draw->cb_used = g.cb_used;
         draw->vb_used = g.vb_used;
     }
-    if (indexed) {
+    if (have_dsv && current_zslot &&
+        ld_soft_shadow_draw(drawSurface, rtv, dsv, &dvp, &sc, Wv, Hv, xf)) {
+        /* Drawn by the soft shadow passes instead. */
+    } else if (indexed) {
         D3D12_INDEX_BUFFER_VIEW ibv;
         ibv.BufferLocation =
             g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
@@ -11150,6 +11224,415 @@ static u32 ld_smaa_run(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight)
     return SRV_SMAA_OUTPUT;
 }
 
+/* ---------------------------------------------------------------------------
+ * Soft shadows (engine setting; 0 = the game's). Folklore's character
+ * shadows are stencil shadow volumes: lit geometry writes stencil 0x80, the
+ * volumes decrement / increment it, and one full-screen quad then blends the
+ * shadow colour (its vertex colour, alpha = strength) over every pixel whose
+ * stencil is below 0x80 (func GREATER, ref 0x80; SRC_ALPHA / ONE_MINUS_
+ * SRC_ALPHA). That edge is a hard, stair-stepped line. Instead of that quad:
+ *   1. a mask: 1 where the same stencil test passes (same depth-stencil
+ *      buffer, the quad's own test), 0 elsewhere;
+ *   2. the mask blurred across and down (13 Gaussian taps each way, spaced
+ *      by 0.5 or 1 screen pixel -- soft or softer);
+ *   3. the shadow colour blended over the scene with alpha = strength x mask.
+ * Where the mask is 1 the result is exactly the game's; at the edge it fades.
+ * Only that exact draw is taken (stencil GREATER 0x80, masks 0xFF, blend
+ * SRC_ALPHA / ONE_MINUS_SRC_ALPHA, no depth test, covering the whole target,
+ * one constant vertex colour); anything else draws as it always did.
+ * -----------------------------------------------------------------------*/
+#define RTV_SHADOW_BASE (RTV_SMAA_BASE + 3)
+
+static const char k_ld_shadow_hlsl[] =
+    "cbuffer ShadowConstants : register(b0)\n"
+    "{\n"
+    "    float4 shadowColour;\n"
+    "    float4 blurStep;     /* xy: host pixels between taps; z: Gaussian sigma in taps */\n"
+    "};\n"
+    "Texture2D<float> shadowMask : register(t0);\n"
+    "float4 shadowVs(uint vertexId : SV_VertexID) : SV_Position\n"
+    "{\n"
+    "    float2 corner = float2((vertexId << 1) & 2, vertexId & 2);\n"
+    "    return float4(corner * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+    "}\n"
+    "float4 shadowMaskPs(float4 position : SV_Position) : SV_Target\n"
+    "{\n"
+    "    return float4(1.0, 0.0, 0.0, 0.0);\n"
+    "}\n"
+    "float4 shadowBlurPs(float4 position : SV_Position) : SV_Target\n"
+    "{\n"
+    "    uint maskWidth, maskHeight;\n"
+    "    shadowMask.GetDimensions(maskWidth, maskHeight);\n"
+    "    const int2 lastTexel = int2((int)maskWidth - 1, (int)maskHeight - 1);\n"
+    "    float total = 0.0;\n"
+    "    float weightSum = 0.0;\n"
+    "    [unroll] for (int tapIndex = -6; tapIndex <= 6; tapIndex++)\n"
+    "    {\n"
+    "        const float weight = exp(-(float)(tapIndex * tapIndex) / (2.0 * blurStep.z * blurStep.z));\n"
+    "        const int2 texel = clamp(int2(floor(position.xy + blurStep.xy * (float)tapIndex)), int2(0, 0), lastTexel);\n"
+    "        total += shadowMask.Load(int3(texel, 0)) * weight;\n"
+    "        weightSum += weight;\n"
+    "    }\n"
+    "    return float4(total / weightSum, 0.0, 0.0, 0.0);\n"
+    "}\n"
+    "float4 shadowCompositePs(float4 position : SV_Position) : SV_Target\n"
+    "{\n"
+    "    const float coverage = shadowMask.Load(int3(int2(position.xy), 0));\n"
+    "    return float4(shadowColour.rgb, shadowColour.a * coverage);\n"
+    "}\n";
+
+static ID3D12PipelineState* ld_shadow_pipeline(ID3DBlob* vertexShader, ID3DBlob* pixelShader, DXGI_FORMAT targetFormat,
+                                               int stencilMask, int blendOver)
+{
+    D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline = {0};
+    pipeline.pRootSignature = g.shadow_rootsig;
+    pipeline.VS.pShaderBytecode = vertexShader->lpVtbl->GetBufferPointer(vertexShader);
+    pipeline.VS.BytecodeLength = vertexShader->lpVtbl->GetBufferSize(vertexShader);
+    pipeline.PS.pShaderBytecode = pixelShader->lpVtbl->GetBufferPointer(pixelShader);
+    pipeline.PS.BytecodeLength = pixelShader->lpVtbl->GetBufferSize(pixelShader);
+    if (blendOver)
+    {
+        pipeline.BlendState.RenderTarget[0].BlendEnable = TRUE;
+        pipeline.BlendState.RenderTarget[0].SrcBlend = D3D12_BLEND_SRC_ALPHA;
+        pipeline.BlendState.RenderTarget[0].DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+        pipeline.BlendState.RenderTarget[0].BlendOp = D3D12_BLEND_OP_ADD;
+        pipeline.BlendState.RenderTarget[0].SrcBlendAlpha = D3D12_BLEND_ZERO;
+        pipeline.BlendState.RenderTarget[0].DestBlendAlpha = D3D12_BLEND_ONE;
+        pipeline.BlendState.RenderTarget[0].BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask =
+            D3D12_COLOR_WRITE_ENABLE_RED | D3D12_COLOR_WRITE_ENABLE_GREEN | D3D12_COLOR_WRITE_ENABLE_BLUE;
+    }
+    else
+    {
+        pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+    }
+    pipeline.SampleMask = 0xFFFFFFFFu;
+    pipeline.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+    pipeline.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+    pipeline.RasterizerState.DepthClipEnable = TRUE;
+    if (stencilMask)
+    {
+        pipeline.DepthStencilState.DepthEnable = FALSE;
+        pipeline.DepthStencilState.StencilEnable = TRUE;
+        pipeline.DepthStencilState.StencilReadMask = 0xFF;
+        pipeline.DepthStencilState.StencilWriteMask = 0x00;
+        pipeline.DepthStencilState.FrontFace.StencilFunc = D3D12_COMPARISON_FUNC_GREATER;
+        pipeline.DepthStencilState.FrontFace.StencilFailOp = D3D12_STENCIL_OP_KEEP;
+        pipeline.DepthStencilState.FrontFace.StencilDepthFailOp = D3D12_STENCIL_OP_KEEP;
+        pipeline.DepthStencilState.FrontFace.StencilPassOp = D3D12_STENCIL_OP_KEEP;
+        pipeline.DepthStencilState.BackFace = pipeline.DepthStencilState.FrontFace;
+        pipeline.DSVFormat = DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
+    }
+    pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+    pipeline.NumRenderTargets = 1;
+    pipeline.RTVFormats[0] = targetFormat;
+    pipeline.SampleDesc.Count = 1;
+    ID3D12PipelineState* state = NULL;
+    if (FAILED(g.dev->lpVtbl->CreateGraphicsPipelineState(g.dev, &pipeline, &IID_ID3D12PipelineState,
+                                                          (void**)&state)))
+    {
+        return NULL;
+    }
+    return state;
+}
+
+/* Root signature: b0 = 8 root constants, t0 = one-SRV table. */
+static int ld_shadow_make_pipelines(void)
+{
+    D3D12_DESCRIPTOR_RANGE maskRange = {0};
+    maskRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    maskRange.NumDescriptors = 1;
+    D3D12_ROOT_PARAMETER parameters[2] = {0};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 8;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &maskRange;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC description = {0};
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    ID3DBlob* serialized = NULL;
+    ID3DBlob* errors = NULL;
+    const HRESULT serializeResult = D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1,
+                                                                &serialized, &errors);
+    if (errors)
+    {
+        errors->lpVtbl->Release(errors);
+    }
+    if (FAILED(serializeResult))
+    {
+        return -1;
+    }
+    const HRESULT rootResult = g.dev->lpVtbl->CreateRootSignature(
+        g.dev, 0, serialized->lpVtbl->GetBufferPointer(serialized),
+        serialized->lpVtbl->GetBufferSize(serialized), &IID_ID3D12RootSignature, (void**)&g.shadow_rootsig);
+    serialized->lpVtbl->Release(serialized);
+    if (FAILED(rootResult))
+    {
+        g.shadow_rootsig = NULL;
+        return -1;
+    }
+    const size_t sourceLength = sizeof(k_ld_shadow_hlsl) - 1u;
+    ID3DBlob* vertexShader = ld_smaa_compile(k_ld_shadow_hlsl, sourceLength, "shadowVs", "vs_5_0");
+    ID3DBlob* maskShader = ld_smaa_compile(k_ld_shadow_hlsl, sourceLength, "shadowMaskPs", "ps_5_0");
+    ID3DBlob* blurShader = ld_smaa_compile(k_ld_shadow_hlsl, sourceLength, "shadowBlurPs", "ps_5_0");
+    ID3DBlob* compositeShader = ld_smaa_compile(k_ld_shadow_hlsl, sourceLength, "shadowCompositePs", "ps_5_0");
+    int status = -1;
+    if (vertexShader && maskShader && blurShader && compositeShader)
+    {
+        g.shadow_pso_mask = ld_shadow_pipeline(vertexShader, maskShader, DXGI_FORMAT_R8_UNORM, 1, 0);
+        g.shadow_pso_blur = ld_shadow_pipeline(vertexShader, blurShader, DXGI_FORMAT_R8_UNORM, 0, 0);
+        g.shadow_pso_composite[0] = ld_shadow_pipeline(vertexShader, compositeShader, DXGI_FORMAT_R8G8B8A8_UNORM, 0, 1);
+        g.shadow_pso_composite[1] = ld_shadow_pipeline(vertexShader, compositeShader,
+                                                       DXGI_FORMAT_R16G16B16A16_FLOAT, 0, 1);
+        if (g.shadow_pso_mask && g.shadow_pso_blur && g.shadow_pso_composite[0] && g.shadow_pso_composite[1])
+        {
+            status = 0;
+        }
+    }
+    ID3DBlob* shaders[4] = { vertexShader, maskShader, blurShader, compositeShader };
+    for (u32 shaderIndex = 0; shaderIndex < 4; shaderIndex++)
+    {
+        if (shaders[shaderIndex])
+        {
+            shaders[shaderIndex]->lpVtbl->Release(shaders[shaderIndex]);
+        }
+    }
+    return status;
+}
+
+static int ld_shadow_size_masks(u32 width, u32 height)
+{
+    if (g.shadow_masks[0] && g.shadow_w == width && g.shadow_h == height)
+    {
+        return 0;
+    }
+    for (u32 maskIndex = 0; maskIndex < 2; maskIndex++)
+    {
+        retire_texture(g.shadow_masks[maskIndex]);
+        g.shadow_masks[maskIndex] = NULL;
+    }
+    g.shadow_w = 0;
+    g.shadow_h = 0;
+    static const u32 maskSlots[2] = { SRV_SHADOW_MASK0, SRV_SHADOW_MASK1 };
+    for (u32 maskIndex = 0; maskIndex < 2; maskIndex++)
+    {
+        g.shadow_masks[maskIndex] = ld_smaa_texture(width, height, DXGI_FORMAT_R8_UNORM, 1,
+                                                    D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+        if (!g.shadow_masks[maskIndex])
+        {
+            return -1;
+        }
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.shadow_masks[maskIndex], NULL,
+                                              rtv_handle(RTV_SHADOW_BASE + maskIndex));
+        srv_write(maskSlots[maskIndex], g.shadow_masks[maskIndex]);
+    }
+    g.shadow_w = width;
+    g.shadow_h = height;
+    fprintf(stderr, "[shadow] soft shadow masks %ux%u\n", width, height);
+    return 0;
+}
+
+static void ld_shadow_transition(ID3D12Resource* resource, D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = resource;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = before;
+    barrier.Transition.StateAfter = after;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
+}
+
+/* One full-screen triangle with `pipeline`, reading SRV `sourceSlot`. */
+static int ld_shadow_pass(ID3D12PipelineState* pipeline, u32 sourceSlot, const float constants[8])
+{
+    u32 slots[SRV_TABLE_SIZE];
+    for (u32 slotIndex = 0; slotIndex < SRV_TABLE_SIZE; slotIndex++)
+    {
+        slots[slotIndex] = SRV_WHITE;
+    }
+    slots[0] = sourceSlot;
+    if (g.srv_ring_used >= ld_srv_end())
+    {
+        return 0;
+    }
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    if (!table.ptr)
+    {
+        return 0;
+    }
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.shadow_rootsig);
+    g.list->lpVtbl->SetPipelineState(g.list, pipeline);
+    g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 8, constants, 0);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    return 1;
+}
+
+/* Is the current draw the stencil shadow quad (see above), and if so draw
+ * it soft. 1 = drawn here (the caller skips its own draw). */
+static int ld_soft_shadow_draw(const surface_t* surface, D3D12_CPU_DESCRIPTOR_HANDLE renderTarget,
+                               D3D12_CPU_DESCRIPTOR_HANDLE depthStencil, const D3D12_VIEWPORT* viewport,
+                               const D3D12_RECT* scissor, float guestWidth, float guestHeight,
+                               const float viewportTransform[8])
+{
+    const LONG softness = InterlockedCompareExchange(&g_ld_shadow_softness, 0, 0);
+    if (softness == 0 || g.shadow_state < 0)
+    {
+        return 0;
+    }
+    render_state_t state;
+    decode_render_state(&state);
+    if (!state.stencil_enable || state.stencil_two_sided || state.s_func != 0x0204u ||
+        (rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu) != 0x80u || state.s_func_mask != 0xFFu ||
+        state.depth_test || !state.blend_enable || state.sf_rgb != 0x0302u || state.df_rgb != 0x0303u ||
+        (state.eq_rgb != 0x8006u && state.eq_rgb != 0u) || state.rt_count > 1u)
+    {
+        return 0;
+    }
+    if (g_ld_current_pso.colour_attr < 0 || g_ld_current_pso.hud_row_x < 0 || g_ld_current_pso.hud_row_y < 0 ||
+        g_ld_current_pso.hud_row_w < 0)
+    {
+        return 0;
+    }
+    const u32 vertexCount = dc.n_source_refs ? dc.n_source_refs : dc.n_verts;
+    if (!vertexCount || !dc.fetch_plan.attr[0].desc.type ||
+        !dc.fetch_plan.attr[g_ld_current_pso.colour_attr].desc.type)
+    {
+        return 0;
+    }
+    /* One colour on every vertex, and the quad covering the target. */
+    float rowX[4];
+    float rowY[4];
+    float rowW[4];
+    memcpy(rowX, g.rsx.constants[g_ld_current_pso.hud_row_x], sizeof(rowX));
+    memcpy(rowY, g.rsx.constants[g_ld_current_pso.hud_row_y], sizeof(rowY));
+    memcpy(rowW, g.rsx.constants[g_ld_current_pso.hud_row_w], sizeof(rowW));
+    float colour[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float lowestX = 1e30f;
+    float highestX = -1e30f;
+    float lowestY = 1e30f;
+    float highestY = -1e30f;
+    for (u32 occurrence = 0; occurrence < vertexCount; occurrence++)
+    {
+        const u32 vertex = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, occurrence) : occurrence;
+        float fallback[4];
+        const float* vertexColour = dc_vertex_attr_canonical(vertex, (u32)g_ld_current_pso.colour_attr, fallback);
+        if (occurrence == 0)
+        {
+            memcpy(colour, vertexColour, sizeof(colour));
+        }
+        else if (memcmp(colour, vertexColour, sizeof(colour)) != 0)
+        {
+            return 0;
+        }
+        float positionFallback[4];
+        const float* position = dc_vertex_attr_canonical(vertex, 0, positionFallback);
+        const float clipX = position[0] * rowX[0] + position[1] * rowX[1] + position[2] * rowX[2] +
+                            position[3] * rowX[3];
+        const float clipY = position[0] * rowY[0] + position[1] * rowY[1] + position[2] * rowY[2] +
+                            position[3] * rowY[3];
+        const float clipW = position[0] * rowW[0] + position[1] * rowW[1] + position[2] * rowW[2] +
+                            position[3] * rowW[3];
+        if (!(clipW > 1e-6f))
+        {
+            return 0;
+        }
+        const float screenX = clipX / clipW * viewportTransform[0] + viewportTransform[4];
+        const float screenY = clipY / clipW * viewportTransform[1] + viewportTransform[5];
+        lowestX = screenX < lowestX ? screenX : lowestX;
+        highestX = screenX > highestX ? screenX : highestX;
+        lowestY = screenY < lowestY ? screenY : lowestY;
+        highestY = screenY > highestY ? screenY : highestY;
+    }
+    if (!(lowestX <= -0.99f && highestX >= 0.99f && lowestY <= -0.99f && highestY >= 0.99f))
+    {
+        return 0;
+    }
+    for (u32 channel = 0; channel < 4; channel++)
+    {
+        colour[channel] = colour[channel] < 0.0f ? 0.0f : (colour[channel] > 1.0f ? 1.0f : colour[channel]);
+    }
+
+    if (g.shadow_state == 0)
+    {
+        g.shadow_state = ld_shadow_make_pipelines() == 0 ? 1 : -1;
+        fprintf(stderr, g.shadow_state == 1 ? "[shadow] soft shadows ready\n"
+                                            : "[shadow] soft shadows unavailable; drawing the game's\n");
+        if (g.shadow_state != 1)
+        {
+            return 0;
+        }
+    }
+    const u32 targetWidth = ld_surface_x(surface, surface->w);
+    const u32 targetHeight = ld_surface_scaled(surface, surface->h);
+    if (!targetWidth || !targetHeight || ld_shadow_size_masks(targetWidth, targetHeight) != 0)
+    {
+        return 0;
+    }
+    if (g.srv_ring_used + 3u >= ld_srv_end())
+    {
+        return 0;                        /* no room for the three tables: the game's own draw */
+    }
+    /* Host pixels per screen pixel, each way (an AA target is wider). */
+    const float pixelsAcross = viewport->Width / (guestWidth > 0.0f ? guestWidth : 1.0f);
+    const float pixelsDown = viewport->Height / (guestHeight > 0.0f ? guestHeight : 1.0f);
+    const float tapSpacing = softness == 2 ? 1.0f : 0.5f;
+    const D3D12_CPU_DESCRIPTOR_HANDLE maskTargets[2] = {
+        rtv_handle(RTV_SHADOW_BASE + 0u), rtv_handle(RTV_SHADOW_BASE + 1u)
+    };
+    const float clearMask[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    const float noConstants[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    int drawn = 1;
+
+    /* 1. The mask, through the quad's own stencil test. */
+    ld_shadow_transition(g.shadow_masks[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &maskTargets[0], FALSE, &depthStencil);
+    g.list->lpVtbl->ClearRenderTargetView(g.list, maskTargets[0], clearMask, 0, NULL);
+    g.list->lpVtbl->RSSetViewports(g.list, 1, viewport);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, scissor);
+    g.list->lpVtbl->OMSetStencilRef(g.list, 0x80u);
+    drawn &= ld_shadow_pass(g.shadow_pso_mask, SRV_WHITE, noConstants);
+    ld_shadow_transition(g.shadow_masks[0], D3D12_RESOURCE_STATE_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    /* 2. Blurred across (into mask 1), then down (back into mask 0). */
+    const D3D12_VIEWPORT fullViewport = {0.0f, 0.0f, (float)targetWidth, (float)targetHeight, 0.0f, 1.0f};
+    const D3D12_RECT fullScissor = {0, 0, (LONG)targetWidth, (LONG)targetHeight};
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &fullViewport);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &fullScissor);
+    const float acrossConstants[8] = {0.0f, 0.0f, 0.0f, 0.0f, pixelsAcross * tapSpacing, 0.0f, 2.0f, 0.0f};
+    const float downConstants[8] = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, pixelsDown * tapSpacing, 2.0f, 0.0f};
+    ld_shadow_transition(g.shadow_masks[1], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &maskTargets[1], FALSE, NULL);
+    drawn &= ld_shadow_pass(g.shadow_pso_blur, SRV_SHADOW_MASK0, acrossConstants);
+    ld_shadow_transition(g.shadow_masks[1], D3D12_RESOURCE_STATE_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+    ld_shadow_transition(g.shadow_masks[0], D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE,
+                         D3D12_RESOURCE_STATE_RENDER_TARGET);
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &maskTargets[0], FALSE, NULL);
+    drawn &= ld_shadow_pass(g.shadow_pso_blur, SRV_SHADOW_MASK1, downConstants);
+    ld_shadow_transition(g.shadow_masks[0], D3D12_RESOURCE_STATE_RENDER_TARGET,
+                         D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE);
+
+    /* 3. The shadow colour over the scene, alpha = strength x mask. */
+    g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &renderTarget, FALSE, NULL);
+    g.list->lpVtbl->RSSetViewports(g.list, 1, viewport);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, scissor);
+    const float compositeConstants[8] = {colour[0], colour[1], colour[2], colour[3], 0.0f, 0.0f, 0.0f, 0.0f};
+    drawn &= ld_shadow_pass(g.shadow_pso_composite[state.rt_fp16 ? 1 : 0], SRV_SHADOW_MASK0, compositeConstants);
+    return drawn;
+}
+
 /* Draw the image in SRV slot `sourceSlot` (sourceWidth x sourceHeight host
  * pixels, already in PIXEL_SHADER_RESOURCE) into back buffer `bufferIndex`,
  * which is in PRESENT and is left in RENDER_TARGET. */
@@ -11609,7 +12092,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES + 3; /* + SMAA's three targets */
+    hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES + 3 + 2; /* + SMAA's three, the shadow masks' two */
     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.rtv_heap);
     g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {

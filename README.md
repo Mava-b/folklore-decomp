@@ -221,6 +221,9 @@ saved to `folklore_settings.ini`.
   - *Bloom*: *Smooth* (the default: steady glow, without the flicker and
     shimmer of the original's low-resolution sampling) or *Original*. Next
     start.
+  - *Shadows*: *Soft* (the default), *Softer* or *Original* — the
+    characters' shadows with soft edges instead of hard, stair-stepped
+    ones. Applies at once.
   - *Ambient occlusion*: *Subtle* (the default), *Strong* or *Off* — soft
     shading where surfaces meet (corners, under ledges, where characters
     stand), worked out from the depth buffer. Next start.

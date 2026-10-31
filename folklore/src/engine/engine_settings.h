@@ -114,6 +114,16 @@ struct EngineSettings
         Strong,
     };
     AmbientOcclusion ambientOcclusion = AmbientOcclusion::Subtle;
+    /* Shadows: the characters' stencil shadows with the game's hard edges,
+     * or with soft ones (the shadow's mask blurred, 0.5 or 1 screen pixel
+     * per tap; patches/0064). Applies at once. */
+    enum class Shadows
+    {
+        Original,
+        Soft,
+        Softer,
+    };
+    Shadows shadows = Shadows::Soft;
     /* Physics: step Havok by the real frame time instead of the game's fixed
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
