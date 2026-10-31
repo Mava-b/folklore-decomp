@@ -1058,6 +1058,8 @@ namespace
         }
         changed |= ImGui::Checkbox("Build new shaders in the background (no hitch when an effect first appears)",
                                    &settings.backgroundShaders);
+        changed |= ImGui::Checkbox("Fast repeated objects (faster in busy towns; turn off if anything looks wrong)",
+                                   &settings.repeatDraws);
         if (changed)
         {
             engineSettingsApplyGraphics();

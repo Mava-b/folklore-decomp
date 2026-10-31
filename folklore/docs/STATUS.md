@@ -1235,6 +1235,35 @@ What 0006 fixes in ps3recomp to make that run:
     Simulated on all six captures: the menu frames all centred (bar the
     seven pieces before the panel, which the previous frame covers in
     play), every gameplay frame unchanged.
+89. Doolin frame rate (capture-20261031-164309, run-20261031-164309): 45
+    fps where it drops, ~2100 draws a frame; the present thread's drain
+    is 20 ms a frame (13 ms in the draws at 6.3 us each: vertex fetch
+    3.1, shader lookup 2.5, textures 2.4, the rest 5.0) and the game
+    waits 9.5 ms a frame for ring space -- the renderer is the limit.
+    1632 of 2180 draws in a frame use one pipeline, 1471 of them one
+    24-vertex mesh with one texture (a small prop placed again and
+    again), each with its own transform constants. (The 17 fps segment,
+    frames 10332-10338 at 0.2-1.2 s each, is the capture itself.)
+    patches/0067:
+    - The dispatcher counts register writes that change a value
+      (rsx_dispatch.state_generation; not the draw packets nor the
+      constant/program upload windows). ld_repeat_draw: a draw with the
+      same generation, vp_generation, primitive, draw packets and
+      fragment-program instructions as the previous draw, in the same
+      frame and ring epoch (g_ld_ring_epoch: rings reset, flush, SRV
+      ring restart, sampler rebuild), re-records the previous draw with a
+      new constant block (and the fragment constants, which the game may
+      patch in place) instead of going through fetch, PSO lookup,
+      texture binding and descriptor tables. Not for draws that sample
+      a render target / depth / their own target, go to a display buffer,
+      were soft-shadow passes, have inline vertices, or during a capture.
+      Engine setting repeat_draws (default on, F1 checkbox).
+    - Each draw copies only the transform constants its vertex program
+      reads (ld_vs_constant_range from the HLSL; all 512 with indexed
+      reads) instead of all 8 KB: the 1632 draws above read c256-c467,
+      the 2D ones c256-c259.
+    - [fps] now also prints the repeated draws per frame and splits the
+      rest into vertex upload, constants and descriptor tables.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

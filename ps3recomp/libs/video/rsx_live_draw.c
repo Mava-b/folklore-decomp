@@ -63,6 +63,7 @@ void rsx_live_draw_set_texture_lod_bias(int h) { (void)h; }
 void rsx_live_draw_set_hud_layout(int m) { (void)m; }
 void rsx_live_draw_set_hud_edge(int p) { (void)p; }
 void rsx_live_draw_set_shadow_softness(int l) { (void)l; }
+void rsx_live_draw_set_repeat_draws(int e) { (void)e; }
 void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
 void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
 void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
@@ -309,6 +310,8 @@ typedef struct {
     volatile LONG pending;
     u32 ps_unit_mask;   /* texture units the fragment program samples */
     s16 colour_attr;    /* the attribute COLOR0 is copied from unchanged (ld_vs_colour_attr), or -1 */
+    u16 const_first;    /* the transform constants the vertex program reads (ld_vs_constant_range) */
+    u16 const_count;
     s16 hud_row_x;      /* constants giving clip x, y and w from attribute 0 (ld_vs_position_rows), or -1 */
     s16 hud_row_y;
     s16 hud_row_w;
@@ -509,6 +512,12 @@ static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-10
 static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 1 centred 16:9, 2 edges */
 static volatile LONG g_ld_hud_edge = 100;        /* edges: how far out, 0 (centred) - 100 (screen edge) % */
 static volatile LONG g_ld_shadow_softness = 0;   /* stencil shadow edges: 0 the game's, 1 soft, 2 softer */
+static volatile LONG g_ld_repeat_draws = 1;      /* the repeat-draw fast path (ld_repeat_draw) */
+/* Bumped whenever the per-draw rings or the command list start over: a draw
+ * recorded under another epoch may not reuse the previous draw's ring
+ * offsets and descriptor tables. */
+static u32 g_ld_ring_epoch = 1;
+static u64 g_ld_repeat_hits = 0;
 static volatile LONG g_ld_pso_jobs_pending = 0;
 static volatile LONG g_ld_pso_jobs_done = 0;
 static volatile LONG g_ld_pso_draws_skipped = 0;
@@ -623,6 +632,7 @@ static u32 ld_srv_end(void) { return ld_srv_base() + SRV_BANK_TABLES; }
  * between draws), and sampler tables are not a ring any more (sampler_table). */
 static void ld_rings_reset(void)
 {
+    g_ld_ring_epoch++;
     g.vb_used = ld_vb_base();
     g.ib_used = ld_ib_base();
     g.cb_used = ld_cb_base();
@@ -692,6 +702,7 @@ typedef struct {
     u32 ps_unit_mask;
     s16 hud_row_x, hud_row_y, hud_row_w;
     s16 colour_attr;
+    u16 const_first, const_count;
 } ld_pso_metadata;
 
 static ld_pso_metadata g_ld_current_pso;
@@ -1934,6 +1945,7 @@ static void ld_refresh_sampler_settings(void)
         return;
     }
     ld_wait_idle();
+    g_ld_ring_epoch++;
     s_ld_sampler_anisotropy = requested;
     s_ld_sampler_lod_bias = requestedBias;
     g.n_samplers = 0;
@@ -2184,6 +2196,7 @@ static void ld_flush(ld_flush_reason reason)
 #else
     (void)reason;
 #endif
+    g_ld_ring_epoch++;
     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
     if (FAILED(close_hr)) {
         fprintf(stderr,
@@ -2517,6 +2530,11 @@ static int ld_apply_ps_replacement(char* hlsl, size_t capacity)
 void rsx_live_draw_set_hud_layout(int mode)
 {
     InterlockedExchange(&g_ld_hud_layout, (mode == 0 || mode == 2) ? mode : 1);
+}
+
+void rsx_live_draw_set_repeat_draws(int enabled)
+{
+    InterlockedExchange(&g_ld_repeat_draws, enabled ? 1 : 0);
 }
 
 void rsx_live_draw_set_shadow_softness(int level)
@@ -5459,6 +5477,48 @@ static int ld_vs_colour_attr(const char* hlsl)
     return strstr(hlsl, inputLine) ? (int)attribute : -1;
 }
 
+/* The range of transform constants a vertex program reads, so a draw copies
+ * only those into its constant buffer block instead of all 512 (8 KB a draw,
+ * 2000+ draws a frame in the busy towns). Indexed reads ("vp_c[(n + a0.x) &
+ * 511u]", the skinned characters' bones) can reach any of them (the index
+ * wraps): then all 512. */
+static void ld_vs_constant_range(const char* hlsl, u16* first, u16* count)
+{
+    u32 lowest = RSX_DSP_NUM_CONSTANTS;
+    u32 highest = 0;
+    int any = 0;
+    for (const char* cursor = strstr(hlsl, "vp_c["); cursor; cursor = strstr(cursor + 5, "vp_c["))
+    {
+        const char next = cursor[5];
+        if (next == '(')
+        {
+            *first = 0;
+            *count = RSX_DSP_NUM_CONSTANTS;
+            return;
+        }
+        if (next < '0' || next > '9')
+        {
+            continue;
+        }
+        const unsigned long index = strtoul(cursor + 5, NULL, 10);
+        if (index >= RSX_DSP_NUM_CONSTANTS)
+        {
+            continue;                    /* the declaration, vp_c[512] */
+        }
+        any = 1;
+        lowest = (u32)index < lowest ? (u32)index : lowest;
+        highest = (u32)index > highest ? (u32)index : highest;
+    }
+    if (!any)
+    {
+        *first = 0;
+        *count = 0;
+        return;
+    }
+    *first = (u16)lowest;
+    *count = (u16)(highest - lowest + 1u);
+}
+
 static void ld_vs_position_rows(const char* hlsl, s16* rowX, s16* rowY, s16* rowW)
 {
     *rowX = -1;
@@ -6174,6 +6234,8 @@ static ID3D12PipelineState* get_pso(
             g_ld_current_pso.hud_row_y = g.psos[found].hud_row_y;
             g_ld_current_pso.hud_row_w = g.psos[found].hud_row_w;
             g_ld_current_pso.colour_attr = g.psos[found].colour_attr;
+            g_ld_current_pso.const_first = g.psos[found].const_first;
+            g_ld_current_pso.const_count = g.psos[found].const_count;
             if (InterlockedCompareExchange(&g.psos[found].pending, 0, 0)) {
                 InterlockedIncrement(&g_ld_pso_draws_skipped);
                 return NULL;             /* still compiling (ld_pso_job) */
@@ -6354,6 +6416,14 @@ static ID3D12PipelineState* get_pso(
     g_ld_current_pso.hud_row_w = g.psos[entryIndex].hud_row_w;
     g.psos[entryIndex].colour_attr = vi > 0 ? (s16)ld_vs_colour_attr(vs_hlsl) : (s16)-1;
     g_ld_current_pso.colour_attr = g.psos[entryIndex].colour_attr;
+    g.psos[entryIndex].const_first = 0;
+    g.psos[entryIndex].const_count = RSX_DSP_NUM_CONSTANTS;
+    if (vi > 0)
+    {
+        ld_vs_constant_range(vs_hlsl, &g.psos[entryIndex].const_first, &g.psos[entryIndex].const_count);
+    }
+    g_ld_current_pso.const_first = g.psos[entryIndex].const_first;
+    g_ld_current_pso.const_count = g.psos[entryIndex].const_count;
     if (vi > 0 && fi > 0) {
         if (ld_pso_job_submit(entryIndex, vs_hlsl, ps_hlsl, &rs, masked_layout,
                               packed_payload)) {
@@ -9302,6 +9372,11 @@ typedef struct
     u64 fetchTicks;
     u64 shaderTicks;
     u64 bindTicks;
+    u64 uploadTicks;       /* vertex and index data into the upload ring */
+    u64 uploadBytes;
+    u64 constantTicks;     /* the constant buffer block */
+    u64 constantBytes;
+    u64 descriptorTicks;   /* SRV and sampler tables */
 } ld_draw_perf;
 
 static ld_draw_perf g_ld_draw_perf;
@@ -9323,6 +9398,202 @@ static double ld_perf_ticks_to_ms(u64 ticks)
         millisecondsPerTick = 1000.0 / (double)frequency.QuadPart;
     }
     return (double)ticks * millisecondsPerTick;
+}
+
+/* ---------------------------------------------------------------------------
+ * Repeat draws. The busy towns draw the same small mesh hundreds of times a
+ * frame -- capture-20261031-164309, in Doolin: 1471 of 2180 draws are one
+ * 24-vertex mesh with one texture, one pipeline and one state, each with its
+ * own transform constants (a plant, a stone, a lamp... placed again and
+ * again). Each went through the whole draw path: vertex fetch and cache
+ * check, shader key, texture binding, descriptor tables -- about 6-8 us,
+ * 9-10 ms a frame for these alone. When nothing but the transform constants
+ * has changed since the previous draw (the dispatcher's state_generation and
+ * vp_generation are the same, the same draw packets, the fragment program's
+ * instructions the same) the draw is the previous one again with new
+ * constants: the vertex data already uploaded, the pipeline, tables, targets
+ * and viewport are all reused, and only the constants are copied (the
+ * fragment program's too, which the game may patch in place). Not taken for
+ * draws that sample a render target, go into a display buffer (the HUD
+ * placement depends on the constants), were drawn by the soft-shadow
+ * passes, carry inline vertex data, or while a capture is being written.
+ * -----------------------------------------------------------------------*/
+#define LD_REPEAT_MAX_BATCHES 8u
+
+typedef struct {
+    int valid;
+    u32 epoch;
+    u32 frame;
+    u32 stateGeneration;
+    u32 vpGeneration;
+    u32 primitive;
+    u32 arrayCount;
+    u32 indexBatchCount;
+    batch_t arrays[LD_REPEAT_MAX_BATCHES];
+    batch_t indexBatches[LD_REPEAT_MAX_BATCHES];
+    ID3D12PipelineState* pipeline;
+    ld_pso_metadata metadata;
+    u64 fragmentHash;
+    D3D12_GPU_DESCRIPTOR_HANDLE textureTable;
+    D3D12_GPU_DESCRIPTOR_HANDLE samplerTable;
+    D3D12_GPU_DESCRIPTOR_HANDLE vertexTextureTable;
+    u32 vertexTextureMask;
+    D3D12_CPU_DESCRIPTOR_HANDLE renderTargets[4];
+    u32 renderTargetCount;
+    u32 targets[4];
+    D3D12_CPU_DESCRIPTOR_HANDLE depthStencil;
+    int haveDepthStencil;
+    u32 depthSlot;
+    int depthTest;
+    int depthWrite;
+    D3D12_VIEWPORT viewport;
+    D3D12_RECT scissor;
+    D3D12_VERTEX_BUFFER_VIEW vertexBuffer;
+    int haveVertexBuffer;
+    D3D12_INDEX_BUFFER_VIEW indexBuffer;
+    int indexed;
+    u32 vertexCount;
+    float viewportTransform[8];
+} ld_repeat_state;
+
+static ld_repeat_state g_ld_repeat;
+
+static u64 ld_repeat_fragment_hash(u32 location, u32 offset, u32 size)
+{
+    const u8* fragmentCode = size ? guest_ptr(location, offset, size) : NULL;
+    if (!fragmentCode)
+    {
+        return 0;
+    }
+    return ld_fp_constants_buffered() ? rsx_fp_structural_hash(fragmentCode, size, 1469598103934665603ull)
+                                      : fnv1a(fragmentCode, size, 1469598103934665603ull);
+}
+
+static int ld_repeat_draw(u32 primitive)
+{
+    ld_repeat_state* previous = &g_ld_repeat;
+    if (!previous->valid || !InterlockedCompareExchange(&g_ld_repeat_draws, 0, 0) || s_csv_file ||
+        previous->epoch != g_ld_ring_epoch || previous->frame != g_ld_frames ||
+        previous->stateGeneration != g.rsx.state_generation || previous->vpGeneration != g.rsx.vp_generation ||
+        previous->primitive != primitive || dc.inl || dc.n_arr != previous->arrayCount ||
+        dc.n_idx != previous->indexBatchCount)
+    {
+        return 0;
+    }
+    if (memcmp(dc.arr, previous->arrays, (size_t)dc.n_arr * sizeof(batch_t)) != 0 ||
+        memcmp(dc.idx, previous->indexBatches, (size_t)dc.n_idx * sizeof(batch_t)) != 0)
+    {
+        return 0;
+    }
+    const ld_pso_metadata* metadata = &previous->metadata;
+    if (ld_repeat_fragment_hash(metadata->fp_location, metadata->fp_offset, metadata->fp_size) !=
+        previous->fragmentHash)
+    {
+        return 0;
+    }
+    if (ld_fp_constants_buffered())
+    {
+        const u8* fragmentCode = guest_ptr(metadata->fp_location, metadata->fp_offset, metadata->fp_size);
+        if (!fragmentCode || rsx_fp_collect_constants(fragmentCode, metadata->fp_size, &g.fp_constants) < 0)
+        {
+            return 0;
+        }
+    }
+    /* Room for the constants without starting the rings over (that would
+     * invalidate everything reused here). */
+    u32 vertexConstantOffset = 0;
+    if (rsx_vertex_constant_ring_plan(g.cb_used, ld_cb_end(), CB_BLOCK_ALIGNED, &vertexConstantOffset) != 1)
+    {
+        return 0;
+    }
+    const u32 epochBefore = g_ld_ring_epoch;
+    u32 pixelConstantOffset = 0;
+    if (!ld_upload_pixel_constants(&pixelConstantOffset) || g_ld_ring_epoch != epochBefore || !g.ready)
+    {
+        return 0;
+    }
+    g.cb_used = vertexConstantOffset;
+    u8* constantBlock = g.cb_mapped + g.cb_used;
+    {
+        u32 constantFirst = metadata->const_first;
+        u32 constantCount = metadata->const_count;
+        if (constantFirst >= RSX_DSP_NUM_CONSTANTS || constantFirst + constantCount > RSX_DSP_NUM_CONSTANTS)
+        {
+            constantFirst = 0;
+            constantCount = RSX_DSP_NUM_CONSTANTS;
+        }
+        if (constantCount)
+        {
+            memcpy(constantBlock + (size_t)constantFirst * 16u, g.rsx.constants[constantFirst],
+                   (size_t)constantCount * 16u);
+        }
+        g_ld_draw_perf.constantBytes += (u64)constantCount * 16u;
+    }
+    memcpy(constantBlock + 512 * 16, previous->viewportTransform, sizeof(previous->viewportTransform));
+
+    g.list->lpVtbl->OMSetRenderTargets(g.list, previous->renderTargetCount, previous->renderTargets, FALSE,
+                                       previous->haveDepthStencil ? &previous->depthStencil : NULL);
+    ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+    g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+    g.list->lpVtbl->SetPipelineState(g.list, previous->pipeline);
+    g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
+    g.list->lpVtbl->SetGraphicsRootConstantBufferView(g.list, 0, g.cb->lpVtbl->GetGPUVirtualAddress(g.cb) + g.cb_used);
+    if (ld_fp_constants_buffered())
+    {
+        g.list->lpVtbl->SetGraphicsRootConstantBufferView(
+            g.list, 4, g.ps_cb->lpVtbl->GetGPUVirtualAddress(g.ps_cb) + pixelConstantOffset);
+    }
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, previous->textureTable);
+    g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 2, previous->samplerTable);
+    if (previous->vertexTextureMask)
+    {
+        g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 3, previous->vertexTextureTable);
+    }
+    g.cb_used += CB_BLOCK_ALIGNED;
+    g.list->lpVtbl->RSSetViewports(g.list, 1, &previous->viewport);
+    g.list->lpVtbl->RSSetScissorRects(g.list, 1, &previous->scissor);
+    g.list->lpVtbl->OMSetStencilRef(g.list, rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    ld_set_blend_factor();
+    if (previous->haveVertexBuffer)
+    {
+        g.list->lpVtbl->IASetVertexBuffers(g.list, 0, 1, &previous->vertexBuffer);
+    }
+    g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    if (previous->indexed)
+    {
+        g.list->lpVtbl->IASetIndexBuffer(g.list, &previous->indexBuffer);
+        g.list->lpVtbl->DrawIndexedInstanced(g.list, previous->vertexCount, 1, 0, 0, 0);
+    }
+    else
+    {
+        g.list->lpVtbl->DrawInstanced(g.list, previous->vertexCount, 1, 0, 0);
+    }
+    g_ld_current_pso = previous->metadata;
+    for (u32 targetIndex = 0; targetIndex < previous->renderTargetCount; targetIndex++)
+    {
+        ld_surface_note_write(previous->targets[targetIndex], LD_SURFACE_WRITE_DRAW);
+    }
+    if (previous->depthSlot)
+    {
+        zdepth_t* depth = &g.zdepths[previous->depthSlot - 1];
+        depth->draws++;
+        if (previous->depthTest)
+        {
+            depth->depth_test_draws++;
+        }
+        if (previous->depthWrite)
+        {
+            depth->depth_write_draws++;
+        }
+        if (previous->depthTest && previous->depthWrite)
+        {
+            depth->depth_both_draws++;
+            depth->had_write = 1;
+        }
+    }
+    g_ld_stats.groups_executed++;
+    g_ld_repeat_hits++;
+    return 1;
 }
 
 static void sink_end_impl(void* user, const rsx_dispatch* r)
@@ -9370,6 +9641,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         }
     }
     const u32 prim = g.rsx.current_primitive;
+    if (ld_repeat_draw(prim))
+    {
+        return;
+    }
+    g_ld_repeat.valid = 0;
     rsx_vertex_layout_plan used_layout;
     ld_current_vertex_layout(&used_layout);
 #if defined(YZ_PERF_PROFILE)
@@ -9443,6 +9719,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         ld_flush(LD_FLUSH_VERTEX_RING);
         ld_rings_reset();
     }
+    const u64 uploadBegin = ld_perf_ticks();
     if (draw_vb_bytes)
         memcpy(
             g.vb_mapped + g.vb_used, vertex_data,
@@ -9450,6 +9727,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     if (indexed)
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
+    g_ld_draw_perf.uploadTicks += ld_perf_ticks() - uploadBegin;
+    g_ld_draw_perf.uploadBytes += draw_vb_bytes + draw_ib_bytes;
 
     ld_probe_init();
     g_ld_probe_variant = 0;
@@ -9967,6 +10246,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         ld_flush(LD_FLUSH_DESCRIPTOR_RING);
         if (!g.ready) return;
         g.srv_ring_used = ld_srv_base();
+        g_ld_ring_epoch++;
     }
     g_ld_draw_perf.bindTicks += ld_perf_ticks() - bindBegin;
 
@@ -10010,6 +10290,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g.list->lpVtbl->OMSetRenderTargets(g.list, n_mrt, rtvs, FALSE,
                                            have_dsv ? &dsv : NULL);
     }
+    const u64 descriptorsBegin = ld_perf_ticks();
     ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
     g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
@@ -10017,6 +10298,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     D3D12_GPU_DESCRIPTOR_HANDLE vtex_table = {0};
     if (vtex_mask)
         vtex_table = srv_table(vtex_slots);
+    g_ld_draw_perf.descriptorTicks += ld_perf_ticks() - descriptorsBegin;
     u64 descriptor_signature =
         fnv1a(slots, sizeof(slots), 1469598103934665603ull);
     descriptor_signature =
@@ -10040,9 +10322,26 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         xf[5] = -((vp.translate[1] - Hv * 0.5f) / (Hv * 0.5f));
         xf[6] = vp.translate[2];
     }
+    const u64 constantsBegin = ld_perf_ticks();
     u8* cbdst = g.cb_mapped + g.cb_used;
-    memcpy(cbdst, g.rsx.constants, RSX_DSP_NUM_CONSTANTS * 16);
+    {
+        /* Only the constants this vertex program reads (the rest of the
+         * block is never looked at). */
+        u32 constantFirst = g_ld_current_pso.const_first;
+        u32 constantCount = g_ld_current_pso.const_count;
+        if (constantFirst >= RSX_DSP_NUM_CONSTANTS || constantFirst + constantCount > RSX_DSP_NUM_CONSTANTS)
+        {
+            constantFirst = 0;
+            constantCount = RSX_DSP_NUM_CONSTANTS;
+        }
+        if (constantCount)
+        {
+            memcpy(cbdst + (size_t)constantFirst * 16u, g.rsx.constants[constantFirst], (size_t)constantCount * 16u);
+        }
+        g_ld_draw_perf.constantBytes += (u64)constantCount * 16u;
+    }
     memcpy(cbdst + 512 * 16, xf, sizeof(xf));
+    g_ld_draw_perf.constantTicks += ld_perf_ticks() - constantsBegin;
 
     g.list->lpVtbl->SetPipelineState(g.list, pso);
     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
@@ -10184,9 +10483,11 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         draw->cb_used = g.cb_used;
         draw->vb_used = g.vb_used;
     }
+    int softShadowDrawn = 0;
     if (have_dsv && current_zslot &&
         ld_soft_shadow_draw(drawSurface, rtv, dsv, &dvp, &sc, Wv, Hv, xf)) {
         /* Drawn by the soft shadow passes instead. */
+        softShadowDrawn = 1;
     } else if (indexed) {
         D3D12_INDEX_BUFFER_VIEW ibv;
         ibv.BufferLocation =
@@ -10198,6 +10499,90 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             g.list, n_tri, 1, 0, 0, 0);
     } else {
         g.list->lpVtbl->DrawInstanced(g.list, n_tri, 1, 0, 0);
+    }
+    /* Keep what the repeat-draw path needs to draw this again with new
+     * constants (see ld_repeat_draw). */
+    {
+        int scanoutTarget = 0;
+        for (u32 bufferIndex = 0; bufferIndex < 8; bufferIndex++)
+        {
+            const display_buffer_t* display = &g.display_buffers[bufferIndex];
+            if (display->valid && display->location == drawSurface->location &&
+                display->offset == drawSurface->offset)
+            {
+                scanoutTarget = 1;
+                break;
+            }
+        }
+        /* Only ordinary textures: a render target, a depth buffer or a copy
+         * of its own target read as a texture can change between two draws. */
+        int plainTextures = 1;
+        for (u32 slotIndex = 0; slotIndex < SRV_TABLE_SIZE; slotIndex++)
+        {
+            if (slots[slotIndex] != SRV_WHITE &&
+                !(slots[slotIndex] >= SRV_TEXTURE_BASE && slots[slotIndex] < SRV_VTEX_BASE))
+            {
+                plainTextures = 0;
+                break;
+            }
+        }
+        ld_repeat_state* repeat = &g_ld_repeat;
+        repeat->valid = 0;
+        if (InterlockedCompareExchange(&g_ld_repeat_draws, 0, 0) && !s_csv_file && !softShadowDrawn && !hudPlace &&
+            !scanoutTarget && plainTextures && n_surf_used == 0 && !dc.inl && dc.n_arr <= LD_REPEAT_MAX_BATCHES &&
+            dc.n_idx <= LD_REPEAT_MAX_BATCHES && n_mrt >= 1u && n_mrt <= 4u && !g_ld_probe_variant)
+        {
+            repeat->fragmentHash = ld_repeat_fragment_hash(g_ld_current_pso.fp_location, g_ld_current_pso.fp_offset,
+                                                           g_ld_current_pso.fp_size);
+            if (repeat->fragmentHash)
+            {
+                repeat->epoch = g_ld_ring_epoch;
+                repeat->frame = g_ld_frames;
+                repeat->stateGeneration = g.rsx.state_generation;
+                repeat->vpGeneration = g.rsx.vp_generation;
+                repeat->primitive = prim;
+                repeat->arrayCount = dc.n_arr;
+                repeat->indexBatchCount = dc.n_idx;
+                memcpy(repeat->arrays, dc.arr, (size_t)dc.n_arr * sizeof(batch_t));
+                memcpy(repeat->indexBatches, dc.idx, (size_t)dc.n_idx * sizeof(batch_t));
+                repeat->pipeline = pso;
+                repeat->metadata = g_ld_current_pso;
+                repeat->textureTable = table;
+                repeat->samplerTable = stbl;
+                repeat->vertexTextureTable = vtex_table;
+                repeat->vertexTextureMask = vtex_mask;
+                repeat->renderTargetCount = n_mrt;
+                repeat->renderTargets[0] = rtv;
+                repeat->targets[0] = target;
+                for (u32 targetIndex = 1; targetIndex < n_mrt; targetIndex++)
+                {
+                    repeat->renderTargets[targetIndex] = rtv_handle(LD_SWAP_BUFFERS + mrt[targetIndex]);
+                    repeat->targets[targetIndex] = mrt[targetIndex];
+                }
+                repeat->haveDepthStencil = have_dsv;
+                if (have_dsv)
+                {
+                    repeat->depthStencil = dsv;
+                }
+                repeat->depthSlot = current_zslot;
+                repeat->depthTest = (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
+                repeat->depthWrite = (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u) != 0;
+                repeat->viewport = dvp;
+                repeat->scissor = sc;
+                repeat->vertexBuffer = vbv;
+                repeat->haveVertexBuffer = vertex_stride != 0;
+                repeat->indexed = indexed;
+                if (indexed)
+                {
+                    repeat->indexBuffer.BufferLocation = g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
+                    repeat->indexBuffer.SizeInBytes = (u32)draw_ib_bytes;
+                    repeat->indexBuffer.Format = DXGI_FORMAT_R32_UINT;
+                }
+                repeat->vertexCount = n_tri;
+                memcpy(repeat->viewportTransform, xf, sizeof(repeat->viewportTransform));
+                repeat->valid = 1;
+            }
+        }
     }
     ld_surface_note_write(target, LD_SURFACE_WRITE_DRAW);
     for (u32 r = 1; r < n_mrt; r++)
@@ -11216,6 +11601,7 @@ static int ld_smaa_pass(u32 passIndex, u32 targetIndex, u32 firstSlot, u32 secon
             return 0;
         }
         g.srv_ring_used = ld_srv_base();
+        g_ld_ring_epoch++;
     }
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
     if (!table.ptr)
@@ -11741,6 +12127,7 @@ static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
             return 0;
         }
         g.srv_ring_used = ld_srv_base();
+        g_ld_ring_epoch++;
     }
     const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
     if (!table.ptr)
@@ -14232,6 +14619,17 @@ void rsx_live_draw_present(u32 buffer_id)
                       (unsigned long long)(g_ld_vp_identity_hits - lastIdentityHits),
                       (unsigned long long)(g_ld_vp_identity_hits - lastIdentityHits +
                                            g_ld_vp_identity_misses - lastIdentityMisses));
+              { static u64 lastRepeatHits = 0;
+                fprintf(stderr, "[fps]   repeated draws (only the constants changed): %.0f per frame\n",
+                        (double)(g_ld_repeat_hits - lastRepeatHits) / frameCount);
+                lastRepeatHits = g_ld_repeat_hits; }
+              fprintf(stderr, "[fps]   of the rest: vertex upload %.1f ms (%.1f MB), constants %.1f ms (%.1f MB), "
+                              "descriptor tables %.1f ms\n",
+                      ld_perf_ticks_to_ms(nowPerf.uploadTicks - lastPerf.uploadTicks) / frameCount,
+                      (double)(nowPerf.uploadBytes - lastPerf.uploadBytes) / (1024.0 * 1024.0) / frameCount,
+                      ld_perf_ticks_to_ms(nowPerf.constantTicks - lastPerf.constantTicks) / frameCount,
+                      (double)(nowPerf.constantBytes - lastPerf.constantBytes) / (1024.0 * 1024.0) / frameCount,
+                      ld_perf_ticks_to_ms(nowPerf.descriptorTicks - lastPerf.descriptorTicks) / frameCount);
               lastPerf = nowPerf;
               lastIdentityHits = g_ld_vp_identity_hits;
               lastIdentityMisses = g_ld_vp_identity_misses; } }

@@ -229,6 +229,9 @@ saved to `folklore_settings.ini`.
     stand), worked out from the depth buffer. Next start.
   - *Build new shaders in the background* (no hitch when an effect first
     appears).
+  - *Fast repeated objects* (on by default): objects the game draws again
+    and again with only their position changed reuse the previous draw's
+    work — faster in busy towns like Doolin.
 - **Game files**: the game folder in use (change it here; it applies on the
   next start) and where the installed data and saves are.
 - **Downloadable content**: the add-on packs installed, **Add DLC from

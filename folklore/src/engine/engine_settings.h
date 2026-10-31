@@ -60,6 +60,10 @@ struct EngineSettings
     int renderScale = 1;
     AntiAliasing antiAliasing = AntiAliasing::Smaa;
     bool backgroundShaders = true;
+    /* Repeat draws: an object drawn again with only its position changed
+     * reuses the previous draw's work (patches/0067; the busy towns draw the
+     * same small meshes hundreds of times a frame). Applies at once. */
+    bool repeatDraws = true;
     /* Anisotropic filtering: 1 (off), 2, 4, 8 or 16 -- sharper textures on
      * surfaces seen at an angle (floors, roads, walls). Sharpening: 0-100 %
      * contrast-adaptive sharpening of the final image. Both apply at once. */

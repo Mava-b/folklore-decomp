@@ -293,6 +293,8 @@ static void vtx_const_set(rsx_dispatch* rsx, u32 attr, u32 c, float v)
 {
     u32 w; memcpy(&w, &v, 4);
     const u32 idx = (M_VTX_ATTR_4F + attr * 0x10 + c * 4) >> 2;
+    if (rsx->regs[idx] != w)
+        rsx->state_generation++;
     rsx->regs[idx] = w;
     /* Folded packed constants also have an explicit canonical value, even
      * when every component is zero. Immediate snapshots need that presence. */
@@ -351,6 +353,13 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         return;
     }
     rsx->seen[idx]++;
+    if (rsx->regs[idx] != arg &&
+        method != M_VERTEX_BEGIN_END && method != M_VB_VERTEX_BATCH &&
+        method != M_VB_INDEX_BATCH && method != M_INLINE_ARRAY &&
+        method != M_VP_UPLOAD_CONST_ID && method != M_VP_UPLOAD_FROM_ID &&
+        !(method >= M_VP_UPLOAD_CONST && method < M_VP_UPLOAD_CONST + 32 * 4) &&
+        !(method >= M_VP_UPLOAD_INST && method < M_VP_UPLOAD_INST + 32 * 4))
+        rsx->state_generation++;
     rsx->regs[idx] = arg;
     if ((method >= 0x1500 && method < 0x1A00) || (method >= 0x1E40 && method < 0x1E80) ||
         (method >= 0x0A80 && method < 0x0B00))

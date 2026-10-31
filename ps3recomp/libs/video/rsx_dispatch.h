@@ -124,6 +124,13 @@ struct rsx_dispatch {
     u32 current_primitive;
     u32 vp_generation;                /* bumped on every vp[] write: lets the
                                        * renderer reuse a program's hash  */
+    u32 state_generation;             /* bumped when a register write CHANGES
+                                       * a value, apart from the draw packets
+                                       * themselves and the transform
+                                       * constant / program upload windows:
+                                       * two draws with the same generation
+                                       * differ only in their constants
+                                       * (the renderer's repeat-draw path) */
 
     u32 inline_len;                   /* bytes accumulated this primitive   */
     u32 inline_dropped;               /* streams lost to the cap            */

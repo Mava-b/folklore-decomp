@@ -164,6 +164,10 @@ void rsx_live_draw_set_hud_edge(int percent);
 /* Soft shadows: 0 the game's stencil shadow edges, 1 soft, 2 softer (the
  * shadow quad's stencil test made into a mask and blurred; live). */
 void rsx_live_draw_set_shadow_softness(int level);
+/* Repeat draws: a draw whose state is the previous draw's apart from its
+ * transform constants reuses that draw's upload, pipeline and tables (1, the
+ * default) or goes through the whole draw path again (0). Live. */
+void rsx_live_draw_set_repeat_draws(int enabled);
 /* Pixel shader replacements: a fragment program whose translated HLSL (as
  * LD_HLSL_DUMP writes it) hashes to `sourceHash` is built from `hlsl` instead
  * -- a title's own better version of one of its effects. The hash is the

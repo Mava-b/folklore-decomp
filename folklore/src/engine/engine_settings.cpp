@@ -201,6 +201,10 @@ void engineSettingsLoad()
         {
             settingsInstance.backgroundShaders = parseBool(value);
         }
+        else if (std::strcmp(key, "repeat_draws") == 0)
+        {
+            settingsInstance.repeatDraws = parseBool(value);
+        }
         else if (std::strcmp(key, "anisotropic_filtering") == 0)
         {
             const int level = std::atoi(value);
@@ -394,6 +398,7 @@ void engineSettingsSave()
                  : current.antiAliasing == AntiAliasing::Smaa ? "smaa"
                                                               : "off");
     std::fprintf(file, "background_shaders = %d\n", current.backgroundShaders ? 1 : 0);
+    std::fprintf(file, "repeat_draws = %d\n", current.repeatDraws ? 1 : 0);
     std::fprintf(file, "anisotropic_filtering = %d\n", current.anisotropy);
     std::fprintf(file, "# wider than 16:9: menus and HUD stretched, centred (at their own proportions) or edges\n");
     std::fprintf(file, "# (centred, with the map, gauges and hints moved hud_edge %% of the way to the edges)\n");
@@ -460,6 +465,7 @@ extern "C"
     void rsx_live_draw_set_hud_layout(int mode);
     void rsx_live_draw_set_hud_edge(int percent);
     void rsx_live_draw_set_shadow_softness(int level);
+    void rsx_live_draw_set_repeat_draws(int enabled);
     void rsx_live_draw_set_sharpening(uint32_t percent);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
@@ -474,6 +480,7 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_render_scale((uint32_t)current.renderScale);
     rsx_live_draw_set_post_aa((int)current.antiAliasing);
     rsx_live_draw_set_async_shaders(current.backgroundShaders ? 1 : 0);
+    rsx_live_draw_set_repeat_draws(current.repeatDraws ? 1 : 0);
     rsx_live_draw_set_anisotropy((uint32_t)current.anisotropy);
     static const int kTextureLodBias[3] = {0, -50, -100};
     rsx_live_draw_set_texture_lod_bias(kTextureLodBias[(int)current.textureDetail]);
