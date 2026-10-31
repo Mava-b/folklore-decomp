@@ -1264,6 +1264,19 @@ What 0006 fixes in ps3recomp to make that run:
       the 2D ones c256-c259.
     - [fps] now also prints the repeated draws per frame and splits the
       rest into vertex upload, constants and descriptor tables.
+90. Health / spirit gauges with the edges HUD (patches/0068). The gauge
+    frames are plain 2D draws (moved right), but the coloured fills and
+    their sparkle strips (capture-20261031-111758 draws 486-496: vertex
+    programs b0b720a3 / 33063bb4, a unit quad scaled and moved by
+    constants first) did not match ld_vs_position_rows, so they stayed
+    stretched and fell out of their frames. rsx_vp_evaluate_position (in
+    the VP decompiler) runs a branch-free program on the CPU, operation for
+    operation as the decompiled HLSL does (checked against a hand-built
+    MAD + 4x DP4 program and its decompiled text); ld_hud_draw_place uses
+    it for display-buffer draws whose program is not the plain kind
+    (at most 1024 vertices; every vertex must have the same w, so
+    perspective overlays stay with the picture), then places them like
+    any other HUD draw.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

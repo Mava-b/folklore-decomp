@@ -7330,9 +7330,26 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     {
         return 0;
     }
-    if (g_ld_current_pso.hud_row_x < 0 || g_ld_current_pso.hud_row_y < 0 || g_ld_current_pso.hud_row_w < 0)
+    /* The plain 2D vertex program: x, y and w straight from four constants.
+     * Anything else (the health and spirit gauges' fills scale and move a
+     * unit quad first) is run on the CPU (rsx_vp_evaluate_position). */
+    const int useRows =
+        g_ld_current_pso.hud_row_x >= 0 && g_ld_current_pso.hud_row_y >= 0 && g_ld_current_pso.hud_row_w >= 0;
+    const u32 programStart = g_ld_current_pso.vp_start;
+    const u8* programCode = NULL;
+    u32 programBytes = 0;
+    if (!useRows)
     {
-        return 0;
+        if (programStart >= RSX_DSP_VP_INSTR || !g_ld_current_pso.vp_instrs)
+        {
+            return 0;
+        }
+        programCode = (const u8*)(g.rsx.vp + programStart * 4u);
+        programBytes = (RSX_DSP_VP_INSTR - programStart) * 16u;
+        if (g_ld_current_pso.vp_instrs * 16u < programBytes)
+        {
+            programBytes = g_ld_current_pso.vp_instrs * 16u;
+        }
     }
     const int depthTested = (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
     int scanout = 0;
@@ -7354,31 +7371,71 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     {
         return 0;
     }
-    float rowX[4];
-    float rowY[4];
-    float rowW[4];
-    memcpy(rowX, g.rsx.constants[g_ld_current_pso.hud_row_x], sizeof(rowX));
-    memcpy(rowY, g.rsx.constants[g_ld_current_pso.hud_row_y], sizeof(rowY));
-    memcpy(rowW, g.rsx.constants[g_ld_current_pso.hud_row_w], sizeof(rowW));
-    /* Orthographic: w does not depend on the position. */
-    if (rowW[0] != 0.0f || rowW[1] != 0.0f || rowW[2] != 0.0f || !(rowW[3] > 1e-6f))
+    float rowX[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float rowY[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float rowW[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (useRows)
     {
-        return 0;
+        memcpy(rowX, g.rsx.constants[g_ld_current_pso.hud_row_x], sizeof(rowX));
+        memcpy(rowY, g.rsx.constants[g_ld_current_pso.hud_row_y], sizeof(rowY));
+        memcpy(rowW, g.rsx.constants[g_ld_current_pso.hud_row_w], sizeof(rowW));
+        /* Orthographic: w does not depend on the position. */
+        if (rowW[0] != 0.0f || rowW[1] != 0.0f || rowW[2] != 0.0f || !(rowW[3] > 1e-6f))
+        {
+            return 0;
+        }
+    }
+    else if (vertexCount > 1024u)
+    {
+        return 0;                        /* not a small overlay */
     }
     float lowestX = 1e30f;
     float highestX = -1e30f;
     float lowestY = 1e30f;
     float highestY = -1e30f;
+    float firstW = 0.0f;
     for (u32 occurrence = 0; occurrence < vertexCount; occurrence++)
     {
         const u32 vertex = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, occurrence) : occurrence;
-        float fallback[4];
-        const float* position = dc_vertex_attr_canonical(vertex, 0, fallback);
-        const float clipX = position[0] * rowX[0] + position[1] * rowX[1] + position[2] * rowX[2] +
-                            position[3] * rowX[3];
-        const float clipY = position[0] * rowY[0] + position[1] * rowY[1] + position[2] * rowY[2] +
-                            position[3] * rowY[3];
-        const float clipW = position[3] * rowW[3];
+        float clipX = 0.0f;
+        float clipY = 0.0f;
+        float clipW = 0.0f;
+        if (useRows)
+        {
+            float fallback[4];
+            const float* position = dc_vertex_attr_canonical(vertex, 0, fallback);
+            clipX = position[0] * rowX[0] + position[1] * rowX[1] + position[2] * rowX[2] + position[3] * rowX[3];
+            clipY = position[0] * rowY[0] + position[1] * rowY[1] + position[2] * rowY[2] + position[3] * rowY[3];
+            clipW = position[3] * rowW[3];
+        }
+        else
+        {
+            float inputs[16][4];
+            for (u32 attribute = 0; attribute < 16; attribute++)
+            {
+                float fallback[4];
+                const float* value = dc_vertex_attr_canonical(vertex, attribute, fallback);
+                memcpy(inputs[attribute], value, sizeof(inputs[attribute]));
+            }
+            float clip[4];
+            if (rsx_vp_evaluate_position(programCode, programBytes, (const float (*)[4])inputs,
+                                         (const u32 (*)[4])g.rsx.constants, clip) != 0)
+            {
+                return 0;
+            }
+            clipX = clip[0];
+            clipY = clip[1];
+            clipW = clip[3];
+            /* Orthographic: every vertex has the same w. */
+            if (occurrence == 0)
+            {
+                firstW = clipW;
+            }
+            else if (fabsf(clipW - firstW) > 1e-4f * fabsf(firstW))
+            {
+                return 0;
+            }
+        }
         if (!(clipW > 1e-6f) || !(clipX == clipX) || !(clipY == clipY))
         {
             return 0;

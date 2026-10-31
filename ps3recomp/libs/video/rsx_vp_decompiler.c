@@ -31,6 +31,7 @@
 #include "rsx_vp_decompiler.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 
 /* ---- little-endian word read (RPCS3-capture native order) --------------- */
 static u32 rd_le(const u8* p)
@@ -677,4 +678,306 @@ static int rsx_vp_decompile_impl(
     (void)n_flow_skipped;
     if (o.overflow) return -1;
     return instrs;
+}
+
+/* ---- CPU evaluation of a program's position (rsx_vp_evaluate_position) --- */
+static float vp_eval_mul(float first, float second)
+{
+    return (first == 0.0f || second == 0.0f) ? 0.0f : first * second;
+}
+
+static void vp_eval_source(u32 src, int isAbs, u32 inputSrc, u32 constSrc, int indexConst, u32 addressSelect,
+                           u32 addressSwizzle, const float inputs[16][4], const u32 constants[][4],
+                           const float temps[32][4], const int addresses[2][4], float result[4])
+{
+    const u32 regType = src & 3u;
+    const u32 tempSrc = (src >> 2) & 0x3Fu;
+    const u32 swizzle[4] = { (src >> 14) & 3u, (src >> 12) & 3u, (src >> 10) & 3u, (src >> 8) & 3u };
+    const int negate = (src >> 16) & 1;
+    float base[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    if (regType == 2u)
+    {
+        memcpy(base, inputs[inputSrc & 15u], sizeof(base));
+    }
+    else if (regType == 3u)
+    {
+        u32 slot = constSrc & 511u;
+        if (indexConst)
+        {
+            slot = (u32)((int)constSrc + addresses[addressSelect & 1u][addressSwizzle & 3u]) & 511u;
+        }
+        memcpy(base, constants[slot], sizeof(base));
+    }
+    else
+    {
+        memcpy(base, temps[tempSrc & 31u], sizeof(base));
+    }
+    for (u32 component = 0; component < 4; component++)
+    {
+        float value = base[swizzle[component]];
+        if (isAbs)
+        {
+            value = value < 0.0f ? -value : value;
+        }
+        result[component] = negate ? -value : value;
+    }
+}
+
+static void vp_eval_store(float target[4], const float value[4], const int mask[4])
+{
+    for (u32 component = 0; component < 4; component++)
+    {
+        if (mask[component])
+        {
+            target[component] = value[component];
+        }
+    }
+}
+
+static float vp_eval_saturate(float value)
+{
+    return value < 0.0f ? 0.0f : (value > 1.0f ? 1.0f : value);
+}
+
+int rsx_vp_evaluate_position(const u8* ucode, u32 max_bytes, const float inputs[16][4],
+                             const u32 constants[][4], float position[4])
+{
+    if (!ucode || !inputs || !constants || !position)
+    {
+        return -1;
+    }
+    static const float defaultValue[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    float temps[32][4];
+    float outputPosition[4];
+    int addresses[2][4];
+    memset(temps, 0, sizeof(temps));
+    memset(addresses, 0, sizeof(addresses));
+    memcpy(outputPosition, defaultValue, sizeof(outputPosition));
+    u32 offset = 0;
+    int ended = 0;
+    u32 instructionCount = 0;
+    while (offset + 16 <= max_bytes && instructionCount < RSX_VP_MAX_INSTR)
+    {
+        const u32 d0 = rd_le(ucode + offset + 0);
+        const u32 d1 = rd_le(ucode + offset + 4);
+        const u32 d2 = rd_le(ucode + offset + 8);
+        const u32 d3 = rd_le(ucode + offset + 12);
+        offset += 16;
+        instructionCount++;
+
+        const u32 vecOp = (d1 >> 22) & 0x1Fu;
+        const u32 scaOp = (d1 >> 27) & 0x1Fu;
+        const u32 inputSrc = (d1 >> 8) & 0xFu;
+        const u32 constSrc = (d1 >> 12) & 0x3FFu;
+        const int indexConst = (d3 >> 1) & 1;
+        const u32 src0 = ((d2 >> 23) & 0x1FFu) | ((d1 & 0xFFu) << 9);
+        const u32 src1 = (d2 >> 6) & 0x1FFFFu;
+        const u32 src2 = ((d3 >> 21) & 0x7FFu) | ((d2 & 0x3Fu) << 11);
+        const u32 addressSelect = (d0 >> 24) & 1u;
+        const u32 addressSwizzle = d0 & 3u;
+        const int saturate = (d0 >> 26) & 1;
+        const int condTest = (d0 >> 13) & 1;
+        const u32 cond = (d0 >> 10) & 7u;
+        const u32 dstTemp = (d0 >> 15) & 0x3Fu;
+        const u32 dstOut = (d3 >> 2) & 0x1Fu;
+        const u32 scaDstTemp = (d3 >> 7) & 0x3Fu;
+        const int vecResult = (d0 >> 30) & 1;
+        const int vecMask[4] = { (int)((d3 >> 16) & 1u), (int)((d3 >> 15) & 1u), (int)((d3 >> 14) & 1u),
+                                 (int)((d3 >> 13) & 1u) };
+        const int scaMask[4] = { (int)((d3 >> 20) & 1u), (int)((d3 >> 19) & 1u), (int)((d3 >> 18) & 1u),
+                                 (int)((d3 >> 17) & 1u) };
+        const int vecWrites = vecMask[0] | vecMask[1] | vecMask[2] | vecMask[3];
+        const int scaWrites = scaMask[0] | scaMask[1] | scaMask[2] | scaMask[3];
+
+        if (vp_is_flow(scaOp) || (condTest && cond != 7u))
+        {
+            return -1;
+        }
+        float first[4];
+        float second[4];
+        float third[4];
+        if (vecWrites && vecOp != 0u)
+        {
+            vp_eval_source(src0, (d0 >> 21) & 1, inputSrc, constSrc, indexConst, addressSelect, addressSwizzle, inputs,
+                           constants, temps, addresses, first);
+            vp_eval_source(src1, (d0 >> 22) & 1, inputSrc, constSrc, indexConst, addressSelect, addressSwizzle, inputs,
+                           constants, temps, addresses, second);
+            vp_eval_source(src2, (d0 >> 23) & 1, inputSrc, constSrc, indexConst, addressSelect, addressSwizzle, inputs,
+                           constants, temps, addresses, third);
+            float value[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            int isAddressLoad = 0;
+            switch (vecOp)
+            {
+            case 0x01:
+                memcpy(value, first, sizeof(value));
+                break;
+            case 0x02:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    value[component] = vp_eval_mul(first[component], second[component]);
+                }
+                break;
+            case 0x03:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    value[component] = first[component] + third[component];
+                }
+                break;
+            case 0x04:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    value[component] = vp_eval_mul(first[component], second[component]) + third[component];
+                }
+                break;
+            case 0x05:
+            case 0x06:
+            case 0x07:
+            {
+                float sum = vp_eval_mul(first[0], second[0]) + vp_eval_mul(first[1], second[1]) +
+                            vp_eval_mul(first[2], second[2]);
+                if (vecOp == 0x06)
+                {
+                    sum += second[3];
+                }
+                else if (vecOp == 0x07)
+                {
+                    sum += vp_eval_mul(first[3], second[3]);
+                }
+                value[0] = value[1] = value[2] = value[3] = sum;
+                break;
+            }
+            case 0x09:
+            case 0x0A:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    const int takeFirst = vecOp == 0x09 ? first[component] < second[component]
+                                                        : first[component] > second[component];
+                    value[component] = takeFirst ? first[component] : second[component];
+                }
+                break;
+            case 0x0B:
+            case 0x0C:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    const int holds = vecOp == 0x0B ? first[component] < second[component]
+                                                    : first[component] >= second[component];
+                    value[component] = holds ? 1.0f : 0.0f;
+                }
+                break;
+            case 0x0D:
+                isAddressLoad = 1;
+                if (dstTemp != 0x3Fu)
+                {
+                    for (u32 component = 0; component < 4; component++)
+                    {
+                        if (vecMask[component])
+                        {
+                            addresses[dstTemp & 1u][component] = (int)floorf(first[component]);
+                        }
+                    }
+                }
+                break;
+            case 0x0E:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    value[component] = first[component] - floorf(first[component]);
+                }
+                break;
+            case 0x0F:
+                for (u32 component = 0; component < 4; component++)
+                {
+                    value[component] = floorf(first[component]);
+                }
+                break;
+            default:
+                return -1;
+            }
+            if (!isAddressLoad)
+            {
+                if (saturate)
+                {
+                    for (u32 component = 0; component < 4; component++)
+                    {
+                        value[component] = vp_eval_saturate(value[component]);
+                    }
+                }
+                if (vecResult && dstOut == 0u)
+                {
+                    vp_eval_store(outputPosition, value, vecMask);
+                }
+                if (dstTemp != 0x3Fu)
+                {
+                    vp_eval_store(temps[dstTemp & 31u], value, vecMask);
+                }
+            }
+        }
+        if (scaWrites && scaOp != 0u)
+        {
+            vp_eval_source(src2, (d0 >> 23) & 1, inputSrc, constSrc, indexConst, addressSelect, addressSwizzle, inputs,
+                           constants, temps, addresses, third);
+            float scalar = 0.0f;
+            switch (scaOp)
+            {
+            case 0x01:
+                break;
+            case 0x02:
+                scalar = 1.0f / third[0];
+                break;
+            case 0x04:
+                scalar = 1.0f / sqrtf(fabsf(third[0]) > 1e-10f ? fabsf(third[0]) : 1e-10f);
+                break;
+            case 0x05:
+            case 0x0E:
+                scalar = exp2f(third[0]);
+                break;
+            case 0x06:
+            case 0x0D:
+                scalar = log2f(fabsf(third[0]) > 1e-10f ? fabsf(third[0]) : 1e-10f);
+                break;
+            case 0x0F:
+                scalar = sinf(third[0]);
+                break;
+            case 0x10:
+                scalar = cosf(third[0]);
+                break;
+            default:
+                return -1;
+            }
+            float value[4];
+            if (scaOp == 0x01)
+            {
+                memcpy(value, third, sizeof(value));
+            }
+            else
+            {
+                value[0] = value[1] = value[2] = value[3] = scalar;
+            }
+            if (saturate)
+            {
+                for (u32 component = 0; component < 4; component++)
+                {
+                    value[component] = vp_eval_saturate(value[component]);
+                }
+            }
+            if (!vecResult && dstOut == 0u)
+            {
+                vp_eval_store(outputPosition, value, scaMask);
+            }
+            if (scaDstTemp != 0x3Fu)
+            {
+                vp_eval_store(temps[scaDstTemp & 31u], value, scaMask);
+            }
+        }
+        if (d3 & 1u)
+        {
+            ended = 1;
+            break;
+        }
+    }
+    if (!ended)
+    {
+        return -1;
+    }
+    memcpy(position, outputPosition, sizeof(outputPosition));
+    return 0;
 }

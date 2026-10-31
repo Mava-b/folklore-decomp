@@ -75,6 +75,16 @@ int rsx_vp_decompile_compact_ex(
 const char* rsx_vp_vec_name(u32 op);
 const char* rsx_vp_sca_name(u32 op);
 
+/* Run a branch-free vertex program on the CPU for one vertex and return its
+ * clip-space position (o[0]), computed exactly as the decompiled HLSL does
+ * (same operations, same order, the legacy 0 x anything = 0 multiply).
+ * `inputs` are the 16 attributes, `constants` the 512 transform constants as
+ * f32 bit patterns. 0 on success; -1 for a program it does not model (flow
+ * control, condition-code tests, texture reads, unknown opcodes) -- the
+ * renderer uses it only to find where a 2D overlay lands on screen. */
+int rsx_vp_evaluate_position(const u8* ucode, u32 max_bytes, const float inputs[16][4],
+                             const u32 constants[][4], float position[4]);
+
 #ifdef __cplusplus
 }
 #endif
