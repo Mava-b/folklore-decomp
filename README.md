@@ -19,9 +19,33 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-Extras over the PS3: 60 fps or unlimited frame rate (with physics stepped to
-match), up to 3x resolution, ultrawide, FXAA, anisotropic filtering,
-sharpening, borderless fullscreen, save backups.
+### What's better than on the PS3
+
+All of these are in the in-game engine menu (**L3 + R3** or **F1**); each can
+be turned back to the original.
+
+- **Frame rate**: 60 fps or unlimited (up to your display's refresh rate),
+  with physics stepped to match so cloth and hair stay stable.
+- **Resolution**: up to 3x the PS3's 1280×720, borderless fullscreen.
+- **Ultrawide**: 21:9, 32:9 or your display's shape, with a wider field of
+  view rather than a stretched picture; the map and gauges move out to the
+  screen's edges (with a *How far out* slider), and menus, speech bubbles
+  and fades stay where they belong.
+- **Anti-aliasing**: SMAA (sharp, clean edges) or FXAA.
+- **Sharper textures**: finer texture levels in the distance, plus up to 16x
+  anisotropic filtering and optional sharpening.
+- **Ambient occlusion**: soft shading where surfaces meet — corners, under
+  ledges, around characters' feet.
+- **Soft shadows**: the characters' shadows with soft edges instead of hard,
+  stair-stepped ones.
+- **Smooth depth of field**: a soft, round blur using the game's own focus,
+  without the original's doubled image.
+- **Smooth bloom**: a steady glow, without the original's flicker.
+- **Faster busy scenes**: objects drawn again and again (Doolin's streets)
+  reuse work instead of being redrawn from scratch.
+- **Quality of life**: skip the opening logos with Start, save backups and
+  restores, no RPCS3 needed to decrypt the game, downloadable content added
+  from the menu, motion controls on any controller with motion sensors.
 
 Builds can be made from the v1.00 disc or from the game's **1.10 update**
 (rumble, and the newer Folk data), and the **downloadable content** you bought
@@ -297,7 +321,6 @@ Good to know:
   snapshots, or `gamedata\` between folders.
 - Nothing in your disc dump or in RPCS3's folder is ever changed.
 
-### Downloadable content
 ### Downloadable content
 
 Folklore's add-on packs from your own purchase: install each pack's `.pkg`
