@@ -99,6 +99,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include "rsx_vp_decompiler.h"
 
 #include <ctype.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 

@@ -338,7 +338,15 @@ diff --git a/libs/video/rsx_vp_decompiler.h b/libs/video/rsx_vp_decompiler.h
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -7330,9 +7330,26 @@
+@@ -99,6 +99,7 @@
+ #include "rsx_vp_decompiler.h"
+ 
+ #include <ctype.h>
++#include <math.h>
+ #include <stdio.h>
+ #include <stdlib.h>
+ 
+@@ -7330,9 +7331,26 @@
      {
          return 0;
      }
@@ -367,7 +375,7 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
      }
      const int depthTested = (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) != 0;
      int scanout = 0;
-@@ -7354,31 +7371,71 @@
+@@ -7354,31 +7372,71 @@
      {
          return 0;
      }
