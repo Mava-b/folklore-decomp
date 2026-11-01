@@ -296,6 +296,10 @@ typedef struct {
     u64 content_hash;
     u32 last_hash_frame;
     u64 last_use_serial;
+    /* Change checks (texture_srv_slot): how many full checks in a row found
+     * it unchanged, and a hash of a few spread-out blocks of it. */
+    u32 stable_checks;
+    u64 sample_hash;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -2964,6 +2968,45 @@ static u64 texture_content_hash(const rsx_dsp_texture* t, int* readable)
     return hash;
 }
 
+/* A quick look at a texture: 64 blocks of 64 bytes spread evenly over its
+ * data, plus the first and last 64 bytes. Replacing a texture's contents
+ * changes it almost always; a small edit somewhere in it may not (the full
+ * check below still finds that, a few frames later). */
+static u64 texture_sample_hash(const rsx_dsp_texture* texture, int* readable)
+{
+    const u32 span = texture_source_span(texture);
+    const u8* source = span ? guest_ptr(texture->location, texture->offset, span) : NULL;
+    if (!source || span < 64u * 66u)
+    {
+        *readable = 0;
+        return 0;
+    }
+    const u64 prime = 1099511628211ull;
+    u64 laneA = 1469598103934665603ull;
+    u64 laneB = 0x9E3779B97F4A7C15ull;
+    const u32 blockCount = 64;
+    const u32 step = (span - 64u) / blockCount;
+    for (u32 blockIndex = 0; blockIndex <= blockCount + 1u; blockIndex++)
+    {
+        const u32 position = blockIndex <= blockCount ? blockIndex * step : span - 64u;
+        for (u32 wordIndex = 0; wordIndex < 8; wordIndex += 2)
+        {
+            u64 words[2];
+            memcpy(words, source + position + wordIndex * 8u, sizeof(words));
+            laneA = (laneA ^ words[0]) * prime;
+            laneB = (laneB ^ words[1]) * prime;
+        }
+    }
+    *readable = 1;
+    return laneA ^ (laneB * 31u) ^ span;
+}
+
+/* Time spent checking textures for changes, for the [fps] report. */
+static u64 g_ld_texture_check_ticks = 0;
+static u64 g_ld_texture_check_bytes = 0;
+static u64 g_ld_texture_quick_checks = 0;
+static u64 ld_perf_ticks(void);
+
 static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
 {
     const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
@@ -3360,8 +3403,60 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             continue;
         if (refresh_enabled && entry->tex &&
             entry->last_hash_frame != g_ld_frames) {
+            /* Every bound texture used to be read in full every frame to see
+             * whether the game had changed it: tens of megabytes a frame
+             * once large textures are on screen (capture-20261101-144056, a
+             * boss fight: 94 textures, many 2048x2048, about 3 ms a frame).
+             * A large texture that has stayed the same for a while now gets
+             * the quick look every frame and the full check once every 16
+             * frames (staggered so they do not all land on one frame); any
+             * change puts it back to a full check every frame.
+             * RSX_FULL_TEX_REFRESH=1 checks everything in full every frame. */
+            static int fullEveryFrame = -1;
+            if (fullEveryFrame < 0)
+            {
+                fullEveryFrame = getenv("RSX_FULL_TEX_REFRESH") ? 1 : 0;
+            }
+            const u64 checkBegin = ld_perf_ticks();
+            const u32 checkSpan = texture_source_span(t);
+            int quickOnly = 0;
+            if (!fullEveryFrame && checkSpan >= 512u * 1024u && entry->stable_checks >= 8u &&
+                ((g_ld_frames + i * 7u) & 15u) != 0u)
+            {
+                int sampleReadable = 0;
+                const u64 sampleHash = texture_sample_hash(t, &sampleReadable);
+                g_ld_texture_quick_checks++;
+                if (sampleReadable && sampleHash == entry->sample_hash)
+                {
+                    quickOnly = 1;
+                }
+            }
+            if (quickOnly)
+            {
+                entry->last_hash_frame = g_ld_frames;
+                g_ld_texture_check_ticks += ld_perf_ticks() - checkBegin;
+                entry->last_use_serial = ++g_ld_texture_use_serial;
+                return SRV_TEXTURE_BASE + i;
+            }
             int readable = 0;
             const u64 hash = texture_content_hash(t, &readable);
+            g_ld_texture_check_bytes += checkSpan;
+            if (readable && hash == entry->content_hash)
+            {
+                if (entry->stable_checks < 0xFFFFu)
+                {
+                    entry->stable_checks++;
+                }
+            }
+            else
+            {
+                entry->stable_checks = 0;
+            }
+            {
+                int sampleReadable = 0;
+                entry->sample_hash = texture_sample_hash(t, &sampleReadable);
+            }
+            g_ld_texture_check_ticks += ld_perf_ticks() - checkBegin;
             /* LD_TEX_RACE=1: hash the SAME source twice, back to back. The two
              * reads are microseconds apart, so they can only disagree if a
              * guest thread is writing this texture right now -- i.e. we are
@@ -6898,6 +6993,46 @@ static int ld_geom_key(const rsx_vertex_layout_plan* layout, u64* outKey, u64* o
     return 1;
 }
 
+/* The hash of a vertex span, worked out at most once a frame for a large
+ * one. A model drawn in several passes (shadow map, depth, colour, outline:
+ * the boss in capture-20261101-144056 is drawn four times a frame from the
+ * same 800 KB of vertices) had each pass read and hash the whole span again
+ * to check its cached copy. Small spans (dynamic buffers the game may refill
+ * between draws) are always hashed. */
+typedef struct
+{
+    u32 location;
+    u32 offset;
+    u32 bytes;
+    u32 frameStamp;   /* g_ld_frames + 1 when it was worked out; 0 unused */
+    u64 hash;
+} ld_span_memo;
+
+static ld_span_memo g_ld_span_memo[512];
+
+static u64 ld_geom_span_hash(u32 location, u32 offset, u32 bytes, const u8* data)
+{
+    if (bytes < 16u * 1024u)
+    {
+        return rsx_geom_hash(data, bytes, LD_GEOM_SPAN_SEED);
+    }
+    const u64 slotKey = rsx_geom_hash_u64(((u64)location << 32) | offset, bytes);
+    ld_span_memo* memo = &g_ld_span_memo[slotKey & 511u];
+    const u32 frameStamp = g_ld_frames + 1u;
+    if (memo->frameStamp == frameStamp && memo->location == location && memo->offset == offset &&
+        memo->bytes == bytes)
+    {
+        return memo->hash;
+    }
+    const u64 hash = rsx_geom_hash(data, bytes, LD_GEOM_SPAN_SEED);
+    memo->location = location;
+    memo->offset = offset;
+    memo->bytes = bytes;
+    memo->frameStamp = frameStamp;
+    memo->hash = hash;
+    return hash;
+}
+
 /* Restore a cached draw into dc. 1 on a hit. */
 static int ld_geom_restore(const rsx_vertex_layout_plan* layout, u64 key, u64 check)
 {
@@ -6915,7 +7050,7 @@ static int ld_geom_restore(const rsx_vertex_layout_plan* layout, u64 key, u64 ch
     {
         const rsx_geom_span* source = &entry->spans[span];
         const u8* bytes = g.guest_ptr(g.guest_user, source->location, source->offset, source->bytes);
-        if (!bytes || rsx_geom_hash(bytes, source->bytes, LD_GEOM_SPAN_SEED) != source->hash)
+        if (!bytes || ld_geom_span_hash(source->location, source->offset, source->bytes, bytes) != source->hash)
         {
             g_ld_geom_stale++;
             rsx_geom_cache_drop(entry);
@@ -7048,7 +7183,7 @@ static void ld_geom_store(const rsx_vertex_layout_plan* layout, u64 key, u64 che
             g_ld_geom_uncacheable++;
             return;
         }
-        spans[index].hash = rsx_geom_hash(bytes, spans[index].bytes, LD_GEOM_SPAN_SEED);
+        spans[index].hash = ld_geom_span_hash(spans[index].location, spans[index].offset, spans[index].bytes, bytes);
     }
     rsx_geom_cache_store(key, check, g_ld_frames, spans, n_spans,
                          dc.refs, dc.n_refs, dc.n_source_refs, dc.refs_remapped,
@@ -9439,6 +9574,8 @@ typedef struct
     u64 constantTicks;     /* the constant buffer block */
     u64 constantBytes;
     u64 descriptorTicks;   /* SRV and sampler tables */
+    u64 setupTicks;        /* constant rings, targets and surfaces, before binding */
+    u64 submitTicks;       /* state, the draw call and its bookkeeping */
 } ld_draw_perf;
 
 static ld_draw_perf g_ld_draw_perf;
@@ -9804,7 +9941,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     ID3D12PipelineState* pso = get_pso(
         ld_vertex_mask_signature() ? &used_layout : NULL,
         ld_vertex_compact_payload());
-    g_ld_draw_perf.shaderTicks += ld_perf_ticks() - shaderBegin;
+    const u64 setupBegin = ld_perf_ticks();
+    g_ld_draw_perf.shaderTicks += setupBegin - shaderBegin;
     if (!pso) {
 #if defined(YZ_PERF_PROFILE)
         ld_profile_note_rejected_pso();
@@ -9977,6 +10115,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         ? zdepth_get(sf.zeta_location, sf.zeta_offset, sf.clip_w, sf.clip_h)
         : 0;
     const u64 bindBegin = ld_perf_ticks();
+    g_ld_draw_perf.setupTicks += bindBegin - setupBegin;
     u32 slots[SRV_TABLE_SIZE], smp_slots[SMP_TABLE_SIZE];
     u32 surf_used[SRV_TABLE_SIZE], n_surf_used = 0;
     u32 zdepth_used[SRV_TABLE_SIZE], n_zdepth_used = 0;
@@ -10403,7 +10542,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         g_ld_draw_perf.constantBytes += (u64)constantCount * 16u;
     }
     memcpy(cbdst + 512 * 16, xf, sizeof(xf));
-    g_ld_draw_perf.constantTicks += ld_perf_ticks() - constantsBegin;
+    const u64 submitBegin = ld_perf_ticks();
+    g_ld_draw_perf.constantTicks += submitBegin - constantsBegin;
 
     g.list->lpVtbl->SetPipelineState(g.list, pso);
     g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.rootsig_x);
@@ -10721,6 +10861,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     g.vb_used += (u32)draw_vb_bytes;
     g.ib_used += (u32)draw_ib_bytes;
     ld_profile_note_ring_highwater();
+    g_ld_draw_perf.submitTicks += ld_perf_ticks() - submitBegin;
 }
 
 static void sink_end(void* user, const rsx_dispatch* r)
@@ -14692,6 +14833,19 @@ void rsx_live_draw_present(u32 buffer_id)
                       ld_perf_ticks_to_ms(nowPerf.constantTicks - lastPerf.constantTicks) / frameCount,
                       (double)(nowPerf.constantBytes - lastPerf.constantBytes) / (1024.0 * 1024.0) / frameCount,
                       ld_perf_ticks_to_ms(nowPerf.descriptorTicks - lastPerf.descriptorTicks) / frameCount);
+              { static u64 lastCheckTicks = 0;
+                static u64 lastCheckBytes = 0;
+                static u64 lastQuickChecks = 0;
+                fprintf(stderr, "[fps]   setup before binding %.1f ms, state+draw %.1f ms; texture change checks %.1f ms "
+                                "(%.1f MB read in full, %.0f quick looks)\n",
+                        ld_perf_ticks_to_ms(nowPerf.setupTicks - lastPerf.setupTicks) / frameCount,
+                        ld_perf_ticks_to_ms(nowPerf.submitTicks - lastPerf.submitTicks) / frameCount,
+                        ld_perf_ticks_to_ms(g_ld_texture_check_ticks - lastCheckTicks) / frameCount,
+                        (double)(g_ld_texture_check_bytes - lastCheckBytes) / (1024.0 * 1024.0) / frameCount,
+                        (double)(g_ld_texture_quick_checks - lastQuickChecks) / frameCount);
+                lastCheckTicks = g_ld_texture_check_ticks;
+                lastCheckBytes = g_ld_texture_check_bytes;
+                lastQuickChecks = g_ld_texture_quick_checks; }
               lastPerf = nowPerf;
               lastIdentityHits = g_ld_vp_identity_hits;
               lastIdentityMisses = g_ld_vp_identity_misses; } }

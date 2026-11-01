@@ -1294,6 +1294,17 @@ What 0006 fixes in ps3recomp to make that run:
     frequency, and filters the cosine to the pixel (fades to its average
     where it would alias); Clear uses the average only. Colour, glow,
     alpha, alpha test and the second target are the game's.
+93. Boss fight at ~45 fps (patches/0070, capture-20261101-144056). About
+    520 draws a frame, but 12 ms of renderer time (23 us a draw against
+    7 us in town): the boss and arena bind 94 textures (many 2048x2048,
+    ~80 MB) and every bound texture was read in full every frame to look
+    for changes; the boss model is drawn four times (shadow, depth,
+    colour, outline) and each pass re-hashed the same ~800 KB of vertices
+    to validate its cached copy. Now: a large texture unchanged for 8
+    checks gets a 66-block quick look each frame and a full check every
+    16 frames (any change -> every frame again; RSX_FULL_TEX_REFRESH=1 for
+    the old behaviour), and large vertex spans are hashed once a frame.
+    The [fps] report gains setup / state+draw / texture-check timings.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
