@@ -55,6 +55,14 @@ typedef struct rsx_geom_entry {
     u32* cuts;                /* n_cuts */
     u8* vertices;             /* n_refs * stride */
     size_t bytes;             /* everything above that was allocated */
+    /* Where the renderer keeps a GPU copy of this draw (0 generation: none). */
+    u32 resident_generation;
+    u32 resident_vb_offset;
+    u32 resident_ib_offset;
+    u32 resident_vb_bytes;
+    u32 resident_ib_bytes;
+    u32 resident_primitive;
+    int resident_indexed;
 } rsx_geom_entry;
 
 /* The entry for (key, check), or NULL. Marks it used in `frame`. */

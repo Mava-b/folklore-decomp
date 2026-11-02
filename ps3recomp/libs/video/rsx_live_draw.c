@@ -445,6 +445,10 @@ typedef struct {
     ID3D12Resource*            ib;
     u32*                       ib_mapped;
     u32                        ib_used;
+    /* Resident geometry (LD_RESIDENT_BYTES): cached draws' vertices and
+     * indices, written once and drawn from frame after frame. */
+    ID3D12Resource*            geo;
+    u8*                        geo_mapped;
 
     u32                        width, height;   /* guest canvas */
     /* Render scale: every colour/depth surface is created scale x its guest
@@ -7033,6 +7037,9 @@ static u64 ld_geom_span_hash(u32 location, u32 offset, u32 bytes, const u8* data
     return hash;
 }
 
+/* The cache entry the current draw was restored from (NULL on a miss). */
+static rsx_geom_entry* g_ld_geom_hit_entry = NULL;
+
 /* Restore a cached draw into dc. 1 on a hit. */
 static int ld_geom_restore(const rsx_vertex_layout_plan* layout, u64 key, u64 check)
 {
@@ -7113,6 +7120,7 @@ static int ld_geom_restore(const rsx_vertex_layout_plan* layout, u64 key, u64 ch
     rsx_vertex_fetch_plan_init(&dc.fetch_plan, &g.rsx, layout,
                                (rsx_vertex_guest_ptr_fn)g.guest_ptr, g.guest_user);
     dc.n_verts = dc.n_refs;
+    g_ld_geom_hit_entry = entry;
     return 1;
 }
 
@@ -9795,6 +9803,36 @@ static int ld_repeat_draw(u32 primitive)
     return 1;
 }
 
+/* ---------------------------------------------------------------------------
+ * Resident geometry. Every draw used to copy its vertices (and write its
+ * indices) into the per-frame upload ring, even when they came straight from
+ * the geometry cache unchanged: about 30 MB a frame in the boss fight
+ * (capture-20261102-161629), 2 ms of copying. A cached draw's vertices and
+ * indices now go once into a buffer that is kept from frame to frame, and
+ * later draws of the same cache entry use them where they are. When the
+ * buffer is full the GPU is waited for and it starts again from the
+ * beginning (every entry re-uploads on its next use). LD_RESIDENT_GEOMETRY=0
+ * turns it off.
+ * -------------------------------------------------------------------------*/
+#define LD_RESIDENT_BYTES (256u * 1024u * 1024u)
+
+static u32 g_ld_resident_generation = 1u;
+static u64 g_ld_resident_used = 0;
+static u64 g_ld_resident_reuses = 0;
+static u64 g_ld_resident_reused_bytes = 0;
+static u64 g_ld_resident_restarts = 0;
+
+static int ld_resident_enabled(void)
+{
+    static int enabled = -1;
+    if (enabled < 0)
+    {
+        const char* text = getenv("LD_RESIDENT_GEOMETRY");
+        enabled = (text && *text == '0') ? 0 : 1;
+    }
+    return enabled && g.geo && g.geo_mapped;
+}
+
 static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -9845,6 +9883,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         return;
     }
     g_ld_repeat.valid = 0;
+    g_ld_geom_hit_entry = NULL;
     rsx_vertex_layout_plan used_layout;
     ld_current_vertex_layout(&used_layout);
 #if defined(YZ_PERF_PROFILE)
@@ -9901,13 +9940,71 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     const u64 draw_vb_bytes = (u64)uploaded_vertices * vertex_stride;
     const u64 draw_ib_bytes = indexed ? (u64)n_tri * sizeof(u32) : 0;
     const u64 vb_capacity = VERT_BANK_SIZE;
-    if (draw_vb_bytes > vb_capacity || draw_ib_bytes > INDEX_BANK_SIZE) {
+    /* Resident geometry: where this draw's vertices and indices are read
+     * from, and how much of the per-frame rings it takes (none when they are
+     * resident). */
+    rsx_geom_entry* residentEntry = g_ld_geom_hit_entry;
+    g_ld_geom_hit_entry = NULL;
+    const u64 residentVertexBytes = (draw_vb_bytes + 255u) & ~(u64)255u;
+    const u64 residentIndexBytes = (draw_ib_bytes + 255u) & ~(u64)255u;
+    int resident = 0;
+    if (residentEntry && draw_vb_bytes && ld_resident_enabled() &&
+        residentVertexBytes + residentIndexBytes <= LD_RESIDENT_BYTES / 8u)
+    {
+        if (residentEntry->resident_generation == g_ld_resident_generation &&
+            residentEntry->resident_vb_bytes == (u32)draw_vb_bytes &&
+            residentEntry->resident_ib_bytes == (u32)draw_ib_bytes &&
+            residentEntry->resident_primitive == prim && residentEntry->resident_indexed == indexed)
+        {
+            resident = 1;
+            g_ld_resident_reuses++;
+            g_ld_resident_reused_bytes += draw_vb_bytes + draw_ib_bytes;
+        }
+        else
+        {
+            if (g_ld_resident_used + residentVertexBytes + residentIndexBytes > LD_RESIDENT_BYTES)
+            {
+                /* Full: wait for the GPU to finish with all of it, then start
+                 * again (every entry's generation is now out of date). */
+                ld_flush(LD_FLUSH_VERTEX_RING);
+                ld_rings_reset();
+                g_ld_resident_generation++;
+                g_ld_resident_used = 0;
+                g_ld_resident_restarts++;
+            }
+            const u64 residentUploadBegin = ld_perf_ticks();
+            const u64 vertexOffset = g_ld_resident_used;
+            const u64 indexOffset = vertexOffset + residentVertexBytes;
+            memcpy(g.geo_mapped + vertexOffset, vertex_data, (size_t)draw_vb_bytes);
+            if (indexed)
+            {
+                write_topology_indices(prim, (u32*)(g.geo_mapped + indexOffset));
+            }
+            g_ld_resident_used = indexOffset + residentIndexBytes;
+            residentEntry->resident_generation = g_ld_resident_generation;
+            residentEntry->resident_vb_offset = (u32)vertexOffset;
+            residentEntry->resident_ib_offset = (u32)indexOffset;
+            residentEntry->resident_vb_bytes = (u32)draw_vb_bytes;
+            residentEntry->resident_ib_bytes = (u32)draw_ib_bytes;
+            residentEntry->resident_primitive = prim;
+            residentEntry->resident_indexed = indexed;
+            g_ld_draw_perf.uploadTicks += ld_perf_ticks() - residentUploadBegin;
+            g_ld_draw_perf.uploadBytes += draw_vb_bytes + draw_ib_bytes;
+            resident = 1;
+        }
+    }
+    const u64 ringVertexBytes = resident ? 0u : draw_vb_bytes;
+    const u64 ringIndexBytes = resident ? 0u : draw_ib_bytes;
+    const u64 geometryBase = resident ? g.geo->lpVtbl->GetGPUVirtualAddress(g.geo) : 0u;
+    const u64 vertexAddress = resident ? geometryBase + residentEntry->resident_vb_offset
+                                       : g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+    if (!resident && (draw_vb_bytes > vb_capacity || draw_ib_bytes > INDEX_BANK_SIZE)) {
         live_draw_csv_emit(prim, n_tri, "drop_vbring_oversize");
         g_ld_stats.group_drop_ring++;
         return;
     }
-    if ((u64)g.vb_used + draw_vb_bytes > ld_vb_end() ||
-        (u64)g.ib_used + draw_ib_bytes > ld_ib_end()) {
+    if ((u64)g.vb_used + ringVertexBytes > ld_vb_end() ||
+        (u64)g.ib_used + ringIndexBytes > ld_ib_end()) {
         /*
          * The replay-proven renderer recycles this upload ring mid-frame.
          * Live used to drop every remaining draw instead, which discarded
@@ -9919,15 +10016,19 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         ld_rings_reset();
     }
     const u64 uploadBegin = ld_perf_ticks();
-    if (draw_vb_bytes)
+    if (ringVertexBytes)
         memcpy(
             g.vb_mapped + g.vb_used, vertex_data,
-            (size_t)draw_vb_bytes);
-    if (indexed)
+            (size_t)ringVertexBytes);
+    if (indexed && !resident)
         write_topology_indices(
             prim, (u32*)((u8*)g.ib_mapped + g.ib_used));
     g_ld_draw_perf.uploadTicks += ld_perf_ticks() - uploadBegin;
-    g_ld_draw_perf.uploadBytes += draw_vb_bytes + draw_ib_bytes;
+    g_ld_draw_perf.uploadBytes += ringVertexBytes + ringIndexBytes;
+    /* Where the indices are read from (after a flush above, g.ib_used has
+     * moved, so this is taken here). */
+    const u64 indexAddress = resident ? geometryBase + residentEntry->resident_ib_offset
+                                      : g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
 
     ld_probe_init();
     g_ld_probe_variant = 0;
@@ -10647,7 +10748,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     ld_set_blend_factor();
 
     D3D12_VERTEX_BUFFER_VIEW vbv;
-    vbv.BufferLocation = g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
+    vbv.BufferLocation = resident ? vertexAddress : g.vb->lpVtbl->GetGPUVirtualAddress(g.vb) + g.vb_used;
     vbv.StrideInBytes = vertex_stride;
     vbv.SizeInBytes = (u32)draw_vb_bytes;
     if (vertex_stride)
@@ -10692,8 +10793,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         softShadowDrawn = 1;
     } else if (indexed) {
         D3D12_INDEX_BUFFER_VIEW ibv;
-        ibv.BufferLocation =
-            g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
+        ibv.BufferLocation = indexAddress;
         ibv.SizeInBytes = (u32)draw_ib_bytes;
         ibv.Format = DXGI_FORMAT_R32_UINT;
         g.list->lpVtbl->IASetIndexBuffer(g.list, &ibv);
@@ -10776,7 +10876,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
                 repeat->indexed = indexed;
                 if (indexed)
                 {
-                    repeat->indexBuffer.BufferLocation = g.ib->lpVtbl->GetGPUVirtualAddress(g.ib) + g.ib_used;
+                    repeat->indexBuffer.BufferLocation = indexAddress;
                     repeat->indexBuffer.SizeInBytes = (u32)draw_ib_bytes;
                     repeat->indexBuffer.Format = DXGI_FORMAT_R32_UINT;
                 }
@@ -10858,8 +10958,8 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
             fflush(stderr);
         }
     }
-    g.vb_used += (u32)draw_vb_bytes;
-    g.ib_used += (u32)draw_ib_bytes;
+    g.vb_used += (u32)ringVertexBytes;
+    g.ib_used += (u32)ringIndexBytes;
     ld_profile_note_ring_highwater();
     g_ld_draw_perf.submitTicks += ld_perf_ticks() - submitBegin;
 }
@@ -12780,6 +12880,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
         D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.ib);
     g.ib->lpVtbl->Map(g.ib, 0, &rr, (void**)&g.ib_mapped);
+
+    /* Resident geometry: not fatal if it cannot be made (draws use the
+     * per-frame rings as before). */
+    bd.Width = LD_RESIDENT_BYTES;
+    if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
+            D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.geo)))
+    {
+        g.geo = NULL;
+    }
+    else if (FAILED(g.geo->lpVtbl->Map(g.geo, 0, &rr, (void**)&g.geo_mapped)))
+    {
+        g.geo_mapped = NULL;
+    }
 
     bd.Width = CB_RING_BYTES;
     g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
@@ -14843,6 +14956,18 @@ void rsx_live_draw_present(u32 buffer_id)
                         ld_perf_ticks_to_ms(g_ld_texture_check_ticks - lastCheckTicks) / frameCount,
                         (double)(g_ld_texture_check_bytes - lastCheckBytes) / (1024.0 * 1024.0) / frameCount,
                         (double)(g_ld_texture_quick_checks - lastQuickChecks) / frameCount);
+                { static u64 lastReuses = 0;
+                  static u64 lastReusedBytes = 0;
+                  static u64 lastRestarts = 0;
+                  fprintf(stderr, "[fps]   resident geometry: %.0f draws a frame drawn in place (%.1f MB not copied), "
+                                  "%.1f MB of 256 used, %llu restarts\n",
+                          (double)(g_ld_resident_reuses - lastReuses) / frameCount,
+                          (double)(g_ld_resident_reused_bytes - lastReusedBytes) / (1024.0 * 1024.0) / frameCount,
+                          (double)g_ld_resident_used / (1024.0 * 1024.0),
+                          (unsigned long long)(g_ld_resident_restarts - lastRestarts));
+                  lastReuses = g_ld_resident_reuses;
+                  lastReusedBytes = g_ld_resident_reused_bytes;
+                  lastRestarts = g_ld_resident_restarts; }
                 lastCheckTicks = g_ld_texture_check_ticks;
                 lastCheckBytes = g_ld_texture_check_bytes;
                 lastQuickChecks = g_ld_texture_quick_checks; }

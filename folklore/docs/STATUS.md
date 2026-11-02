@@ -1305,6 +1305,14 @@ What 0006 fixes in ps3recomp to make that run:
     16 frames (any change -> every frame again; RSX_FULL_TEX_REFRESH=1 for
     the old behaviour), and large vertex spans are hashed once a frame.
     The [fps] report gains setup / state+draw / texture-check timings.
+94. Resident geometry (patches/0071, capture-20261102-161629). After 0070
+    the boss fight ran 55-60 fps with ~13.7 ms drain; the largest
+    remaining item was copying every draw's vertices into the per-frame
+    upload ring (~30 MB, ~2.2 ms) even for unchanged geometry-cache hits.
+    A cache hit now uploads its vertices and indices once into a 256 MB
+    buffer kept across frames and later draws use them in place; when the
+    buffer fills, the GPU is waited for and it starts again. Off with
+    LD_RESIDENT_GEOMETRY=0. The [fps] report gains a resident line.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
