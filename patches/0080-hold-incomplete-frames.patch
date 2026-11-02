@@ -1,0 +1,44 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -14094,6 +14094,40 @@
+ 
+     /* Submit without waiting for the GPU (frame pipelining). */
+     ld_submit_frame();
++    /* A frame some of whose draws were left out because their shaders were
++     * still being built in the background is not shown: the screen keeps
++     * the last whole frame instead. Loading a save compiles dozens of new
++     * shaders in its first frames, and showing those frames put pieces of
++     * the scene, the HUD without its picture and stale images on screen
++     * for a moment (capture-20261102-183530: 11-32 draws a frame left out
++     * as the save faded in). At most 20 frames in a row are held back, so
++     * a long compile cannot freeze the picture. LD_HOLD_INCOMPLETE=0 shows
++     * every frame as before. */
++    int holdFrame = 0;
++    {
++        static int holdEnabled = -1;
++        static LONG skippedAtLastPresent = 0;
++        static u32 framesHeld = 0;
++        static u32 framesShown = 0;
++        if (holdEnabled < 0)
++        {
++            const char* text = getenv("LD_HOLD_INCOMPLETE");
++            holdEnabled = (text && *text == '0') ? 0 : 1;
++        }
++        const LONG skippedNow = InterlockedCompareExchange(&g_ld_pso_draws_skipped, 0, 0);
++        if (holdEnabled && skippedNow != skippedAtLastPresent && framesShown > 0 && framesHeld < 20u)
++        {
++            holdFrame = 1;
++            framesHeld++;
++        }
++        else
++        {
++            framesHeld = 0;
++            framesShown++;
++        }
++        skippedAtLastPresent = skippedNow;
++    }
++    if (!holdFrame)
+     {
+         const u64 swapBegin = gcm_perf_now_ns();
+         const HRESULT present_hr = g.swap->lpVtbl->Present(g.swap, 1, 0);

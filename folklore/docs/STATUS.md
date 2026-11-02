@@ -1428,6 +1428,14 @@ What 0006 fixes in ps3recomp to make that run:
     lap counts are re-derived whenever the drain is caught up with put
     (put's lap, or the one before when put is on a wrap's JUMP; the lap
     read on both sides of put), so a skipped jump cannot hold them apart.
+100. Corruption as a save loads (patches/0080, capture-20261102-183530):
+    the frames as the save fades in had 11-32 draws each left out
+    (drop_pso: background shader builds still running), including the
+    scene composite on some -- so the screen showed the HUD without its
+    picture, a stale image of another place and stray pieces for a few
+    frames. A frame with any draw left out for a pending shader is now
+    not presented (the last whole frame stays up), at most 20 in a row.
+    LD_HOLD_INCOMPLETE=0 shows every frame as before.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
