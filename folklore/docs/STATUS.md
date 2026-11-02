@@ -1385,6 +1385,19 @@ What 0006 fixes in ps3recomp to make that run:
     each flip was queued (marker + put published, marker left for the
     guest to publish, no marker) and whether the markers of the flips not
     yet drained are still in the ring or have been written over.
+99. The lost flip markers (patches/0076, run-20261102-180554 frame 2958,
+    579 ms: 14 flips issued, all queued with a marker and put published,
+    one marker reached). The guest's write limit on the runtime ring
+    (gcm_ring_soft_end) comes from g_gcm_fifo_drained_ea, which the drain
+    only refreshed every 2048 words and at the end of a pass. A Folklore
+    frame is close to the ring's size, so every flip wraps the ring: when
+    the drain jumped back to the start for the next frame, the published
+    position still said "near the end", and a guest that wrapped in that
+    moment was allowed to write its next frame over the one the drain had
+    just begun -- marker included. The drain then ran on through frame
+    after frame with nothing to stop at. The position is now published at
+    every JUMP, CALL and RET (inside a CALL, the return point in the ring,
+    since everything after it there is still unread).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

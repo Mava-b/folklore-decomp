@@ -1,0 +1,82 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1859,6 +1859,27 @@
+     s_drain_passes++;
+ }
+ 
++/* Where the drain has read up to, for the guest's write limit
++ * (gcm_ring_soft_end). Inside a CALL the position that matters is the
++ * return point in the ring: everything after it there is still unread, so
++ * the guest must not be let past it while the drain is away in the called
++ * buffer (a position outside the ring would let it write to the real end). */
++static void gcm_note_drained_position(u32 ea)
++{
++    if (s_fifo_calloff)
++    {
++        const u32 returnEa = gcm_io2ea(s_fifo_calloff);
++        if (returnEa)
++        {
++            ea = returnEa;
++        }
++    }
++    if (ea)
++    {
++        g_gcm_fifo_drained_ea = ea;
++    }
++}
++
+ static void gcm_rsx_process_fifo_unlocked(void)
+ {
+     { static unsigned _n = 0; static unsigned long long _t0 = 0;
+@@ -1983,7 +2004,7 @@
+          * pass covers a whole frame. Everything before `ea` has been read. */
+         if ((budget & 0x7FF) == 0 && ea)
+         {
+-            g_gcm_fifo_drained_ea = ea;
++            gcm_note_drained_position(ea);
+         }
+         if (!ea) {
+             /* get is sitting on an IO offset with no mapping -- the title
+@@ -2125,19 +2146,30 @@
+                   why = "parked";
+                   break;
+               }
+-              s_fifo_getoff = tgt; }
++              s_fifo_getoff = tgt;
++              /* The guest is told how far it may write from this: say where
++               * the drain is NOW. After the jump back to the ring's start the
++               * last published position was still near the end, so a guest
++               * that wrapped in that moment was allowed to write over the
++               * frame the drain had only just begun to read -- its flip
++               * marker went with it, and the drain ran on through frame
++               * after frame without a present (the combat stutters,
++               * run-20261102-180554: 14 flips, one marker reached). */
++              gcm_note_drained_position(gcm_io2ea(tgt)); }
+             continue;
+         }
+         if ((w & 3) == 2) {                    /* CALL: offset | 2 */
+             { u32 tgt = w & 0x1FFFFFFCu;
+               if (!gcm_io2ea(tgt)) { gcm_fifo_bad_branch("CALL", tgt, w); gcm_fifo_resync_why("unmapped-CALL", &s_fifo_getoff, put); break; }
+               s_fifo_calloff = s_fifo_getoff + 4;
+-              s_fifo_getoff  = tgt; }
++              s_fifo_getoff  = tgt;
++              gcm_note_drained_position(gcm_io2ea(tgt)); }
+             continue;
+         }
+         if (w == 0x00020000u) {                /* RET */
+             s_fifo_getoff = s_fifo_calloff;
+             s_fifo_calloff = 0;
++            gcm_note_drained_position(gcm_io2ea(s_fifo_getoff));
+             continue;
+         }
+         if (type == 0 || type == 2) {          /* method (incrementing / NI) */
+@@ -2575,7 +2607,7 @@
+         }
+     }
+ 
+-    g_gcm_fifo_drained_ea = gcm_io2ea(s_fifo_getoff);
++    gcm_note_drained_position(gcm_io2ea(s_fifo_getoff));
+     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
+      * the walker actually is. A probe, not a fix -- it removes the back-pressure
+      * a title uses to avoid overwriting commands the GPU has not read. It exists
