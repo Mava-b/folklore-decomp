@@ -2626,6 +2626,28 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     gcm_note_drained_position(gcm_io2ea(s_fifo_getoff));
+    /* Keep the lap counts honest (a jump the drain skipped would leave them
+     * apart for good, and a guest that looks two laps ahead is held 150 ms
+     * at a time -- run-20261102-182600). Caught up with put, the drain is in
+     * put's lap: the guest's lap, or the one before when put is on a wrap's
+     * JUMP (the guest counts its new lap only after publishing it). The lap
+     * is read on both sides of put; if it moved, try again next pass. */
+    if (s_ring_begin)
+    {
+        const u32 lapBefore = s_ring_guest_lap;
+        atomic_thread_fence(memory_order_acquire);
+        const u32 putNow = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+        atomic_thread_fence(memory_order_acquire);
+        const u32 lapAfter = s_ring_guest_lap;
+        if (lapBefore == lapAfter && s_fifo_getoff == putNow)
+        {
+            const u32 putEa = gcm_io2ea(putNow);
+            const u32 word = putEa ? vm_read32(putEa) : 0u;
+            const int onWrapJump = (word >> 29) == 1u && gcm_io2ea(word & 0x1FFFFFFCu) == s_ring_begin &&
+                                   putEa != s_ring_begin;
+            s_ring_drain_lap = onWrapJump ? lapAfter - 1u : lapAfter;
+        }
+    }
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
      * a title uses to avoid overwriting commands the GPU has not read. It exists
@@ -3071,6 +3093,19 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
         if (!waitBegin)
         {
             waitBegin = gcm_perf_now_ns();
+            /* Publish what the guest has written before waiting for room, as
+             * the SDK's buffer-full callback flushes: since a wrapping frame
+             * leaves put on its JUMP, the drain stops there and only goes on
+             * once something is published in the new lap -- without this the
+             * guest waited for the drain and the drain for the guest, 150 ms
+             * at a time (run-20261102-182600, 2-3 fps once a fight began).
+             * Not at the ring's start: put there would read "nothing to do"
+             * to a drain that is itself at the start of the previous lap. */
+            if (current != s_ring_begin)
+            {
+                atomic_thread_fence(memory_order_release);
+                vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(current));
+            }
             SetEvent((HANDLE)cellGcm_fifo_kick_event());
         }
         Sleep(1);

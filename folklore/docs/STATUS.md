@@ -1418,6 +1418,16 @@ What 0006 fixes in ps3recomp to make that run:
     a wrapping frame publishes put on its JUMP instead; the drain stops
     there after the flip marker and takes the JUMP when the guest next
     publishes. The ring's full/empty ambiguity, in other words.
+    Regression (run-20261102-182600): once a fight began, 2-3 fps for
+    good -- "ring back-pressure ... after 150 ms; letting the guest go"
+    over and over. With put on the JUMP the drain waits for the guest to
+    publish in the new lap, while a guest out of room waited for the
+    drain: each broke only at the 150 ms stall limit. patches/0079: the
+    guest publishes its write position (not at the ring's start) before
+    it waits for room, as the SDK's buffer-full callback flushes; and the
+    lap counts are re-derived whenever the drain is caught up with put
+    (put's lap, or the one before when put is on a wrap's JUMP; the lap
+    read on both sides of put), so a skipped jump cannot hold them apart.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
