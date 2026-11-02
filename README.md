@@ -44,7 +44,9 @@ be turned back to the original.
 - **Cleaner Id souls**: the enemies' souls as a soft shimmer (or a clear
   translucent shape) instead of pixel static.
 - **Faster busy scenes**: objects drawn again and again (Doolin's streets)
-  reuse work instead of being redrawn from scratch.
+  reuse work instead of being redrawn from scratch, unchanged models stay on
+  the graphics card instead of being copied every frame, and large textures
+  are no longer re-read every frame — boss fights hold 60 fps.
 - **Quality of life**: skip the opening logos with Start, save backups and
   restores, no RPCS3 needed to decrypt the game, downloadable content added
   from the menu, motion controls on any controller with motion sensors.
@@ -310,6 +312,13 @@ licence. RPCS3 is used only to install them.
 
 Good to know:
 
+- Copied RPCS3's game folder into `hdd0\game` by hand instead? RPCS3 keeps
+  the paid packs encrypted with your licences, so the port decrypts them at
+  start when it finds the `.rap` files — copy RPCS3's
+  `dev_hdd0\home\00000001\exdata` to `hdd0\home\00000001\exdata` too, or
+  just press *Add DLC from RPCS3...*. F1 lists, in red, any pack still
+  missing its licence (without it, its costumes and Folks are broken and the
+  game can crash).
 - Each project copy (and each package folder) has its own `hdd0\`, so add the
   DLC once in each one you play. `run.bat -ResetInstall` empties `hdd0\`, DLC
   included; press *Add DLC* again afterwards.
