@@ -1832,6 +1832,17 @@ void cellGcm_ref_on_poll(void)
  * that is busy (a pass still running -- a shader being compiled, a long
  * frame) from one that keeps running and cannot get past something. */
 static volatile u32 s_drain_passes = 0;
+/* For the renderer's [hitch] line: flip words the drain has reached, and the
+ * drain passes so far (a frame that drew several game frames says whether
+ * the drain went past flips or the presents did not happen). */
+static volatile u32 s_flip_words_drained = 0;
+void cellGcm_debug_flip_counts(u32* flipWords, u32* drainPasses, u32* flipsIssued, u32* flipsShown)
+{
+    *flipWords = s_flip_words_drained;
+    *drainPasses = s_drain_passes;
+    *flipsIssued = s_flips_issued;
+    *flipsShown = s_flips_shown;
+}
 
 void cellGcm_rsx_process_fifo(void)
 {
@@ -2007,6 +2018,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * frame split across 4 presents, layout flashing/zooming). */
             extern s32 cellGcmSetFlipCommand(u32 bufferId);
             s_fifo_getoff += 4;
+            s_flip_words_drained++;
             /* Count the flip WORDS the title actually writes into the FIFO,
              * separately from the presents that result. When a title stops
              * appearing on screen the first question is which side stopped:

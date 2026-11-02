@@ -9861,6 +9861,10 @@ typedef struct
 static ld_tally_entry g_ld_frame_tally[LD_TALLY_SLOTS];
 static u32 g_ld_frame_tally_overflow = 0;
 static u32 g_ld_frame_soft_shadows = 0;
+static u32 g_ld_hitch_last_flip_words = 0;
+static u32 g_ld_hitch_last_passes = 0;
+static u32 g_ld_hitch_last_issued = 0;
+static u64 g_ld_hitch_last_requested = 0;
 
 static void ld_frame_tally_note(u64 key, u32 vertices, u32 target)
 {
@@ -14609,7 +14613,27 @@ void rsx_live_draw_present(u32 buffer_id)
               fprintf(stderr, "[hitch]   frame %u: GPU waits mid-frame: %s; soft shadow passes %u; most drawn: %s\n",
                       g_ld_frames, flushLength ? flushText : "none", g_ld_frame_soft_shadows,
                       topLength ? topText : "-");
+              {
+                  extern void cellGcm_debug_flip_counts(u32*, u32*, u32*, u32*);
+                  u32 flipWords = 0;
+                  u32 drainPasses = 0;
+                  u32 flipsIssued = 0;
+                  u32 flipsShown = 0;
+                  cellGcm_debug_flip_counts(&flipWords, &drainPasses, &flipsIssued, &flipsShown);
+                  fprintf(stderr, "[hitch]   frame %u: since the last present: flip words drained %u, drain passes %u, "
+                                  "flips issued %u, flip requests seen by the renderer %llu; now issued %u shown %u\n",
+                          g_ld_frames, flipWords - g_ld_hitch_last_flip_words, drainPasses - g_ld_hitch_last_passes,
+                          flipsIssued - g_ld_hitch_last_issued,
+                          (unsigned long long)(g_ld_flip_requested - g_ld_hitch_last_requested), flipsIssued, flipsShown);
+              }
           }
+      }
+      {
+          extern void cellGcm_debug_flip_counts(u32*, u32*, u32*, u32*);
+          u32 flipsShownNow = 0;
+          cellGcm_debug_flip_counts(&g_ld_hitch_last_flip_words, &g_ld_hitch_last_passes, &g_ld_hitch_last_issued,
+                                    &flipsShownNow);
+          g_ld_hitch_last_requested = g_ld_flip_requested;
       }
       memset(g_ld_frame_flushes, 0, sizeof(g_ld_frame_flushes));
       memset(g_ld_frame_tally, 0, sizeof(g_ld_frame_tally));

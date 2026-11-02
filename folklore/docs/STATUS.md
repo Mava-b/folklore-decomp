@@ -1370,6 +1370,15 @@ What 0006 fixes in ps3recomp to make that run:
     already holds the guest until the drain has read enough, so nothing
     deadlocks, and every frame is shown (titles with their own ring keep
     the old rule).
+    Still there (run-20261102-174007: frame 2510, 839 ms, 14,403 draws,
+    18 shadow passes), so the catch-up rule is not what merges the frames:
+    with it off the drain stops at every flip marker, and the ticker
+    presents each pending flip before draining again. Just before it the
+    guest issued eight flips while the drain sat at get == put with the
+    last drained flip eight behind ("not flushed yet"), i.e. frames the
+    drain could not see yet. patches/0075 adds a third [hitch] line: flip
+    words drained, drain passes, flips issued and flip requests seen by
+    the renderer since the last present, to find where the presents go.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

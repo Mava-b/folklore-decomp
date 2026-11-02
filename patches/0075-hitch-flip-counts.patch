@@ -1,0 +1,72 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -1832,6 +1832,17 @@
+  * that is busy (a pass still running -- a shader being compiled, a long
+  * frame) from one that keeps running and cannot get past something. */
+ static volatile u32 s_drain_passes = 0;
++/* For the renderer's [hitch] line: flip words the drain has reached, and the
++ * drain passes so far (a frame that drew several game frames says whether
++ * the drain went past flips or the presents did not happen). */
++static volatile u32 s_flip_words_drained = 0;
++void cellGcm_debug_flip_counts(u32* flipWords, u32* drainPasses, u32* flipsIssued, u32* flipsShown)
++{
++    *flipWords = s_flip_words_drained;
++    *drainPasses = s_drain_passes;
++    *flipsIssued = s_flips_issued;
++    *flipsShown = s_flips_shown;
++}
+ 
+ void cellGcm_rsx_process_fifo(void)
+ {
+@@ -2007,6 +2018,7 @@
+              * frame split across 4 presents, layout flashing/zooming). */
+             extern s32 cellGcmSetFlipCommand(u32 bufferId);
+             s_fifo_getoff += 4;
++            s_flip_words_drained++;
+             /* Count the flip WORDS the title actually writes into the FIFO,
+              * separately from the presents that result. When a title stops
+              * appearing on screen the first question is which side stopped:
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -9861,6 +9861,10 @@
+ static ld_tally_entry g_ld_frame_tally[LD_TALLY_SLOTS];
+ static u32 g_ld_frame_tally_overflow = 0;
+ static u32 g_ld_frame_soft_shadows = 0;
++static u32 g_ld_hitch_last_flip_words = 0;
++static u32 g_ld_hitch_last_passes = 0;
++static u32 g_ld_hitch_last_issued = 0;
++static u64 g_ld_hitch_last_requested = 0;
+ 
+ static void ld_frame_tally_note(u64 key, u32 vertices, u32 target)
+ {
+@@ -14609,8 +14613,28 @@
+               fprintf(stderr, "[hitch]   frame %u: GPU waits mid-frame: %s; soft shadow passes %u; most drawn: %s\n",
+                       g_ld_frames, flushLength ? flushText : "none", g_ld_frame_soft_shadows,
+                       topLength ? topText : "-");
++              {
++                  extern void cellGcm_debug_flip_counts(u32*, u32*, u32*, u32*);
++                  u32 flipWords = 0;
++                  u32 drainPasses = 0;
++                  u32 flipsIssued = 0;
++                  u32 flipsShown = 0;
++                  cellGcm_debug_flip_counts(&flipWords, &drainPasses, &flipsIssued, &flipsShown);
++                  fprintf(stderr, "[hitch]   frame %u: since the last present: flip words drained %u, drain passes %u, "
++                                  "flips issued %u, flip requests seen by the renderer %llu; now issued %u shown %u\n",
++                          g_ld_frames, flipWords - g_ld_hitch_last_flip_words, drainPasses - g_ld_hitch_last_passes,
++                          flipsIssued - g_ld_hitch_last_issued,
++                          (unsigned long long)(g_ld_flip_requested - g_ld_hitch_last_requested), flipsIssued, flipsShown);
++              }
+           }
+       }
++      {
++          extern void cellGcm_debug_flip_counts(u32*, u32*, u32*, u32*);
++          u32 flipsShownNow = 0;
++          cellGcm_debug_flip_counts(&g_ld_hitch_last_flip_words, &g_ld_hitch_last_passes, &g_ld_hitch_last_issued,
++                                    &flipsShownNow);
++          g_ld_hitch_last_requested = g_ld_flip_requested;
++      }
+       memset(g_ld_frame_flushes, 0, sizeof(g_ld_frame_flushes));
+       memset(g_ld_frame_tally, 0, sizeof(g_ld_frame_tally));
+       g_ld_frame_tally_overflow = 0;
