@@ -1333,6 +1333,20 @@ What 0006 fixes in ps3recomp to make that run:
     title cancelling, -> failed) behind cellSaveDataHostSaveCounts; the
     engine overlay polls it each frame and shows "Game saved" (or "Save
     failed -- see the log") at the top centre for 2.5 s, fading out.
+97. Item pick-up box with the edges HUD (patches/0073,
+    capture-20261102-171100): the box in the bottom right is drawn right to
+    left -- icon (x 1128..1192), right end, middle (952..1096), left end
+    (920..952) -- and the line continuation only followed pieces to the
+    right, so the left end (centred at x 936, short of the 960 bottom-right
+    line) stayed in the middle. A piece touching or overlapping the one
+    before on either side now goes with it.
+    Combat hitches (same run, frames 2688-2691 and 3767-3770, ~300 ms):
+    4000-5900 draws in a frame (about 700 usually), so the per-bank
+    constant and descriptor rings (4096 draws) ran out and the drain waited
+    for the GPU mid-frame (gpu wait 122 ms). The [hitch] line now has a
+    second line with the mid-frame GPU waits by reason, the soft shadow
+    passes and the six pipelines drawn most, to find out what those draws
+    are before changing anything.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

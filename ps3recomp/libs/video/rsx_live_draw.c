@@ -1300,6 +1300,10 @@ static u64 g_ld_texture_upload_bytes = 0;
  * heartbeat; the orphanage window is therefore visible without turning the
  * log itself into a benchmark cost.
  */
+/* Mid-frame GPU waits this frame, by reason (ld_flush), for the [hitch]
+ * line; reset when a frame is presented. */
+static u32 g_ld_frame_flushes[16];
+
 typedef enum {
     LD_FLUSH_PRESENT = 0,
     LD_FLUSH_GUEST_REFERENCE,
@@ -2205,6 +2209,10 @@ static void ld_flush(ld_flush_reason reason)
 #else
     (void)reason;
 #endif
+    if ((u32)reason < 16u)
+    {
+        g_ld_frame_flushes[reason]++;
+    }
     g_ld_ring_epoch++;
     const HRESULT close_hr = g.list->lpVtbl->Close(g.list);
     if (FAILED(close_hr)) {
@@ -7666,10 +7674,16 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
         }
     }
     const ld_hud_previous* previous = &g_ld_hud_previous;
+    /* A line is drawn in pieces left to right (text), or right to left: the
+     * item pick-up box in the bottom right (capture-20261102-171100) draws
+     * its icon, then its middle, then its left end, each touching the one
+     * before -- the left end, centred at x 936, stayed in the middle while
+     * the rest moved out. A piece that touches or overlaps the one before
+     * (within 4% of the screen on either side) goes with it. */
     const int continuesLine = previous->frame == g_ld_frames && previous->target == target &&
                               previous->key == g_ld_current_pso.key && top < previous->bottom &&
-                              bottom > previous->top && left >= previous->left - 0.004f &&
-                              left <= previous->right + 0.04f;
+                              bottom > previous->top && left <= previous->right + 0.04f &&
+                              right >= previous->left - 0.04f;
     if (continuesLine)
     {
         place = previous->place;
@@ -9833,6 +9847,39 @@ static int ld_resident_enabled(void)
     return enabled && g.geo && g.geo_mapped;
 }
 
+/* What a frame drew, by pipeline, for the [hitch] line: a frame with far
+ * more draws than usual (a big fight's effects, say) says which ones. */
+typedef struct
+{
+    u64 key;
+    u32 draws;
+    u64 vertices;
+    u32 target;
+} ld_tally_entry;
+
+#define LD_TALLY_SLOTS 256u
+static ld_tally_entry g_ld_frame_tally[LD_TALLY_SLOTS];
+static u32 g_ld_frame_tally_overflow = 0;
+static u32 g_ld_frame_soft_shadows = 0;
+
+static void ld_frame_tally_note(u64 key, u32 vertices, u32 target)
+{
+    u32 slot = (u32)(key ^ (key >> 29) ^ (key >> 47)) & (LD_TALLY_SLOTS - 1u);
+    for (u32 probe = 0; probe < 16u; probe++)
+    {
+        ld_tally_entry* entry = &g_ld_frame_tally[(slot + probe) & (LD_TALLY_SLOTS - 1u)];
+        if (entry->draws == 0u || entry->key == key)
+        {
+            entry->key = key;
+            entry->draws++;
+            entry->vertices += vertices;
+            entry->target = target;
+            return;
+        }
+    }
+    g_ld_frame_tally_overflow++;
+}
+
 static void sink_end_impl(void* user, const rsx_dispatch* r)
 {
     (void)user; (void)r;
@@ -10204,6 +10251,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         }
     }
     live_draw_csv_emit(prim, n_tri, "execute");
+    ld_frame_tally_note(g_ld_current_pso.key, n_tri, target);
     if (rsx_live_draw_a010_probe_active() && target < 64)
         g_ld_a010_probe_touched |= 1ull << target;
     { static u32 last_target = LD_INVALID_SURFACE;
@@ -10791,6 +10839,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         ld_soft_shadow_draw(drawSurface, rtv, dsv, &dvp, &sc, Wv, Hv, xf)) {
         /* Drawn by the soft shadow passes instead. */
         softShadowDrawn = 1;
+        g_ld_frame_soft_shadows++;
     } else if (indexed) {
         D3D12_INDEX_BUFFER_VIEW ibv;
         ibv.BufferLocation = indexAddress;
@@ -14513,8 +14562,59 @@ void rsx_live_draw_present(u32 buffer_id)
                       (unsigned long long)((g_ld_texture_upload_bytes - lastUploadBytes) / 1024u),
                       g.n_surfaces - lastSurfaces,
                       (unsigned long long)(g_ld_geom_misses - lastGeomMisses));
+              /* Mid-frame GPU waits, soft shadow passes and the pipelines
+               * drawn most, to tell a GPU-bound frame from a CPU-bound one. */
+              static const char* const flushNames[] = {"present", "guest reference", "vertex ring",
+                                                       "vertex constants", "retired resources", "movie",
+                                                       "movie present", "readback", "pixel constants",
+                                                       "descriptors", "shutdown"};
+              char flushText[256];
+              int flushLength = 0;
+              flushText[0] = '\0';
+              for (u32 reasonIndex = 1; reasonIndex < (u32)LD_FLUSH_REASON_COUNT && reasonIndex < 11u; reasonIndex++)
+              {
+                  if (g_ld_frame_flushes[reasonIndex] && flushLength < (int)sizeof(flushText) - 48)
+                  {
+                      flushLength += snprintf(flushText + flushLength, sizeof(flushText) - (size_t)flushLength,
+                                              "%s%s %u", flushLength ? ", " : "", flushNames[reasonIndex],
+                                              g_ld_frame_flushes[reasonIndex]);
+                  }
+              }
+              ld_tally_entry top[6];
+              memset(top, 0, sizeof(top));
+              for (u32 slotIndex = 0; slotIndex < LD_TALLY_SLOTS; slotIndex++)
+              {
+                  const ld_tally_entry* entry = &g_ld_frame_tally[slotIndex];
+                  for (u32 rank = 0; rank < 6u; rank++)
+                  {
+                      if (entry->draws > top[rank].draws)
+                      {
+                          memmove(&top[rank + 1], &top[rank], (5u - rank) * sizeof(top[0]));
+                          top[rank] = *entry;
+                          break;
+                      }
+                  }
+              }
+              char topText[512];
+              int topLength = 0;
+              topText[0] = '\0';
+              for (u32 rank = 0; rank < 6u && top[rank].draws; rank++)
+              {
+                  topLength += snprintf(topText + topLength, sizeof(topText) - (size_t)topLength,
+                                        "%s%016llx x%u (%llu verts, surface 0x%X)", rank ? "; " : "",
+                                        (unsigned long long)top[rank].key, top[rank].draws,
+                                        (unsigned long long)top[rank].vertices,
+                                        top[rank].target < g.n_surfaces ? g.surfaces[top[rank].target].offset : 0u);
+              }
+              fprintf(stderr, "[hitch]   frame %u: GPU waits mid-frame: %s; soft shadow passes %u; most drawn: %s\n",
+                      g_ld_frames, flushLength ? flushText : "none", g_ld_frame_soft_shadows,
+                      topLength ? topText : "-");
           }
       }
+      memset(g_ld_frame_flushes, 0, sizeof(g_ld_frame_flushes));
+      memset(g_ld_frame_tally, 0, sizeof(g_ld_frame_tally));
+      g_ld_frame_tally_overflow = 0;
+      g_ld_frame_soft_shadows = 0;
       previousTicks = nowTicks;
       lastWaitFlip = g_gcm_perf_waitflip_ns; lastUsleep = g_gcm_perf_main_usleep_ns;
       lastSyscall = g_gcm_perf_main_syscall_ns; lastHle = g_gcm_perf_main_hle_ns;
