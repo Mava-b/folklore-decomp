@@ -9865,6 +9865,9 @@ static u32 g_ld_hitch_last_flip_words = 0;
 static u32 g_ld_hitch_last_passes = 0;
 static u32 g_ld_hitch_last_issued = 0;
 static u64 g_ld_hitch_last_requested = 0;
+static u32 g_ld_hitch_last_published = 0;
+static u32 g_ld_hitch_last_unpublished = 0;
+static u32 g_ld_hitch_last_fallback = 0;
 
 static void ld_frame_tally_note(u64 key, u32 vertices, u32 target)
 {
@@ -14625,6 +14628,18 @@ void rsx_live_draw_present(u32 buffer_id)
                           g_ld_frames, flipWords - g_ld_hitch_last_flip_words, drainPasses - g_ld_hitch_last_passes,
                           flipsIssued - g_ld_hitch_last_issued,
                           (unsigned long long)(g_ld_flip_requested - g_ld_hitch_last_requested), flipsIssued, flipsShown);
+                  extern void cellGcm_debug_flip_paths(u32*, u32*, u32*, u32*, u32*);
+                  u32 published = 0;
+                  u32 unpublished = 0;
+                  u32 fallback = 0;
+                  u32 intact = 0;
+                  u32 lost = 0;
+                  cellGcm_debug_flip_paths(&published, &unpublished, &fallback, &intact, &lost);
+                  fprintf(stderr, "[hitch]   frame %u: flips since the last present: %u with a marker and put published, "
+                                  "%u with a marker left for the guest to publish, %u with no marker; markers not yet "
+                                  "drained: %u in place, %u written over\n",
+                          g_ld_frames, published - g_ld_hitch_last_published, unpublished - g_ld_hitch_last_unpublished,
+                          fallback - g_ld_hitch_last_fallback, intact, lost);
               }
           }
       }
@@ -14634,6 +14649,11 @@ void rsx_live_draw_present(u32 buffer_id)
           cellGcm_debug_flip_counts(&g_ld_hitch_last_flip_words, &g_ld_hitch_last_passes, &g_ld_hitch_last_issued,
                                     &flipsShownNow);
           g_ld_hitch_last_requested = g_ld_flip_requested;
+          extern void cellGcm_debug_flip_paths(u32*, u32*, u32*, u32*, u32*);
+          u32 intactNow = 0;
+          u32 lostNow = 0;
+          cellGcm_debug_flip_paths(&g_ld_hitch_last_published, &g_ld_hitch_last_unpublished, &g_ld_hitch_last_fallback,
+                                   &intactNow, &lostNow);
       }
       memset(g_ld_frame_flushes, 0, sizeof(g_ld_frame_flushes));
       memset(g_ld_frame_tally, 0, sizeof(g_ld_frame_tally));

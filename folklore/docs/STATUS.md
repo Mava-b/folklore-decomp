@@ -1379,6 +1379,12 @@ What 0006 fixes in ps3recomp to make that run:
     drain could not see yet. patches/0075 adds a third [hitch] line: flip
     words drained, drain passes, flips issued and flip requests seen by
     the renderer since the last present, to find where the presents go.
+    Answer (run-20261102-175001, 60 fps cap, frame 3300, 489 ms): 17
+    flips issued, 1 flip word drained. The drain never met the other 16
+    markers, so it had nowhere to stop. A fourth [hitch] line now says how
+    each flip was queued (marker + put published, marker left for the
+    guest to publish, no marker) and whether the markers of the flips not
+    yet drained are still in the ring or have been written over.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

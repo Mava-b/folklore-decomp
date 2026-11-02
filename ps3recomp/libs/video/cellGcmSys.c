@@ -1836,6 +1836,13 @@ static volatile u32 s_drain_passes = 0;
  * drain passes so far (a frame that drew several game frames says whether
  * the drain went past flips or the presents did not happen). */
 static volatile u32 s_flip_words_drained = 0;
+/* How each flip was queued (gcm_flip_into_fifo), and where its marker went,
+ * for the [hitch] line. */
+static volatile u32 s_flip_path_published = 0;   /* marker written, put published */
+static volatile u32 s_flip_path_unpublished = 0; /* marker written, put left to the guest */
+static volatile u32 s_flip_path_fallback = 0;    /* no marker: flipped at once */
+static u32 s_marker_ea[32];
+static u32 s_marker_number[32];
 void cellGcm_debug_flip_counts(u32* flipWords, u32* drainPasses, u32* flipsIssued, u32* flipsShown)
 {
     *flipWords = s_flip_words_drained;
@@ -3046,6 +3053,8 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
         s_flip_issue_ns[flipNumber & 31u] = gcm_perf_now_ns();
         s_flip_drain_ns[flipNumber & 31u] = 0;
         vm_write32(cur, GCM_FLIP_MARKER | ((flipNumber & 31u) << 3) | bufferId);
+        s_marker_ea[flipNumber & 31u] = cur;
+        s_marker_number[flipNumber & 31u] = flipNumber;
     }
     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
@@ -3068,10 +3077,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     if (!runtime_ring || io_begin == 0xFFFFFFFFu)
     {
         vm_write32(ctx + 8, cur + 4);
+        s_flip_path_unpublished++;
         return 1;
     }
     if (!gcm_ring_is_runtime(ctx))
     {
+        s_flip_path_unpublished++;
         /* The runtime's callback on a ring it did not set up: the old rule. */
         if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN)
         {
@@ -3106,7 +3117,38 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * until its next 4 ms idle wait runs out. */
     SetEvent((HANDLE)cellGcm_fifo_kick_event());
     gcm_ring_publish_end(ctx, nextWrite);
+    s_flip_path_published++;
     return 1;
+}
+
+/* For the [hitch] line: how flips were queued so far, and of the flips
+ * issued but not yet drained, how many markers are still in the ring
+ * (intact) and how many have been written over (lost). */
+void cellGcm_debug_flip_paths(u32* published, u32* unpublished, u32* fallback, u32* intact, u32* lost)
+{
+    *published = s_flip_path_published;
+    *unpublished = s_flip_path_unpublished;
+    *fallback = s_flip_path_fallback;
+    *intact = 0;
+    *lost = 0;
+    for (u32 flipNumber = s_flips_drained + 1u; (s32)(s_flips_issued - flipNumber) >= 0 &&
+         (s32)(flipNumber - s_flips_drained) <= 31; flipNumber++)
+    {
+        const u32 slot = flipNumber & 31u;
+        if (s_marker_number[slot] != flipNumber || !s_marker_ea[slot])
+        {
+            continue;
+        }
+        const u32 word = vm_read32(s_marker_ea[slot]);
+        if ((word & 0xFFFFFF00u) == GCM_FLIP_MARKER && ((word >> 3) & 31u) == slot)
+        {
+            (*intact)++;
+        }
+        else
+        {
+            (*lost)++;
+        }
+    }
 }
 
 /* cellGcmSetFlip(context, buffer_id). PSL1GHT's gcmSetFlip import (NID
@@ -3130,6 +3172,7 @@ s32 cellGcmSetFlip(void* context, u32 bufferId)
     if (!immediate && gcm_flip_into_fifo((u32)(uintptr_t)context, bufferId)) {
         return gcm_flip_request(bufferId, 1);
     }
+    s_flip_path_fallback++;
     return cellGcmSetFlipCommand(bufferId);
 }
 
@@ -3887,6 +3930,7 @@ s32 _cellGcmSetFlipCommand(void* ctx, u32 bufferId)
 {
     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
         return gcm_flip_request(bufferId, 1);
+    s_flip_path_fallback++;
     return cellGcmSetFlipCommand(bufferId);
 }
 

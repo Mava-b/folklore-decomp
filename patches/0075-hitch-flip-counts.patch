@@ -1,7 +1,7 @@
 diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 --- a/libs/video/cellGcmSys.c
 +++ b/libs/video/cellGcmSys.c
-@@ -1832,6 +1832,17 @@
+@@ -1832,6 +1832,24 @@
   * that is busy (a pass still running -- a shader being compiled, a long
   * frame) from one that keeps running and cannot get past something. */
  static volatile u32 s_drain_passes = 0;
@@ -9,6 +9,13 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
 + * drain passes so far (a frame that drew several game frames says whether
 + * the drain went past flips or the presents did not happen). */
 +static volatile u32 s_flip_words_drained = 0;
++/* How each flip was queued (gcm_flip_into_fifo), and where its marker went,
++ * for the [hitch] line. */
++static volatile u32 s_flip_path_published = 0;   /* marker written, put published */
++static volatile u32 s_flip_path_unpublished = 0; /* marker written, put left to the guest */
++static volatile u32 s_flip_path_fallback = 0;    /* no marker: flipped at once */
++static u32 s_marker_ea[32];
++static u32 s_marker_number[32];
 +void cellGcm_debug_flip_counts(u32* flipWords, u32* drainPasses, u32* flipsIssued, u32* flipsShown)
 +{
 +    *flipWords = s_flip_words_drained;
@@ -19,7 +26,7 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
  
  void cellGcm_rsx_process_fifo(void)
  {
-@@ -2007,6 +2018,7 @@
+@@ -2007,6 +2025,7 @@
               * frame split across 4 presents, layout flashing/zooming). */
              extern s32 cellGcmSetFlipCommand(u32 bufferId);
              s_fifo_getoff += 4;
@@ -27,10 +34,89 @@ diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
              /* Count the flip WORDS the title actually writes into the FIFO,
               * separately from the presents that result. When a title stops
               * appearing on screen the first question is which side stopped:
+@@ -3034,6 +3053,8 @@
+         s_flip_issue_ns[flipNumber & 31u] = gcm_perf_now_ns();
+         s_flip_drain_ns[flipNumber & 31u] = 0;
+         vm_write32(cur, GCM_FLIP_MARKER | ((flipNumber & 31u) << 3) | bufferId);
++        s_marker_ea[flipNumber & 31u] = cur;
++        s_marker_number[flipNumber & 31u] = flipNumber;
+     }
+     /* Wrap here, on the guest thread, once the ring is nearly used -- what the
+      * SDK's buffer-full callback does. Otherwise the drain thread recycles it
+@@ -3056,10 +3077,12 @@
+     if (!runtime_ring || io_begin == 0xFFFFFFFFu)
+     {
+         vm_write32(ctx + 8, cur + 4);
++        s_flip_path_unpublished++;
+         return 1;
+     }
+     if (!gcm_ring_is_runtime(ctx))
+     {
++        s_flip_path_unpublished++;
+         /* The runtime's callback on a ring it did not set up: the old rule. */
+         if (end - (cur + 4) < GCM_FLIP_WRAP_BYTES && s_fifo_getoff >= io_begin + GCM_RECYCLE_MARGIN)
+         {
+@@ -3094,9 +3117,40 @@
+      * until its next 4 ms idle wait runs out. */
+     SetEvent((HANDLE)cellGcm_fifo_kick_event());
+     gcm_ring_publish_end(ctx, nextWrite);
++    s_flip_path_published++;
+     return 1;
+ }
+ 
++/* For the [hitch] line: how flips were queued so far, and of the flips
++ * issued but not yet drained, how many markers are still in the ring
++ * (intact) and how many have been written over (lost). */
++void cellGcm_debug_flip_paths(u32* published, u32* unpublished, u32* fallback, u32* intact, u32* lost)
++{
++    *published = s_flip_path_published;
++    *unpublished = s_flip_path_unpublished;
++    *fallback = s_flip_path_fallback;
++    *intact = 0;
++    *lost = 0;
++    for (u32 flipNumber = s_flips_drained + 1u; (s32)(s_flips_issued - flipNumber) >= 0 &&
++         (s32)(flipNumber - s_flips_drained) <= 31; flipNumber++)
++    {
++        const u32 slot = flipNumber & 31u;
++        if (s_marker_number[slot] != flipNumber || !s_marker_ea[slot])
++        {
++            continue;
++        }
++        const u32 word = vm_read32(s_marker_ea[slot]);
++        if ((word & 0xFFFFFF00u) == GCM_FLIP_MARKER && ((word >> 3) & 31u) == slot)
++        {
++            (*intact)++;
++        }
++        else
++        {
++            (*lost)++;
++        }
++    }
++}
++
+ /* cellGcmSetFlip(context, buffer_id). PSL1GHT's gcmSetFlip import (NID
+  * 0xDC09357E) lands here; without it vkcube's flip was a no-op, GetFlipStatus
+  * never cleared, and init timed out into exit(-1).
+@@ -3118,6 +3172,7 @@
+     if (!immediate && gcm_flip_into_fifo((u32)(uintptr_t)context, bufferId)) {
+         return gcm_flip_request(bufferId, 1);
+     }
++    s_flip_path_fallback++;
+     return cellGcmSetFlipCommand(bufferId);
+ }
+ 
+@@ -3875,6 +3930,7 @@
+ {
+     if (gcm_flip_into_fifo((u32)(uintptr_t)ctx, bufferId))
+         return gcm_flip_request(bufferId, 1);
++    s_flip_path_fallback++;
+     return cellGcmSetFlipCommand(bufferId);
+ }
+ 
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
-@@ -9861,6 +9861,10 @@
+@@ -9861,6 +9861,13 @@
  static ld_tally_entry g_ld_frame_tally[LD_TALLY_SLOTS];
  static u32 g_ld_frame_tally_overflow = 0;
  static u32 g_ld_frame_soft_shadows = 0;
@@ -38,10 +124,13 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 +static u32 g_ld_hitch_last_passes = 0;
 +static u32 g_ld_hitch_last_issued = 0;
 +static u64 g_ld_hitch_last_requested = 0;
++static u32 g_ld_hitch_last_published = 0;
++static u32 g_ld_hitch_last_unpublished = 0;
++static u32 g_ld_hitch_last_fallback = 0;
  
  static void ld_frame_tally_note(u64 key, u32 vertices, u32 target)
  {
-@@ -14609,8 +14613,28 @@
+@@ -14609,8 +14616,45 @@
                fprintf(stderr, "[hitch]   frame %u: GPU waits mid-frame: %s; soft shadow passes %u; most drawn: %s\n",
                        g_ld_frames, flushLength ? flushText : "none", g_ld_frame_soft_shadows,
                        topLength ? topText : "-");
@@ -57,6 +146,18 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 +                          g_ld_frames, flipWords - g_ld_hitch_last_flip_words, drainPasses - g_ld_hitch_last_passes,
 +                          flipsIssued - g_ld_hitch_last_issued,
 +                          (unsigned long long)(g_ld_flip_requested - g_ld_hitch_last_requested), flipsIssued, flipsShown);
++                  extern void cellGcm_debug_flip_paths(u32*, u32*, u32*, u32*, u32*);
++                  u32 published = 0;
++                  u32 unpublished = 0;
++                  u32 fallback = 0;
++                  u32 intact = 0;
++                  u32 lost = 0;
++                  cellGcm_debug_flip_paths(&published, &unpublished, &fallback, &intact, &lost);
++                  fprintf(stderr, "[hitch]   frame %u: flips since the last present: %u with a marker and put published, "
++                                  "%u with a marker left for the guest to publish, %u with no marker; markers not yet "
++                                  "drained: %u in place, %u written over\n",
++                          g_ld_frames, published - g_ld_hitch_last_published, unpublished - g_ld_hitch_last_unpublished,
++                          fallback - g_ld_hitch_last_fallback, intact, lost);
 +              }
            }
        }
@@ -66,6 +167,11 @@ diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
 +          cellGcm_debug_flip_counts(&g_ld_hitch_last_flip_words, &g_ld_hitch_last_passes, &g_ld_hitch_last_issued,
 +                                    &flipsShownNow);
 +          g_ld_hitch_last_requested = g_ld_flip_requested;
++          extern void cellGcm_debug_flip_paths(u32*, u32*, u32*, u32*, u32*);
++          u32 intactNow = 0;
++          u32 lostNow = 0;
++          cellGcm_debug_flip_paths(&g_ld_hitch_last_published, &g_ld_hitch_last_unpublished, &g_ld_hitch_last_fallback,
++                                   &intactNow, &lostNow);
 +      }
        memset(g_ld_frame_flushes, 0, sizeof(g_ld_frame_flushes));
        memset(g_ld_frame_tally, 0, sizeof(g_ld_frame_tally));
