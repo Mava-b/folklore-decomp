@@ -1063,6 +1063,29 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * catches up instead. Sized well above a frame's command list so a
  * title that keeps up never sees this path. */
 #define GCM_FIFO_CATCHUP_BYTES 0x10000u
+/* The largest recent frame's commands (defined with the ring state below).
+ * Folklore's frames are 1-2 MB, so a 64 KB backlog only meant the guest had
+ * started its next frame: the drain then went on through it without
+ * presenting, which made that drain twice as long, which let the guest get
+ * further ahead -- in a big fight (capture-free run 20261102-172056) sixteen
+ * frames were drawn and one shown, a 472 ms stall. The backlog now has to be
+ * more than two of the largest recent frames as well. */
+static u32 s_ring_frame_peak;
+static u32 gcm_fifo_catchup_bytes(void)
+{
+    static int fixedBytes = -2;
+    if (fixedBytes == -2)
+    {
+        const char* text = getenv("GCM_FIFO_CATCHUP_KB");
+        fixedBytes = text ? atoi(text) * 1024 : -1;
+    }
+    if (fixedBytes >= 0)
+    {
+        return (u32)fixedBytes;
+    }
+    const u32 twoFrames = s_ring_frame_peak * 2u;
+    return twoFrames > GCM_FIFO_CATCHUP_BYTES ? twoFrames : GCM_FIFO_CATCHUP_BYTES;
+}
 /* How long a self-JUMP park may stand with `put` somewhere else before the
  * drain gives up on it being patched and follows `put` instead. */
 #define GCM_PARK_GRACE_MS 50ull
@@ -2019,7 +2042,7 @@ static void gcm_rsx_process_fifo_unlocked(void)
              * draining -- the intermediate presents are frames we are too far
              * behind to show anyway. No-op for a title that is keeping up. */
             if (put < s_fifo_getoff ||
-                put - s_fifo_getoff < GCM_FIFO_CATCHUP_BYTES)
+                put - s_fifo_getoff < gcm_fifo_catchup_bytes())
                 { why = "flip"; break; }
             continue;
         }

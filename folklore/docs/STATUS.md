@@ -1347,6 +1347,22 @@ What 0006 fixes in ps3recomp to make that run:
     second line with the mid-frame GPU waits by reason, the soft shadow
     passes and the six pipelines drawn most, to find out what those draws
     are before changing anything.
+98. The combat hitches found (patches/0074, run-20261102-172056, frame
+    rate unlimited): frame 4362 took 472 ms and drew 14,054 draws with 16
+    soft shadow passes -- sixteen game frames drawn, one shown (the
+    character pipeline 1836e474 x2688 against x168 in a frame). The drain
+    stops at each flip to present it unless the guest is more than
+    GCM_FIFO_CATCHUP_BYTES (64 KB) ahead, when it goes on without
+    presenting (for titles that would otherwise fill their ring). A
+    Folklore frame is 1-2 MB, so being 64 KB ahead only meant the next
+    frame had begun: after one slow frame (a shader built for the Id soul,
+    new enemies' data) the drain merged two frames, took twice as long,
+    fell further behind, and so on to sixteen. Catching up now also needs
+    more than two of the largest recent frames of backlog (the ring is
+    2 MB, so for Folklore it no longer happens); GCM_FIFO_CATCHUP_KB=<n>
+    sets it outright. The "Game saved" notice did not show in the same run
+    though the save completed; it now logs "[engine] save notice" when it
+    fires, is larger, lower and stays 3.5 s.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

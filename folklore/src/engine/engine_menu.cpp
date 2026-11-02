@@ -769,7 +769,7 @@ namespace
     };
     SaveNotice saveNotice;
 
-    constexpr unsigned long long kSaveNoticeMs = 2500;
+    constexpr unsigned long long kSaveNoticeMs = 3500;
     constexpr unsigned long long kSaveNoticeFadeMs = 600;
 
     /* True while there is a notice to draw. */
@@ -789,11 +789,14 @@ namespace
         {
             saveNotice.failed = true;
             saveNotice.shownUntil = nowMs + kSaveNoticeMs + 1500;
+            std::fprintf(stderr, "[engine] save notice: save failed (%u failed so far)\n", failures);
         }
         else if (saves != saveNotice.saves)
         {
             saveNotice.failed = false;
             saveNotice.shownUntil = nowMs + kSaveNoticeMs;
+            std::fprintf(stderr, "[engine] save notice: game saved (%u saves so far)%s\n", saves,
+                         engineSettings().showSaveNotice ? "" : " -- notice turned off");
         }
         saveNotice.saves = saves;
         saveNotice.failures = failures;
@@ -814,7 +817,8 @@ namespace
         const unsigned long long remaining = saveNotice.shownUntil - nowMs;
         const float fade = remaining < kSaveNoticeFadeMs ? (float)remaining / (float)kSaveNoticeFadeMs : 1.0f;
         const float scale = ImGui::GetIO().DisplaySize.y / 1080.0f;
-        ImGui::SetNextWindowPos(ImVec2(width * 0.5f, 48.0f * (scale > 0.5f ? scale : 0.5f)), ImGuiCond_Always,
+        /* Top centre, below where the game's own banners sit. */
+        ImGui::SetNextWindowPos(ImVec2(width * 0.5f, 140.0f * (scale > 0.5f ? scale : 0.5f)), ImGuiCond_Always,
                                 ImVec2(0.5f, 0.0f));
         ImGui::SetNextWindowBgAlpha(0.65f * fade);
         const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
@@ -825,6 +829,7 @@ namespace
         ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
         if (ImGui::Begin("##savenotice", nullptr, flags))
         {
+            ImGui::SetWindowFontScale(1.6f);
             if (saveNotice.failed)
             {
                 ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "Save failed -- see the log");
