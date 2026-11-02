@@ -1363,6 +1363,13 @@ What 0006 fixes in ps3recomp to make that run:
     sets it outright. The "Game saved" notice did not show in the same run
     though the save completed; it now logs "[engine] save notice" when it
     fires, is larger, lower and stays 3.5 s.
+    Not enough on its own (run-20261102-173152): frame 4571 still drew 19
+    frames (747 ms) -- a long fight has frames up to 1.9 MB in the 2 MB
+    ring, so two frames of backlog was still reached. On the runtime's own
+    ring catching up is now off altogether: the buffer-full callback
+    already holds the guest until the drain has read enough, so nothing
+    deadlocks, and every frame is shown (titles with their own ring keep
+    the old rule).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

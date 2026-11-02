@@ -1071,6 +1071,8 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * frames were drawn and one shown, a 472 ms stall. The backlog now has to be
  * more than two of the largest recent frames as well. */
 static u32 s_ring_frame_peak;
+static u32 s_ring_ctx;
+static int gcm_ring_is_runtime(u32 ctx);
 static u32 gcm_fifo_catchup_bytes(void)
 {
     static int fixedBytes = -2;
@@ -1082,6 +1084,16 @@ static u32 gcm_fifo_catchup_bytes(void)
     if (fixedBytes >= 0)
     {
         return (u32)fixedBytes;
+    }
+    /* The runtime's own ring never needs it: when the guest runs out of room
+     * there, the buffer-full callback holds it until the drain has read
+     * enough (cellGcm_fifo_reserve), so nothing deadlocks, and every frame is
+     * shown. Two frames' worth was still reached in a long fight
+     * (run-20261102-173152: 19 frames drawn, one shown, 747 ms): Folklore's
+     * frames there are up to 1.9 MB in a 2 MB ring. */
+    if (s_ring_ctx && gcm_ring_is_runtime(s_ring_ctx))
+    {
+        return 0xFFFFFFFFu;
     }
     const u32 twoFrames = s_ring_frame_peak * 2u;
     return twoFrames > GCM_FIFO_CATCHUP_BYTES ? twoFrames : GCM_FIFO_CATCHUP_BYTES;
