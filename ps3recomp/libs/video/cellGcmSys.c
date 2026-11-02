@@ -1072,6 +1072,20 @@ static u32 s_sema_offset = 0;   /* NV406E semaphore offset (label window) */
  * more than two of the largest recent frames as well. */
 static u32 s_ring_frame_peak;
 static u32 s_ring_ctx;
+static u32 s_ring_begin;
+/* Laps of the runtime's ring: the guest's (each time it goes back to the
+ * start) and the drain's (each time it takes the JUMP back to the start).
+ * gcm_ring_soft_end needs to know whether the drain is in the guest's lap,
+ * the one before, or further behind: an address alone cannot tell "the
+ * drain is ahead of the guest in the previous lap" (the guest may write up
+ * to it) from "the drain is two laps behind" (the guest's last lap is still
+ * unread and must not be written over). Folklore's frames are nearly the
+ * ring's size, so it wraps at every flip and the second case happened in big
+ * fights: the guest wrote its next frame over one the drain had not read,
+ * flip marker and all, and the drain then ran through several frames
+ * without a present (run-20261102-181115: 7 flips, one marker reached). */
+static volatile u32 s_ring_guest_lap = 0;
+static volatile u32 s_ring_drain_lap = 0;
 static int gcm_ring_is_runtime(u32 ctx);
 static u32 gcm_fifo_catchup_bytes(void)
 {
@@ -2146,6 +2160,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
                   why = "parked";
                   break;
               }
+              if (s_ring_begin && gcm_io2ea(tgt) == s_ring_begin)
+              {
+                  s_ring_drain_lap++;
+              }
               s_fifo_getoff = tgt;
               /* The guest is told how far it may write from this: say where
                * the drain is NOW. After the jump back to the ring's start the
@@ -2608,6 +2626,19 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     gcm_note_drained_position(gcm_io2ea(s_fifo_getoff));
+    /* Caught up with what the guest has published: the drain is in the
+     * guest's lap (put is always in it). Read the lap before put -- the
+     * guest publishes put before it counts a new lap -- so a wrap racing
+     * this cannot make the drain look a lap further on than it is. */
+    {
+        const u32 guestLap = s_ring_guest_lap;
+        atomic_thread_fence(memory_order_acquire);
+        if (s_ring_begin && s_fifo_getoff == vm_read32(GCM_CONTROL_GUEST_ADDR + 0) &&
+            (s32)(guestLap - s_ring_drain_lap) > 0)
+        {
+            s_ring_drain_lap = guestLap;   /* only ever forward */
+        }
+    }
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
      * a title uses to avoid overwriting commands the GPU has not read. It exists
@@ -2687,6 +2718,10 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     }
 
     vm_write32(ctx_ea + 0x8, begin);                    /* recycle ring to base */
+    if (begin == s_ring_begin)
+    {
+        s_ring_guest_lap++;
+    }
 
     if (s_recdbg)
         fprintf(stderr, "[REC<] tid=%lu cur-now=%08X put=%08X get=%08X drained=%08X spins=%d\n",
@@ -2916,11 +2951,24 @@ static int gcm_ring_is_runtime(u32 ctx)
 static u32 gcm_ring_soft_end(u32 writePos)
 {
     const u32 drainedEa = g_gcm_fifo_drained_ea;
-    /* Outside the ring (the drain is in a CALL target), or at or behind the
-     * guest in its own lap: up to the real end. */
+    const s32 lapsAhead = (s32)(s_ring_guest_lap - s_ring_drain_lap);
+    if (lapsAhead >= 2)
+    {
+        /* The drain has not started on the guest's previous lap yet:
+         * nothing may be written until it has. */
+        return writePos;
+    }
+    if (lapsAhead <= 0)
+    {
+        /* Same lap: the drain is behind the guest, and everything past the
+         * guest is from a lap already read. */
+        return s_ring_end;
+    }
+    /* One lap behind: the drain is ahead of the guest in address, and
+     * everything from it on is unread. */
     if (drainedEa < s_ring_begin || drainedEa > s_ring_end + GCM_RECYCLE_SLACK || drainedEa <= writePos)
     {
-        return s_ring_end;
+        return writePos;
     }
     /* Still in the previous lap, ahead of the guest in address: everything
      * from drainedEa on is unread. */
@@ -2943,6 +2991,8 @@ static void gcm_ring_setup(u32 ctx, u32 begin, u32 end)
     s_ring_end = end;
     s_ring_frame_start = begin;
     s_ring_frame_peak = 0;
+    s_ring_guest_lap = 0;
+    s_ring_drain_lap = 0;
 }
 
 static void gcm_ring_publish_end(u32 ctx, u32 writePos)
@@ -3133,10 +3183,12 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
     const u32 neededBytes = gcm_ring_note_frame(cur + 4);
     const u32 wrapThreshold = neededBytes > GCM_FLIP_WRAP_BYTES ? neededBytes : GCM_FLIP_WRAP_BYTES;
     u32 nextWrite = cur + 4;
+    int wrapped = 0;
     if (realEnd - (cur + 4) < wrapThreshold)
     {
         vm_write32(cur + 4, 0x20000000u | io_begin);   /* JUMP -> begin */
         nextWrite = begin;
+        wrapped = 1;
     }
     vm_write32(ctx + 8, nextWrite);
     s_ring_frame_start = nextWrite;
@@ -3145,6 +3197,11 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * (and the JUMP, when wrapping). */
     atomic_thread_fence(memory_order_release);
     vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(nextWrite));
+    if (wrapped)
+    {
+        atomic_thread_fence(memory_order_release);
+        s_ring_guest_lap++;
+    }
     /* ...and wake the present thread for it, rather than leaving the frame
      * until its next 4 ms idle wait runs out. */
     SetEvent((HANDLE)cellGcm_fifo_kick_event());

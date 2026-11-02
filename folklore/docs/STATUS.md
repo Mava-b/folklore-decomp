@@ -1398,6 +1398,16 @@ What 0006 fixes in ps3recomp to make that run:
     after frame with nothing to stop at. The position is now published at
     every JUMP, CALL and RET (inside a CALL, the return point in the ring,
     since everything after it there is still unread).
+    Helped (run-20261102-181115: 7 and 5 frames merged instead of 14-18)
+    but not all of it. patches/0077: the soft end only had addresses to
+    go on, and "the drain is ahead of the guest in the previous lap" (the
+    guest may write up to it) looks the same as "the drain is two laps
+    behind" (the guest's last lap is unread). With a frame per lap, a
+    guest one frame ahead wraps into the second case. The ring now counts
+    laps -- the guest's at each wrap (after publishing put), the drain's
+    at each JUMP to the ring's start, and brought forward to the guest's
+    when the drain is caught up with put -- and the soft end holds the
+    guest at its write position while it is two laps ahead.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
