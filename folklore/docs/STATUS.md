@@ -1313,6 +1313,20 @@ What 0006 fixes in ps3recomp to make that run:
     buffer kept across frames and later draws use them in place; when the
     buffer fills, the GPU is waited for and it starts again. Off with
     LD_RESIDENT_GEOMETRY=0. The [fps] report gains a resident line.
+95. DLC copied in by hand (user report: a European build, RPCS3's
+    BCES00050 folder with European, North American and Japanese packs
+    mixed, copied into hdd0\game). Costume names showed as text IDs,
+    costumes' models and textures broke, the Netherworld Core crashed and
+    leaving it hung on loading. RPCS3 keeps paid packs' files as licence
+    type 2 EDATs; the runtime can only decrypt klicensee (type 3) files, so
+    edat_resolve handed the game ciphertext. engineDlcRepairInstalled
+    (engine_dlc.cpp, called at start after the removals) decrypts every
+    type 1/2 file under bin in place with a licence from hdd0\home\*\exdata
+    or licences\, reports the rest in red in the menu, and adds this
+    release's English names for the other release's recorded files.
+    Tested off Windows (tools/test_dlc_import.cpp --repair): the North
+    American sample copied in as BCES00050 -> 22 files decrypted, 13 _uk
+    copies, second start a no-op; without licences, the six packs listed.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

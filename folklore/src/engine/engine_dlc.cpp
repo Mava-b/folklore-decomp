@@ -32,6 +32,7 @@
 #include "edat.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -1131,4 +1132,214 @@ std::string engineDlcTakeRemovalReport()
     std::error_code error;
     fs::remove(path, error);
     return report;
+}
+
+/* ---------------------------------------------------------------------------
+ * DLC copied in by hand. A player who copies RPCS3's game folder
+ * (dev_hdd0\game\BCES00050 or BCUS98147) straight into the port's hdd0\game
+ * brings the paid packs' files still encrypted with their own licence. The
+ * runtime can only decrypt files keyed by the game's klicensee, so it handed
+ * the game the ciphertext: costume names shown as their text IDs, costume
+ * models and textures in pieces, and crashes or endless loading where the
+ * pack's Folks and areas are used (user report, a European build with
+ * European, North American and Japanese packs mixed as on RPCS3). The same
+ * folder copied with only RPCS3's packs of the other release also lacked
+ * this release's English names.
+ *
+ * At every start, before the game opens anything: each encrypted
+ * licence-type-2 file under bin is decrypted in place with its licence when
+ * one is found (hdd0\home\<user>\exdata, as RPCS3 keeps them, or the
+ * licences folder beside hdd0); files still missing a licence are reported
+ * in the engine menu with what to do. Then every recorded English file of
+ * the other release that has no counterpart under this release's name gets
+ * one, recorded under the same pack, as the importer does.
+ * -------------------------------------------------------------------------*/
+namespace
+{
+    std::string g_dlcRepairStatus;
+
+    std::vector<std::string> ownLicenceFolders()
+    {
+        std::vector<std::string> folders;
+        std::error_code error;
+        const fs::path hdd0(hdd0Directory());
+        for (const fs::directory_entry& user : fs::directory_iterator(hdd0 / "home", error))
+        {
+            if (user.is_directory(error) && isDirectory(user.path() / "exdata"))
+            {
+                folders.push_back((user.path() / "exdata").string());
+            }
+        }
+        const fs::path ownLicences = hdd0.parent_path() / "licences";
+        if (isDirectory(ownLicences))
+        {
+            folders.push_back(ownLicences.string());
+        }
+        return folders;
+    }
+
+    bool isWorkingFile(const fs::path& path)
+    {
+        const std::string extension = path.extension().string();
+        return sameText(extension, ".dec") || sameText(extension, ".importing") ||
+               sameText(extension, ".decrypted") || sameText(extension, ".rifkey");
+    }
+
+    /* The NPD header's licence type (big-endian word at 8); 0 for a plain
+     * file. Type 3 files are keyed by the game's klicensee, which the runtime
+     * has; types 1 and 2 need the buyer's licence. */
+    unsigned int encryptedLicenceType(const fs::path& path)
+    {
+        const std::vector<unsigned char> header = readBytes(path, 0x10);
+        if (header.size() < 0x10 || header[0] != 'N' || header[1] != 'P' || header[2] != 'D' || header[3] != 0)
+        {
+            return 0;
+        }
+        return ((unsigned int)header[8] << 24) | ((unsigned int)header[9] << 16) | ((unsigned int)header[10] << 8) |
+               (unsigned int)header[11];
+    }
+}
+
+std::string engineDlcRepairInstalled()
+{
+    g_dlcRepairStatus.clear();
+    const fs::path bin = targetBin();
+    if (!isDirectory(bin))
+    {
+        return std::string();
+    }
+    const std::vector<std::string> licenceFolders = ownLicenceFolders();
+    std::map<std::string, int> missingLicence;
+    std::map<std::string, bool> licenceKnown;
+    std::map<std::string, std::vector<unsigned char>> licenceKeys;
+    int decrypted = 0;
+    int failed = 0;
+    std::error_code error;
+    std::vector<fs::path> encryptedFiles;
+    for (fs::recursive_directory_iterator walker(bin, fs::directory_options::skip_permission_denied, error), end;
+         !error && walker != end; walker.increment(error))
+    {
+        if (!walker->is_regular_file(error) || isWorkingFile(walker->path()))
+        {
+            continue;
+        }
+        const unsigned int licenceType = encryptedLicenceType(walker->path());
+        if (licenceType == 1 || licenceType == 2)
+        {
+            encryptedFiles.push_back(walker->path());
+        }
+    }
+    for (const fs::path& file : encryptedFiles)
+    {
+        const std::string contentId = encryptedContentId(file);
+        if (!licenceKnown.count(contentId))
+        {
+            unsigned char rifKey[16];
+            const bool found = !contentId.empty() && findLicence(licenceFolders, contentId, rifKey);
+            licenceKnown[contentId] = found;
+            if (found)
+            {
+                licenceKeys[contentId].assign(rifKey, rifKey + 16);
+            }
+        }
+        if (!licenceKnown[contentId])
+        {
+            missingLicence[contentId.empty() ? std::string("(no content ID)") : contentId]++;
+            continue;
+        }
+        if (decryptInto(file, file, licenceKeys[contentId].data()))
+        {
+            decrypted++;
+            fs::remove(fs::path(file.string() + ".dec"), error);   /* the runtime's old decrypt attempt */
+        }
+        else
+        {
+            failed++;
+        }
+    }
+
+    /* The other release's English under this release's names. */
+    int englishCopies = 0;
+    std::vector<ListEntry> installed;
+    if (isFile(bin / "install.dat_") && readList(bin / "install.dat_", &installed))
+    {
+        const bool thisIsEuropean = std::string(FOLKLORE_TITLE_ID) == FOLKLORE_EU_TITLE_ID;
+        const std::string englishFrom = thisIsEuropean ? "en" : "uk";
+        const std::string englishTo = thisIsEuropean ? "uk" : "en";
+        std::set<std::string> recorded;
+        for (const ListEntry& entry : installed)
+        {
+            std::string lowered = entry.path;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                           [](unsigned char character) { return (char)std::tolower(character); });
+            recorded.insert(lowered);
+        }
+        const size_t originalCount = installed.size();
+        for (size_t index = 0; index < originalCount; index++)
+        {
+            const std::string renamed = englishForOtherRelease(installed[index].path, englishFrom, englishTo);
+            if (renamed.empty())
+            {
+                continue;
+            }
+            std::string lowered = renamed;
+            std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+                           [](unsigned char character) { return (char)std::tolower(character); });
+            const fs::path source = bin / relativeToPath(installed[index].path);
+            const fs::path target = bin / relativeToPath(renamed);
+            if (recorded.count(lowered) || isFile(target) || !isFile(source))
+            {
+                continue;
+            }
+            if (copyFileOver(source, target))
+            {
+                installed.push_back({installed[index].pack, renamed});
+                recorded.insert(lowered);
+                englishCopies++;
+            }
+        }
+        if (englishCopies > 0)
+        {
+            writeList(bin / "install.dat_", installed);
+        }
+    }
+
+    std::string report;
+    if (decrypted > 0)
+    {
+        report += "Decrypted " + std::to_string(decrypted) + " DLC files copied in still encrypted.\n";
+    }
+    if (englishCopies > 0)
+    {
+        report += "Added " + std::to_string(englishCopies) + " English files of the other release's packs under " +
+                  "this release's names.\n";
+    }
+    if (failed > 0)
+    {
+        report += std::to_string(failed) + " DLC files could not be decrypted with the licence found " +
+                  "(a licence for another account, or a damaged file).\n";
+    }
+    if (!missingLicence.empty())
+    {
+        std::string status = "Some DLC files are still encrypted and the game cannot read them (their costumes, "
+                             "text and Folks will be broken and the game may crash):\n";
+        for (const auto& [contentId, count] : missingLicence)
+        {
+            status += "  " + contentId + " (" + std::to_string(count) + " files): no " + contentId + ".rap found\n";
+        }
+        status += "Fix: press Add DLC from RPCS3... below and pick RPCS3's folder, or copy the .rap licences into " +
+                  (fs::path(hdd0Directory()).parent_path() / "licences").string() + " and restart.";
+        g_dlcRepairStatus = status;
+        report += status + "\n";
+    }
+    if (!report.empty())
+    {
+        std::fprintf(stderr, "[engine] DLC check:\n%s", report.c_str());
+    }
+    return report;
+}
+
+std::string engineDlcRepairStatus()
+{
+    return g_dlcRepairStatus;
 }

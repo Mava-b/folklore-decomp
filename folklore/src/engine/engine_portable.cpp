@@ -952,6 +952,8 @@ extern "C" const char* ps3_host_bootstrap(const char* elfFromCommandLine)
     /* DLC packs the engine menu was asked to remove: now, before the game
      * opens any of their files (engine_dlc.cpp). */
     engineDlcApplyPendingRemovals();
+    /* DLC copied in by hand, still encrypted (engine_dlc.cpp). */
+    engineDlcRepairInstalled();
 
     if (elfFromCommandLine && *elfFromCommandLine)
     {

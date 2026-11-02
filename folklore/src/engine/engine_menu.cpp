@@ -352,6 +352,15 @@ namespace
             removalMessage = dlcImport.removalMessage;
         }
 
+        {
+            const std::string repairStatus = engineDlcRepairStatus();
+            if (!repairStatus.empty())
+            {
+                ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 640.0f);
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "%s", repairStatus.c_str());
+                ImGui::PopTextWrapPos();
+            }
+        }
         int pressedRemove = -2;     /* -2 nothing; 0 Remove all; else a pack */
         int pressedKeep = -1;
         if (installed.empty())

@@ -37,8 +37,15 @@ int main(int argumentCount, char** arguments)
 {
     if (argumentCount < 2)
     {
-        std::fprintf(stderr, "usage: %s <folder to import from> | --remove <pack>...\n", arguments[0]);
+        std::fprintf(stderr, "usage: %s <folder to import from> | --remove <pack>... | --repair\n", arguments[0]);
         return 2;
+    }
+    if (std::string(arguments[1]) == "--repair")
+    {
+        /* What a start does with DLC copied into hdd0 by hand. */
+        std::printf("repair report:\n%s", engineDlcRepairInstalled().c_str());
+        std::printf("menu status: %s\n", engineDlcRepairStatus().empty() ? "(none)" : engineDlcRepairStatus().c_str());
+        return 0;
     }
     if (std::string(arguments[1]) == "--remove")
     {

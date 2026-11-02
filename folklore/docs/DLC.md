@@ -28,6 +28,23 @@ port's `hdd0`, and in the folder you picked. A pack whose licence is missing
 — or belongs to another account — is left out whole, with a line saying so;
 the others still go in.
 
+## Copying the folder in by hand
+
+Copying RPCS3's game folder (`dev_hdd0\game\BCES00050` or `BCUS98147`)
+straight into the port's `hdd0\game` works too, but RPCS3 keeps the paid
+packs' files encrypted with your licences, and the game cannot read them like
+that: costumes come out with text IDs for names and broken models, and the
+game can crash or hang on loading where the packs' Folks are used. So at
+every start the port looks for such files and decrypts them in place with
+your licences, from `hdd0\home\<user>\exdata` (copy RPCS3's
+`dev_hdd0\home\00000001\exdata` there) or a `licences` folder beside
+`hdd0`. If some licences are missing, the engine menu's *Downloadable
+content* section says which, in red; **Add DLC from RPCS3...** fixes it as
+well, since it reads the licences from RPCS3's own folder. The same check
+gives the other release's packs this release's English names (see below), so
+a folder that mixes releases' packs reads in English either way. It takes a
+few seconds the first time, and nothing after.
+
 ## Removing packs
 
 Each installed pack has a **Remove** button in the menu's *Downloadable

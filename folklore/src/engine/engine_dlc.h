@@ -78,6 +78,17 @@ std::string engineDlcApplyPendingRemovals();
 /* The report of the removals done at this start, once; empty after. */
 std::string engineDlcTakeRemovalReport();
 
+/* At start, after the removals: DLC copied into hdd0 by hand from RPCS3
+ * keeps its paid packs' files encrypted. Decrypt them in place with the
+ * licences found in hdd0\home\<user>\exdata or the licences folder, and
+ * add the other release's English files under this release's names.
+ * Returns what was done, for the log. */
+std::string engineDlcRepairInstalled();
+
+/* Files the start-up check could not decrypt (no licence), for the engine
+ * menu; empty when there are none. */
+std::string engineDlcRepairStatus();
+
 /* "Add-on pack 3" for a paid pack (numbered by its content ID), "Free pack
  * (19)" for the others. */
 std::string engineDlcPackName(const DlcPackInfo& pack);
