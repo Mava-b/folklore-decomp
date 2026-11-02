@@ -2626,19 +2626,6 @@ static void gcm_rsx_process_fifo_unlocked(void)
     }
 
     gcm_note_drained_position(gcm_io2ea(s_fifo_getoff));
-    /* Caught up with what the guest has published: the drain is in the
-     * guest's lap (put is always in it). Read the lap before put -- the
-     * guest publishes put before it counts a new lap -- so a wrap racing
-     * this cannot make the drain look a lap further on than it is. */
-    {
-        const u32 guestLap = s_ring_guest_lap;
-        atomic_thread_fence(memory_order_acquire);
-        if (s_ring_begin && s_fifo_getoff == vm_read32(GCM_CONTROL_GUEST_ADDR + 0) &&
-            (s32)(guestLap - s_ring_drain_lap) > 0)
-        {
-            s_ring_drain_lap = guestLap;   /* only ever forward */
-        }
-    }
     /* GCM_GET_EQ_PUT=1: publish `get` as having reached `put` rather than where
      * the walker actually is. A probe, not a fix -- it removes the back-pressure
      * a title uses to avoid overwriting commands the GPU has not read. It exists
@@ -3196,7 +3183,18 @@ static int gcm_flip_into_fifo(u32 ctx, u32 bufferId)
      * so the drain can start on it: it is complete up to its flip marker
      * (and the JUMP, when wrapping). */
     atomic_thread_fence(memory_order_release);
-    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(nextWrite));
+    /* When the frame wrapped, put goes on the JUMP, not past it to the
+     * ring's start: a put at `begin` reads "nothing to do" to a drain that
+     * is itself at `begin` -- which it is, whenever it has just taken the
+     * previous wrap -- although a whole frame lies between them. The drain
+     * then sat idle on an unread frame, the guest (whose limit said the
+     * drain was behind it in the same lap) wrote its next frame over it, and
+     * that frame's flip marker was lost: the combat stutters
+     * (run-20261102-181911, the WaitFlip lines "not flushed yet" with get ==
+     * put while flips piled up). With put on the JUMP the drain stops just
+     * short of it, after the flip marker, and takes it once the guest
+     * publishes anything in the new lap. */
+    vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(wrapped ? cur + 4 : nextWrite));
     if (wrapped)
     {
         atomic_thread_fence(memory_order_release);

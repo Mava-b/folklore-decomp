@@ -1408,6 +1408,16 @@ What 0006 fixes in ps3recomp to make that run:
     at each JUMP to the ring's start, and brought forward to the guest's
     when the drain is caught up with put -- and the soft end holds the
     guest at its write position while it is two laps ahead.
+    Still 9 frames (run-20261102-181911), and the WaitFlip lines show why:
+    get == put while flips piled up. A frame that wraps published put at
+    the ring's start -- where the drain also is, whenever it has just
+    taken the previous wrap. get == put then reads as "nothing to do"
+    though a whole frame lies between them: the drain idled on it, the
+    guest wrote the next frame over it, and its marker was gone (and the
+    "caught up" lap sync made it worse, so it is removed). patches/0078:
+    a wrapping frame publishes put on its JUMP instead; the drain stops
+    there after the flip marker and takes the JUMP when the guest next
+    publishes. The ring's full/empty ambiguity, in other words.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
