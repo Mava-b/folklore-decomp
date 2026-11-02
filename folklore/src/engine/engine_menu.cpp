@@ -58,6 +58,8 @@ extern "C"
      * or Switch Pro. Buttons in CELL_PAD packing. */
     int cellPad_host_ds3_state(uint16_t* buttons, uint8_t* stickLeftX, uint8_t* stickLeftY, int* psButton);
     const char* cellPad_host_pad_name(void);
+    /* Saves finished since start (cellSaveData.c, patches/0072). */
+    void cellSaveDataHostSaveCounts(uint32_t* done, uint32_t* failed);
     int cellPad_motion_live(void);
     /* [fps] breakdown counters (cellGcmSys.c), nanoseconds since start. */
     extern volatile uint64_t g_gcm_perf_main_usleep_ns;
@@ -754,6 +756,88 @@ namespace
         menu.windowFrames = 0;
     }
 
+    /* "Game saved": when the game finishes a save, a small notice at the top
+     * of the screen for a few seconds, fading out (or, if the save failed,
+     * one saying so). The counts come from the save data module. */
+    struct SaveNotice
+    {
+        bool countsKnown = false;
+        uint32_t saves = 0;
+        uint32_t failures = 0;
+        unsigned long long shownUntil = 0;     /* GetTickCount64 */
+        bool failed = false;
+    };
+    SaveNotice saveNotice;
+
+    constexpr unsigned long long kSaveNoticeMs = 2500;
+    constexpr unsigned long long kSaveNoticeFadeMs = 600;
+
+    /* True while there is a notice to draw. */
+    bool updateSaveNotice()
+    {
+        uint32_t saves = 0;
+        uint32_t failures = 0;
+        cellSaveDataHostSaveCounts(&saves, &failures);
+        if (!saveNotice.countsKnown)
+        {
+            saveNotice.countsKnown = true;
+            saveNotice.saves = saves;
+            saveNotice.failures = failures;
+        }
+        const unsigned long long nowMs = GetTickCount64();
+        if (failures != saveNotice.failures)
+        {
+            saveNotice.failed = true;
+            saveNotice.shownUntil = nowMs + kSaveNoticeMs + 1500;
+        }
+        else if (saves != saveNotice.saves)
+        {
+            saveNotice.failed = false;
+            saveNotice.shownUntil = nowMs + kSaveNoticeMs;
+        }
+        saveNotice.saves = saves;
+        saveNotice.failures = failures;
+        if (!engineSettings().showSaveNotice)
+        {
+            saveNotice.shownUntil = 0;
+        }
+        return nowMs < saveNotice.shownUntil;
+    }
+
+    void drawSaveNotice(float width)
+    {
+        const unsigned long long nowMs = GetTickCount64();
+        if (nowMs >= saveNotice.shownUntil)
+        {
+            return;
+        }
+        const unsigned long long remaining = saveNotice.shownUntil - nowMs;
+        const float fade = remaining < kSaveNoticeFadeMs ? (float)remaining / (float)kSaveNoticeFadeMs : 1.0f;
+        const float scale = ImGui::GetIO().DisplaySize.y / 1080.0f;
+        ImGui::SetNextWindowPos(ImVec2(width * 0.5f, 48.0f * (scale > 0.5f ? scale : 0.5f)), ImGuiCond_Always,
+                                ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.65f * fade);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+        ImGui::PushStyleVar(ImGuiStyleVar_Alpha, fade);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(16.0f, 8.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 6.0f);
+        if (ImGui::Begin("##savenotice", nullptr, flags))
+        {
+            if (saveNotice.failed)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.5f, 0.4f, 1.0f), "Save failed -- see the log");
+            }
+            else
+            {
+                ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f), "Game saved");
+            }
+        }
+        ImGui::End();
+        ImGui::PopStyleVar(3);
+    }
+
     void drawPerformanceOverlay()
     {
         ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
@@ -1231,6 +1315,7 @@ namespace
 
             ImGui::SeparatorText("Display");
             changed |= ImGui::Checkbox("Performance overlay", &settings.showPerformanceOverlay);
+            changed |= ImGui::Checkbox("\"Game saved\" notice", &settings.showSaveNotice);
 
             ImGui::SeparatorText("Now");
             ImGui::Text("%.1f fps, %.1f ms per frame", menu.shownFps, menu.shownFrameMs);
@@ -1366,7 +1451,8 @@ namespace
         updatePerformance(frameSeconds);
 
         const bool showOverlay = engineSettings().showPerformanceOverlay;
-        if (!menu.menuOpen && !showOverlay)
+        const bool showSaveNotice = updateSaveNotice();
+        if (!menu.menuOpen && !showOverlay && !showSaveNotice)
         {
             return;     /* nothing to draw: no ImGui work at all */
         }
@@ -1406,6 +1492,10 @@ namespace
         if (showOverlay)
         {
             drawPerformanceOverlay();
+        }
+        if (showSaveNotice)
+        {
+            drawSaveNotice((float)width);
         }
         if (menu.menuOpen)
         {

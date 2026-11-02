@@ -280,6 +280,9 @@ s32 cellSaveDataFixedLoad(u32 version, CellSaveDataSetList* setList,
                           CellSaveDataStatCallback funcStat,
                           CellSaveDataFileCallback funcFile, u32 container);
 
+/* Saves finished since start: succeeded and failed (for a host notice). */
+void cellSaveDataHostSaveCounts(u32* done, u32* failed);
+
 s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
                            CellSaveDataSetBuf* setBuf,
                            CellSaveDataListCallback funcList,

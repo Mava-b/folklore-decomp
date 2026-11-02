@@ -1,0 +1,77 @@
+diff --git a/libs/system/cellSaveData.h b/libs/system/cellSaveData.h
+--- a/libs/system/cellSaveData.h
++++ b/libs/system/cellSaveData.h
+@@ -280,6 +280,9 @@
+                           CellSaveDataStatCallback funcStat,
+                           CellSaveDataFileCallback funcFile, u32 container);
+ 
++/* Saves finished since start: succeeded and failed (for a host notice). */
++void cellSaveDataHostSaveCounts(u32* done, u32* failed);
++
+ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
+                            CellSaveDataSetBuf* setBuf,
+                            CellSaveDataListCallback funcList,
+diff --git a/libs/system/cellSaveData.c b/libs/system/cellSaveData.c
+--- a/libs/system/cellSaveData.c
++++ b/libs/system/cellSaveData.c
+@@ -826,13 +826,59 @@
+     }
+ }
+ 
+-/* Core save/load implementation shared by List/Fixed/Auto variants */
++/* Saves finished, for a host that shows the player a notice (Folklore's
++ * engine overlay): how many succeeded and how many failed since start. */
++static volatile long g_savedata_saves_done = 0;
++static volatile long g_savedata_saves_failed = 0;
++
++void cellSaveDataHostSaveCounts(u32* done, u32* failed)
++{
++    if (done)
++    {
++        *done = (u32)g_savedata_saves_done;
++    }
++    if (failed)
++    {
++        *failed = (u32)g_savedata_saves_failed;
++    }
++}
++
++static s32 savedata_execute_core(const char* dirName, int is_save,
++                                 CellSaveDataSetBuf* setBuf,
++                                 CellSaveDataStatCallback funcStat,
++                                 CellSaveDataFileCallback funcFile,
++                                 void* userdata);
++
++/* Core save/load implementation shared by List/Fixed/Auto variants. A save
++ * the title itself cancels (its callback answering NODATA) is counted as
++ * neither. */
+ static s32 savedata_execute(const char* dirName, int is_save,
+                              CellSaveDataSetBuf* setBuf,
+                              CellSaveDataStatCallback funcStat,
+                              CellSaveDataFileCallback funcFile,
+                              void* userdata)
+ {
++    const s32 result = savedata_execute_core(dirName, is_save, setBuf, funcStat, funcFile, userdata);
++    if (is_save)
++    {
++        if (result == CELL_OK)
++        {
++            g_savedata_saves_done++;
++        }
++        else if (result != CELL_SAVEDATA_ERROR_NODATA)
++        {
++            g_savedata_saves_failed++;
++        }
++    }
++    return result;
++}
++
++static s32 savedata_execute_core(const char* dirName, int is_save,
++                                 CellSaveDataSetBuf* setBuf,
++                                 CellSaveDataStatCallback funcStat,
++                                 CellSaveDataFileCallback funcFile,
++                                 void* userdata)
++{
+     if (!dirName || !funcStat)
+         return CELL_SAVEDATA_ERROR_PARAM;
+ 

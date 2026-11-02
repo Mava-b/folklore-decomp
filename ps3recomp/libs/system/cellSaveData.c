@@ -826,12 +826,58 @@ static void read_param_sfo(const char* save_path, CellSaveDataSystemFileParam* p
     }
 }
 
-/* Core save/load implementation shared by List/Fixed/Auto variants */
+/* Saves finished, for a host that shows the player a notice (Folklore's
+ * engine overlay): how many succeeded and how many failed since start. */
+static volatile long g_savedata_saves_done = 0;
+static volatile long g_savedata_saves_failed = 0;
+
+void cellSaveDataHostSaveCounts(u32* done, u32* failed)
+{
+    if (done)
+    {
+        *done = (u32)g_savedata_saves_done;
+    }
+    if (failed)
+    {
+        *failed = (u32)g_savedata_saves_failed;
+    }
+}
+
+static s32 savedata_execute_core(const char* dirName, int is_save,
+                                 CellSaveDataSetBuf* setBuf,
+                                 CellSaveDataStatCallback funcStat,
+                                 CellSaveDataFileCallback funcFile,
+                                 void* userdata);
+
+/* Core save/load implementation shared by List/Fixed/Auto variants. A save
+ * the title itself cancels (its callback answering NODATA) is counted as
+ * neither. */
 static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile,
                              void* userdata)
+{
+    const s32 result = savedata_execute_core(dirName, is_save, setBuf, funcStat, funcFile, userdata);
+    if (is_save)
+    {
+        if (result == CELL_OK)
+        {
+            g_savedata_saves_done++;
+        }
+        else if (result != CELL_SAVEDATA_ERROR_NODATA)
+        {
+            g_savedata_saves_failed++;
+        }
+    }
+    return result;
+}
+
+static s32 savedata_execute_core(const char* dirName, int is_save,
+                                 CellSaveDataSetBuf* setBuf,
+                                 CellSaveDataStatCallback funcStat,
+                                 CellSaveDataFileCallback funcFile,
+                                 void* userdata)
 {
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;

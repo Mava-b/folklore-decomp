@@ -54,6 +54,9 @@ struct EngineSettings
      * up to 10 ms after it. */
     bool fineLimiterSleep = true;
     bool showPerformanceOverlay = false;
+    /* A short "Game saved" notice when the game finishes a save (or says
+     * when one failed); engine_menu.cpp. */
+    bool showSaveNotice = true;
     /* Graphics. renderScale: colour and depth buffers at 1-3x the PS3's
      * 1280x720; read when the renderer starts, so a change applies on the
      * next launch. The other two apply at once. */

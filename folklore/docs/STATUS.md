@@ -1327,6 +1327,12 @@ What 0006 fixes in ps3recomp to make that run:
     Tested off Windows (tools/test_dlc_import.cpp --repair): the North
     American sample copied in as BCES00050 -> 22 files decrypted, 13 _uk
     copies, second start a no-op; without licences, the six packs listed.
+96. "Game saved" notice (engine setting show_save_notice, on by default).
+    patches/0072 counts the saves cellSaveData finishes (savedata_execute
+    wraps the old body: CELL_OK -> done; any error but NODATA, which is the
+    title cancelling, -> failed) behind cellSaveDataHostSaveCounts; the
+    engine overlay polls it each frame and shows "Game saved" (or "Save
+    failed -- see the log") at the top centre for 2.5 s, fading out.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

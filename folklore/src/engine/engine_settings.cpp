@@ -177,6 +177,10 @@ void engineSettingsLoad()
         {
             settingsInstance.showPerformanceOverlay = parseBool(value);
         }
+        else if (std::strcmp(key, "show_save_notice") == 0)
+        {
+            settingsInstance.showSaveNotice = parseBool(value);
+        }
         else if (std::strcmp(key, "render_scale") == 0)
         {
             const int scale = std::atoi(value);
@@ -406,6 +410,7 @@ void engineSettingsSave()
     std::fprintf(file, "frame_rate_cap = %s\n", capText);
     std::fprintf(file, "fine_limiter_sleep = %d\n", current.fineLimiterSleep ? 1 : 0);
     std::fprintf(file, "show_performance_overlay = %d\n", current.showPerformanceOverlay ? 1 : 0);
+    std::fprintf(file, "show_save_notice = %d\n", current.showSaveNotice ? 1 : 0);
     std::fprintf(file, "render_scale = %d\n", current.renderScale);
     std::fprintf(file, "# off, fxaa or smaa\n");
     std::fprintf(file, "anti_aliasing = %s\n",
