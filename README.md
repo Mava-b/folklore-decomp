@@ -468,6 +468,14 @@ When something draws wrong, press **F2** (or the PS button on a DualShock 3)
 while it is on screen, or double-click `capture.bat`. The next four seconds of
 draws go to `logs\capture-<date-time>\`.
 
+### Motion watch (for the capture mechanics)
+
+**F3** in game starts a 20-second watch of where the game reads the
+controller's motion sensors (the game runs slower while it watches; F3
+again stops it early). The results go to the run log as `[motion-watch]`
+lines. Used to find the capture code, so auto-capture can handle the boss
+Ids' capture mechanics.
+
 ### Comparing with Sony's libsre
 
 Until October 2026 the port ran the game's SPU jobs on Sony's own SPURS

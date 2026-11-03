@@ -1462,6 +1462,19 @@ What 0006 fixes in ps3recomp to make that run:
     RGBA8 and BGRA8, DX10 or legacy headers, sRGB read as UNORM; RGBA files
     without mips get them box-filtered. The folder is listed once, at the
     first texture decode.
+104. Auto-capture does not finish boss captures (player report): the boss
+    Ids use the Time / Beat / Balance / Stop & Go mechanics, which need the
+    right motion at the right moment, and auto-capture only feeds constant
+    full-scale motion. Doing them needs the game's capture state. The pad
+    library keeps the sensor words (minus 512) at +24..+31 of each pad in
+    its pad array (1.00: 0x109547F0, 104-byte pads; 1.10: 0x10955AFC,
+    108-byte pads -- 1.10 added a field), but no code in the game reads them
+    there in a way the disassembly shows (the library's own accessors are
+    never called). Diagnostic, src/engine/engine_motion_watch.cpp: F3 makes
+    that page a guard page for 20 s, and every access is logged with the
+    game call chain (host stack unwound, frames mapped back through
+    function_table), sensor readers first. Next: run it during a boss
+    capture, then follow the reader to the capture state.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

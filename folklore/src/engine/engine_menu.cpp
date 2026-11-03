@@ -18,6 +18,7 @@
 #include "engine_saves.h"
 #include "engine_portable.h"
 #include "engine_dlc.h"
+#include "engine_motion_watch.h"
 #include "engine_region.h"
 
 #ifdef _WIN32
@@ -104,6 +105,7 @@ namespace
         WORD previousButtons = 0;
         bool previousToggleKey = false;
         bool previousCaptureKey = false;
+        bool previousWatchKey = false;
         bool captureActive = false;
         LARGE_INTEGER captureStart = {};
         bool previousEscape = false;
@@ -844,6 +846,25 @@ namespace
         ImGui::PopStyleVar(3);
     }
 
+    /* While the motion watch runs: a reminder that it is on (the game is
+     * slower while it watches). */
+    void drawWatchNotice(float width, unsigned secondsLeft)
+    {
+        const float scale = ImGui::GetIO().DisplaySize.y / 1080.0f;
+        ImGui::SetNextWindowPos(ImVec2(width * 0.5f, 60.0f * (scale > 0.5f ? scale : 0.5f)), ImGuiCond_Always,
+                                ImVec2(0.5f, 0.0f));
+        ImGui::SetNextWindowBgAlpha(0.65f);
+        const ImGuiWindowFlags flags = ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                                       ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoFocusOnAppearing |
+                                       ImGuiWindowFlags_NoNav | ImGuiWindowFlags_NoInputs;
+        if (ImGui::Begin("##motionwatch", nullptr, flags))
+        {
+            ImGui::SetWindowFontScale(1.3f);
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Motion watch: %u s left (F3 stops)", secondsLeft);
+        }
+        ImGui::End();
+    }
+
     void drawPerformanceOverlay()
     {
         ImGui::SetNextWindowPos(ImVec2(10.0f, 10.0f), ImGuiCond_Always);
@@ -1448,6 +1469,15 @@ namespace
             }
         }
         menu.previousCaptureKey = captureKey;
+        /* F3: the motion watch (engine_motion_watch.cpp), a diagnostic for
+         * finding the game's capture code. */
+        const bool watchKey = focused && keyDown(VK_F3);
+        if (watchKey && !menu.previousWatchKey)
+        {
+            engineMotionWatchToggle();
+        }
+        menu.previousWatchKey = watchKey;
+        engineMotionWatchUpdate();
         menu.previousButtons = controller.buttons;
         menu.previousToggleKey = toggleKey;
         menu.previousEscape = escapeKey;
@@ -1488,7 +1518,9 @@ namespace
 
         const bool showOverlay = engineSettings().showPerformanceOverlay;
         const bool showSaveNotice = updateSaveNotice();
-        if (!menu.menuOpen && !showOverlay && !showSaveNotice)
+        unsigned watchSecondsLeft = 0;
+        const bool showWatch = engineMotionWatchActive(&watchSecondsLeft);
+        if (!menu.menuOpen && !showOverlay && !showSaveNotice && !showWatch)
         {
             return;     /* nothing to draw: no ImGui work at all */
         }
@@ -1532,6 +1564,10 @@ namespace
         if (showSaveNotice)
         {
             drawSaveNotice((float)width);
+        }
+        if (showWatch)
+        {
+            drawWatchNotice((float)width, watchSecondsLeft);
         }
         if (menu.menuOpen)
         {
