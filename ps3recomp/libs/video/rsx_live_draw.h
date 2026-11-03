@@ -176,6 +176,14 @@ void rsx_live_draw_set_repeat_draws(int enabled);
  * units hold cube maps. `hlsl` must stay valid; NULL removes the entry. Applies to shaders
  * built after the call, so set it before the first frame. Up to 16. */
 void rsx_live_draw_set_ps_replacement(u64 sourceHash, const char* hlsl);
+/* Texture pack: replacement textures (DDS files named by the key the
+ * texture dump gives them) from this folder and the folders under it; NULL
+ * or "" for none. Read when the first texture is decoded, so set it before
+ * the first frame; later calls change nothing until the next launch. */
+void rsx_live_draw_set_texture_pack(const char* folder);
+/* Whether a texture pack is in use, and its files: found in the folder,
+ * replacing a texture so far, and unusable (the log says why). */
+int  rsx_live_draw_get_texture_pack_stats(u32* filesFound, u32* filesInUse, u32* filesBroken);
 /* Background shader builds queued now, built so far, and draws skipped while
  * waiting for one (for a performance overlay). */
 void rsx_live_draw_get_shader_stats(u32* pending, u32* built, u32* skipped_draws);

@@ -249,6 +249,14 @@ void engineSettingsLoad()
                 settingsInstance.textureDetail = EngineSettings::TextureDetail::Sharper;
             }
         }
+        else if (std::strcmp(key, "texture_pack") == 0)
+        {
+            settingsInstance.texturePack = parseBool(value);
+        }
+        else if (std::strcmp(key, "texture_pack_dir") == 0)
+        {
+            settingsInstance.texturePackDir = value;
+        }
         else if (std::strcmp(key, "bloom") == 0)
         {
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
@@ -433,6 +441,9 @@ void engineSettingsSave()
                  : current.textureDetail == EngineSettings::TextureDetail::Sharpest ? "sharpest"
                                                                                     : "sharper");
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
+    std::fprintf(file, "# Replacement textures (next start); folder empty = textures\\replace next to this file\n");
+    std::fprintf(file, "texture_pack = %d\n", current.texturePack ? 1 : 0);
+    std::fprintf(file, "texture_pack_dir = %s\n", current.texturePackDir.c_str());
     std::fprintf(file, "# original (the game's two-tap blur) or smooth (next start)\n");
     std::fprintf(file, "depth_of_field = %s\n",
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
@@ -492,6 +503,7 @@ extern "C"
     void rsx_live_draw_set_shadow_softness(int level);
     void rsx_live_draw_set_repeat_draws(int enabled);
     void rsx_live_draw_set_sharpening(uint32_t percent);
+    void rsx_live_draw_set_texture_pack(const char* folder);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
     float rsx_live_draw_get_aspect(void);
@@ -499,9 +511,41 @@ extern "C"
     void rsx_null_backend_set_fullscreen(int enabled);
 }
 
+namespace
+{
+    /* -1 until the first graphics apply, then whether the pack was on. */
+    int texturePackLaunchState = -1;
+}
+
+std::string engineTexturePackFolder()
+{
+    const EngineSettings& current = engineSettings();
+    if (!current.texturePackDir.empty())
+    {
+        return current.texturePackDir;
+    }
+    std::string folder = engineSettingsPath();
+    const size_t separator = folder.find_last_of("\\/");
+    folder = separator == std::string::npos ? std::string(".") : folder.substr(0, separator);
+    return folder + "\\textures\\replace";
+}
+
+bool engineTexturePackOnThisLaunch()
+{
+    return texturePackLaunchState == 1;
+}
+
 void engineSettingsApplyGraphics()
 {
     const EngineSettings& current = engineSettings();
+    /* The renderer lists the pack's folder once, as it starts: only the
+     * launch's own setting is handed over. */
+    if (texturePackLaunchState < 0)
+    {
+        texturePackLaunchState = current.texturePack ? 1 : 0;
+        const std::string folder = current.texturePack ? engineTexturePackFolder() : std::string();
+        rsx_live_draw_set_texture_pack(folder.c_str());
+    }
     rsx_live_draw_set_render_scale((uint32_t)current.renderScale);
     rsx_live_draw_set_post_aa((int)current.antiAliasing);
     rsx_live_draw_set_async_shaders(current.backgroundShaders ? 1 : 0);

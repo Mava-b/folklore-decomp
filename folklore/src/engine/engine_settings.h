@@ -82,6 +82,11 @@ struct EngineSettings
         Sharpest,
     };
     TextureDetail textureDetail = TextureDetail::Sharper;
+    /* Texture pack: replacement textures (higher resolution) from
+     * texturePackDir, or textures\replace next to the settings file when
+     * that is empty. Read when the renderer starts: next launch. */
+    bool texturePack = false;
+    std::string texturePackDir;
     /* Menus and HUD wider than 16:9: stretched across the screen (as the
      * game draws them), centred at their own proportions, or centred with
      * the map, gauges and hints moved out towards the edges (hudEdge: 0-100
@@ -206,6 +211,12 @@ void engineDepthOfFieldApply();
 void engineBloomApply();
 /* engine_ids.cpp: the same for the Ids' souls. */
 void engineIdSoulsApply();
+/* The texture pack folder the setting points at (textures\replace next to
+ * the settings file unless texture_pack_dir says otherwise). */
+std::string engineTexturePackFolder();
+/* Whether this launch started with the texture pack on (the renderer reads
+ * it once). */
+bool engineTexturePackOnThisLaunch();
 /* Hand the input settings to the pad runtime (startup and every change). */
 void engineSettingsApplyInput();
 /* The aspect ratio a setting asks for (16:9 for Original). */

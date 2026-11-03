@@ -49,6 +49,7 @@ extern "C"
                                         uint32_t width, uint32_t height);
     void rsx_live_draw_set_overlay(rsx_live_overlay_fn fn);
     uint32_t rsx_live_draw_get_render_scale(void);
+    int rsx_live_draw_get_texture_pack_stats(uint32_t* filesFound, uint32_t* filesInUse, uint32_t* filesBroken);
     float rsx_live_draw_get_aspect(void);
     int rsx_null_backend_is_fullscreen(void);
     void rsx_null_backend_set_fullscreen(int enabled);
@@ -1079,6 +1080,36 @@ namespace
                 settings.textureDetail = (EngineSettings::TextureDetail)detailIndex;
                 changed = true;
             }
+        }
+        changed |= ImGui::Checkbox("High-resolution textures (texture pack)", &settings.texturePack);
+        if (settings.texturePack != engineTexturePackOnThisLaunch())
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Turned %s; applies when you next start the game.",
+                               settings.texturePack ? "on" : "off");
+        }
+        else if (settings.texturePack)
+        {
+            uint32_t filesFound = 0;
+            uint32_t filesInUse = 0;
+            uint32_t filesBroken = 0;
+            rsx_live_draw_get_texture_pack_stats(&filesFound, &filesInUse, &filesBroken);
+            if (filesFound == 0)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "No replacement textures found yet.");
+            }
+            else if (filesBroken > 0)
+            {
+                ImGui::TextDisabled("%u replacement textures, %u in use so far, %u unusable (the log says why).",
+                                    filesFound, filesInUse, filesBroken);
+            }
+            else
+            {
+                ImGui::TextDisabled("%u replacement textures, %u in use so far.", filesFound, filesInUse);
+            }
+        }
+        if (settings.texturePack)
+        {
+            ImGui::TextDisabled("Folder: %s", engineTexturePackFolder().c_str());
         }
         ImGui::TextUnformatted("Sharpening");
         changed |= radioSharpening("Off##sharpen", 0);

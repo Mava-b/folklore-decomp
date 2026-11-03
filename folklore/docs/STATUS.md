@@ -1453,6 +1453,15 @@ What 0006 fixes in ps3recomp to make that run:
     A cache entry whose contents change three times within 60 frames of
     each other is not dumped (movie frames). Render targets never reach the
     decode path, so they are not dumped either.
+103. Texture packs (patches/0083; engine menu "High-resolution textures",
+    setting texture_pack / texture_pack_dir, next launch): every .dds under
+    textures\replace whose name starts with a dump key replaces that
+    texture at any size, uploaded through its own upload buffer (a big one
+    does not fit the shared ring) and bound with its own format in the SRV
+    (the guest's remap still applies to a replaced DXT texture). BC1-BC7,
+    RGBA8 and BGRA8, DX10 or legacy headers, sRGB read as UNORM; RGBA files
+    without mips get them box-filtered. The folder is listed once, at the
+    first texture decode.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

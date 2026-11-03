@@ -66,6 +66,9 @@ void rsx_live_draw_set_shadow_softness(int l) { (void)l; }
 void rsx_live_draw_set_repeat_draws(int e) { (void)e; }
 void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
 void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
+void rsx_live_draw_set_texture_pack(const char* f) { (void)f; }
+int  rsx_live_draw_get_texture_pack_stats(u32* f, u32* r, u32* b)
+{ if (f) *f = 0; if (r) *r = 0; if (b) *b = 0; return 0; }
 void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
 { if (p) *p = 0; if (b) *b = 0; if (s) *s = 0; }
 u32  rsx_live_draw_get_frames(void) { return 0; }
@@ -305,6 +308,8 @@ typedef struct {
      * rewrites all the time -- a movie frame -- is not dumped). */
     u32 dump_change_frame;
     u32 dump_quick_changes;
+    /* A texture pack's replacement is bound (its own format; 0 = none). */
+    DXGI_FORMAT replaced_format;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -3582,11 +3587,679 @@ static ID3D12Resource* decode_guest_texture_profiled(
     return result;
 }
 
-/* decode_guest_texture_profiled, writing the texture to the dump folder on
+/* ---------------------------------------------------------------------------
+ * Texture pack (rsx_live_draw_set_texture_pack; the engine menu's
+ * "High-resolution textures", textures\replace)
+ *
+ * Every .dds file in the folder, or any folder under it, whose name starts
+ * with a texture's 16-digit key (as the dump names them) replaces that
+ * texture, at any size. Read from disk each time the texture is uploaded;
+ * the folder is listed once, when the first texture is decoded, so files
+ * added later and a change of setting show on the next launch.
+ *
+ * Shaders sample textures by 0..1 coordinates (texel-addressed units are
+ * divided by the game's own size first), so a bigger replacement simply
+ * has more detail. Formats: BC1-BC7, RGBA8 and BGRA8 (sRGB variants are read
+ * as plain, as the game does its own gamma); a cube map must replace a cube
+ * map. An uncompressed file without mipmaps gets them made here; a
+ * compressed one should be saved with them (texconv -m 0), or it shimmers
+ * in the distance. A replacement that cannot be read is skipped (the
+ * game's own texture shows) and logged once.
+ *
+ * The game's own colour remap still applies to a replaced DXT texture,
+ * since its dump is the disc's data; the other formats were dumped with it
+ * already applied.
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    u64 key;
+    char* path;
+    u32 failed;
+    u32 loaded;
+} ld_texture_pack_file;
+
+static SRWLOCK g_ld_texture_pack_lock = SRWLOCK_INIT;
+static char g_ld_texture_pack_folder[MAX_PATH];
+static int g_ld_texture_pack_started = 0;       /* render thread: folder listed (or none) */
+static ld_texture_pack_file* g_ld_texture_pack_files = NULL;
+static u32 g_ld_texture_pack_capacity = 0;
+static u32 g_ld_texture_pack_count = 0;
+static volatile LONG g_ld_texture_pack_replaced = 0;   /* distinct files in use */
+static volatile LONG g_ld_texture_pack_broken = 0;     /* files that could not be used */
+
+void rsx_live_draw_set_texture_pack(const char* folder)
+{
+    AcquireSRWLockExclusive(&g_ld_texture_pack_lock);
+    if (!g_ld_texture_pack_started)
+    {
+        snprintf(g_ld_texture_pack_folder, sizeof(g_ld_texture_pack_folder), "%s", folder ? folder : "");
+    }
+    ReleaseSRWLockExclusive(&g_ld_texture_pack_lock);
+}
+
+int rsx_live_draw_get_texture_pack_stats(u32* filesFound, u32* filesInUse, u32* filesBroken)
+{
+    if (filesFound)
+    {
+        *filesFound = g_ld_texture_pack_count;
+    }
+    if (filesInUse)
+    {
+        *filesInUse = (u32)g_ld_texture_pack_replaced;
+    }
+    if (filesBroken)
+    {
+        *filesBroken = (u32)g_ld_texture_pack_broken;
+    }
+    return g_ld_texture_pack_started && g_ld_texture_pack_folder[0] ? 1 : 0;
+}
+
+static int ld_texture_pack_parse_key(const char* fileName, u64* key)
+{
+    u64 value = 0;
+    for (int digitIndex = 0; digitIndex < 16; digitIndex++)
+    {
+        const char digit = fileName[digitIndex];
+        u32 nibble;
+        if (digit >= '0' && digit <= '9')
+        {
+            nibble = (u32)(digit - '0');
+        }
+        else if (digit >= 'A' && digit <= 'F')
+        {
+            nibble = (u32)(digit - 'A' + 10);
+        }
+        else if (digit >= 'a' && digit <= 'f')
+        {
+            nibble = (u32)(digit - 'a' + 10);
+        }
+        else
+        {
+            return 0;
+        }
+        value = (value << 4) | nibble;
+    }
+    const char next = fileName[16];
+    if (next != '_' && next != '.' && next != '-' && next != ' ')
+    {
+        return 0;
+    }
+    *key = value;
+    return 1;
+}
+
+static ld_texture_pack_file* ld_texture_pack_find(u64 key)
+{
+    if (!g_ld_texture_pack_capacity)
+    {
+        return NULL;
+    }
+    u32 slot = (u32)(key ^ (key >> 32)) & (g_ld_texture_pack_capacity - 1u);
+    while (g_ld_texture_pack_files[slot].path)
+    {
+        if (g_ld_texture_pack_files[slot].key == key)
+        {
+            return &g_ld_texture_pack_files[slot];
+        }
+        slot = (slot + 1u) & (g_ld_texture_pack_capacity - 1u);
+    }
+    return NULL;
+}
+
+static void ld_texture_pack_add(u64 key, const char* path)
+{
+    if ((g_ld_texture_pack_count + 1u) * 2u > g_ld_texture_pack_capacity)
+    {
+        const u32 newCapacity = g_ld_texture_pack_capacity ? g_ld_texture_pack_capacity * 2u : 4096u;
+        ld_texture_pack_file* newTable = (ld_texture_pack_file*)calloc(newCapacity, sizeof(ld_texture_pack_file));
+        if (!newTable)
+        {
+            return;
+        }
+        for (u32 oldIndex = 0; oldIndex < g_ld_texture_pack_capacity; oldIndex++)
+        {
+            const ld_texture_pack_file* oldFile = &g_ld_texture_pack_files[oldIndex];
+            if (oldFile->path)
+            {
+                u32 slot = (u32)(oldFile->key ^ (oldFile->key >> 32)) & (newCapacity - 1u);
+                while (newTable[slot].path)
+                {
+                    slot = (slot + 1u) & (newCapacity - 1u);
+                }
+                newTable[slot] = *oldFile;
+            }
+        }
+        free(g_ld_texture_pack_files);
+        g_ld_texture_pack_files = newTable;
+        g_ld_texture_pack_capacity = newCapacity;
+    }
+    const ld_texture_pack_file* existing = ld_texture_pack_find(key);
+    if (existing)
+    {
+        fprintf(stderr, "[tex-pack] %016llX is in the pack twice; using %s, not %s\n",
+                (unsigned long long)key, existing->path, path);
+        return;
+    }
+    char* pathCopy = _strdup(path);
+    if (!pathCopy)
+    {
+        return;
+    }
+    u32 slot = (u32)(key ^ (key >> 32)) & (g_ld_texture_pack_capacity - 1u);
+    while (g_ld_texture_pack_files[slot].path)
+    {
+        slot = (slot + 1u) & (g_ld_texture_pack_capacity - 1u);
+    }
+    g_ld_texture_pack_files[slot].key = key;
+    g_ld_texture_pack_files[slot].path = pathCopy;
+    g_ld_texture_pack_count++;
+}
+
+static void ld_texture_pack_scan(const char* folder, int depth)
+{
+    if (depth > 8)
+    {
+        return;
+    }
+    char pattern[MAX_PATH + 4];
+    snprintf(pattern, sizeof(pattern), "%s\\*", folder);
+    WIN32_FIND_DATAA found;
+    HANDLE search = FindFirstFileA(pattern, &found);
+    if (search == INVALID_HANDLE_VALUE)
+    {
+        return;
+    }
+    do
+    {
+        if (found.cFileName[0] == '.')
+        {
+            continue;
+        }
+        char path[MAX_PATH];
+        const int pathLength = snprintf(path, sizeof(path), "%s\\%s", folder, found.cFileName);
+        if (pathLength <= 0 || pathLength >= (int)sizeof(path))
+        {
+            continue;
+        }
+        if (found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        {
+            ld_texture_pack_scan(path, depth + 1);
+            continue;
+        }
+        const size_t nameLength = strlen(found.cFileName);
+        u64 key = 0;
+        if (nameLength > 4 && _stricmp(found.cFileName + nameLength - 4, ".dds") == 0 &&
+            ld_texture_pack_parse_key(found.cFileName, &key))
+        {
+            ld_texture_pack_add(key, path);
+        }
+    } while (FindNextFileA(search, &found));
+    FindClose(search);
+}
+
+/* Render thread, before the first texture: list the folder once. */
+static int ld_texture_pack_active(void)
+{
+    if (!g_ld_texture_pack_started)
+    {
+        AcquireSRWLockExclusive(&g_ld_texture_pack_lock);
+        g_ld_texture_pack_started = 1;
+        ReleaseSRWLockExclusive(&g_ld_texture_pack_lock);
+        if (g_ld_texture_pack_folder[0])
+        {
+            size_t length = strlen(g_ld_texture_pack_folder);
+            while (length > 0 && (g_ld_texture_pack_folder[length - 1] == '\\' ||
+                                  g_ld_texture_pack_folder[length - 1] == '/'))
+            {
+                length--;
+                g_ld_texture_pack_folder[length] = 0;
+            }
+            ld_texture_pack_scan(g_ld_texture_pack_folder, 0);
+            fprintf(stderr, "[tex-pack] %u replacement textures in %s\n", g_ld_texture_pack_count,
+                    g_ld_texture_pack_folder);
+            fflush(stderr);
+        }
+    }
+    return g_ld_texture_pack_count != 0;
+}
+
+static void ld_texture_pack_broken(ld_texture_pack_file* file, const char* reason)
+{
+    if (!file->failed)
+    {
+        file->failed = 1;
+        InterlockedIncrement(&g_ld_texture_pack_broken);
+        fprintf(stderr, "[tex-pack] cannot use %s: %s\n", file->path, reason);
+        fflush(stderr);
+    }
+}
+
+/* The DXGI format a DDS file holds (0 if not one of those above), and the
+ * block size (0 = uncompressed, 4 bytes a pixel). */
+static DXGI_FORMAT ld_texture_pack_format(const u8* header, const u8* dx10Header, u32* blockBytes)
+{
+    u32 pixelFlags;
+    u32 fourCc;
+    u32 bitCount;
+    u32 redMask;
+    /* DDS_HEADER offsets (after the magic): the pixel format is at 72. */
+    memcpy(&pixelFlags, header + 76, 4);
+    memcpy(&fourCc, header + 80, 4);
+    memcpy(&bitCount, header + 84, 4);
+    memcpy(&redMask, header + 88, 4);
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    if (dx10Header)
+    {
+        u32 dxgiValue;
+        memcpy(&dxgiValue, dx10Header, 4);
+        format = (DXGI_FORMAT)dxgiValue;
+    }
+    else if (pixelFlags & 0x4u)
+    {
+        switch (fourCc)
+        {
+        case 0x31545844u: format = DXGI_FORMAT_BC1_UNORM; break;   /* DXT1 */
+        case 0x32545844u:                                           /* DXT2 */
+        case 0x33545844u: format = DXGI_FORMAT_BC2_UNORM; break;   /* DXT3 */
+        case 0x34545844u:                                           /* DXT4 */
+        case 0x35545844u: format = DXGI_FORMAT_BC3_UNORM; break;   /* DXT5 */
+        case 0x31495441u:                                           /* ATI1 */
+        case 0x55344342u: format = DXGI_FORMAT_BC4_UNORM; break;   /* BC4U */
+        case 0x32495441u:                                           /* ATI2 */
+        case 0x55354342u: format = DXGI_FORMAT_BC5_UNORM; break;   /* BC5U */
+        default: break;
+        }
+    }
+    else if ((pixelFlags & 0x40u) && bitCount == 32)
+    {
+        if (redMask == 0x000000FFu)
+        {
+            format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        }
+        else if (redMask == 0x00FF0000u)
+        {
+            format = (pixelFlags & 0x1u) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_B8G8R8X8_UNORM;
+        }
+    }
+    switch (format)
+    {
+    case DXGI_FORMAT_BC1_TYPELESS: case DXGI_FORMAT_BC1_UNORM: case DXGI_FORMAT_BC1_UNORM_SRGB:
+        *blockBytes = 8;
+        return DXGI_FORMAT_BC1_UNORM;
+    case DXGI_FORMAT_BC2_TYPELESS: case DXGI_FORMAT_BC2_UNORM: case DXGI_FORMAT_BC2_UNORM_SRGB:
+        *blockBytes = 16;
+        return DXGI_FORMAT_BC2_UNORM;
+    case DXGI_FORMAT_BC3_TYPELESS: case DXGI_FORMAT_BC3_UNORM: case DXGI_FORMAT_BC3_UNORM_SRGB:
+        *blockBytes = 16;
+        return DXGI_FORMAT_BC3_UNORM;
+    case DXGI_FORMAT_BC4_TYPELESS: case DXGI_FORMAT_BC4_UNORM:
+        *blockBytes = 8;
+        return DXGI_FORMAT_BC4_UNORM;
+    case DXGI_FORMAT_BC5_TYPELESS: case DXGI_FORMAT_BC5_UNORM:
+        *blockBytes = 16;
+        return DXGI_FORMAT_BC5_UNORM;
+    case DXGI_FORMAT_BC7_TYPELESS: case DXGI_FORMAT_BC7_UNORM: case DXGI_FORMAT_BC7_UNORM_SRGB:
+        *blockBytes = 16;
+        return DXGI_FORMAT_BC7_UNORM;
+    case DXGI_FORMAT_R8G8B8A8_TYPELESS: case DXGI_FORMAT_R8G8B8A8_UNORM: case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+        *blockBytes = 0;
+        return DXGI_FORMAT_R8G8B8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8A8_TYPELESS: case DXGI_FORMAT_B8G8R8A8_UNORM: case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+        *blockBytes = 0;
+        return DXGI_FORMAT_B8G8R8A8_UNORM;
+    case DXGI_FORMAT_B8G8R8X8_TYPELESS: case DXGI_FORMAT_B8G8R8X8_UNORM: case DXGI_FORMAT_B8G8R8X8_UNORM_SRGB:
+        *blockBytes = 0;
+        return DXGI_FORMAT_B8G8R8X8_UNORM;
+    default:
+        return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+/* The next mip of a 4-byte-a-pixel level: each pixel the average of the
+ * (up to) four under it. */
+static void ld_texture_pack_half(const u8* source, u32 sourceWidth, u32 sourceHeight, u8* target,
+                                 u32 targetWidth, u32 targetHeight)
+{
+    for (u32 targetY = 0; targetY < targetHeight; targetY++)
+    {
+        const u32 rowA = targetY * 2u < sourceHeight ? targetY * 2u : sourceHeight - 1u;
+        const u32 rowB = rowA + 1u < sourceHeight ? rowA + 1u : rowA;
+        for (u32 targetX = 0; targetX < targetWidth; targetX++)
+        {
+            const u32 columnA = targetX * 2u < sourceWidth ? targetX * 2u : sourceWidth - 1u;
+            const u32 columnB = columnA + 1u < sourceWidth ? columnA + 1u : columnA;
+            for (u32 channel = 0; channel < 4; channel++)
+            {
+                const u32 sum = source[((size_t)rowA * sourceWidth + columnA) * 4u + channel] +
+                                source[((size_t)rowA * sourceWidth + columnB) * 4u + channel] +
+                                source[((size_t)rowB * sourceWidth + columnA) * 4u + channel] +
+                                source[((size_t)rowB * sourceWidth + columnB) * 4u + channel];
+                target[((size_t)targetY * targetWidth + targetX) * 4u + channel] = (u8)((sum + 2u) / 4u);
+            }
+        }
+    }
+}
+
+/* Loads a replacement and records its upload; NULL if it cannot be used. */
+static ID3D12Resource* ld_texture_pack_load(ld_texture_pack_file* file, int wantCube, DXGI_FORMAT* formatOut)
+{
+    if (file->failed)
+    {
+        return NULL;
+    }
+    FILE* stream = fopen(file->path, "rb");
+    if (!stream)
+    {
+        ld_texture_pack_broken(file, "could not open it");
+        return NULL;
+    }
+    fseek(stream, 0, SEEK_END);
+    const long fileSize = ftell(stream);
+    fseek(stream, 0, SEEK_SET);
+    if (fileSize < 128 || fileSize > 1024L * 1024L * 1024L)
+    {
+        fclose(stream);
+        ld_texture_pack_broken(file, "not a DDS file");
+        return NULL;
+    }
+    u8* contents = (u8*)malloc((size_t)fileSize);
+    if (!contents)
+    {
+        fclose(stream);
+        return NULL;
+    }
+    const size_t readBytes = fread(contents, 1, (size_t)fileSize, stream);
+    fclose(stream);
+    u32 magic;
+    memcpy(&magic, contents, 4);
+    if (readBytes != (size_t)fileSize || magic != 0x20534444u)
+    {
+        free(contents);
+        ld_texture_pack_broken(file, "not a DDS file");
+        return NULL;
+    }
+    const u8* header = contents + 4;
+    u32 headerFlags;
+    u32 height;
+    u32 width;
+    u32 mipCount;
+    u32 fourCc;
+    u32 caps2;
+    memcpy(&headerFlags, header + 4, 4);
+    memcpy(&height, header + 8, 4);
+    memcpy(&width, header + 12, 4);
+    memcpy(&mipCount, header + 24, 4);
+    memcpy(&fourCc, header + 80, 4);
+    memcpy(&caps2, header + 108, 4);
+    u32 dataOffset = 128;
+    const u8* dx10Header = NULL;
+    int cube = (caps2 & 0x200u) != 0;
+    if (fourCc == 0x30315844u)   /* "DX10" */
+    {
+        if (fileSize < 148)
+        {
+            free(contents);
+            ld_texture_pack_broken(file, "truncated");
+            return NULL;
+        }
+        dx10Header = contents + 128;
+        u32 miscFlags;
+        u32 arraySize;
+        memcpy(&miscFlags, dx10Header + 8, 4);
+        memcpy(&arraySize, dx10Header + 12, 4);
+        cube = (miscFlags & 0x4u) != 0;
+        if (arraySize > 1)
+        {
+            free(contents);
+            ld_texture_pack_broken(file, "texture arrays are not supported");
+            return NULL;
+        }
+        dataOffset = 148;
+    }
+    u32 blockBytes = 0;
+    const DXGI_FORMAT format = ld_texture_pack_format(header, dx10Header, &blockBytes);
+    if (format == DXGI_FORMAT_UNKNOWN)
+    {
+        free(contents);
+        ld_texture_pack_broken(file, "format not supported (use BC1-BC7, RGBA8 or BGRA8)");
+        return NULL;
+    }
+    if (cube != (wantCube != 0))
+    {
+        free(contents);
+        ld_texture_pack_broken(file, cube ? "a cube map replacing a flat texture" : "a flat texture replacing a cube map");
+        return NULL;
+    }
+    if (!width || !height || width > 16384 || height > 16384 ||
+        (blockBytes && ((width & 3u) || (height & 3u))))
+    {
+        free(contents);
+        ld_texture_pack_broken(file, "bad size (compressed textures need sides that are multiples of 4)");
+        return NULL;
+    }
+    if (!(headerFlags & 0x20000u) || mipCount == 0)
+    {
+        mipCount = 1;
+    }
+    u32 fullChain = 1;
+    for (u32 sideW = width, sideH = height; sideW > 1 || sideH > 1; fullChain++)
+    {
+        sideW = sideW > 1 ? sideW >> 1 : 1;
+        sideH = sideH > 1 ? sideH >> 1 : 1;
+    }
+    if (mipCount > fullChain)
+    {
+        mipCount = fullChain;
+    }
+    const int makeMips = !blockBytes && mipCount == 1 && fullChain > 1;
+    const u32 faceCount = cube ? 6u : 1u;
+    const u32 levelsPerFace = makeMips ? fullChain : mipCount;
+
+    /* Where each level of the file starts, and how many fit. */
+    tex_level_t* levels = (tex_level_t*)calloc((size_t)faceCount * levelsPerFace, sizeof(tex_level_t));
+    u8** madeLevels = (u8**)calloc((size_t)faceCount * levelsPerFace, sizeof(u8*));
+    if (!levels || !madeLevels)
+    {
+        free(levels);
+        free(madeLevels);
+        free(contents);
+        return NULL;
+    }
+    size_t position = dataOffset;
+    int truncated = 0;
+    int outOfMemory = 0;
+    for (u32 faceIndex = 0; faceIndex < faceCount && !truncated && !outOfMemory; faceIndex++)
+    {
+        u32 levelWidth = width;
+        u32 levelHeight = height;
+        for (u32 mipIndex = 0; mipIndex < levelsPerFace; mipIndex++)
+        {
+            tex_level_t* level = &levels[faceIndex * levelsPerFace + mipIndex];
+            if (blockBytes)
+            {
+                level->w = (levelWidth + 3u) & ~3u;
+                level->h = (levelHeight + 3u) & ~3u;
+                level->row_bytes = ((levelWidth + 3u) / 4u) * blockBytes;
+                level->rows = (levelHeight + 3u) / 4u;
+            }
+            else
+            {
+                level->w = levelWidth;
+                level->h = levelHeight;
+                level->row_bytes = levelWidth * 4u;
+                level->rows = levelHeight;
+            }
+            if (mipIndex < mipCount)
+            {
+                const size_t levelBytes = (size_t)level->row_bytes * level->rows;
+                if (position + levelBytes > (size_t)fileSize)
+                {
+                    truncated = 1;
+                    break;
+                }
+                level->data = contents + position;
+                position += levelBytes;
+            }
+            else
+            {
+                const tex_level_t* above = &levels[faceIndex * levelsPerFace + mipIndex - 1u];
+                u8* made = (u8*)malloc((size_t)level->row_bytes * level->rows);
+                if (!made)
+                {
+                    outOfMemory = 1;
+                    break;
+                }
+                ld_texture_pack_half(above->data, above->w, above->h, made, level->w, level->h);
+                madeLevels[faceIndex * levelsPerFace + mipIndex] = made;
+                level->data = made;
+            }
+            levelWidth = levelWidth > 1 ? levelWidth >> 1 : 1;
+            levelHeight = levelHeight > 1 ? levelHeight >> 1 : 1;
+        }
+    }
+    ID3D12Resource* texture = NULL;
+    if (truncated)
+    {
+        ld_texture_pack_broken(file, "the file is shorter than its header says");
+    }
+    else if (!outOfMemory)
+    {
+        D3D12_HEAP_PROPERTIES defaultHeap = {0};
+        defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC textureDesc = {0};
+        textureDesc.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+        textureDesc.Width = width;
+        textureDesc.Height = height;
+        textureDesc.DepthOrArraySize = (u16)faceCount;
+        textureDesc.MipLevels = (u16)levelsPerFace;
+        textureDesc.Format = format;
+        textureDesc.SampleDesc.Count = 1;
+        /* Its own upload buffer: a replacement can be bigger than the
+         * shared upload ring has room for. Released once the GPU is past it. */
+        u64 uploadBytes = 0;
+        const u32 levelTotal = faceCount * levelsPerFace;
+        for (u32 levelIndex = 0; levelIndex < levelTotal; levelIndex++)
+        {
+            const u32 pitch = (levels[levelIndex].row_bytes + 255u) & ~255u;
+            uploadBytes = (uploadBytes + 511u) & ~(u64)511u;
+            uploadBytes += (u64)pitch * levels[levelIndex].rows;
+        }
+        D3D12_HEAP_PROPERTIES uploadHeap = {0};
+        uploadHeap.Type = D3D12_HEAP_TYPE_UPLOAD;
+        D3D12_RESOURCE_DESC bufferDesc = {0};
+        bufferDesc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+        bufferDesc.Width = uploadBytes;
+        bufferDesc.Height = 1;
+        bufferDesc.DepthOrArraySize = 1;
+        bufferDesc.MipLevels = 1;
+        bufferDesc.SampleDesc.Count = 1;
+        bufferDesc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+        ID3D12Resource* uploadBuffer = NULL;
+        u8* mapped = NULL;
+        if (SUCCEEDED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDesc,
+                                                             D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                                             &IID_ID3D12Resource, (void**)&texture)) &&
+            SUCCEEDED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &uploadHeap, D3D12_HEAP_FLAG_NONE, &bufferDesc,
+                                                             D3D12_RESOURCE_STATE_GENERIC_READ, NULL,
+                                                             &IID_ID3D12Resource, (void**)&uploadBuffer)) &&
+            SUCCEEDED(uploadBuffer->lpVtbl->Map(uploadBuffer, 0, NULL, (void**)&mapped)))
+        {
+            u64 offset = 0;
+            for (u32 levelIndex = 0; levelIndex < levelTotal; levelIndex++)
+            {
+                const tex_level_t* level = &levels[levelIndex];
+                const u32 pitch = (level->row_bytes + 255u) & ~255u;
+                offset = (offset + 511u) & ~(u64)511u;
+                for (u32 rowIndex = 0; rowIndex < level->rows; rowIndex++)
+                {
+                    memcpy(mapped + offset + (size_t)rowIndex * pitch,
+                           level->data + (size_t)rowIndex * level->row_bytes, level->row_bytes);
+                }
+                D3D12_TEXTURE_COPY_LOCATION source = {0};
+                D3D12_TEXTURE_COPY_LOCATION target = {0};
+                source.pResource = uploadBuffer;
+                source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+                source.PlacedFootprint.Offset = offset;
+                source.PlacedFootprint.Footprint.Format = format;
+                source.PlacedFootprint.Footprint.Width = level->w;
+                source.PlacedFootprint.Footprint.Height = level->h;
+                source.PlacedFootprint.Footprint.Depth = 1;
+                source.PlacedFootprint.Footprint.RowPitch = pitch;
+                target.pResource = texture;
+                target.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+                target.SubresourceIndex = levelIndex;
+                g.list->lpVtbl->CopyTextureRegion(g.list, &target, 0, 0, 0, &source, NULL);
+                offset += (u64)pitch * level->rows;
+            }
+            uploadBuffer->lpVtbl->Unmap(uploadBuffer, 0, NULL);
+            g_ld_texture_upload_bytes += uploadBytes;
+            D3D12_RESOURCE_BARRIER barrier = {0};
+            barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+            barrier.Transition.pResource = texture;
+            barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+            barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+            barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
+            retire_texture(uploadBuffer);
+            *formatOut = format;
+            if (!file->loaded)
+            {
+                file->loaded = 1;
+                const LONG inUse = InterlockedIncrement(&g_ld_texture_pack_replaced);
+                if (inUse <= 8 || (inUse & 63) == 0)
+                {
+                    fprintf(stderr, "[tex-pack] %ld in use; now %016llX at %ux%u%s\n", (long)inUse,
+                            (unsigned long long)file->key, width, height,
+                            (blockBytes && mipCount == 1 && fullChain > 1) ? " (no mipmaps in the file)" : "");
+                    fflush(stderr);
+                }
+            }
+        }
+        else
+        {
+            if (texture)
+            {
+                texture->lpVtbl->Release(texture);
+                texture = NULL;
+            }
+            if (uploadBuffer)
+            {
+                uploadBuffer->lpVtbl->Release(uploadBuffer);
+            }
+            ld_texture_pack_broken(file, "the GPU could not make it (out of video memory?)");
+        }
+    }
+    for (u32 levelIndex = 0; levelIndex < faceCount * levelsPerFace; levelIndex++)
+    {
+        free(madeLevels[levelIndex]);
+    }
+    free(madeLevels);
+    free(levels);
+    free(contents);
+    return texture;
+}
+
+/* decode_guest_texture_profiled, or the texture pack's replacement for it
+ * (*replacedFormat says which), writing the texture to the dump folder on
  * the way when dumping is on and this texture has not been written yet. */
 static ID3D12Resource* decode_guest_texture_dumping(
-    const rsx_dsp_texture* texture, u32 remap, u64 contentHash, int dumpAllowed)
+    const rsx_dsp_texture* texture, u32 remap, u64 contentHash, int dumpAllowed, DXGI_FORMAT* replacedFormat)
 {
+    *replacedFormat = DXGI_FORMAT_UNKNOWN;
+    const u32 baseFormat = texture->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
+    if (contentHash && baseFormat != TEX_FMT_DEPTH24_D8 && baseFormat != RSX_TEX_FMT_W16Z16Y16X16_FLOAT &&
+        ld_texture_pack_active())
+    {
+        ld_texture_pack_file* file = ld_texture_pack_find(ld_texture_replace_key(texture, remap, contentHash));
+        if (file)
+        {
+            ID3D12Resource* replaced = ld_texture_pack_load(file, texture->cubemap ? 1 : 0, replacedFormat);
+            if (replaced)
+            {
+                return replaced;
+            }
+            *replacedFormat = DXGI_FORMAT_UNKNOWN;
+        }
+    }
     if (dumpAllowed && contentHash && ld_texture_dump_enabled())
     {
         const u64 key = ld_texture_replace_key(texture, remap, contentHash);
@@ -3628,6 +4301,10 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
                     : base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
                     : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
                                                 : DXGI_FORMAT_BC3_UNORM;
+        if (entry->replaced_format)
+        {
+            desc.Format = entry->replaced_format;
+        }
         desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURECUBE;
         desc.Shader4ComponentMapping =
             !compressed || entry->remap == 0xAAE4
@@ -3651,6 +4328,10 @@ static void write_texture_srv(u32 index, const texcache_t* entry)
         desc.Format = base_fmt == TEX_FMT_DXT1 ? DXGI_FORMAT_BC1_UNORM
                     : base_fmt == TEX_FMT_DXT23 ? DXGI_FORMAT_BC2_UNORM
                                                 : DXGI_FORMAT_BC3_UNORM;
+        if (entry->replaced_format)
+        {
+            desc.Format = entry->replaced_format;
+        }
         desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
         desc.Shader4ComponentMapping = mapping[0] | (mapping[1] << 3) |
                                        (mapping[2] << 6) | (mapping[3] << 9) |
@@ -3859,12 +4540,14 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                 {
                     g_ld_texture_dump_changing++;
                 }
+                DXGI_FORMAT replacedFormat = DXGI_FORMAT_UNKNOWN;
                 ID3D12Resource* replacement =
-                    decode_guest_texture_dumping(t, remap, hash, dumpAllowed);
+                    decode_guest_texture_dumping(t, remap, hash, dumpAllowed, &replacedFormat);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
                     entry->content_hash = hash;
+                    entry->replaced_format = replacedFormat;
                     write_texture_srv(i, entry);
                     retire_texture(old);
                     static u32 refresh_count = 0;
@@ -3928,7 +4611,8 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.dump_change_frame = g_ld_frames;
     int replacementReadable = 0;
     replacement.content_hash = texture_content_hash(t, &replacementReadable);
-    replacement.tex = decode_guest_texture_dumping(t, remap, replacement.content_hash, replacementReadable);
+    replacement.tex = decode_guest_texture_dumping(t, remap, replacement.content_hash, replacementReadable,
+                                                   &replacement.replaced_format);
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
         if (evicted)

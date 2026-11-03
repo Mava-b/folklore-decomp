@@ -434,6 +434,34 @@ you want; later runs add only what is new.
 The dumped textures are the game's own art: do not share them or commit
 them (`textures/` is in `.gitignore`).
 
+### Higher-resolution textures (texture packs)
+
+Engine menu → Graphics → **High-resolution textures (texture pack)**, then
+restart the game. Replacement textures are read from `textures\replace`
+(next to `folklore_settings.ini`; `texture_pack_dir =` in the ini for
+another folder), including any folders inside it, so packs can be kept in
+their own subfolders.
+
+- A replacement is a `.dds` file whose name starts with the 16-digit key of
+  the texture it replaces, as the dump names it: copy a file from
+  `textures\dump`, upscale or repaint it, and save it under
+  `textures\replace` with the key still at the front. Any size works.
+- Formats: BC1-BC7 (BC7 is the best quality for its size), RGBA8 or BGRA8.
+  Compressed textures need sides that are multiples of 4.
+- Save with mipmaps (for example `texconv -m 0 -f BC7_UNORM file.dds`), or
+  distant surfaces shimmer. Uncompressed files without them get them made
+  as they load.
+- A cube map can only replace a cube map.
+- The menu shows how many replacements were found and how many are in use.
+  A file that cannot be used is skipped (the game's own texture shows) and
+  the log says why (`[tex-pack]` lines).
+- Large packs use video memory: a 2048x2048 BC7 texture with mipmaps is
+  about 5 MB, the same as RGBA8 at 1024x1024 with mipmaps.
+
+The quickest check that it works: open a dumped texture that is easy to
+spot, paint something obvious on it, save it into `textures\replace` and
+start the game with the option on.
+
 ### Render capture (for bug reports)
 
 When something draws wrong, press **F2** (or the PS button on a DualShock 3)
