@@ -300,6 +300,11 @@ typedef struct {
      * it unchanged, and a hash of a few spread-out blocks of it. */
     u32 stable_checks;
     u64 sample_hash;
+    /* Texture dump (RSX_TEXTURE_DUMP): when its contents last changed, and
+     * how many changes in a row came close together (a texture the game
+     * rewrites all the time -- a movie frame -- is not dumped). */
+    u32 dump_change_frame;
+    u32 dump_quick_changes;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -2735,9 +2740,303 @@ static void decode_texel(u32 base_fmt, const u8* p, u32 remap, u8 d[4])
 
 typedef struct { u32 w, h; const u8* data; u32 row_bytes, rows; } tex_level_t;
 
+/* ---------------------------------------------------------------------------
+ * Texture dump (RSX_TEXTURE_DUMP=<folder>, run.ps1 -DumpTextures)
+ *
+ * Every texture the game binds is written once, as the renderer uploads it,
+ * to <folder>\<key>_<width>x<height>_<format>.dds, and listed in
+ * <folder>\index.csv. DXT textures are written as they are (BC1/BC2/BC3, with
+ * their mips); every other format as the RGBA8 the renderer decodes it to.
+ * Cube maps are written as DDS cube maps.
+ *
+ * The key is what a replacement will be found by: a hash of the texture's
+ * guest data (all of its mips) with its format, size and channel remap, so
+ * the same texture gets the same key on every run and on both game versions
+ * wherever its data is the same. A file already in the folder is not written
+ * again, so a dump can be added to over several runs.
+ *
+ * Not dumped: textures the game keeps rewriting (three changes within a
+ * second of each other: movie frames and other generated images), and render
+ * targets, which the renderer samples directly and never decodes here.
+ * --------------------------------------------------------------------------- */
+typedef struct {
+    int active;
+    u64 key;
+    u32 width;
+    u32 height;
+    u32 guestFormat;
+    u32 remap;
+    int cubemap;
+} ld_texture_dump_context;
+
+static ld_texture_dump_context g_ld_texture_dump_context;
+static int g_ld_texture_dump_enabled = -1;
+static char g_ld_texture_dump_folder[MAX_PATH];
+static u64* g_ld_texture_dump_seen = NULL;
+static u32 g_ld_texture_dump_seen_capacity = 0;
+static u32 g_ld_texture_dump_seen_count = 0;
+static u64 g_ld_texture_dump_written = 0;
+static u64 g_ld_texture_dump_written_bytes = 0;
+static u64 g_ld_texture_dump_already_there = 0;
+static u64 g_ld_texture_dump_changing = 0;
+
+static int ld_texture_dump_enabled(void)
+{
+    if (g_ld_texture_dump_enabled >= 0)
+    {
+        return g_ld_texture_dump_enabled;
+    }
+    g_ld_texture_dump_enabled = 0;
+    const char* folder = getenv("RSX_TEXTURE_DUMP");
+    if (folder && folder[0])
+    {
+        snprintf(g_ld_texture_dump_folder, sizeof(g_ld_texture_dump_folder), "%s", folder);
+        size_t length = strlen(g_ld_texture_dump_folder);
+        while (length > 0 && (g_ld_texture_dump_folder[length - 1] == '\\' ||
+                              g_ld_texture_dump_folder[length - 1] == '/'))
+        {
+            length--;
+            g_ld_texture_dump_folder[length] = 0;
+        }
+        CreateDirectoryA(g_ld_texture_dump_folder, NULL);
+        const DWORD attributes = GetFileAttributesA(g_ld_texture_dump_folder);
+        if (attributes != INVALID_FILE_ATTRIBUTES && (attributes & FILE_ATTRIBUTE_DIRECTORY))
+        {
+            g_ld_texture_dump_enabled = 1;
+            fprintf(stderr, "[tex-dump] writing new textures to %s\n", g_ld_texture_dump_folder);
+        }
+        else
+        {
+            fprintf(stderr, "[tex-dump] cannot create %s; not dumping\n", g_ld_texture_dump_folder);
+        }
+        fflush(stderr);
+    }
+    return g_ld_texture_dump_enabled;
+}
+
+/* The replacement key: the content hash mixed with what else decides how the
+ * texture looks (splitmix64's finaliser, so nearby inputs spread out). */
+static u64 ld_texture_replace_key(const rsx_dsp_texture* texture, u32 remap, u64 contentHash)
+{
+    u64 key = contentHash;
+    key ^= ((u64)(texture->format & 0xFFu) << 56) ^ ((u64)texture->width << 36) ^
+           ((u64)texture->height << 20) ^ ((u64)remap << 2) ^ (texture->cubemap ? 1u : 0u);
+    key ^= key >> 30;
+    key *= 0xBF58476D1CE4E5B9ull;
+    key ^= key >> 27;
+    key *= 0x94D049BB133111EBull;
+    key ^= key >> 31;
+    return key;
+}
+
+/* Whether this key has been seen this run; notes it if not. */
+static int ld_texture_dump_seen_before(u64 key)
+{
+    if (key == 0)
+    {
+        key = 1;
+    }
+    if (g_ld_texture_dump_seen_count * 2u >= g_ld_texture_dump_seen_capacity)
+    {
+        const u32 newCapacity = g_ld_texture_dump_seen_capacity ? g_ld_texture_dump_seen_capacity * 2u : 4096u;
+        u64* newTable = (u64*)calloc(newCapacity, sizeof(u64));
+        if (!newTable)
+        {
+            return 1;
+        }
+        for (u32 oldIndex = 0; oldIndex < g_ld_texture_dump_seen_capacity; oldIndex++)
+        {
+            const u64 oldKey = g_ld_texture_dump_seen[oldIndex];
+            if (oldKey)
+            {
+                u32 slot = (u32)(oldKey ^ (oldKey >> 32)) & (newCapacity - 1u);
+                while (newTable[slot])
+                {
+                    slot = (slot + 1u) & (newCapacity - 1u);
+                }
+                newTable[slot] = oldKey;
+            }
+        }
+        free(g_ld_texture_dump_seen);
+        g_ld_texture_dump_seen = newTable;
+        g_ld_texture_dump_seen_capacity = newCapacity;
+    }
+    u32 slot = (u32)(key ^ (key >> 32)) & (g_ld_texture_dump_seen_capacity - 1u);
+    while (g_ld_texture_dump_seen[slot])
+    {
+        if (g_ld_texture_dump_seen[slot] == key)
+        {
+            return 1;
+        }
+        slot = (slot + 1u) & (g_ld_texture_dump_seen_capacity - 1u);
+    }
+    g_ld_texture_dump_seen[slot] = key;
+    g_ld_texture_dump_seen_count++;
+    return 0;
+}
+
+static void ld_texture_dump_put32(u8* header, u32 position, u32 value)
+{
+    memcpy(header + position, &value, sizeof(value));
+}
+
+/* Writes the levels being uploaded (layout as create_texture_mipped /
+ * create_texture_cube take them) when a dump context is active. */
+static void ld_texture_dump_levels(DXGI_FORMAT format, const tex_level_t* levels, u32 mipCount, int cube)
+{
+    ld_texture_dump_context* context = &g_ld_texture_dump_context;
+    if (!context->active || !mipCount)
+    {
+        return;
+    }
+    context->active = 0;
+    const char* formatName = NULL;
+    u32 fourCc = 0;
+    u32 blockBytes = 0;
+    switch (format)
+    {
+    case DXGI_FORMAT_BC1_UNORM:
+        formatName = "BC1";
+        fourCc = 0x31545844u;   /* "DXT1" */
+        blockBytes = 8;
+        break;
+    case DXGI_FORMAT_BC2_UNORM:
+        formatName = "BC2";
+        fourCc = 0x33545844u;   /* "DXT3" */
+        blockBytes = 16;
+        break;
+    case DXGI_FORMAT_BC3_UNORM:
+        formatName = "BC3";
+        fourCc = 0x35545844u;   /* "DXT5" */
+        blockBytes = 16;
+        break;
+    case DXGI_FORMAT_R8G8B8A8_UNORM:
+        formatName = "RGBA8";
+        break;
+    default:
+        return;
+    }
+    const u32 width = context->width;
+    const u32 height = context->height;
+    char fileName[MAX_PATH + 96];
+    snprintf(fileName, sizeof(fileName), "%s\\%016llX_%ux%u_%s%s.dds", g_ld_texture_dump_folder,
+             (unsigned long long)context->key, width, height, formatName, cube ? "_cube" : "");
+    if (GetFileAttributesA(fileName) != INVALID_FILE_ATTRIBUTES)
+    {
+        g_ld_texture_dump_already_there++;
+        return;
+    }
+    FILE* file = fopen(fileName, "wb");
+    if (!file)
+    {
+        return;
+    }
+    /* DDS header: magic + 124-byte DDS_HEADER (no DX10 extension, so every
+     * DDS reader opens it). */
+    u8 header[128];
+    memset(header, 0, sizeof(header));
+    ld_texture_dump_put32(header, 0, 0x20534444u);                 /* "DDS " */
+    ld_texture_dump_put32(header, 4, 124);
+    u32 flags = 0x1u | 0x2u | 0x4u | 0x1000u;                       /* CAPS HEIGHT WIDTH PIXELFORMAT */
+    if (mipCount > 1)
+    {
+        flags |= 0x20000u;                                          /* MIPMAPCOUNT */
+    }
+    u32 topLevelBytes;
+    if (blockBytes)
+    {
+        flags |= 0x80000u;                                          /* LINEARSIZE */
+        topLevelBytes = ((width + 3u) / 4u) * ((height + 3u) / 4u) * blockBytes;
+    }
+    else
+    {
+        flags |= 0x8u;                                              /* PITCH */
+        topLevelBytes = width * 4u;
+    }
+    ld_texture_dump_put32(header, 8, flags);
+    ld_texture_dump_put32(header, 12, height);
+    ld_texture_dump_put32(header, 16, width);
+    ld_texture_dump_put32(header, 20, topLevelBytes);
+    ld_texture_dump_put32(header, 28, mipCount);
+    /* DDS_PIXELFORMAT at 76. */
+    ld_texture_dump_put32(header, 76, 32);
+    if (blockBytes)
+    {
+        ld_texture_dump_put32(header, 80, 0x4u);                    /* FOURCC */
+        ld_texture_dump_put32(header, 84, fourCc);
+    }
+    else
+    {
+        ld_texture_dump_put32(header, 80, 0x40u | 0x1u);            /* RGB | ALPHAPIXELS */
+        ld_texture_dump_put32(header, 88, 32);
+        ld_texture_dump_put32(header, 92, 0x000000FFu);
+        ld_texture_dump_put32(header, 96, 0x0000FF00u);
+        ld_texture_dump_put32(header, 100, 0x00FF0000u);
+        ld_texture_dump_put32(header, 104, 0xFF000000u);
+    }
+    u32 caps = 0x1000u;                                             /* TEXTURE */
+    if (mipCount > 1 || cube)
+    {
+        caps |= 0x8u;                                               /* COMPLEX */
+    }
+    if (mipCount > 1)
+    {
+        caps |= 0x400000u;                                          /* MIPMAP */
+    }
+    ld_texture_dump_put32(header, 108, caps);
+    if (cube)
+    {
+        ld_texture_dump_put32(header, 112, 0x200u | 0xFC00u);      /* CUBEMAP, all six faces */
+    }
+    fwrite(header, 1, sizeof(header), file);
+    u64 written = sizeof(header);
+    /* Faces then mips, which is how the levels arrive and how DDS stores a
+     * cube map. A DXT level's rows are rows of 4x4 blocks. */
+    const u32 levelCount = cube ? mipCount * 6u : mipCount;
+    for (u32 levelIndex = 0; levelIndex < levelCount; levelIndex++)
+    {
+        const tex_level_t* level = &levels[levelIndex];
+        for (u32 rowIndex = 0; rowIndex < level->rows; rowIndex++)
+        {
+            fwrite(level->data + (size_t)rowIndex * level->row_bytes, 1, level->row_bytes, file);
+        }
+        written += (u64)level->rows * level->row_bytes;
+    }
+    fclose(file);
+    g_ld_texture_dump_written++;
+    g_ld_texture_dump_written_bytes += written;
+
+    char indexName[MAX_PATH + 16];
+    snprintf(indexName, sizeof(indexName), "%s\\index.csv", g_ld_texture_dump_folder);
+    const int indexIsNew = GetFileAttributesA(indexName) == INVALID_FILE_ATTRIBUTES;
+    FILE* indexFile = fopen(indexName, "a");
+    if (indexFile)
+    {
+        if (indexIsNew)
+        {
+            fprintf(indexFile, "key,width,height,format,mips,cube,guest_format,remap,frame\n");
+        }
+        fprintf(indexFile, "%016llX,%u,%u,%s,%u,%d,0x%02X,0x%04X,%u\n", (unsigned long long)context->key,
+                width, height, formatName, mipCount, cube ? 1 : 0, context->guestFormat & 0xFFu,
+                context->remap, g_ld_frames);
+        fclose(indexFile);
+    }
+    if (g_ld_texture_dump_written <= 4u || (g_ld_texture_dump_written & 255u) == 0u)
+    {
+        fprintf(stderr, "[tex-dump] %llu written (%.1f MB), %llu already in the folder, %llu skipped "
+                        "as changing all the time\n",
+                (unsigned long long)g_ld_texture_dump_written,
+                (double)g_ld_texture_dump_written_bytes / (1024.0 * 1024.0),
+                (unsigned long long)g_ld_texture_dump_already_there,
+                (unsigned long long)g_ld_texture_dump_changing);
+        fflush(stderr);
+    }
+}
+
 static ID3D12Resource* create_texture_mipped(DXGI_FORMAT fmt, const tex_level_t* lv, u32 n)
 {
     if (n == 0) return NULL;
+    ld_texture_dump_levels(fmt, lv, n, 0);
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -2789,6 +3088,7 @@ static ID3D12Resource* create_texture_cube(
     DXGI_FORMAT fmt, const tex_level_t* lv, u32 n_mips)
 {
     if (!n_mips) return NULL;
+    ld_texture_dump_levels(fmt, lv, n_mips, 1);
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -3282,6 +3582,31 @@ static ID3D12Resource* decode_guest_texture_profiled(
     return result;
 }
 
+/* decode_guest_texture_profiled, writing the texture to the dump folder on
+ * the way when dumping is on and this texture has not been written yet. */
+static ID3D12Resource* decode_guest_texture_dumping(
+    const rsx_dsp_texture* texture, u32 remap, u64 contentHash, int dumpAllowed)
+{
+    if (dumpAllowed && contentHash && ld_texture_dump_enabled())
+    {
+        const u64 key = ld_texture_replace_key(texture, remap, contentHash);
+        if (!ld_texture_dump_seen_before(key))
+        {
+            ld_texture_dump_context* context = &g_ld_texture_dump_context;
+            context->active = 1;
+            context->key = key;
+            context->width = texture->width;
+            context->height = texture->height;
+            context->guestFormat = texture->format;
+            context->remap = remap;
+            context->cubemap = texture->cubemap ? 1 : 0;
+        }
+    }
+    ID3D12Resource* result = decode_guest_texture_profiled(texture, remap);
+    g_ld_texture_dump_context.active = 0;
+    return result;
+}
+
 static void write_texture_srv(u32 index, const texcache_t* entry)
 {
     const u32 base_fmt = entry->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
@@ -3515,8 +3840,27 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
               } }
             entry->last_hash_frame = g_ld_frames;
             if (readable && hash != entry->content_hash) {
+                /* Three changes each within a second of the last: the game
+                 * is generating it, not loading it; do not dump it. */
+                if (g_ld_frames - entry->dump_change_frame < 60u)
+                {
+                    if (entry->dump_quick_changes < 0xFFFFu)
+                    {
+                        entry->dump_quick_changes++;
+                    }
+                }
+                else
+                {
+                    entry->dump_quick_changes = 0;
+                }
+                entry->dump_change_frame = g_ld_frames;
+                const int dumpAllowed = entry->dump_quick_changes < 3u;
+                if (!dumpAllowed && g_ld_texture_dump_enabled > 0)
+                {
+                    g_ld_texture_dump_changing++;
+                }
                 ID3D12Resource* replacement =
-                    decode_guest_texture_profiled(t, remap);
+                    decode_guest_texture_dumping(t, remap, hash, dumpAllowed);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
@@ -3581,11 +3925,10 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     replacement.cubemap = t->cubemap;
     replacement.last_hash_frame = g_ld_frames;
     replacement.last_use_serial = ++g_ld_texture_use_serial;
-    {
-        int readable = 0;
-        replacement.content_hash = texture_content_hash(t, &readable);
-    }
-    replacement.tex = decode_guest_texture_profiled(t, remap);
+    replacement.dump_change_frame = g_ld_frames;
+    int replacementReadable = 0;
+    replacement.content_hash = texture_content_hash(t, &replacementReadable);
+    replacement.tex = decode_guest_texture_dumping(t, remap, replacement.content_hash, replacementReadable);
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
         if (evicted)

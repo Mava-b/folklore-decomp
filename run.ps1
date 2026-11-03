@@ -16,6 +16,10 @@
 #   ... run.ps1 -Profile                            record where the CPU time goes
 #                                                   (a report every 10 s in the log)
 #   ... run.ps1 -BlockingWaitFlip                   old frame pacing (A/B comparison)
+#   ... run.ps1 -DumpTextures                       write every texture the game shows to
+#                                                   textures\dump (DDS, once each; adds to
+#                                                   what is there). -DumpDir <folder> for
+#                                                   somewhere else. Slower while it writes.
 #   ... run.ps1 -TraceSpurs                         record what SPURS does (add -Libsre for
 #                                                   Sony's) to logs\spurs-<date-time>.trace (each new
 #                                                   kind of event once, then counts; a few
@@ -62,6 +66,10 @@ param(
     # Make cellGcmSetWaitFlip block the game thread until the next vblank, as
     # the runtime used to (the hardware call does not block).
     [switch]$BlockingWaitFlip,
+    # Write each texture the game binds to textures\dump (or -DumpDir) as a
+    # DDS file named by the key a replacement texture will be found by.
+    [switch]$DumpTextures,
+    [string]$DumpDir = '',
     # SPURS_GOLDEN_TRACE: record every libsre call, SPU DMA, lock-line
     # atomic and job entry/exit to logs\spurs-<date-time>.trace, the reference
     # for replacing libsre (ps3recomp runtime/spu/spurs_trace.c).
@@ -285,6 +293,20 @@ if ($Profile)
 else
 {
     Remove-Item Env:PS3_SAMPLE -ErrorAction SilentlyContinue
+}
+if ($DumpTextures -or $DumpDir)
+{
+    if (-not $DumpDir)
+    {
+        $DumpDir = Join-Path $Root 'textures\dump'
+    }
+    New-Item -ItemType Directory -Force -Path $DumpDir | Out-Null
+    $env:RSX_TEXTURE_DUMP = (Resolve-Path $DumpDir).Path
+    Write-Host "Dumping textures to $env:RSX_TEXTURE_DUMP (new ones only; expect brief hitches)." -ForegroundColor Yellow
+}
+else
+{
+    Remove-Item Env:RSX_TEXTURE_DUMP -ErrorAction SilentlyContinue
 }
 # cellGcmSetWaitFlip lets the game build the next frame while the last one
 # waits for its vblank, as on the PS3, holding it back only when it gets more

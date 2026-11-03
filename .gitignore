@@ -35,3 +35,6 @@ __pycache__/
 
 # EBOOT.BIN decrypted by setup / run.ps1 (the game's own code).
 /decrypted/
+
+# Textures dumped from the game (run.ps1 -DumpTextures) and replacements.
+/textures/

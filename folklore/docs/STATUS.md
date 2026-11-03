@@ -1443,6 +1443,16 @@ What 0006 fixes in ps3recomp to make that run:
     Victrix, ZEROPLUS, Brook...) are now read the same way; only a pad's
     controller collection is opened (not its keyboard/vendor ones), and a
     HID game controller that is not in the list is logged with its VID:PID.
+102. Texture dump (patches/0082, run.ps1 -DumpTextures), the first step to
+    higher-resolution textures: RSX_TEXTURE_DUMP=<folder> writes each
+    texture once as the renderer uploads it, as DDS (DXT as BC1-3 with its
+    mips, everything else as the decoded RGBA8, cube maps as DDS cubes),
+    named <key>_<w>x<h>_<format>.dds and listed in index.csv. The key is the
+    full content hash mixed with format, size, remap and cube flag, so it is
+    the same on every run; it is what the replacement loader will look up.
+    A cache entry whose contents change three times within 60 frames of
+    each other is not dumped (movie frames). Render targets never reach the
+    decode path, so they are not dumped either.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

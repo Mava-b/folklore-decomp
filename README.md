@@ -391,6 +391,7 @@ the pad is not in the list yet: please report that VVVV:PPPP.
 .\run.ps1 -Libsre                         # Sony's libsre instead of the port's SPURS, to compare (see below)
 .\run.ps1 -InterpJobs                     # SPU jobs in the interpreter (A/B, slower)
 .\run.ps1 -TraceSpurs                     # record what SPURS does (logs\spurs-*.trace; folklore/docs/SPURS.md)
+.\run.ps1 -DumpTextures                   # write the game's textures to textures\dump (see below)
 .\build.ps1 -Clean                        # full rebuild
 $env:AUDIO_LATENCY_MS = '48'; .\run.ps1   # more audio buffering if sound breaks up (default 32)
 ```
@@ -410,6 +411,28 @@ does: it sets the same environment and starts the game as a second
 the exe (or in `data_dir` from `folklore_settings.ini`). (Running the game in
 the first process instead, as earlier builds did, drew the title screen
 wrongly and stopped at a black screen.)
+
+### Dumping textures
+
+The first step towards higher-resolution textures: `.\run.ps1 -DumpTextures`
+writes every texture the game shows to `textures\dump`, once each, as you
+play (`-DumpDir D:\somewhere` for another folder). Play through the areas
+you want; later runs add only what is new.
+
+- Files are DDS: `<key>_<width>x<height>_<format>.dds`. DXT textures are
+  written as they are on the disc (BC1/BC2/BC3, with their mipmaps); other
+  formats as plain RGBA8. Cube maps end in `_cube`.
+- The 16-digit key at the start of the name is what a replacement will be
+  found by, so keep it when you save an upscaled copy.
+- `index.csv` in the folder lists every texture written: key, size, format,
+  mip count and the frame it first appeared.
+- Textures the game keeps rewriting (movie frames and the like) and render
+  targets are not dumped.
+- Writing a new texture takes a moment, so expect small hitches the first
+  time a new area loads while dumping.
+
+The dumped textures are the game's own art: do not share them or commit
+them (`textures/` is in `.gitignore`).
 
 ### Render capture (for bug reports)
 
