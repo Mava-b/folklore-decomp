@@ -1436,6 +1436,13 @@ What 0006 fixes in ps3recomp to make that run:
     frames. A frame with any draw left out for a pending shader is now
     not presented (the last whole frame stays up), at most 20 in a row.
     LD_HOLD_INCOMPLETE=0 shows every frame as before.
+101. DualShock 4 without DS4Windows (patches/0081, a player's report): the
+    DualShock 4 was already read directly, but only Sony's own IDs
+    (054C:05C4/09CC/0BA0). Licensed and third-party PS4/PS5-style pads
+    (SDL's controller_list.h: Hori, Nacon, Razer, PowerA, Mad Catz, Qanba,
+    Victrix, ZEROPLUS, Brook...) are now read the same way; only a pad's
+    controller collection is opened (not its keyboard/vendor ones), and a
+    HID game controller that is not in the list is logged with its VID:PID.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

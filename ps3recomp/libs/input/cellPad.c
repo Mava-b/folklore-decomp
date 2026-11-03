@@ -512,7 +512,8 @@ static int pad_ds3_snapshot(PadHidState* out)
  * all, and their motion sensors stand in for the SIXAXIS the same way RPCS3's
  * handlers use them. Over USB or Bluetooth, through Windows' own HID driver:
  *
- *   DualShock 4  054C:05C4, 054C:09CC, wireless adapter 054C:0BA0
+ *   DualShock 4  054C:05C4, 054C:09CC, wireless adapter 054C:0BA0, and the
+ *                third-party pads that present themselves as one (below)
  *     input report 0x01 (USB), 0x11-0x19 (Bluetooth, two more header bytes).
  *     Reading feature report 0x02 (and 0x05 over Bluetooth) is what switches
  *     a Bluetooth pad from its short 0x01 report to the full one.
@@ -559,7 +560,130 @@ static const PadHidModel s_hid_models[] = {
     { 0x054C, 0x0CE6, PAD_HID_DUALSENSE },
     { 0x054C, 0x0DF2, PAD_HID_DUALSENSE },    /* DualSense Edge */
     { 0x057E, 0x2009, PAD_HID_SWITCH_PRO },
+    /* Licensed and third-party pads that speak the DualShock 4's reports
+     * (from SDL's controller_list.h, Valve, zlib licence). Some have no
+     * touchpad, motion sensors or rumble; what they lack reads as at rest. */
+    { 0x0079, 0x181B, PAD_HID_DUALSHOCK4 },   /* Venom Arcade Stick */
+    { 0x044F, 0xD00E, PAD_HID_DUALSHOCK4 },   /* Thrustmaster Eswap Pro */
+    { 0x054C, 0x05C5, PAD_HID_DUALSHOCK4 },   /* STRIKEPAD PS4 Grip Add-on */
+    { 0x0738, 0x8250, PAD_HID_DUALSHOCK4 },   /* Mad Catz FightPad Pro PS4 */
+    { 0x0738, 0x8384, PAD_HID_DUALSHOCK4 },   /* Mad Catz FightStick TE S+ PS4 */
+    { 0x0738, 0x8480, PAD_HID_DUALSHOCK4 },   /* Mad Catz FightStick TE 2 PS4 */
+    { 0x0738, 0x8481, PAD_HID_DUALSHOCK4 },   /* Mad Catz FightStick TE 2+ PS4 */
+    { 0x0C12, 0x0E10, PAD_HID_DUALSHOCK4 },   /* Armor Armor 3 Pad PS4 */
+    { 0x0C12, 0x0E13, PAD_HID_DUALSHOCK4 },   /* ZEROPLUS P4 Wired Gamepad */
+    { 0x0C12, 0x0E15, PAD_HID_DUALSHOCK4 },   /* Game:Pad 4 */
+    { 0x0C12, 0x0E20, PAD_HID_DUALSHOCK4 },   /* Brook Mars Controller */
+    { 0x0C12, 0x0EF6, PAD_HID_DUALSHOCK4 },   /* Hitbox Arcade Stick */
+    { 0x0C12, 0x1CF6, PAD_HID_DUALSHOCK4 },   /* EMIO PS4 Elite Controller */
+    { 0x0C12, 0x1E10, PAD_HID_DUALSHOCK4 },   /* P4 Wired Gamepad (generic) */
+    { 0x0C12, 0x2E18, PAD_HID_DUALSHOCK4 },   /* ZEROPLUS P4 Wired Gamepad */
+    { 0x0E6F, 0x0203, PAD_HID_DUALSHOCK4 },   /* Victrix Pro FS */
+    { 0x0E6F, 0x0207, PAD_HID_DUALSHOCK4 },   /* Victrix Pro FS V2 */
+    { 0x0E6F, 0x020A, PAD_HID_DUALSHOCK4 },   /* Victrix Pro FS (PS4 mode) */
+    { 0x0F0D, 0x0055, PAD_HID_DUALSHOCK4 },   /* HORIPAD 4 FPS */
+    { 0x0F0D, 0x005E, PAD_HID_DUALSHOCK4 },   /* HORI Fighting Commander 4 */
+    { 0x0F0D, 0x0066, PAD_HID_DUALSHOCK4 },   /* HORIPAD 4 FPS Plus */
+    { 0x0F0D, 0x0084, PAD_HID_DUALSHOCK4 },   /* HORI Fighting Commander PS4 */
+    { 0x0F0D, 0x0087, PAD_HID_DUALSHOCK4 },   /* HORI Fighting Stick mini 4 */
+    { 0x0F0D, 0x008A, PAD_HID_DUALSHOCK4 },   /* HORI Real Arcade Pro 4 */
+    { 0x0F0D, 0x009C, PAD_HID_DUALSHOCK4 },   /* HORI TAC PRO */
+    { 0x0F0D, 0x00A0, PAD_HID_DUALSHOCK4 },   /* HORI TAC4 */
+    { 0x0F0D, 0x00EE, PAD_HID_DUALSHOCK4 },   /* HORI mini wired gamepad */
+    { 0x0F0D, 0x011C, PAD_HID_DUALSHOCK4 },   /* HORI Fighting Stick Alpha */
+    { 0x0F0D, 0x0123, PAD_HID_DUALSHOCK4 },   /* HORI Wireless Controller Light */
+    { 0x0F0D, 0x0162, PAD_HID_DUALSHOCK4 },   /* HORI Fighting Commander OCTA */
+    { 0x11C0, 0x4001, PAD_HID_DUALSHOCK4 },   /* "PS4 Fun Controller" */
+    { 0x146B, 0x0D01, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution Pro */
+    { 0x146B, 0x0D02, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution Pro v2 */
+    { 0x146B, 0x0D06, PAD_HID_DUALSHOCK4 },   /* Nacon Asymmetric dongle */
+    { 0x146B, 0x0D08, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution Unlimited dongle */
+    { 0x146B, 0x0D09, PAD_HID_DUALSHOCK4 },   /* Nacon Daija Fight Stick */
+    { 0x146B, 0x0D10, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution Infinite / Unlimited */
+    { 0x146B, 0x0D13, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution Pro 3 */
+    { 0x146B, 0x1103, PAD_HID_DUALSHOCK4 },   /* Nacon Asymmetric */
+    { 0x1532, 0x0401, PAD_HID_DUALSHOCK4 },   /* Razer Panthera */
+    { 0x1532, 0x1000, PAD_HID_DUALSHOCK4 },   /* Razer Raiju */
+    { 0x1532, 0x1004, PAD_HID_DUALSHOCK4 },   /* Razer Raiju 2 Ultimate (USB) */
+    { 0x1532, 0x1007, PAD_HID_DUALSHOCK4 },   /* Razer Raiju 2 Tournament (USB) */
+    { 0x1532, 0x1008, PAD_HID_DUALSHOCK4 },   /* Razer Panthera Evo */
+    { 0x1532, 0x1009, PAD_HID_DUALSHOCK4 },   /* Razer Raiju 2 Ultimate (Bluetooth) */
+    { 0x1532, 0x100A, PAD_HID_DUALSHOCK4 },   /* Razer Raiju 2 Tournament (Bluetooth) */
+    { 0x1532, 0x1100, PAD_HID_DUALSHOCK4 },   /* Razer RAION Fightpad */
+    { 0x20D6, 0x792A, PAD_HID_DUALSHOCK4 },   /* PowerA Fusion Fight Pad */
+    { 0x2C22, 0x2000, PAD_HID_DUALSHOCK4 },   /* Qanba Drone */
+    { 0x2C22, 0x2300, PAD_HID_DUALSHOCK4 },   /* Qanba Obsidian */
+    { 0x2C22, 0x2500, PAD_HID_DUALSHOCK4 },   /* Qanba Dragon */
+    { 0x3285, 0x0D16, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution 5 Pro (PS4, dongle) */
+    { 0x3285, 0x0D17, PAD_HID_DUALSHOCK4 },   /* Nacon Revolution 5 Pro (PS4, wired) */
+    { 0x7545, 0x0104, PAD_HID_DUALSHOCK4 },   /* Armor 3 / Level Up Cobra */
+    { 0x9886, 0x0025, PAD_HID_DUALSHOCK4 },   /* Astro C40 */
+    /* ...and the DualSense's. */
+    { 0x054C, 0x0E5F, PAD_HID_DUALSENSE },    /* Access Controller */
+    { 0x0E6F, 0x0209, PAD_HID_DUALSENSE },    /* Victrix Pro FS (PS5 mode) */
+    { 0x0F0D, 0x0163, PAD_HID_DUALSENSE },    /* HORI Fighting Commander OCTA (PS5) */
+    { 0x0F0D, 0x0184, PAD_HID_DUALSENSE },    /* HORI Fighting Stick Alpha (PS5) */
+    { 0x1532, 0x100B, PAD_HID_DUALSENSE },    /* Razer Wolverine V2 Pro (wired) */
+    { 0x1532, 0x100C, PAD_HID_DUALSENSE },    /* Razer Wolverine V2 Pro (wireless) */
+    { 0x1532, 0x1012, PAD_HID_DUALSENSE },    /* Razer Kitsune */
+    { 0x1532, 0x1024, PAD_HID_DUALSENSE },    /* Razer Raiju V3 Pro (wired) */
+    { 0x1532, 0x1026, PAD_HID_DUALSENSE },    /* Razer Raiju V3 Pro (dongle) */
+    { 0x3285, 0x0D18, PAD_HID_DUALSENSE },    /* Nacon Revolution 5 Pro (PS5, dongle) */
+    { 0x3285, 0x0D19, PAD_HID_DUALSENSE },    /* Nacon Revolution 5 Pro (PS5, wired) */
+    { 0x358A, 0x0104, PAD_HID_DUALSENSE },    /* Backbone One PlayStation Edition */
+    { 0x358A, 0x0304, PAD_HID_DUALSENSE },    /* Backbone One PlayStation Edition Gen 2 */
 };
+
+/* Whether a HID collection can be a controller: anything but a keyboard,
+ * mouse or vendor-defined collection, which some pads expose as well. */
+static int pad_hid_collection_may_be_pad(const HIDP_CAPS* caps)
+{
+    if (caps->UsagePage >= 0xFF00)
+    {
+        return 0;
+    }
+    if (caps->UsagePage == 0x01 && (caps->Usage == 0x02 || caps->Usage == 0x06))
+    {
+        return 0;
+    }
+    return 1;
+}
+
+/* A game controller that is not in the table, logged once per VID:PID so a
+ * report shows what a pad that went unseen was (Xbox pads are XInput's). */
+static void pad_hid_note_unknown(const HIDD_ATTRIBUTES* attributes, const HIDP_CAPS* caps)
+{
+    static u32 loggedIds[32];
+    static int loggedCount = 0;
+    if (caps->UsagePage != 0x01 || (caps->Usage != 0x04 && caps->Usage != 0x05))
+    {
+        return;
+    }
+    if (attributes->VendorID == 0x045E)
+    {
+        return;
+    }
+    if (attributes->VendorID == 0x054C && attributes->ProductID == 0x0268)
+    {
+        return;   /* the DualShock 3, read on its own above */
+    }
+    const u32 controllerId = ((u32)attributes->VendorID << 16) | attributes->ProductID;
+    for (int loggedIndex = 0; loggedIndex < loggedCount; loggedIndex++)
+    {
+        if (loggedIds[loggedIndex] == controllerId)
+        {
+            return;
+        }
+    }
+    if (loggedCount < (int)(sizeof(loggedIds) / sizeof(loggedIds[0])))
+    {
+        loggedIds[loggedCount] = controllerId;
+        loggedCount++;
+    }
+    printf("[cellPad] HID game controller %04X:%04X is not one the game reads directly "
+           "(XInput pads are read separately)\n", attributes->VendorID, attributes->ProductID);
+    fflush(stdout);
+}
 
 static const char* pad_hid_kind_name(PadHidKind kind)
 {
@@ -668,6 +792,26 @@ static int pad_hid_open(PadHidDevice* pad)
                 {
                     kind = s_hid_models[modelIndex].kind;
                 }
+            }
+            /* Third-party pads can have more than one collection; only the
+             * controller's own is opened. */
+            PHIDP_PREPARSED_DATA probeParsed = NULL;
+            if (HidD_GetPreparsedData(probe, &probeParsed))
+            {
+                HIDP_CAPS probeCaps;
+                memset(&probeCaps, 0, sizeof(probeCaps));
+                if (HidP_GetCaps(probeParsed, &probeCaps) == HIDP_STATUS_SUCCESS)
+                {
+                    if (kind != PAD_HID_NONE && !pad_hid_collection_may_be_pad(&probeCaps))
+                    {
+                        kind = PAD_HID_NONE;
+                    }
+                    else if (kind == PAD_HID_NONE)
+                    {
+                        pad_hid_note_unknown(&attributes, &probeCaps);
+                    }
+                }
+                HidD_FreePreparsedData(probeParsed);
             }
         }
         CloseHandle(probe);

@@ -360,6 +360,7 @@ directly — buttons, sticks and the motion sensors — and take controller port
 |---|---|---|
 | DualShock 4 (and Sony's wireless adapter) | USB or Bluetooth | no extra software |
 | DualSense, DualSense Edge | USB or Bluetooth | no extra software |
+| PS4/PS5-style pads from Hori, Nacon, Razer, PowerA, Mad Catz, Qanba, Victrix and others | USB or Bluetooth | no extra software; some have no motion sensors or rumble |
 | Switch Pro Controller | USB or Bluetooth | buttons by position: B = Cross, A = Circle, Y = Square, X = Triangle |
 | DualShock 3 | USB or Bluetooth | needs [DsHidMini](https://github.com/nefarius/DsHidMini) in **SXS** mode (set in DSHMC); also gives pressure-sensitive buttons |
 
@@ -372,6 +373,11 @@ Steam Input, DsHidMini in XInput mode) has no motion data. If DS4Windows hides
 the real controller (HidHide), the game cannot see it either; close it or let
 the game through. If two of these controllers are connected, the DualShock 3
 is used, otherwise the first one found.
+
+The log says `[cellPad] DualShock 4 connected over USB` (or Bluetooth) when
+the pad is found. `found but could not be opened` means another program has
+it; `HID game controller VVVV:PPPP is not one the game reads directly` means
+the pad is not in the list yet: please report that VVVV:PPPP.
 
 ### run.ps1 options
 
