@@ -19,6 +19,12 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
+**New in v0.5:** [the launcher](#the-launcher) (FolkloreLauncher.exe, or
+run_launcher.bat): game, update and DLC folders, every setting, then Play.
+Also: licences (.rap) added from a button, the title bar showing the real
+render size, and a fix for the logo movie looping over a blue screen when
+the game was started outside run.ps1 in a project folder.
+
 ### What's better than on the PS3
 
 All of these are in the in-game engine menu (**L3 + R3** or **F1**); each can
@@ -47,6 +53,8 @@ be turned back to the original.
   reuse work instead of being redrawn from scratch, unchanged models stay on
   the graphics card instead of being copied every frame, and large textures
   are no longer re-read every frame — boss fights hold 60 fps.
+- **A launcher**: set the game's folders, DLC and every setting in one
+  window, then Play.
 - **Quality of life**: skip the opening logos with Start, save backups and
   restores, no RPCS3 needed to decrypt the game, downloadable content added
   from the menu, motion controls on any controller with motion sensors.
@@ -440,7 +448,9 @@ does: it sets the same environment and starts the game as a second
 `hdd0\`, `hdd1\`, `gamedata\` (saves), the shader cache and `logs\` go beside
 the exe (or in `data_dir` from `folklore_settings.ini`). (Running the game in
 the first process instead, as earlier builds did, drew the title screen
-wrongly and stopped at a black screen.)
+wrongly and stopped at a black screen.) In a project folder it finds FFmpeg
+(for the movies) in `tools\ffmpeg\bin` itself, as run.ps1 does; a package
+has it beside the exe.
 
 ### Dumping textures
 

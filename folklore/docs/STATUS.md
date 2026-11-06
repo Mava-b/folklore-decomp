@@ -1527,6 +1527,27 @@ What 0006 fixes in ps3recomp to make that run:
     not fit, the chain's layout starts again from 0x4C00; and a binary
     placed high gets its working memory below it. Jobs are fetched again
     for every run, so their LS address never matters to them.
+106. FolkloreLauncher.exe (src/launcher, v0.5): a Win32 + D3D11 + Dear
+    ImGui window over the same settings, folder checks and DLC code the
+    engine uses (engine_settings, engine_portable, engine_dlc,
+    engine_self), with the renderer calls stubbed. Play saves the
+    settings and starts folklore.exe, then stays until the game's window
+    is up and hands it the foreground (Windows lets only the window in
+    front do that). run_launcher.bat opens it in a package or a project
+    folder. "Add licences (.rap)..." (engine_dlc) copies licences in and
+    repairs packs still encrypted.
+107. Blue screen from the launcher in a project folder (not in a package):
+    the FFmpeg DLLs are in tools\ffmpeg\bin, which only run.ps1 put on
+    PATH, so cellVdec opened with no decoder, the logo movie ended at once
+    and started again forever behind the window's blue background.
+    engine_portable now puts tools\ffmpeg\bin (up to two folders above
+    the exe) on PATH when no avcodec DLL is beside the exe.
+108. Title bar size (patches/0085): it showed the PS3's 1280x720 whatever
+    the render scale; it now shows the size frames are drawn at (render
+    scale and aspect included) and the window's when that differs. (The
+    first version of the patch also rewrote four CRLF lines of
+    rsx_live_draw.c and git on Windows refused it; edit those files as
+    bytes.)
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
