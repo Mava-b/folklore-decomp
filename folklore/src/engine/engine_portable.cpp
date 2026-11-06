@@ -285,6 +285,44 @@ namespace
             }
         }
 
+        /* FFmpeg (the movies): a package has its DLLs beside the exe; a
+         * project folder has them in tools\ffmpeg\bin, which run.ps1 puts on
+         * PATH. Started any other way (the launcher, a double-click on
+         * folklore\build\folklore.exe) the movies had no decoder: the logo
+         * movie ended at once and started again, over a blank blue window.
+         * The exe is in folklore\build, so the project is two folders up. */
+        WIN32_FIND_DATAA ffmpegBesideExe;
+        const HANDLE ffmpegSearch = FindFirstFileA((baseDirectory + "\\avcodec-*.dll").c_str(), &ffmpegBesideExe);
+        const bool ffmpegIsBesideExe = ffmpegSearch != INVALID_HANDLE_VALUE;
+        if (ffmpegIsBesideExe)
+        {
+            FindClose(ffmpegSearch);
+        }
+        if (!ffmpegIsBesideExe)
+        {
+            const std::string ffmpegCandidates[4] = {
+                baseDirectory + "\\tools\\ffmpeg\\bin",
+                parentFolder(baseDirectory) + "\\tools\\ffmpeg\\bin",
+                parentFolder(parentFolder(baseDirectory)) + "\\tools\\ffmpeg\\bin",
+                dataDirectory + "\\tools\\ffmpeg\\bin"};
+            for (const std::string& candidate : ffmpegCandidates)
+            {
+                if (directoryExists(candidate))
+                {
+                    char currentPath[32768];
+                    const DWORD pathLength = GetEnvironmentVariableA("PATH", currentPath, (DWORD)sizeof(currentPath));
+                    std::string newPath = candidate;
+                    if (pathLength > 0 && pathLength < sizeof(currentPath))
+                    {
+                        newPath += ";" + std::string(currentPath, pathLength);
+                    }
+                    SetEnvironmentVariableA("PATH", newPath.c_str());
+                    std::fprintf(stderr, "[engine] FFmpeg from %s\n", candidate.c_str());
+                    break;
+                }
+            }
+        }
+
         /* Sony's SPURS library, lifted from the builder's own firmware: the
          * image beside the exe when there is one, else the path baked in at
          * build time (src/prx/libsre_load.cpp). */
