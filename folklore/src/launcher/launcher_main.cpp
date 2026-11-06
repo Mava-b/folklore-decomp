@@ -1065,6 +1065,12 @@ namespace
             }
             const float playWidth = 220.0f * scale;
             const float playHeight = 56.0f * scale;
+            const float donateWidth = 190.0f * scale;
+            const float buttonGap = ImGui::GetStyle().ItemSpacing.x * 1.5f;
+            const float buttonsLeft = ImGui::GetWindowWidth() - playWidth - donateWidth - buttonGap -
+                                      ImGui::GetStyle().WindowPadding.x;
+            /* The message wraps before Ko-fi rather than running under it. */
+            ImGui::PushTextWrapPos(buttonsLeft - buttonGap);
             ImGui::BeginGroup();
             if (!launchProblem.empty())
             {
@@ -1095,12 +1101,10 @@ namespace
                                                                   : settingsPath.c_str() + separator + 1);
             }
             ImGui::EndGroup();
+            ImGui::PopTextWrapPos();
 
             /* Ko-fi, then Play, at the right. */
-            const float donateWidth = 190.0f * scale;
-            const float buttonGap = ImGui::GetStyle().ItemSpacing.x * 1.5f;
-            ImGui::SameLine(ImGui::GetWindowWidth() - playWidth - donateWidth - buttonGap -
-                            ImGui::GetStyle().WindowPadding.x);
+            ImGui::SameLine(buttonsLeft);
             const ImVec4 kofiBlue(0.161f, 0.671f, 0.878f, 1.0f);
             const ImVec4 kofiBlueHover(0.302f, 0.749f, 0.929f, 1.0f);
             ImGui::PushStyleColor(ImGuiCol_Button, kofiBlue);

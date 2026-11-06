@@ -19,11 +19,19 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-**New in v0.5:** [the launcher](#the-launcher) (FolkloreLauncher.exe, or
-run_launcher.bat): game, update and DLC folders, every setting, then Play.
-Also: licences (.rap) added from a button, the title bar showing the real
-render size, and a fix for the logo movie looping over a blue screen when
-the game was started outside run.ps1 in a project folder.
+### New in v0.5: the launcher
+
+![Folklore launcher, Game page](docs/images/launcher_game.png)
+
+**FolkloreLauncher.exe** (double-click **run_launcher.bat**) sets the game
+up in one window: your disc dump, the 1.10 update and your DLC, each checked
+as you choose it, and every graphics, display and gameplay setting. Then
+press **Play**. No scripts or settings files to edit; the in-game engine
+menu is still there too. See [*The launcher*](#the-launcher).
+
+Also in v0.5: licences (.rap) added from a button, the title bar showing the
+real render size, and a fix for the logo movie looping over a blue screen
+when the game was started outside run.ps1 in a project folder.
 
 ### What's better than on the PS3
 
@@ -168,6 +176,10 @@ powershell -ExecutionPolicy Bypass -File .\run.ps1
    **run.bat** does the same with a double-click (any run.ps1 options can
    follow it, e.g. `run.bat -ResetInstall`).
 
+Or, after build.ps1, double-click **run_launcher.bat** instead of run.ps1:
+[the launcher](#the-launcher) asks for the same folders in its own window and
+starts the game with Play.
+
 With both releases (an EU copy of this folder beside it, see *Sharing what
 you built*), `.\build_all.ps1` builds this folder, brings the EU copy up to
 date and builds that too; then `run.bat` in either folder runs its build.
@@ -205,6 +217,8 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
 
 ### The launcher
 
+![Folklore launcher, Graphics page](docs/images/launcher_graphics.png)
+
 **FolkloreLauncher.exe** (built beside folklore.exe, and in every package)
 sets everything up in one window before the game starts. Double-click
 **run_launcher.bat** to open it: in the project folder it opens the one in
@@ -227,8 +241,12 @@ ones `run.ps1` uses).
   [Ko-fi page](https://ko-fi.com/mavab).
 
 Its picture is `launcher_art.jpg` (or `.png`) in the project folder (or
-beside the launcher): put your own copy of the cover art there. It is not in
-the repository; without it the launcher shows a plain panel.
+beside the launcher): put your own copy of the cover art there and it fills
+the left-hand panel. It is not in the repository; without it the launcher
+shows the plain panel in the screenshots above.
+
+**From a package**: unzip, double-click `run_launcher.bat`, choose your disc
+dump (and the 1.10 update for a 1.10 build) on the Game page, press Play.
 
 ### Engine menu
 
