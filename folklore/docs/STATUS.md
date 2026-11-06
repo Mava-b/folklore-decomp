@@ -1475,6 +1475,20 @@ What 0006 fixes in ps3recomp to make that run:
     game call chain (host stack unwound, frames mapped back through
     function_table), sensor readers first. Next: run it during a boss
     capture, then follow the reader to the capture state.
+    Round 1 (run-20261106-131249, US 1.10, a boss capture): only the pad
+    library touches the sensor words, plus one reader: func_000F8FC8 (axis
+    0-3) reads them from the game's own copy (TOC -21232 -> 0x10149AF8,
+    +8..+14) for func_000F90A0, which keeps the motion object (1.10
+    0x1014ED5C, 1.00 0x1014ED4C; TOC -21700 / -21716): ten frames of the four
+    values at +64..+207 and its gesture results at +244..+259. It is
+    updated from the player's update (func_000F4AC4). The capture code is
+    whatever reads the motion object, so round 2 watches that instead.
+    Capture completion itself: func_00144B48 ("Captured c[%d]", adds the Id
+    to the collection), reached through func_000FC160.
+    The flickering seed in the same capture (capture-20261106-131249) is
+    the game's own blink: its sprite (PSO 52e5ea..., 128x128 texture at
+    0x9814700, two quads) is drawn in every frame where it shows and not
+    issued at all in the others, three frames on and three off.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

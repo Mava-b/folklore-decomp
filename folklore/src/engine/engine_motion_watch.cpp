@@ -1,31 +1,35 @@
 /*
  * engine_motion_watch.cpp -- a diagnostic: which of the game's functions
- * read the motion sensor values, and from where they are called (F3).
+ * read the motion input, and from where they are called (F3).
  *
  * Why: auto-capture (motion controls off) feeds every capture full-scale
  * motion, which finishes the ordinary "pull" captures but not the boss Ids'
  * Time / Beat / Balance / Stop & Go captures, which need the right motion at
  * the right moment. To do those automatically the port has to know the
- * game's capture state, and the way in is the code that reads the sensors.
- * The game's pad library keeps them in its pad array (three pads; the four
- * sensor words, each minus 512, at +24..+31), but nothing in the game's
- * code reads them there in any way a reading of the code can find.
+ * game's capture state, and the way in is the code that reads the motion.
  *
- * So: F3 starts a 20-second watch. The page holding the pad array is made a
- * guard page; every access to it stops once in the exception handler below,
- * which notes the access (read or write, which field) and walks the host
- * stack -- the lifted game functions call each other directly, so the host
- * stack is the game's call chain -- and turns each frame back into the game
- * function it belongs to (function_table). The page is armed again after
- * each access (single step). At the end the log gets one line per distinct
- * call chain, with counts:
+ * Round 1 watched the pad library's pad array: only the library and one
+ * reader touch the sensor words; the reader (func_000F8FC8, called four times
+ * a frame by func_000F90A0) copies them into the game's motion object, which
+ * keeps the last ten frames of the four sensor values (+64..+207) and what
+ * it makes of them (+244..+259). Round 2 (this) watches the motion object:
+ * the capture code reads it.
  *
- *   [motion-watch] 812 reads of sensors (pad 0, +24..+31) by
- *       func_001CEA08 <- func_0023F1C0 <- func_00241A88 <- ...
+ * F3 starts a 20-second watch. The page holding the object is made a guard
+ * page; every access to it stops once in the exception handler below, which
+ * notes the access (read or write, which field) and walks the host stack --
+ * the lifted game functions call each other directly, so the host stack is
+ * the game's call chain -- and turns each frame back into the game function
+ * it belongs to (function_table). The page is armed again after each access
+ * (single step). At the end the log gets one line per distinct call chain,
+ * with counts and the fields it touched:
  *
- * Only the sensor fields are reported in full; other accesses to the page
- * are counted. Each access costs two exceptions, so the game runs slower
- * while it watches; it stops by itself after 20 s, or press F3 again.
+ *   [motion-watch] read motion: 812 reads, 0 writes at +64,+68 by
+ *       func_000A7ED0 <- func_000A5230 <- ...
+ *
+ * Accesses to the rest of the page are only counted. Each access costs two
+ * exceptions, so the game runs slower while it watches; it stops by itself
+ * after 20 s, or press F3 again.
  */
 #include "engine_motion_watch.h"
 #include "engine_region.h"
@@ -55,18 +59,17 @@ extern "C"
 
 namespace
 {
-    /* The pad library's array of three pads (TOC slot of its pad lookup,
-     * folklore/docs/REGIONS.md): the 1.10 update added a field, so a pad is
-     * 108 bytes there instead of 104. */
+    /* The game's motion object (the TOC slot func_000F4AC4 passes to the
+     * motion reader; the same in both releases of a version). The pad
+     * library's pad array, watched in round 1: 1.00 0x109547F0 (104-byte
+     * pads), 1.10 0x10955AFC (108-byte pads). */
 #if FOLKLORE_GAME_VERSION == 110
-    constexpr uint32_t kPadArray = 0x10955AFCu;
-    constexpr uint32_t kPadStride = 108u;
+    constexpr uint32_t kWatchStart = 0x1014ED5Cu;
 #else
-    constexpr uint32_t kPadArray = 0x109547F0u;
-    constexpr uint32_t kPadStride = 104u;
+    constexpr uint32_t kWatchStart = 0x1014ED4Cu;
 #endif
-    constexpr uint32_t kPadCount = 3u;
-    constexpr uint32_t kSensorEnd = 32u;
+    constexpr uint32_t kWatchBytes = 0x180u;
+    constexpr uint32_t kPad = 0u;
     constexpr unsigned long long kWatchMs = 20000ull;
     constexpr int kMaxFrames = 14;
     constexpr size_t kMaxChains = 256;
@@ -84,7 +87,7 @@ namespace
         uint32_t pad;
         uint64_t reads;
         uint64_t writes;
-        uint32_t wordMask;       /* bit n: the pad's bytes 4n..4n+3 were where an access started */
+        uint64_t wordMask[2];    /* bit n: bytes 4n..4n+3 of the object were where an access started */
     };
 
     std::vector<HostFunction> hostFunctions;
@@ -232,7 +235,11 @@ namespace
             {
                 found->reads++;
             }
-            found->wordMask |= 1u << (offset / 4u);
+            const uint32_t word = offset / 4u;
+            if (word < 128u)
+            {
+                found->wordMask[word / 64u] |= 1ull << (word % 64u);
+            }
         }
         else
         {
@@ -261,17 +268,11 @@ namespace
             {
                 const bool isWrite = pointers->ExceptionRecord->ExceptionInformation[0] == 1;
                 const uint32_t guestAddress = (uint32_t)(address - (uintptr_t)vm_base);
-                const uint32_t arrayEnd = kPadArray + kPadStride * kPadCount;
                 bool sensor = false;
-                if (guestAddress >= kPadArray && guestAddress < arrayEnd)
+                if (guestAddress >= kWatchStart && guestAddress < kWatchStart + kWatchBytes)
                 {
-                    const uint32_t pad = (guestAddress - kPadArray) / kPadStride;
-                    const uint32_t offset = (guestAddress - kPadArray) % kPadStride;
-                    /* Every access to the pads is recorded (a copy of a
-                     * whole pad would read the sensors too); the report
-                     * puts the ones that touch the sensor words first. */
                     sensor = true;
-                    noteSensorAccess(pointers->ContextRecord, isWrite, pad, offset);
+                    noteSensorAccess(pointers->ContextRecord, isWrite, kPad, guestAddress - kWatchStart);
                 }
                 if (!sensor)
                 {
@@ -295,20 +296,13 @@ namespace
         return EXCEPTION_CONTINUE_SEARCH;
     }
 
-    bool touchesSensors(const Chain& chain)
-    {
-        /* Words 6 and 7 are the sensors (+24..+31); an access starting at
-         * +16 or +20 can be a wide copy that runs over them. */
-        return (chain.wordMask & 0xF0u) != 0;
-    }
-
     void printChain(const Chain& chain, const char* label)
     {
-        char offsets[160];
+        char offsets[400];
         int written = 0;
-        for (uint32_t word = 0; word < 32 && written < (int)sizeof(offsets) - 8; word++)
+        for (uint32_t word = 0; word < 128 && written < (int)sizeof(offsets) - 8; word++)
         {
-            if (chain.wordMask & (1u << word))
+            if (chain.wordMask[word / 64u] & (1ull << (word % 64u)))
             {
                 written += std::snprintf(offsets + written, sizeof(offsets) - (size_t)written, "%s+%u",
                                          written ? "," : "", word * 4u);
@@ -321,7 +315,7 @@ namespace
             frameWritten += std::snprintf(frameText + frameWritten, sizeof(frameText) - (size_t)frameWritten,
                                           "%sfunc_%08X", frameIndex ? " <- " : "", chain.frames[frameIndex]);
         }
-        std::fprintf(stderr, "[motion-watch] %s pad %u: %llu reads, %llu writes at %s by %s\n", label, chain.pad,
+        std::fprintf(stderr, "[motion-watch] %s motion: %llu reads, %llu writes at %s by %s\n", label,
                      (unsigned long long)chain.reads, (unsigned long long)chain.writes, written ? offsets : "?",
                      chain.frameCount ? frameText : "(no game code on the stack)");
     }
@@ -332,22 +326,22 @@ namespace
         {
             YieldProcessor();
         }
-        std::fprintf(stderr, "[motion-watch] finished: %llu accesses to the pads in %zu call chains, %llu other "
-                             "accesses to the page%s\n",
+        std::fprintf(stderr, "[motion-watch] finished: %llu accesses to the motion object in %zu call chains, "
+                             "%llu other accesses to the page%s\n",
                      (unsigned long long)sensorAccesses, chainCount, (unsigned long long)otherAccesses,
                      droppedChains ? " (some chains not recorded: too many)" : "");
         for (size_t chainIndex = 0; chainIndex < chainCount; chainIndex++)
         {
-            if (touchesSensors(chains[chainIndex]))
+            if (chains[chainIndex].reads)
             {
-                printChain(chains[chainIndex], "SENSORS");
+                printChain(chains[chainIndex], "read");
             }
         }
         for (size_t chainIndex = 0; chainIndex < chainCount; chainIndex++)
         {
-            if (!touchesSensors(chains[chainIndex]))
+            if (!chains[chainIndex].reads)
             {
-                printChain(chains[chainIndex], "other");
+                printChain(chains[chainIndex], "write");
             }
         }
         std::fflush(stderr);
@@ -378,14 +372,14 @@ void engineMotionWatchToggle()
     SYSTEM_INFO systemInfo;
     GetSystemInfo(&systemInfo);
     const uintptr_t pageSize = systemInfo.dwPageSize ? systemInfo.dwPageSize : 4096u;
-    const uintptr_t first = (uintptr_t)vm_base + kPadArray;
-    const uintptr_t last = first + kPadStride * kPadCount;
+    const uintptr_t first = (uintptr_t)vm_base + kWatchStart;
+    const uintptr_t last = first + kWatchBytes;
     pageStart = (uint8_t*)(first & ~(pageSize - 1u));
     pageBytes = (SIZE_T)(((last + pageSize - 1u) & ~(pageSize - 1u)) - (uintptr_t)pageStart);
     MEMORY_BASIC_INFORMATION memoryInfo;
     if (!VirtualQuery(pageStart, &memoryInfo, sizeof(memoryInfo)) || memoryInfo.State != MEM_COMMIT)
     {
-        std::fprintf(stderr, "[motion-watch] the pad array's memory is not there yet; try again in game\n");
+        std::fprintf(stderr, "[motion-watch] the motion object's memory is not there yet; try again in game\n");
         std::fflush(stderr);
         return;
     }
@@ -409,13 +403,12 @@ void engineMotionWatchToggle()
     if (!VirtualProtect(pageStart, pageBytes, originalProtection | PAGE_GUARD, &previous))
     {
         watching.store(false);
-        std::fprintf(stderr, "[motion-watch] could not watch the pad array (error %lu)\n", GetLastError());
+        std::fprintf(stderr, "[motion-watch] could not watch the motion object (error %lu)\n", GetLastError());
         std::fflush(stderr);
         return;
     }
-    std::fprintf(stderr, "[motion-watch] started (20 s; pad array 0x%08X, %u-byte pads, %zu game functions "
-                         "mapped)\n",
-                 kPadArray, kPadStride, hostFunctions.size());
+    std::fprintf(stderr, "[motion-watch] started (20 s; motion object 0x%08X, %zu game functions mapped)\n",
+                 kWatchStart, hostFunctions.size());
     std::fflush(stderr);
 }
 
