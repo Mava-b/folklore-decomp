@@ -1546,6 +1546,34 @@ void spu_overlay_register_region_at(uint32_t content_ea, uint32_t span, uint32_t
     s_ovl_src[s_ovl_src_count - 1].at_lsa = lsa | 0x80000000u;   /* bit 31: set */
 }
 
+/* For a job runner that chooses where a binary goes: an LS address where the
+ * code fetched from content_ea has a lift. Returns preferred when there is a
+ * lift there, or when the code has no address-bound lift at all (nothing to
+ * choose); otherwise the first address it was lifted for. Placing a binary
+ * there instead of somewhere unlifted keeps it out of the interpreter. */
+uint32_t spu_overlay_lifted_placement(uint32_t content_ea, uint32_t preferred)
+{
+    uint32_t firstLifted = 0xFFFFFFFFu;
+    for (int sourceIndex = 0; sourceIndex < s_ovl_src_count; sourceIndex++)
+    {
+        const spu_ovl_src* source = &s_ovl_src[sourceIndex];
+        if (source->has_sig || !source->at_lsa || source->src_ea != content_ea)
+        {
+            continue;
+        }
+        const uint32_t liftedLsa = source->at_lsa & SPU_LS_MASK;
+        if (liftedLsa == preferred)
+        {
+            return preferred;
+        }
+        if (firstLifted == 0xFFFFFFFFu)
+        {
+            firstLifted = liftedLsa;
+        }
+    }
+    return firstLifted == 0xFFFFFFFFu ? preferred : firstLifted;
+}
+
 /* Register one-way runtime entries that replace the guest call stack.
  * Matching the resolved function, not just its LS address, avoids affecting
  * unrelated overlays using the same address. Registration precedes execution. */

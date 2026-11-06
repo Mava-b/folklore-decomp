@@ -1513,6 +1513,20 @@ What 0006 fixes in ps3recomp to make that run:
     (motion controls off, or no motion sensors reporting), the count is
     raised to the target over about three seconds and never lowered, and the
     game completes the capture itself.
+105. Netherworld Core (near the Twin Trees) crash and endless loading on
+    leaving it (player report, EU 1.10, run-20261102-182402): there the
+    load chain uses more job binaries than the traces ever showed. Packed
+    from 0x4C00 in order of use, images 63, 61 and 56 landed at LS 0x18400,
+    0x28800 and 0x2B000, where they have no lift (they ran in the
+    interpreter), and image 53 at 0x2E800 left no room for its working
+    memory and stack, so the runner dropped it ("memory 0x2E800..0x4C400
+    does not fit") and the area load waited for it forever. Fix
+    (spurs_native_job.c, with patches/0084 adding
+    spu_overlay_lifted_placement to the runtime): a new binary goes to an
+    address it has a lift for when the packed one has none; when it would
+    not fit, the chain's layout starts again from 0x4C00; and a binary
+    placed high gets its working memory below it. Jobs are fetched again
+    for every run, so their LS address never matters to them.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

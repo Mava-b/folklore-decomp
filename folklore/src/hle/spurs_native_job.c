@@ -19,6 +19,15 @@
  *     otherwise right after this job's own binary;
  *   - the job context at LS 0x48F0 is zero but for +0x70 (working memory)
  *     and +0x78 (the descriptor's EA); nothing else in LS is cleared;
+ *   - two departures, for chains the traces never showed (the Netherworld
+ *     Core uses more binaries in one chain than fit packed this way): a
+ *     binary that has a lift at another LS address goes there instead of to
+ *     an unlifted one (spu_overlay_lifted_placement), so it runs compiled
+ *     rather than in the interpreter; and when a new binary with its working
+ *     memory and stack would not fit below 0x3F000, the chain's binary
+ *     layout starts again from 0x4C00 rather than the job being dropped
+ *     (which left the area load waiting for it forever). Binaries are fetched
+ *     again for every job, so where one goes never matters to the job;
  *   - the job is called at its first instruction with r3 = context,
  *     r4 = descriptor, r1 = stack top - 0x30 (a four-word frame there), and
  *     r5 = 0xFFFFFFFF, and returns through r0.
@@ -39,6 +48,7 @@
 extern uint8_t* vm_base;
 extern int spu_run_with_halt(void (*entry)(spu_context*), spu_context* ctx);
 extern void spu_indirect_branch(spu_context* ctx);
+extern uint32_t spu_overlay_lifted_placement(uint32_t content_ea, uint32_t preferred);
 
 #define JOB_CONTEXT_LS          0x48F0u
 #define JOB_FIRST_BINARY_LS     0x4C00u
@@ -151,8 +161,11 @@ uint64_t folklore_job_runner_count(const folklore_job_runner* runner)
 }
 
 /* Where the chain keeps this binary: the address it was given when the chain
- * first ran it, or the next free one. */
-static uint32_t placeBinary(folklore_job_runner* runner, uint32_t binaryEa, uint32_t binarySize)
+ * first ran it, or the next free one -- or, when that has no lift for this
+ * binary and another address has, that one. memoryNeeded is the job's
+ * working memory and stack, which go above the binary. */
+static uint32_t placeBinary(folklore_job_runner* runner, uint32_t binaryEa, uint32_t binarySize,
+                            uint32_t memoryNeeded)
 {
     for (uint32_t index = 0; index < runner->binaryCount; index++)
     {
@@ -161,13 +174,36 @@ static uint32_t placeBinary(folklore_job_runner* runner, uint32_t binaryEa, uint
             return runner->binaryBase[index];
         }
     }
-    const uint32_t base = runner->nextBinaryBase;
-    if (runner->binaryCount < JOB_MAX_BINARIES)
+    const uint32_t binaryBytes = alignTo1k(binarySize);
+    if (runner->nextBinaryBase + binaryBytes + memoryNeeded > JOB_MEMORY_LIMIT_LS ||
+        runner->binaryCount >= JOB_MAX_BINARIES)
     {
-        runner->binaryEa[runner->binaryCount] = binaryEa;
-        runner->binaryBase[runner->binaryCount] = base;
-        runner->binaryCount++;
-        runner->nextBinaryBase = base + alignTo1k(binarySize);
+        /* Out of room: lay the chain's binaries out again from the start. */
+        runner->binaryCount = 0;
+        runner->nextBinaryBase = JOB_FIRST_BINARY_LS;
+        runner->previousBinaryEnd = 0;
+    }
+    const uint32_t packedBase = runner->nextBinaryBase;
+    uint32_t base = spu_overlay_lifted_placement(binaryEa, packedBase);
+    if (base != packedBase && base + binaryBytes > JOB_MEMORY_LIMIT_LS)
+    {
+        base = packedBase;
+    }
+    runner->binaryEa[runner->binaryCount] = binaryEa;
+    runner->binaryBase[runner->binaryCount] = base;
+    runner->binaryCount++;
+    if (base == packedBase)
+    {
+        runner->nextBinaryBase = packedBase + binaryBytes;
+    }
+    else
+    {
+        static int s_reported = 0;
+        if (s_reported++ < 16)
+        {
+            fprintf(stderr, "[spurs-native] binary 0x%08X goes to its lifted LS 0x%05X instead of 0x%05X\n",
+                    binaryEa, base, packedBase);
+        }
     }
     return base;
 }
@@ -203,7 +239,8 @@ int folklore_job_runner_run(folklore_job_runner* runner, uint32_t descriptorEa)
     }
 
     /* The binary, at its place in the chain's layout. */
-    const uint32_t binaryBase = placeBinary(runner, binaryEa, binarySize);
+    const uint32_t memoryNeeded = workSize + JOB_STACK_SIZE;
+    const uint32_t binaryBase = placeBinary(runner, binaryEa, binarySize, memoryNeeded);
     const uint32_t binaryEnd = binaryBase + alignTo1k(binarySize);
     if (binaryEnd > JOB_MEMORY_LIMIT_LS || getFromGuest(spu, binaryBase, binaryEa, binarySize) != 0)
     {
@@ -218,6 +255,11 @@ int folklore_job_runner_run(folklore_job_runner* runner, uint32_t descriptorEa)
         runner->previousBinaryEnd + workSize + JOB_STACK_SIZE <= JOB_MEMORY_LIMIT_LS)
     {
         workBase = runner->previousBinaryEnd;
+    }
+    else if (workBase + memoryNeeded > JOB_MEMORY_LIMIT_LS && JOB_FIRST_BINARY_LS + memoryNeeded <= binaryBase)
+    {
+        /* A binary placed high at its lift: its memory fits below it. */
+        workBase = JOB_FIRST_BINARY_LS;
     }
     const uint32_t stackTop = workBase + workSize + JOB_STACK_SIZE;
     if (stackTop > JOB_MEMORY_LIMIT_LS)
