@@ -211,7 +211,9 @@ saved to `folklore_settings.ini`.
 - **Motion controls** (on by default): capture Folks by moving the controller,
   as on the PS3. Works with any controller that has motion sensors (below); a
   controller without them still captures by itself. Turn it off and every
-  capture completes by itself, whatever the controller. The menu shows which
+  capture completes by itself, whatever the controller -- boss captures too
+  (Time, Beat, Balance, Stop & Go: the capture bar fills over a few seconds
+  and the game finishes the capture as if you had). The menu shows which
   controller is connected and whether its sensors are live.
 - **Opening logos**: *Play them* (as on the PS3), *Start skips them*
   (the default: press **Start**, or Enter, once the logos have been on for a
@@ -473,8 +475,8 @@ draws go to `logs\capture-<date-time>\`.
 **F3** in game starts a 20-second watch of where the game reads the
 controller's motion sensors (the game runs slower while it watches; F3
 again stops it early). The results go to the run log as `[motion-watch]`
-lines. Used to find the capture code, so auto-capture can handle the boss
-Ids' capture mechanics.
+lines. It found the capture code that auto-capture now uses for the boss
+Ids' capture mechanics; kept for looking into anything else motion does.
 
 **F5-F9** search the game's memory for the capture state, as the boss
 capture is played: F5 when the Id is red, F6 when it is not, F7 each time
