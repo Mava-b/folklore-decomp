@@ -1489,6 +1489,19 @@ What 0006 fixes in ps3recomp to make that run:
     the game's own blink: its sprite (PSO 52e5ea..., 128x128 texture at
     0x9814700, two quads) is drawn in every frame where it shows and not
     issued at all in the others, three frames on and three off.
+    Round 2 (run-20261106-132537, Cernunnos, the Time mechanic: flick up
+    when the Id is red): the readers are the player's capture controller,
+    the object at 0x1014F0F0 (updated by func_000FF864 through
+    func_00103008), a state machine of 36 member-function states (table at
+    TOC -20596 = 0x100328F0, current state at +208, func_00100CE8 changes
+    state). During the whole capture it sat in state 1, func_00104D30, which
+    asks func_000F8EBC (is the controller moving: |x| or |y| over a
+    threshold) and func_00100B78 (sensor axis of a history frame, scaled).
+    States 2, 3 and 10 (func_00103270, func_0010394C, func_00104308) read
+    the motion the same way: probably the other mechanics. Where the Id's
+    colour and the capture bar live is not found yet, so engine_capture_
+    finder.cpp searches memory for them while the player says what is on
+    screen (F5 red / F6 not red; F7 bar up / F8 bar down; F9 restart).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

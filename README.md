@@ -476,6 +476,12 @@ again stops it early). The results go to the run log as `[motion-watch]`
 lines. Used to find the capture code, so auto-capture can handle the boss
 Ids' capture mechanics.
 
+**F5-F9** search the game's memory for the capture state, as the boss
+capture is played: F5 when the Id is red, F6 when it is not, F7 each time
+the capture bar has gone up since the last F7/F8, F8 each time it has gone
+down, F9 to start again. Each press briefly pauses the game while it copies
+the game's memory; the results are `[capture-finder]` lines in the log.
+
 ### Comparing with Sony's libsre
 
 Until October 2026 the port ran the game's SPU jobs on Sony's own SPURS

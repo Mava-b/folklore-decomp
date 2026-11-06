@@ -19,6 +19,7 @@
 #include "engine_portable.h"
 #include "engine_dlc.h"
 #include "engine_motion_watch.h"
+#include "engine_capture_finder.h"
 #include "engine_region.h"
 
 #ifdef _WIN32
@@ -106,6 +107,7 @@ namespace
         bool previousToggleKey = false;
         bool previousCaptureKey = false;
         bool previousWatchKey = false;
+        bool previousFinderKeys[5] = {false, false, false, false, false};
         bool captureActive = false;
         LARGE_INTEGER captureStart = {};
         bool previousEscape = false;
@@ -1478,6 +1480,16 @@ namespace
         }
         menu.previousWatchKey = watchKey;
         engineMotionWatchUpdate();
+        /* F5-F9: the capture finder (engine_capture_finder.cpp). */
+        for (int finderIndex = 0; finderIndex < 5; finderIndex++)
+        {
+            const bool finderKey = focused && keyDown(VK_F5 + finderIndex);
+            if (finderKey && !menu.previousFinderKeys[finderIndex])
+            {
+                engineCaptureFinderKey(5 + finderIndex);
+            }
+            menu.previousFinderKeys[finderIndex] = finderKey;
+        }
         menu.previousButtons = controller.buttons;
         menu.previousToggleKey = toggleKey;
         menu.previousEscape = escapeKey;
