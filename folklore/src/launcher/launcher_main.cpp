@@ -20,6 +20,11 @@
  *
  * Win32 + Direct3D 11 + Dear ImGui (src/third_party/imgui, MIT).
  */
+/* windows.h would otherwise define min and max as macros, breaking std::min. */
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #include "engine_dlc.h"
 #include "engine_portable.h"
 #include "engine_region.h"
