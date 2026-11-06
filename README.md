@@ -317,8 +317,9 @@ Good to know:
 - Copied RPCS3's game folder into `hdd0\game` by hand instead? RPCS3 keeps
   the paid packs encrypted with your licences, so the port decrypts them at
   start when it finds the `.rap` files — copy RPCS3's
-  `dev_hdd0\home\00000001\exdata` to `hdd0\home\00000001\exdata` too, or
-  just press *Add DLC from RPCS3...*. F1 lists, in red, any pack still
+  `dev_hdd0\home\00000001\exdata` to `hdd0\home\00000001\exdata` too, press
+  *Add licences (.rap)...* and pick the `.rap` files, or just press *Add DLC
+  from RPCS3...*. F1 lists, in red, any pack still
   missing its licence (without it, its costumes and Folks are broken and the
   game can crash).
 - Each project copy (and each package folder) has its own `hdd0\`, so add the

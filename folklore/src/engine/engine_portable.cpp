@@ -680,6 +680,69 @@ std::string enginePickFolder(const std::string& startFolder, const std::string& 
     return chosen;
 }
 
+std::vector<std::string> enginePickFiles(const std::string& startFolder, const std::string& title,
+                                         const std::string& filterName, const std::string& pattern)
+{
+    const HRESULT initialised = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    std::vector<std::string> chosen;
+    IFileOpenDialog* dialog = nullptr;
+    if (SUCCEEDED(CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog))))
+    {
+        DWORD options = 0;
+        dialog->GetOptions(&options);
+        dialog->SetOptions(options | FOS_ALLOWMULTISELECT | FOS_FORCEFILESYSTEM | FOS_FILEMUSTEXIST);
+        dialog->SetTitle(narrowToWide(title).c_str());
+        const std::wstring wideFilterName = narrowToWide(filterName);
+        const std::wstring widePattern = narrowToWide(pattern);
+        COMDLG_FILTERSPEC filters[2] = {
+            {wideFilterName.c_str(), widePattern.c_str()},
+            {L"All files", L"*.*"},
+        };
+        dialog->SetFileTypes(2, filters);
+        if (!startFolder.empty() && directoryExists(startFolder))
+        {
+            IShellItem* startItem = nullptr;
+            if (SUCCEEDED(SHCreateItemFromParsingName(narrowToWide(startFolder).c_str(), nullptr,
+                                                      IID_PPV_ARGS(&startItem))))
+            {
+                dialog->SetFolder(startItem);
+                startItem->Release();
+            }
+        }
+        if (SUCCEEDED(dialog->Show(nullptr)))
+        {
+            IShellItemArray* results = nullptr;
+            if (SUCCEEDED(dialog->GetResults(&results)))
+            {
+                DWORD resultCount = 0;
+                results->GetCount(&resultCount);
+                for (DWORD resultIndex = 0; resultIndex < resultCount; resultIndex++)
+                {
+                    IShellItem* result = nullptr;
+                    if (FAILED(results->GetItemAt(resultIndex, &result)))
+                    {
+                        continue;
+                    }
+                    PWSTR widePath = nullptr;
+                    if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &widePath)))
+                    {
+                        chosen.push_back(wideToNarrow(widePath));
+                        CoTaskMemFree(widePath);
+                    }
+                    result->Release();
+                }
+                results->Release();
+            }
+        }
+        dialog->Release();
+    }
+    if (SUCCEEDED(initialised))
+    {
+        CoUninitialize();
+    }
+    return chosen;
+}
+
 std::string engineDataDirectory()
 {
     const EngineSettings& settings = engineSettings();

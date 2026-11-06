@@ -40,6 +40,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <mutex>
 #include <set>
 #include <system_error>
 
@@ -1156,6 +1157,9 @@ std::string engineDlcTakeRemovalReport()
  * -------------------------------------------------------------------------*/
 namespace
 {
+    /* Set by the repair (at start, or on a thread after Add licences),
+     * read by the menu every frame. */
+    std::mutex g_dlcRepairStatusLock;
     std::string g_dlcRepairStatus;
 
     std::vector<std::string> ownLicenceFolders()
@@ -1202,7 +1206,10 @@ namespace
 
 std::string engineDlcRepairInstalled()
 {
-    g_dlcRepairStatus.clear();
+    {
+        std::lock_guard<std::mutex> guard(g_dlcRepairStatusLock);
+        g_dlcRepairStatus.clear();
+    }
     const fs::path bin = targetBin();
     if (!isDirectory(bin))
     {
@@ -1327,9 +1334,12 @@ std::string engineDlcRepairInstalled()
         {
             status += "  " + contentId + " (" + std::to_string(count) + " files): no " + contentId + ".rap found\n";
         }
-        status += "Fix: press Add DLC from RPCS3... below and pick RPCS3's folder, or copy the .rap licences into " +
-                  (fs::path(hdd0Directory()).parent_path() / "licences").string() + " and restart.";
-        g_dlcRepairStatus = status;
+        status += "Fix: press Add licences (.rap)... below and pick these .rap files, or Add DLC from RPCS3... and "
+                  "pick RPCS3's folder.";
+        {
+            std::lock_guard<std::mutex> guard(g_dlcRepairStatusLock);
+            g_dlcRepairStatus = status;
+        }
         report += status + "\n";
     }
     if (!report.empty())
@@ -1341,5 +1351,81 @@ std::string engineDlcRepairInstalled()
 
 std::string engineDlcRepairStatus()
 {
+    std::lock_guard<std::mutex> guard(g_dlcRepairStatusLock);
     return g_dlcRepairStatus;
+}
+
+std::string engineDlcAddLicences(const std::vector<std::string>& rapFiles)
+{
+    const fs::path licences = fs::path(hdd0Directory()).parent_path() / "licences";
+    std::error_code error;
+    fs::create_directories(licences, error);
+    std::vector<std::string> added;
+    std::string problems;
+    for (const std::string& rapFile : rapFiles)
+    {
+        const fs::path source(rapFile);
+        const std::string name = source.filename().string();
+        const std::vector<unsigned char> rap = readBytes(source, 64);
+        unsigned char rifKey[16];
+        if (!sameText(source.extension().string(), ".rap") || rap.size() != 16 || !rapToRifKey(rap.data(), rifKey))
+        {
+            problems += "  " + name + ": not a .rap licence (one is 16 bytes, named <content ID>.rap)\n";
+            continue;
+        }
+        const fs::path target = licences / name;
+        if (fs::equivalent(source, target, error))
+        {
+            added.push_back(source.stem().string());
+            continue;
+        }
+        if (!copyFileOver(source, target))
+        {
+            problems += "  " + name + ": could not be copied to " + licences.string() + "\n";
+            continue;
+        }
+        added.push_back(source.stem().string());
+    }
+    std::string report;
+    if (!added.empty())
+    {
+        report += "Added " + std::to_string(added.size()) + " licence" + (added.size() == 1 ? "" : "s") + " to " +
+                  licences.string() + ":\n";
+        for (const std::string& contentId : added)
+        {
+            report += "  " + contentId + "\n";
+        }
+    }
+    if (!problems.empty())
+    {
+        report += "Not added:\n" + problems;
+    }
+    if (added.empty())
+    {
+        return report;
+    }
+    const bool wasMissing = !engineDlcRepairStatus().empty();
+    const std::string repaired = engineDlcRepairInstalled();
+    const bool stillMissing = !engineDlcRepairStatus().empty();
+    const bool unlockedSome = repaired.find("Decrypted ") != std::string::npos;
+    if (!repaired.empty() && !stillMissing)
+    {
+        report += repaired;
+    }
+    if (stillMissing)
+    {
+        report += unlockedSome ? "Restart the game to use the packs that are unlocked now; the ones listed in red "
+                                 "above still need their licences."
+                               : "None of the packs listed in red above is unlocked by these; they still need their "
+                                 "own licences.";
+    }
+    else if (wasMissing || unlockedSome)
+    {
+        report += "Every installed DLC file can be read now. Restart the game to use the packs.";
+    }
+    else
+    {
+        report += "No installed DLC was waiting for these; they will be used for packs copied in later.";
+    }
+    return report;
 }

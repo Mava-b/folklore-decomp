@@ -39,8 +39,13 @@ every start the port looks for such files and decrypts them in place with
 your licences, from `hdd0\home\<user>\exdata` (copy RPCS3's
 `dev_hdd0\home\00000001\exdata` there) or a `licences` folder beside
 `hdd0`. If some licences are missing, the engine menu's *Downloadable
-content* section says which, in red; **Add DLC from RPCS3...** fixes it as
-well, since it reads the licences from RPCS3's own folder. The same check
+content* section says which, in red. **Add licences (.rap)...** beside *Add
+DLC* fixes it: pick the packs' `.rap` files (RPCS3 keeps them in
+`dev_hdd0\home\00000001\exdata`); they are copied into the `licences`
+folder and the installed files they unlock are decrypted straight away, so
+the warning clears -- restart the game to use the packs. **Add DLC from
+RPCS3...** fixes it as well, since it reads the licences from RPCS3's own
+folder. The same check
 gives the other release's packs this release's English names (see below), so
 a folder that mixes releases' packs reads in English either way. It takes a
 few seconds the first time, and nothing after.

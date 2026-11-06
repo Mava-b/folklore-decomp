@@ -89,6 +89,13 @@ std::string engineDlcRepairInstalled();
  * menu; empty when there are none. */
 std::string engineDlcRepairStatus();
 
+/* Copy the .rap licences chosen (the file name is the content ID: 16 bytes,
+ * named <content ID>.rap) into the licences folder beside hdd0, then decrypt
+ * the installed DLC files they unlock (engineDlcRepairInstalled). Returns a
+ * few lines for the user: what was added, what was not, what is still
+ * missing, and to restart the game. */
+std::string engineDlcAddLicences(const std::vector<std::string>& rapFiles);
+
 /* "Add-on pack 3" for a paid pack (numbered by its content ID), "Free pack
  * (19)" for the others. */
 std::string engineDlcPackName(const DlcPackInfo& pack);

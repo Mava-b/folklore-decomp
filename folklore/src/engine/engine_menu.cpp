@@ -277,6 +277,53 @@ namespace
         }).detach();
     }
 
+    /* Add licences: the user picks .rap files (for a game folder copied in
+     * by hand, whose packs are still encrypted); they go into the licences
+     * folder and the installed packs they unlock are decrypted, on a thread
+     * of its own like the import, sharing its state and report. */
+    void startLicenceImport(const std::string& startFolder)
+    {
+        {
+            std::lock_guard<std::mutex> guard(dlcImport.lock);
+            if (dlcImport.running)
+            {
+                return;
+            }
+            dlcImport.running = true;
+            dlcImport.filesDone = 0;
+            dlcImport.filesTotal = 0;
+            dlcImport.currentFile = "Choosing licences...";
+            dlcImport.report.clear();
+        }
+        const bool wasFullscreen = rsx_null_backend_is_fullscreen() != 0;
+        std::thread([startFolder, wasFullscreen]() {
+            if (wasFullscreen)
+            {
+                rsx_null_backend_set_fullscreen(0);
+            }
+            const std::vector<std::string> picked =
+                enginePickFiles(startFolder, "Folklore: choose your DLC licences (.rap files)", "Licences (*.rap)",
+                                "*.rap");
+            if (wasFullscreen)
+            {
+                rsx_null_backend_set_fullscreen(1);
+            }
+            std::string report;
+            if (!picked.empty())
+            {
+                {
+                    std::lock_guard<std::mutex> guard(dlcImport.lock);
+                    dlcImport.currentFile = "Unlocking the installed packs...";
+                }
+                report = engineDlcAddLicences(picked);
+            }
+            std::lock_guard<std::mutex> guard(dlcImport.lock);
+            dlcImport.report = report;
+            dlcImport.running = false;
+            dlcImport.installedCheckedAt = -100.0;
+        }).detach();
+    }
+
     /* The folder the picker opens in: RPCS3's dev_hdd0\game, when the 1.10
      * update folder is known (it is in RPCS3), else the game folder. */
     std::string dlcStartFolder()
@@ -423,12 +470,19 @@ namespace
         ImGui::TextDisabled("Install Packages/Raps/Edats), then add them here from RPCS3's folder. The other");
         ImGui::TextDisabled("release's packs work too (North American packs in the European build, and back).");
         bool startImport = false;
+        bool startLicences = false;
         ImGui::BeginDisabled(running);
         if (ImGui::Button(running ? "Adding DLC..." : "Add DLC from RPCS3..."))
         {
             startImport = true;
         }
+        ImGui::SameLine();
+        if (ImGui::Button("Add licences (.rap)..."))
+        {
+            startLicences = true;
+        }
         ImGui::EndDisabled();
+        ImGui::TextDisabled("Copied the game's folder in by hand? Add licences takes the packs' .rap files and unlocks them.");
         if (running)
         {
             const float fraction = filesTotal > 0 ? (float)filesDone / (float)filesTotal : 0.0f;
@@ -472,6 +526,10 @@ namespace
         if (startImport)
         {
             startDlcImport(dlcStartFolder());
+        }
+        if (startLicences)
+        {
+            startLicenceImport(dlcStartFolder());
         }
     }
 

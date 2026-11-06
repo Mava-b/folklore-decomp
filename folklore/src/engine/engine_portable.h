@@ -5,6 +5,7 @@
 #pragma once
 
 #include <string>
+#include <vector>
 
 /* The folder the user means: a picked PS3_GAME or USRDIR folder becomes the
  * folder above PS3_GAME; trailing separators go. */
@@ -39,6 +40,12 @@ std::string enginePickGameFolder(const std::string& startFolder, bool forUpdate 
 /* The same picker with any title; the folder as picked (trailing separators
  * removed), or an empty string when cancelled. */
 std::string enginePickFolder(const std::string& startFolder, const std::string& title);
+
+/* A picker for one or more files matching pattern (e.g. "*.rap"), described
+ * as filterName (blocking; any thread). The files chosen, or none when
+ * cancelled. */
+std::vector<std::string> enginePickFiles(const std::string& startFolder, const std::string& title,
+                                         const std::string& filterName, const std::string& pattern);
 
 /* Where hdd0, hdd1 and logs live: the data_dir setting, else beside the exe. */
 std::string engineDataDirectory();
