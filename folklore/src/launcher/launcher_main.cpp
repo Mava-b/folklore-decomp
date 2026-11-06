@@ -316,6 +316,8 @@ namespace
      * as run.ps1 -DumpTextures). For this run only: dumping makes new areas
      * hitch while it writes, so it is not kept in the settings. */
     bool dumpTexturesThisRun = false;
+    /* folklore.exe once Play has started it, until its window is up. */
+    HANDLE gameProcess = nullptr;
     const char* const kDonateUrl = "https://ko-fi.com/mavab";
 
     /* Where the texture dump goes: textures\dump in the data folder, the
@@ -884,6 +886,9 @@ namespace
         PROCESS_INFORMATION process = {};
         std::vector<char> commandBuffer(commandLine.begin(), commandLine.end());
         commandBuffer.push_back(0);
+        /* The launcher is the window in front; the game (started by
+         * folklore.exe in turn) may bring its own window forward. */
+        AllowSetForegroundWindow(ASFW_ANY);
         if (!CreateProcessA(nullptr, commandBuffer.data(), nullptr, nullptr, FALSE, 0, nullptr, folder.c_str(),
                             &startup, &process))
         {
@@ -891,8 +896,41 @@ namespace
             return false;
         }
         CloseHandle(process.hThread);
-        CloseHandle(process.hProcess);
+        gameProcess = process.hProcess;
         return true;
+    }
+
+    /* After Play: stay open until the game's window is up and give it the
+     * foreground. Windows only lets the window in front pass the foreground
+     * on; a launcher that closed straight away left the game's window behind
+     * other windows, without keyboard input (the keys only reach the game
+     * while its window is in front). Gives up after a minute, or when the
+     * game has already closed. */
+    void handForegroundToGame(HWND launcherWindow)
+    {
+        SetWindowTextW(launcherWindow, L"Folklore Launcher - starting the game...");
+        const ULONGLONG giveUpMs = GetTickCount64() + 60000ull;
+        while (GetTickCount64() < giveUpMs)
+        {
+            MSG message;
+            while (PeekMessageW(&message, nullptr, 0U, 0U, PM_REMOVE))
+            {
+                TranslateMessage(&message);
+                DispatchMessageW(&message);
+            }
+            if (WaitForSingleObject(gameProcess, 0) == WAIT_OBJECT_0)
+            {
+                return;
+            }
+            const HWND gameWindow = FindWindowA("ps3recomp_null", nullptr);
+            if (gameWindow && IsWindowVisible(gameWindow))
+            {
+                SetForegroundWindow(gameWindow);
+                BringWindowToTop(gameWindow);
+                return;
+            }
+            Sleep(50);
+        }
     }
 
     /* ---- The frame -------------------------------------------------------- */
@@ -1240,6 +1278,12 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE previousInstance, LPSTR command
     if (settingsDirty)
     {
         engineSettingsSave();
+    }
+    if (gameProcess)
+    {
+        handForegroundToGame(window);
+        CloseHandle(gameProcess);
+        gameProcess = nullptr;
     }
     ImGui_ImplDX11_Shutdown();
     ImGui_ImplWin32_Shutdown();

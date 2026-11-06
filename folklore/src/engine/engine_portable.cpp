@@ -398,6 +398,10 @@ namespace
             SetInformationJobObject(job, JobObjectExtendedLimitInformation, &limits, sizeof(limits));
             AssignProcessToJobObject(job, process.hProcess);
         }
+        /* Started from a launcher or Explorer, this process may bring a
+         * window forward; pass that on to the game, whose window is the
+         * one that needs it. */
+        AllowSetForegroundWindow(process.dwProcessId);
         ResumeThread(process.hThread);
         CloseHandle(process.hThread);
         WaitForSingleObject(process.hProcess, INFINITE);
