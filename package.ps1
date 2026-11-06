@@ -136,6 +136,25 @@ if ($Kind -eq 'Binaries')
     Write-Step 'folklore.exe'
     Copy-Item $exe $package
 
+    # FolkloreLauncher.exe: folders, DLC and settings in one window, then
+    # Play. Its picture is launcher_art.jpg (or .png) from the project folder,
+    # when there is one (it is not in the repository).
+    $launcherExe = Join-Path $PortDir 'build\FolkloreLauncher.exe'
+    if (Test-Path $launcherExe)
+    {
+        Copy-Item $launcherExe $package
+        Write-Host '    FolkloreLauncher.exe'
+        foreach ($artName in @('launcher_art.jpg', 'launcher_art.png'))
+        {
+            $art = Join-Path $Root $artName
+            if (Test-Path $art)
+            {
+                Copy-Item $art $package
+                Write-Host "    $artName"
+            }
+        }
+    }
+
     # The launcher: run.bat runs run.ps1 (with common.ps1), which sets the
     # runtime up the way it is tested -- environment, log file, render
     # capture (capture.bat). run.ps1 finds folklore.exe beside itself here.
@@ -232,7 +251,9 @@ dumped to a folder (it contains PS3_GAME), AND the 1.10 update for it
 installed (in RPCS3: File > Install Packages, then it is in
 <RPCS3>\dev_hdd0\game\$titleId). No PS3 firmware is needed.
 
-1. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
+1. Double-click FolkloreLauncher.exe: choose your disc dump and the 1.10
+   update on its Game page, add DLC, change any setting, then press Play.
+   Or double-click run.bat (or folklore.exe). The first time, folklore.exe asks
    for the disc dump folder (the one that contains PS3_GAME), then for the
    update folder (the one that contains PARAM.SFO and USRDIR), and
    remembers both in folklore_settings.ini. It decrypts the update's
@@ -252,7 +273,9 @@ You need your own copy of Folklore on the disc this build was made from:
 $releaseLine,
 dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
-1. Double-click run.bat (or folklore.exe). The first time, folklore.exe asks
+1. Double-click FolkloreLauncher.exe: choose your disc dump on its Game
+   page, add DLC, change any setting, then press Play.
+   Or double-click run.bat (or folklore.exe). The first time, folklore.exe asks
    for the dump folder (the one that contains PS3_GAME), remembers it in
    folklore_settings.ini and decrypts its EBOOT.BIN into decrypted\ here
    (nothing in the dump is changed). Either way the game starts with the

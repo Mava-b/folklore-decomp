@@ -195,6 +195,24 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
 
 ## Playing
 
+### The launcher
+
+**FolkloreLauncher.exe** (built beside folklore.exe, and in every package)
+sets everything up in one window before the game starts:
+
+- **Game**: your disc dump and, for a 1.10 build, the installed 1.10 update,
+  each checked the way the game checks them; where saves and installed data
+  go; optional firmware fonts.
+- **DLC**: the packs installed, **Add DLC from RPCS3...** and **Add licences
+  (.rap)...**, and any pack still missing its licence.
+- **Graphics**, **Display**, **Gameplay**: every setting of the in-game
+  engine menu, including the ones that only apply when the game starts.
+- **Play** saves `folklore_settings.ini` and starts folklore.exe.
+
+Its picture is `launcher_art.jpg` (or `.png`) in the project folder (or
+beside the launcher): put your own copy of the cover art there. It is not in
+the repository; without it the launcher shows a plain panel.
+
 ### Engine menu
 
 Press **L3 + R3 together** (or **F1**) in game. D-pad / left stick or the arrow

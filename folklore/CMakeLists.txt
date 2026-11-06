@@ -180,3 +180,39 @@ else()
     find_package(Threads REQUIRED)
     target_link_libraries(folklore PRIVATE SDL2::SDL2 Threads::Threads ${CMAKE_DL_LIBS} m)
 endif()
+
+# FolkloreLauncher.exe (src/launcher): the game's folders, DLC and settings
+# in one window, then Play starts folklore.exe beside it. It shares the
+# settings, folder checks and DLC importer with the game (src/engine), and
+# draws with Dear ImGui's Win32 + Direct3D 11 backends.
+if(WIN32)
+    add_executable(FolkloreLauncher WIN32
+        "src/launcher/launcher_main.cpp"
+        "src/launcher/launcher_stubs.cpp"
+        "src/engine/engine_settings.cpp"
+        "src/engine/engine_portable.cpp"
+        "src/engine/engine_dlc.cpp"
+        "src/engine/engine_self.cpp"
+        "${PS3RECOMP_DIR}/libs/filesystem/edat.c"
+        "${IMGUI_DIR}/imgui.cpp"
+        "${IMGUI_DIR}/imgui_draw.cpp"
+        "${IMGUI_DIR}/imgui_tables.cpp"
+        "${IMGUI_DIR}/imgui_widgets.cpp"
+        "${IMGUI_DIR}/backends/imgui_impl_win32.cpp"
+        "${IMGUI_DIR}/backends/imgui_impl_dx11.cpp")
+    if(FOLKLORE_RECOMP_DIR)
+        set(LAUNCHER_REGION_DIR "${FOLKLORE_RECOMP_DIR}")
+    else()
+        set(LAUNCHER_REGION_DIR "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp")
+    endif()
+    target_include_directories(FolkloreLauncher PRIVATE
+        "${LAUNCHER_REGION_DIR}"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/recomp"
+        "${CMAKE_CURRENT_SOURCE_DIR}/src/engine"
+        "${IMGUI_DIR}"
+        "${IMGUI_DIR}/backends"
+        "${PS3RECOMP_DIR}/libs/filesystem"
+        "${PS3RECOMP_DIR}/libs/codec"
+        "${PS3RECOMP_DIR}/include")
+    target_link_libraries(FolkloreLauncher PRIVATE d3d11 dxgi dwmapi ole32 shell32 uuid bcrypt)
+endif()
