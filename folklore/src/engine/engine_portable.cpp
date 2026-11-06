@@ -750,6 +750,19 @@ std::string engineDataDirectory()
     {
         return settings.dataDir;
     }
+    /* run_launcher.bat in a project folder: the project's hdd0, saves and
+     * logs, the ones run.ps1 uses, rather than ones beside folklore\build. */
+    char value[MAX_PATH * 2];
+    const DWORD length = GetEnvironmentVariableA("FOLKLORE_DATA_DIR", value, (DWORD)sizeof(value));
+    if (length > 0 && length < sizeof(value))
+    {
+        std::string folder(value, length);
+        while (folder.size() > 3 && (folder.back() == '\\' || folder.back() == '/'))
+        {
+            folder.pop_back();
+        }
+        return folder;
+    }
     return engineExecutableDirectory();
 }
 

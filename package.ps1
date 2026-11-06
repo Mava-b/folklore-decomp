@@ -144,6 +144,8 @@ if ($Kind -eq 'Binaries')
     {
         Copy-Item $launcherExe $package
         Write-Host '    FolkloreLauncher.exe'
+        Copy-Item (Join-Path $Root 'run_launcher.bat') $package
+        Write-Host '    run_launcher.bat'
         foreach ($artName in @('launcher_art.jpg', 'launcher_art.png'))
         {
             $art = Join-Path $Root $artName
@@ -251,7 +253,7 @@ dumped to a folder (it contains PS3_GAME), AND the 1.10 update for it
 installed (in RPCS3: File > Install Packages, then it is in
 <RPCS3>\dev_hdd0\game\$titleId). No PS3 firmware is needed.
 
-1. Double-click FolkloreLauncher.exe: choose your disc dump and the 1.10
+1. Double-click FolkloreLauncher.exe (or run_launcher.bat): choose your disc dump and the 1.10
    update on its Game page, add DLC, change any setting, then press Play.
    Or double-click run.bat (or folklore.exe). The first time, folklore.exe asks
    for the disc dump folder (the one that contains PS3_GAME), then for the
@@ -273,7 +275,7 @@ You need your own copy of Folklore on the disc this build was made from:
 $releaseLine,
 dumped to a folder. That folder contains PS3_GAME. No PS3 firmware is needed.
 
-1. Double-click FolkloreLauncher.exe: choose your disc dump on its Game
+1. Double-click FolkloreLauncher.exe (or run_launcher.bat): choose your disc dump on its Game
    page, add DLC, change any setting, then press Play.
    Or double-click run.bat (or folklore.exe). The first time, folklore.exe asks
    for the dump folder (the one that contains PS3_GAME), remembers it in

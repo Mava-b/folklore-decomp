@@ -362,6 +362,11 @@ namespace
     {
         const std::string dataDirectory = engineDataDirectory();
         CreateDirectoryA(dataDirectory.c_str(), nullptr);
+        char existing[MAX_PATH * 2];
+        if (GetEnvironmentVariableA("PS3_HDD0_ROOT", existing, (DWORD)sizeof(existing)) > 0)
+        {
+            return;     /* set by whoever started the launcher, as for the game */
+        }
         const std::string hdd0 = dataDirectory + "\\hdd0";
         CreateDirectoryA(hdd0.c_str(), nullptr);
         SetEnvironmentVariableA("PS3_HDD0_ROOT", hdd0.c_str());

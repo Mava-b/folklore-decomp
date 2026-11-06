@@ -198,7 +198,11 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
 ### The launcher
 
 **FolkloreLauncher.exe** (built beside folklore.exe, and in every package)
-sets everything up in one window before the game starts:
+sets everything up in one window before the game starts. Double-click
+**run_launcher.bat** to open it: in the project folder it opens the one in
+`folklore\build` with this folder's settings, `hdd0`, saves and logs (the
+ones `run.ps1` uses).
+
 
 - **Game**: your disc dump and, for a 1.10 build, the installed 1.10 update,
   each checked the way the game checks them; where saves and installed data
