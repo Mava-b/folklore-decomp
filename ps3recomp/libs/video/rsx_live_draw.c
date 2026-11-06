@@ -74,6 +74,8 @@ void rsx_live_draw_get_shader_stats(u32* p, u32* b, u32* s)
 u32  rsx_live_draw_get_frames(void) { return 0; }
 void* rsx_live_draw_get_present_thread_handle(void) { return NULL; }
 u32  rsx_live_draw_get_last_draws(void) { return 0; }
+int  rsx_live_draw_get_render_size(u32* rw, u32* rh, u32* ow, u32* oh)
+{ (void)rw; (void)rh; (void)ow; (void)oh; return 0; }
 double rsx_live_draw_get_present_fps(void) { return 0.0; }
 void rsx_live_draw_dump_present_samples(void) {}
 void rsx_live_draw_a010_probe_begin(void) {}
@@ -14318,6 +14320,31 @@ static u32 g_ld_last_frame_draws = 0;
  * "presenting fresh content" from "flipping a static image" -- the dead
  * journal-consumer limp state renders ~0 draws/frame while flips tick). */
 u32 rsx_live_draw_get_last_draws(void) { return g_ld_last_frame_draws; }
+
+int rsx_live_draw_get_render_size(u32* renderWidth, u32* renderHeight, u32* outputWidth, u32* outputHeight)
+{
+    if (!g.ready || g.width == 0u || g.height == 0u)
+    {
+        return 0;
+    }
+    if (renderWidth)
+    {
+        *renderWidth = ld_scaled_x(g.width);
+    }
+    if (renderHeight)
+    {
+        *renderHeight = g.height * g.scale;
+    }
+    if (outputWidth)
+    {
+        *outputWidth = g.bb_w;
+    }
+    if (outputHeight)
+    {
+        *outputHeight = g.bb_h;
+    }
+    return 1;
+}
 
 double rsx_live_draw_get_present_fps(void)
 {

@@ -202,6 +202,11 @@ void* rsx_live_draw_get_present_thread_handle(void);
 /* Draws in the last completed frame (title-bar telemetry). */
 u32  rsx_live_draw_get_last_draws(void);
 
+/* The size the game's frames are drawn at (the guest size times the render
+ * scale, widened for a wider aspect) and the window's back buffer, for the
+ * title bar. Returns 0 (sizes left alone) before the engine is up. */
+int  rsx_live_draw_get_render_size(u32* renderWidth, u32* renderHeight, u32* outputWidth, u32* outputHeight);
+
 /* Informational rolling presented FPS for the window title. The benchmark
  * recomputes its selected interval from the preserved raw QPC samples. */
 double rsx_live_draw_get_present_fps(void);

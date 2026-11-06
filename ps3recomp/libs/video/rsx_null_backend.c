@@ -427,9 +427,28 @@ int rsx_null_backend_pump_messages(void)
         if (fps <= 0.0)
             fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
                   (double)(now - s_state.title_time);
+        /* The size frames are drawn at (render scale and aspect included)
+         * and, when it differs, the window's; s_state.width/height is the
+         * PS3's own 1280x720 and never changes. */
+        extern int rsx_live_draw_get_render_size(u32*, u32*, u32*, u32*);
+        u32 renderWidth = s_state.width;
+        u32 renderHeight = s_state.height;
+        u32 outputWidth = 0;
+        u32 outputHeight = 0;
+        char sizeText[64];
+        if (rsx_live_draw_get_render_size(&renderWidth, &renderHeight, &outputWidth, &outputHeight) &&
+            outputWidth != 0 && (outputWidth != renderWidth || outputHeight != renderHeight))
+        {
+            snprintf(sizeText, sizeof(sizeText), "%ux%u (window %ux%u)", renderWidth, renderHeight,
+                     outputWidth, outputHeight);
+        }
+        else
+        {
+            snprintf(sizeText, sizeof(sizeText), "%ux%u", renderWidth, renderHeight);
+        }
         char tb[256];
-        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %ux%u", s_state.title, fps,
-                 rsx_live_draw_get_last_draws(), s_state.width, s_state.height);
+        snprintf(tb, sizeof(tb), "%s | FPS: %.2f | draws: %u | %s", s_state.title, fps,
+                 rsx_live_draw_get_last_draws(), sizeText);
         SetWindowTextA(s_state.hwnd, tb);
         s_state.title_frames = s_state.frame_count;
         s_state.title_time = now;
