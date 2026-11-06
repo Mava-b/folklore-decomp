@@ -20,6 +20,7 @@
 #include "engine_dlc.h"
 #include "engine_motion_watch.h"
 #include "engine_capture_finder.h"
+#include "engine_capture_assist.h"
 #include "engine_region.h"
 
 #ifdef _WIN32
@@ -1326,7 +1327,7 @@ namespace
                 const char* padName = cellPad_host_pad_name();
                 if (!settings.motionControls)
                 {
-                    ImGui::TextDisabled("Off: captures complete by themselves, with any controller.");
+                    ImGui::TextDisabled("Off: captures complete by themselves (boss captures too), with any controller.");
                 }
                 else if (padName && cellPad_motion_live())
                 {
@@ -1480,6 +1481,7 @@ namespace
         }
         menu.previousWatchKey = watchKey;
         engineMotionWatchUpdate();
+        engineCaptureAssistUpdate();
         /* F5-F9: the capture finder (engine_capture_finder.cpp). */
         for (int finderIndex = 0; finderIndex < 5; finderIndex++)
         {

@@ -1502,6 +1502,17 @@ What 0006 fixes in ps3recomp to make that run:
     colour and the capture bar live is not found yet, so engine_capture_
     finder.cpp searches memory for them while the player says what is on
     screen (F5 red / F6 not red; F7 bar up / F8 bar down; F9 restart).
+    Found (run-20261106-154928): the capture bar is a copy, at
+    0x1014F6DC (the capture sound object's +12), of count / target on the
+    capture controller: +292 / +288 in 1.10 (+268 / +264 in 1.00, where the
+    controller is 0x1014F0D4 and its state is at +184; 1.10 added 24 bytes).
+    State 1 (Time) writes count / target to the bar each frame and finishes
+    the capture once count reaches target; states 2, 3 and 10 compare the
+    same two fields. Fix, src/engine/engine_capture_assist.cpp: while the
+    controller is in state 1, 2, 3 or 10 and auto-capture is in effect
+    (motion controls off, or no motion sensors reporting), the count is
+    raised to the target over about three seconds and never lowered, and the
+    game completes the capture itself.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
