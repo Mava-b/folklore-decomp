@@ -211,7 +211,12 @@ ones `run.ps1` uses).
   (.rap)...**, and any pack still missing its licence.
 - **Graphics**, **Display**, **Gameplay**: every setting of the in-game
   engine menu, including the ones that only apply when the game starts.
-- **Play** saves `folklore_settings.ini` and starts folklore.exe.
+- **Dump textures this run** (Graphics page): the next Play starts the game
+  with the texture dump on, into `textures\dump` (as `run.ps1
+  -DumpTextures`); not kept between runs.
+- **Play** saves `folklore_settings.ini` and starts folklore.exe;
+  **Support on Ko-fi** beside it opens the project's
+  [Ko-fi page](https://ko-fi.com/mavab).
 
 Its picture is `launcher_art.jpg` (or `.png`) in the project folder (or
 beside the launcher): put your own copy of the cover art there. It is not in

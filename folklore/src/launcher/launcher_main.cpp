@@ -8,7 +8,9 @@
  *   Graphics, Display, Gameplay
  *             the settings the in-game engine menu (F1) has, including the
  *             ones that only apply when the game starts;
- *   Play      saves folklore_settings.ini and starts folklore.exe beside it.
+ *   Play      saves folklore_settings.ini and starts folklore.exe beside it
+ *             (with the texture dump on, when ticked for this run);
+ *   Ko-fi     the project's donation page, in the browser.
  *
  * It edits the same folklore_settings.ini through the same code as the game
  * (engine_settings.cpp), checks folders with the game's own checks
@@ -38,6 +40,7 @@
 #include <windows.h>
 #include <d3d11.h>
 #include <dwmapi.h>
+#include <shellapi.h>
 
 #include <algorithm>
 #include <atomic>
@@ -309,6 +312,18 @@ namespace
     FolderCheck updateCheck;
     std::string launchProblem;
     bool settingsDirty = false;
+    /* Graphics page: run the game with the texture dump on (RSX_TEXTURE_DUMP,
+     * as run.ps1 -DumpTextures). For this run only: dumping makes new areas
+     * hitch while it writes, so it is not kept in the settings. */
+    bool dumpTexturesThisRun = false;
+    const char* const kDonateUrl = "https://ko-fi.com/mavab";
+
+    /* Where the texture dump goes: textures\dump in the data folder, the
+     * one run.ps1 -DumpTextures uses in a project folder. */
+    std::string textureDumpFolder()
+    {
+        return engineDataDirectory() + "\\textures\\dump";
+    }
 
     /* The DLC importer and the licence import run on a thread of their own,
      * with progress shown here (as in the engine menu). */
@@ -710,6 +725,15 @@ namespace
         changed |= ImGui::SliderInt("Sharpening", &settings.sharpening, 0, 100, "%d%%");
         changed |= ImGui::Checkbox("High-resolution textures (texture pack in textures\\replace)", &settings.texturePack);
 
+        sectionHeading("Texture dump");
+        ImGui::Checkbox("Dump textures this run (for making a texture pack)", &dumpTexturesThisRun);
+        note("Every texture the game shows is saved once, as a DDS file named by the key a replacement is found by. "
+             "The game hitches briefly when a new area loads while it writes. Only for the next Play; it is not kept.");
+        if (dumpTexturesThisRun)
+        {
+            ImGui::TextColored(kTextDim, "Into: %s", textureDumpFolder().c_str());
+        }
+
         sectionHeading("Effects");
         changed |= enumChoice("Depth of field", &settings.depthOfField, {"Original (the PS3's)", "Smooth"});
         changed |= enumChoice("Bloom", &settings.bloom, {"Original (the PS3's)", "Smooth (no flicker)"});
@@ -843,6 +867,18 @@ namespace
         settingsDirty = false;
         const std::string folder = engineExecutableDirectory();
         std::string commandLine = "\"" + folder + "\\folklore.exe\"";
+        /* The game (and the run it starts) inherits this. */
+        if (dumpTexturesThisRun)
+        {
+            const std::string dumpFolder = textureDumpFolder();
+            CreateDirectoryA((engineDataDirectory() + "\\textures").c_str(), nullptr);
+            CreateDirectoryA(dumpFolder.c_str(), nullptr);
+            SetEnvironmentVariableA("RSX_TEXTURE_DUMP", dumpFolder.c_str());
+        }
+        else
+        {
+            SetEnvironmentVariableA("RSX_TEXTURE_DUMP", nullptr);
+        }
         STARTUPINFOA startup = {};
         startup.cb = sizeof(startup);
         PROCESS_INFORMATION process = {};
@@ -1004,6 +1040,10 @@ namespace
             {
                 ImGui::TextColored(kTextDim, "Adding DLC...");
             }
+            else if (dumpTexturesThisRun)
+            {
+                ImGui::TextColored(kWarning, "Texture dump on for this run.");
+            }
             else
             {
                 ImGui::TextColored(kTextDim, "Settings are saved when you press Play.");
@@ -1017,7 +1057,28 @@ namespace
                                                                   : settingsPath.c_str() + separator + 1);
             }
             ImGui::EndGroup();
-            ImGui::SameLine(ImGui::GetWindowWidth() - playWidth - ImGui::GetStyle().WindowPadding.x);
+
+            /* Ko-fi, then Play, at the right. */
+            const float donateWidth = 190.0f * scale;
+            const float buttonGap = ImGui::GetStyle().ItemSpacing.x * 1.5f;
+            ImGui::SameLine(ImGui::GetWindowWidth() - playWidth - donateWidth - buttonGap -
+                            ImGui::GetStyle().WindowPadding.x);
+            const ImVec4 kofiBlue(0.161f, 0.671f, 0.878f, 1.0f);
+            const ImVec4 kofiBlueHover(0.302f, 0.749f, 0.929f, 1.0f);
+            ImGui::PushStyleColor(ImGuiCol_Button, kofiBlue);
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kofiBlueHover);
+            ImGui::PushStyleColor(ImGuiCol_ButtonActive, kofiBlueHover);
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
+            if (ImGui::Button("Support on Ko-fi", ImVec2(donateWidth, playHeight)))
+            {
+                ShellExecuteA(nullptr, "open", kDonateUrl, nullptr, nullptr, SW_SHOWNORMAL);
+            }
+            ImGui::PopStyleColor(4);
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetTooltip("Donate to this project: opens ko-fi.com/mavab in your browser");
+            }
+            ImGui::SameLine(0.0f, buttonGap);
             ImGui::BeginDisabled(!ready || dlcRunning);
             ImGui::PushStyleColor(ImGuiCol_Button, kAccent);
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHover);
