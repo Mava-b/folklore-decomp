@@ -285,6 +285,10 @@ static void cellFsOpen(ppu_context* ctx)
     uint32_t flags  = (uint32_t)ctx->gpr[4];
     uint32_t fd_ptr = (uint32_t)ctx->gpr[5];
     host_path(hpath, sizeof hpath, gpath);
+    if (!gpath[0]) {   /* an empty path names nothing: see cellFsStat */
+        fprintf(stderr, "[fs] open FAIL '' (empty path) lr=0x%08X\n", (uint32_t)ctx->lr);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
+    }
 
     /* NPDRM: see the note in sys_fs.c -- an EDAT is decrypted once into a cache
      * file and that is opened in its place. */
@@ -722,7 +726,13 @@ static void cellFsStat(ppu_context* ctx)
     uint32_t sb = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
     fs_stat64_t st;
-    if (FS_STAT64(hpath, &st) != 0) {
+    /* An empty path names nothing (lv2: ENOENT). host_path maps it to a host
+     * folder that exists, so the stat answered OK -- Folklore stats "" while
+     * looking for downloaded data, took the OK for a pack waiting to be
+     * installed, and ran its installer over a list it never loaded (garbage
+     * file names, then "An HDD access error occurred." on a black screen).
+     * Windows' _stat64("") fails by itself, which is why it played there. */
+    if (!gpath[0] || FS_STAT64(hpath, &st) != 0) {
         if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] stat '%s' -> ENOENT\n", gpath);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
@@ -784,7 +794,7 @@ static void cellFsOpendir(ppu_context* ctx)
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     uint32_t fd_ptr = (uint32_t)ctx->gpr[4];
     host_path(hpath, sizeof hpath, gpath);
-    DIR* d = opendir(hpath);
+    DIR* d = gpath[0] ? opendir(hpath) : NULL;   /* "" names nothing: see cellFsStat */
     if (ps3_env_once("PS3_FSLOG")) fprintf(stderr, "[fs] opendir '%s' -> %s\n", gpath, d ? "OK" : "ENOENT");
     if (!d) { ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return; }
     int fd = fd_alloc_dir(d);
