@@ -2158,6 +2158,10 @@ static MTLBlendFactor blend_factor_to_metal(u32 f)
     case 0x0306: return MTLBlendFactorDestinationColor;
     case 0x0307: return MTLBlendFactorOneMinusDestinationColor;
     case 0x0308: return MTLBlendFactorSourceAlphaSaturated;
+    case 0x8001: return MTLBlendFactorBlendColor;            /* CONSTANT_COLOR */
+    case 0x8002: return MTLBlendFactorOneMinusBlendColor;
+    case 0x8003: return MTLBlendFactorBlendAlpha;            /* CONSTANT_ALPHA */
+    case 0x8004: return MTLBlendFactorOneMinusBlendAlpha;
     default:     return MTLBlendFactorOne;
     }
 }
@@ -2634,6 +2638,7 @@ typedef struct {
     /* Polygon offset in Metal's terms (setDepthBias:slopeScale:clamp:),
      * dynamic encoder state like the stencil reference. */
     float depth_bias, depth_slope;
+    float blend_rgba[4];        /* SET_BLEND_COLOR, encoder state */
 } EngRecord;
 
 static EngRecord s_eng_rec[ENG_MAX_RECORDS];
@@ -3740,6 +3745,8 @@ static void eng_set_scissor(void* user, u32 x, u32 y, u32 w, u32 h)
 
 static void eng_set_stencil_ref(void* user, u32 ref)
 { (void)user; s_eng_pending.stencil_ref = ref; }
+static void eng_set_blend_color(void* user, const float rgba[4])
+{ (void)user; memcpy(s_eng_pending.blend_rgba, rgba, sizeof s_eng_pending.blend_rgba); }
 
 /* Polygon offset. glPolygonOffset's units are steps of the guest depth
  * buffer, 2^-16 for Z16 and 2^-24 for Z24S8. Metal's depthBias on the
@@ -3854,6 +3861,8 @@ static void eng_encode_draw(id<MTLRenderCommandEncoder> enc, const EngRecord* r,
     [enc setFrontFacingWinding:p->winding];
     [enc setDepthClipMode:p->clip];
     [enc setStencilReferenceValue:r->stencil_ref];
+    [enc setBlendColorRed:r->blend_rgba[0] green:r->blend_rgba[1]
+                     blue:r->blend_rgba[2] alpha:r->blend_rgba[3]];
     [enc setDepthBias:r->depth_bias slopeScale:r->depth_slope clamp:0.0f];
     MTLViewport vp = { r->vp[0], r->vp[1], r->vp[2], r->vp[3], 0.0, 1.0 };
     [enc setViewport:vp];
@@ -4744,6 +4753,7 @@ static const rsx_draw_backend s_engine_backend = {
     .set_viewport         = eng_set_viewport,
     .set_scissor          = eng_set_scissor,
     .set_stencil_ref      = eng_set_stencil_ref,
+    .set_blend_color      = eng_set_blend_color,
     .set_depth_bias       = eng_set_depth_bias,
     .draw                 = eng_draw,
     .clear_color          = eng_clear_color,

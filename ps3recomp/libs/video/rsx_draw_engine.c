@@ -19,6 +19,7 @@
 #include "rsx_vertex_formats.h"
 #include "rsx_vp_decompiler.h"
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -1809,9 +1810,13 @@ static void eng_decode_sampler(u32 filter, u32 wrap, u32 control0,
 {
     const u32 minf = (filter >> 16) & 7u;
     const u32 magf = (filter >> 24) & 7u;
-    out->min_linear  = (u8)(minf == 2 || minf == 4 || minf == 6);
-    out->mag_linear  = (u8)(magf == 2);
-    out->mip_present = (u8)(minf >= 3);
+    /* 7 CONVOLUTION_MIN / 4 CONVOLUTION_MAG filter through a kernel: bilinear
+     * here, and the fragment program applies the kernel
+     * (rsx_fp_apply_convolution). Read as nearest they showed Folklore's
+     * low-resolution bloom buffer as a grid of squares. */
+    out->min_linear  = (u8)(minf == 2 || minf == 4 || minf == 6 || minf == 7);
+    out->mag_linear  = (u8)(magf == 2 || magf == 4);
+    out->mip_present = (u8)(minf >= 3 && minf <= 6);
     out->mip_linear  = (u8)(minf == 5 || minf == 6);
     out->wrap_s = (u8)(wrap & 0xFu);
     out->wrap_t = (u8)((wrap >> 8) & 0xFu);
@@ -2236,6 +2241,25 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
     for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES; ++u)
         if (!(expand_units & (1u << u))) expand_masks[u] = 0;
 
+    /* Units filtered through the RSX convolution kernel: the kernel goes into
+     * the shader (rsx_fp_apply_convolution), so the set and the kernels are
+     * pipeline identity. PS3_RSX_NO_CONVOLUTION=1 compares without. */
+    u32 conv_mask = 0;
+    u8 conv_kernels[16] = {0};
+    {
+        static int conv_off = -1;
+        if (conv_off < 0) conv_off = getenv("PS3_RSX_NO_CONVOLUTION") ? 1 : 0;
+        if (!fixed && !conv_off) for (u32 u = 0; u < RSX_DSP_NUM_TEXTURES && u < 16; ++u) {
+            if (!(sampled_units & (1u << u))) continue;
+            rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
+            const u32 minf = (t.filter >> 16) & 7u, magf = (t.filter >> 24) & 7u;
+            if (!t.enabled || (minf != 7u && magf != 4u)) continue;
+            conv_mask |= 1u << u;
+            conv_kernels[u] = (u8)((t.filter >> 13) & 7u);
+        }
+        conv_mask &= ~cube_mask;
+    }
+
     u32 unnorm_dim[RSX_DSP_NUM_TEXTURES][3];
     /* Shadow helpers normalize against the bound resource themselves. Only
      * sampled ordinary UN units need baked dimensions or cache identity. */
@@ -2286,6 +2310,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (dbz) { const u32 tag = 0x5A424400u | dbz; key = eng_fnv1a(&tag, sizeof tag, key); }
         key = eng_fnv1a(&unnorm_mask, sizeof unnorm_mask, key);
         if (unnorm_mask) key = eng_fnv1a(unnorm_dim, sizeof unnorm_dim, key);
+        if (conv_mask) {
+            key = eng_fnv1a(&conv_mask, sizeof conv_mask, key);
+            key = eng_fnv1a(conv_kernels, sizeof conv_kernels, key);
+        }
         if (wpos_scaled) key = eng_fnv1a(wpos_grid, sizeof wpos_grid, key);
     }
     key = eng_fnv1a(&layout->mask, sizeof layout->mask, key);
@@ -2337,6 +2365,10 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
         if (fi > 0 && rsx_fp_apply_unnorm_scale(s_ps_hlsl, sizeof s_ps_hlsl, unnorm_mask,
                                                 (const u32 (*)[3])unnorm_dim, cube_mask,
                                                 vol_mask) < 0)
+            fi = -1;
+        if (fi > 0 && conv_mask &&
+            rsx_fp_apply_convolution(s_ps_hlsl, sizeof s_ps_hlsl, conv_mask,
+                                     conv_kernels, cube_mask) < 0)
             fi = -1;
         if (fi > 0 && srgb_output &&
             rsx_fp_apply_srgb_output(s_ps_hlsl, sizeof s_ps_hlsl) < 0)
@@ -3499,6 +3531,31 @@ static void sink_end(void* user, const rsx_dispatch* r)
     /* Dynamic, and deliberately outside the pipeline key. */
     g.be->set_stencil_ref(g.be->user,
                           rsx_dsp_reg(&g.rsx, M_STENCIL_FUNC_REF) & 0xFFu);
+    /* SET_BLEND_COLOR (0x031C, and 0x0390 for the FP16 target's upper half),
+     * read by the CONSTANT_* blend factors. It was never passed on, so those
+     * draws blended against a constant of 1 (Folklore's D3D12 patch 0038). */
+    if (g.be->set_blend_color) {
+        const u32 bc = rsx_dsp_reg(&g.rsx, 0x031Cu);
+        float rgba[4];
+        if (sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16) {
+            const u32 bc2 = rsx_dsp_reg(&g.rsx, 0x0390u);
+            const u16 h[4] = { (u16)(bc & 0xFFFFu), (u16)(bc >> 16),
+                               (u16)(bc2 & 0xFFFFu), (u16)(bc2 >> 16) };
+            for (int c = 0; c < 4; c++) {
+                const u32 sign = (u32)(h[c] >> 15), exp = (h[c] >> 10) & 0x1Fu, man = h[c] & 0x3FFu;
+                float v = exp == 0 ? ldexpf((float)man, -24)
+                        : exp == 31 ? (man ? NAN : INFINITY)
+                        : ldexpf((float)(man | 0x400u), (int)exp - 25);
+                rgba[c] = sign ? -v : v;
+            }
+        } else {
+            rgba[0] = (float)((bc >> 16) & 0xFFu) / 255.0f;
+            rgba[1] = (float)((bc >> 8) & 0xFFu) / 255.0f;
+            rgba[2] = (float)(bc & 0xFFu) / 255.0f;
+            rgba[3] = (float)(bc >> 24) / 255.0f;
+        }
+        g.be->set_blend_color(g.be->user, rgba);
+    }
     /* The bounds too: a deferred renderer moves them between its light and
      * sky passes without changing anything else. Raw floats, as written. */
     if (g.be->set_depth_bounds) {

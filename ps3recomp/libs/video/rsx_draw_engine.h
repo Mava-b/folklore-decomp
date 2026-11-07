@@ -213,6 +213,10 @@ typedef struct rsx_draw_backend {
      * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
      * NULL draws as if the test were off. */
     void (*set_depth_bounds)(void* user, float min, float max);
+    /* Optional: SET_BLEND_COLOR as RGBA floats, for the CONSTANT_COLOR /
+     * CONSTANT_ALPHA blend factors (0x8001-0x8004). Dynamic, like the stencil
+     * reference. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
     /* Optional. The NV4097 polygon offset for the next draw, called before
      * every draw like the stencil reference (SET_POLY_OFFSET_{POINT,LINE,
      * FILL}_ENABLE 0x0A60/0x0A64/0x0A68, SCALE_FACTOR 0x0A78, BIAS 0x0A7C).
