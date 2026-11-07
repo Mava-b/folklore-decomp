@@ -1599,6 +1599,13 @@ What 0006 fixes in ps3recomp to make that run:
     0090: only boxes left in the middle pull text to them -- 111 needs no
     more (the place-name bubble is in the middle), and a moved-out box's own
     contents already go its way by the zones.
+114. Player select arrows beside "Keats" (screenshot, no capture): the
+    arrows between the two names went right with Keats after 0088. The
+    likely cause is 0088's vertex limit: a mesh over 1024 vertices used to
+    be left stretched (and so stayed in the middle); now classified, it
+    could join Keats's line or go by the zones. patches/0091: such a big
+    CPU-evaluated mesh keeps its proportions but always stays in the middle
+    and never continues a line.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

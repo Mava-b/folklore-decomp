@@ -8821,7 +8821,13 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
      * before -- the left end, centred at x 936, stayed in the middle while
      * the rest moved out. A piece that touches or overlaps the one before
      * (within 4% of the screen on either side) goes with it. */
-    const int continuesLine = previous->frame == g_ld_frames && previous->target == target &&
+    /* A big mesh (over 1024 vertices: let in by 0088 for the place-name
+     * bubble) was stretched with the picture before; it now keeps its
+     * proportions but stays in the middle, never moved out or carried along
+     * a line: the player-select arrows (between "Ellen" and "Keats") went to
+     * the right with Keats. */
+    const int bigMesh = !useRows && vertexCount > 1024u;
+    const int continuesLine = !bigMesh && previous->frame == g_ld_frames && previous->target == target &&
                               previous->key == g_ld_current_pso.key && top < previous->bottom &&
                               bottom > previous->top && left <= previous->right + 0.04f &&
                               right >= previous->left - 0.04f;
@@ -8860,6 +8866,10 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     else if (overBox >= 0)
     {
         place = g_ld_hud_boxes.places[overBox];
+    }
+    else if (bigMesh)
+    {
+        place = LD_HUD_CENTRE;
     }
     else
     {
