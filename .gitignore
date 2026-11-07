@@ -42,3 +42,9 @@ __pycache__/
 # The launcher's picture (your own copy of the cover art; not distributed here).
 /launcher_art.jpg
 /launcher_art.png
+
+# macOS build (setup_mac.sh / run_mac.sh).
+/folklore_mac.env
+/gamedisc/
+/folklore/build-mac/
+/folklore/src/recomp/.lifted_from

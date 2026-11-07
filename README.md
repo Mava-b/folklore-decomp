@@ -211,6 +211,34 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
   copies of this folder.
 - setup and build are safe to re-run; each step skips what is already done.
 
+### macOS (Apple silicon) — early
+
+The game also builds natively for Apple-silicon Macs, drawing with Metal
+through ps3recomp's own renderer. A new game starts and plays: cutscenes,
+Doolin, the story pages. The PS3's yes/no prompts appear as a sheet on the
+window: answer with Cross/A or Circle/B, Return/Escape, or the mouse. The Mac
+build is much newer than the Windows build. Most of the
+**What's better than on the PS3** list, and the engine menu, are written for
+the Direct3D 12 renderer and are not on the Mac yet. Controllers' motion
+sensors are not read on the Mac yet, so captures complete by themselves
+(auto-capture, boss captures included). The Windows settings file is read
+from `folklore_settings.ini` beside `run_mac.sh`.
+
+You need [Homebrew](https://brew.sh) and the Xcode command-line tools
+(`xcode-select --install`). Then:
+
+```sh
+./setup_mac.sh ~/path/to/Folklore.iso      # or the folder that contains PS3_GAME
+./run_mac.sh
+```
+
+`setup_mac.sh` installs `cmake ninja sdl2 glslang spirv-cross ffmpeg` with
+Homebrew. It then decrypts the EBOOT with the port's own decrypter, lifts the
+game code, and builds `folklore/build-mac/folklore`. A disc image is mounted
+read only at `gamedisc/`. Saves go to `hdd0/` and `hdd1/`, as on Windows.
+The log is `logs/run-mac.log`. Extra arguments to `run_mac.sh` are
+environment overrides, for example `./run_mac.sh PS3_AA=smaa PS3_ANISO=16`.
+
 ---
 
 ## Playing
