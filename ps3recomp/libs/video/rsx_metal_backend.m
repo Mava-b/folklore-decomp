@@ -869,6 +869,13 @@ void rsx_metal_backend_prepare_app(void)
         [NSApplication sharedApplication];
         [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
         [NSApp finishLaunching];
+        /* Opt out of App Nap and timer coalescing for the whole run: with the
+         * window in the background macOS otherwise slows the game's timers
+         * and the frame clock (from the inFAMOUS 2 port). */
+        static id<NSObject> s_activity;
+        s_activity = [[NSProcessInfo processInfo]
+            beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical
+                              reason:@"Game running"];
     }
 #endif
 }
@@ -2556,11 +2563,14 @@ static void release_surfaces(void)
 
 #include "rsx_draw_engine.h"
 
-#define ENG_MAX_OBJECTS  4096
-#define ENG_MAX_PIPES    4096
-#define ENG_MAX_RECORDS  8192
+/* Sized for a long session: when a table filled, every later draw that
+ * needed a new entry was dropped without a word (Resistance 2 lost geometry
+ * minutes into a level at 4096 pipelines). */
+#define ENG_MAX_OBJECTS  16384
+#define ENG_MAX_PIPES    32768
+#define ENG_MAX_RECORDS  65536
 #define ENG_MAX_VIEWS    256
-#define ENG_MAX_FUNCS    4096
+#define ENG_MAX_FUNCS    32768
 #define ENG_MAX_SAMPLERS 256
 #define ENG_ALIGN        256u
 /* One frame's staging. Past it the backend submits and waits rather than
@@ -2948,7 +2958,11 @@ static u32 eng_obj_add(id<MTLTexture> t)
     if (s_eng_obj_free_count) {
         slot = s_eng_obj_free[--s_eng_obj_free_count];
     } else {
-        if (s_eng_obj_count >= ENG_MAX_OBJECTS) return 0;
+        if (s_eng_obj_count >= ENG_MAX_OBJECTS) {
+            static int said;
+            if (!said) { said = 1; fprintf(stderr, "[RSX metal] object table full (%u)\n", (unsigned)ENG_MAX_OBJECTS); }
+            return 0;
+        }
         slot = s_eng_obj_count++;
     }
     s_eng_obj[slot] = t;
@@ -3433,7 +3447,11 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     const u64 hash = fnv1a64(hlsl, (u32)strlen(hlsl), 1469598103934665603ull);
     for (u32 i = 0; i < s_eng_func_count; i++)
         if (s_eng_func[i].hash == hash) return s_eng_func[i].fn;
-    if (s_eng_func_count >= ENG_MAX_FUNCS) return nil;
+    if (s_eng_func_count >= ENG_MAX_FUNCS) {
+        static int said;
+        if (!said) { said = 1; fprintf(stderr, "[RSX metal] shader function table full (%u): new shaders are not built\n", (unsigned)ENG_MAX_FUNCS); }
+        return nil;
+    }
 
     id<MTLFunction> fn = nil;
     char name[64];
@@ -3464,7 +3482,11 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     if (!s_dev || !s_guest_shaders || !vertex_stride) return 0;
     if (!rt_count) rt_count = 1;
     if (rt_count > RSX_BE_MAX_COLOR_TARGETS) rt_count = RSX_BE_MAX_COLOR_TARGETS;
-    if (s_eng_pipe_count >= ENG_MAX_PIPES) return 0;
+    if (s_eng_pipe_count >= ENG_MAX_PIPES) {
+        static int said;
+        if (!said) { said = 1; fprintf(stderr, "[RSX metal] pipeline table full (%u): new pipelines are not built\n", (unsigned)ENG_MAX_PIPES); }
+        return 0;
+    }
     id<MTLFunction> vs = eng_function(vs_hlsl, RSX_SHADER_STAGE_VERTEX, "vp");
     if (!vs) return 0;
     id<MTLFunction> fs = eng_function(ps_hlsl, RSX_SHADER_STAGE_FRAGMENT, "fp");

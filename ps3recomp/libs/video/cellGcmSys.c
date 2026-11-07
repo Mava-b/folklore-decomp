@@ -1911,7 +1911,10 @@ static void gcm_2d_method(u32 subch, u32 method, u32 data)
         case 0x0308: s_gcm2d.size_out = data; return;
         case 0x030C: return;                /* SIZE_IN */
         }
-        if (method >= 0x0400 && method <= 0x07FC) {
+        /* NV308A COLOR is 0x0400-0x1FFC (1792 words). At 0x07FC everything
+         * past the first 1 KB of an inline upload was dropped; PES 2013 sends
+         * fragment programs this way and got zeroed shaders (black faces). */
+        if (method >= 0x0400 && method <= 0x1FFC) {
             /* COLOR data word: write into the destination surface. Inline
              * transfers use format Y32 (4 bytes/px, one row per point.y).
              * DMA 0xFEED0000 = local memory, 0xFEED0001 = main memory. */

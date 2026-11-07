@@ -45,8 +45,8 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_ZDEPTHS    64
 #define ENG_MAX_TEXTURES   RSX_DRAW_ENGINE_TEXTURE_CACHE
 #define ENG_MAX_VTEXTURES  64
-#define ENG_MAX_PIPELINES  8192
-#define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
+#define ENG_MAX_PIPELINES  32768       /* 8192 filled up in long sessions */
+#define ENG_PIPELINE_INDEX 65536u        /* open-addressed key index, 2x the table (u16 slots) */
 #define ENG_VP_MEMO        8
 /* One BEGIN/END can carry far more than 256 packets: each DRAW_ARRAYS /
  * DRAW_INDEX_ARRAY word covers at most 256 vertices, so a big mesh arrives as
@@ -2334,7 +2334,11 @@ static u32 eng_pipeline_get(const rsx_vertex_layout_plan* layout,
             return p->handle;
         }
     }
-    if (g.n_pipelines >= ENG_MAX_PIPELINES) return 0;
+    if (g.n_pipelines >= ENG_MAX_PIPELINES) {
+        static int said;
+        if (!said) { said = 1; fprintf(stderr, "[rsx engine] pipeline table full (%u): new draws are dropped\n", (unsigned)ENG_MAX_PIPELINES); }
+        return 0;
+    }
 
     u32 handle = 0;
     int vi = 1, fi = 1;

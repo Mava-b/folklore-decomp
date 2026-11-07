@@ -63,6 +63,8 @@ int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
  * (Ported from the Demon's Souls port's ps3recomp-local.patch, commit 098465f.) */
 #include <CoreFoundation/CoreFoundation.h>
 #include <pthread.h>
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void  objc_autoreleasePoolPop(void* pool);
 struct boot_guest_run { uint32_t entry, stack_top; int rc; volatile int done; };
 static void* boot_guest_thread(void* arg)
 {
@@ -584,7 +586,19 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         }
     }
     TickClock::time_point nextTick = TickClock::now();
+#if defined(__APPLE__)
+    /* This thread draws (the Metal draw engine runs from the flips it
+     * delivers) and is a plain pthread with no autorelease pool, so every
+     * autoreleased Metal descriptor it made lived until exit: about 2 GB in
+     * three hours in Resistance 2. One pool per pass, popped at the top of
+     * the next (so no path through the body can skip it). */
+    void* frame_pool = nullptr;
+#endif
     for (;;) {
+#if defined(__APPLE__)
+        if (frame_pool) objc_autoreleasePoolPop(frame_pool);
+        frame_pool = objc_autoreleasePoolPush();
+#endif
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
          * fence still paid the whole tick. Waiting on it keeps the same 4 ms

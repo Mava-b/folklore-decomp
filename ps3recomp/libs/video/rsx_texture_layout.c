@@ -3,6 +3,7 @@
  */
 #include "rsx_texture_layout.h"
 
+#include <stdio.h>
 #include <stdlib.h>   /* getenv, atoi */
 #include <string.h>   /* memcpy       */
 
@@ -95,6 +96,17 @@ void rsx_texture_layout_pitched(u32 rsx_fmt, u32 w, u32 h, u32 pitch,
     default:   break;   /* R8, one byte per texel -- the pre-existing fallback */
     }
 
+    /* The fallback above is silent; name a format with no decoder once, so a
+     * texture that draws as noise can be matched to it (from the PES port). */
+    if (out->fmt == RSX_TEXFMT_R8 && basef != 0x81u && basef != 0x80u) {
+        static unsigned char seen[256];
+        if (!seen[basef & 0xFFu]) {
+            seen[basef & 0xFFu] = 1;
+            fprintf(stderr, "[rsx] texture format 0x%02X (word 0x%08X) has no "
+                            "decoder -- decoded as R8\n", basef & 0xFFu, rsx_fmt);
+        }
+    }
+
     if (out->compressed) {
         /* Compressed data is stored as linear rows of 4x4 blocks, and is never
          * Morton-swizzled on RSX. */
@@ -135,9 +147,11 @@ u32 rsx_texture_mip_chain(u32 rsx_fmt, u32 w, u32 h, u32 levels, u32 pitch,
     while (n < levels) {
         rsx_tex_level* lv = &out[n];
         lv->w = mw; lv->h = mh; lv->offset = off;
-        /* Only level 0 has a pitch register; the rest are packed at their own
-         * width, as the live draw engine's texture_source_span walks them. */
-        rsx_texture_layout_pitched(rsx_fmt, mw, mh, n == 0 ? pitch : 0, &lv->tl);
+        /* A linear image keeps its pitch at every level (PES 2013: a 1024x512
+         * texture with pitch 4096 has level 1 after 512 rows and its rows 4096
+         * apart). Each level's own width turned the small levels into stripes.
+         * From the PES 2013 and Resistance 2 ports. */
+        rsx_texture_layout_pitched(rsx_fmt, mw, mh, pitch, &lv->tl);
         off += lv->tl.face_bytes;
         n++;
         if (mw == 1 && mh == 1) break;   /* no level below 1x1 */
