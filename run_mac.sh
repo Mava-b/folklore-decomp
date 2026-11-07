@@ -45,4 +45,13 @@ export DYLD_FALLBACK_LIBRARY_PATH=/opt/homebrew/lib:/usr/local/lib${DYLD_FALLBAC
 
 cd "$ROOT"
 step "Folklore (log: logs/run-mac.log)"
-env "$@" "$EXE" "$elf" > "$ROOT/logs/run-mac.log" 2>&1
+# Through the host window (MetalFX, window modes, display choice) unless
+# FOLKLORE_HOST_WINDOW=0: then the game opens its own window (no MetalFX).
+WIN=${EXE:h}/folklore.app/Contents/MacOS/folklore-window
+[ -L "$EXE" ] && WIN=${EXE:A:h}/folklore-window
+for a in "$@"; do [ "$a" = FOLKLORE_HOST_WINDOW=0 ] && FOLKLORE_HOST_WINDOW=0; done
+if [ "${FOLKLORE_HOST_WINDOW:-1}" != 0 ] && [ -x "$WIN" ]; then
+    env "$@" "$WIN" -- "$EXE" "$elf" > "$ROOT/logs/run-mac.log" 2>&1
+else
+    env "$@" "$EXE" "$elf" > "$ROOT/logs/run-mac.log" 2>&1
+fi

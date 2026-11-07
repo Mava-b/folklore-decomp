@@ -244,9 +244,94 @@ static void update_active(void)
 {
     g_ps3_overlay_active = s_enabled;
 }
+/* ---- The PS3's system dialogs (cellMsgDialog) drawn here -----------------
+ * When the game runs inside the host window it has no window of its own for
+ * the backend's NSAlert sheet, so yes/no and OK prompts are drawn by the menu
+ * instead, over the game: Cross/A or Return answer yes/OK, Circle/B or Escape
+ * answer no. The prompt that opened it must be released first, so the press
+ * that led to it does not answer it. The game sees no pad while it is up. */
+extern "C" int cellPad_host_confirm_buttons(void);
+extern "C" volatile int g_cellpad_block_guest_input;
+static char s_dlg_text[1024];
+static int s_dlg_yes_no, s_dlg_default_no, s_dlg_armed;
+static int s_dlg_seq;                       /* the prompt on screen, 0 = none */
+static void (*s_dlg_done)(int seq, int yes);
+
+extern "C" int ps3_overlay_show_dialog(const char* text, int yes_no, int default_no, int seq,
+                                       void (*done)(int seq, int yes))
+{
+    if (!s_enabled || !done || !seq) return -1;
+    snprintf(s_dlg_text, sizeof s_dlg_text, "%s", text ? text : "");
+    s_dlg_yes_no = yes_no; s_dlg_default_no = default_no; s_dlg_done = done; s_dlg_armed = 0;
+    g_cellpad_block_guest_input = 1;
+    __atomic_store_n(&s_dlg_seq, seq, __ATOMIC_RELEASE);
+    return 0;
+}
+
+extern "C" void ps3_overlay_dismiss_dialog(int seq)
+{
+    int want = seq;
+    if (__atomic_compare_exchange_n(&s_dlg_seq, &want, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        g_cellpad_block_guest_input = 0;
+}
+
+static bool dialog_up(void) { return __atomic_load_n(&s_dlg_seq, __ATOMIC_ACQUIRE) != 0; }
+
+static bool vk_down(const ps3_host_input* in, unsigned vk)
+{
+    return in && vk < 128 && (atomic_load(&in->keys[vk >> 5]) >> (vk & 31)) & 1u;
+}
+
+static void dialog_answer(int seq, int yes)
+{
+    int want = seq;
+    if (!__atomic_compare_exchange_n(&s_dlg_seq, &want, 0, false, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+        return;
+    /* cellPad keeps a button still held out of the game until it is let go */
+    g_cellpad_block_guest_input = 0;
+    s_dlg_done(seq, yes);
+}
+
+static void draw_dialog(ps3_host_input* in)
+{
+    const int seq = __atomic_load_n(&s_dlg_seq, __ATOMIC_ACQUIRE);
+    if (!seq) return;
+    const int pad = cellPad_host_confirm_buttons();
+    const bool enter = vk_down(in, 0x24) || vk_down(in, 0x4C), escape = vk_down(in, 0x35);
+    if (!s_dlg_armed) {
+        s_dlg_armed = pad == 0 && !enter && !escape;
+    } else if ((pad & 1) || enter) {
+        dialog_answer(seq, s_dlg_yes_no && s_dlg_default_no && enter && !(pad & 1) ? 0 : 1);
+        return;
+    } else if (((pad & 2) || escape) && s_dlg_yes_no) {
+        dialog_answer(seq, 0);
+        return;
+    }
+    const ImGuiIO& io = ImGui::GetIO();
+    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+    ImGui::SetNextWindowSizeConstraints(ImVec2(360, 0), ImVec2(io.DisplaySize.x * 0.8f, FLT_MAX));
+    if (ImGui::Begin("###ps3dialog", NULL, ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove |
+                                          ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoSavedSettings |
+                                          ImGuiWindowFlags_NoCollapse)) {
+        ImGui::PushTextWrapPos(io.DisplaySize.x * 0.75f);
+        ImGui::TextUnformatted(s_dlg_text);
+        ImGui::PopTextWrapPos();
+        ImGui::Spacing();
+        if (s_dlg_yes_no) {
+            const bool yes = ImGui::Button(L("Yes  (\u2715 / A / Return)", "Sim  (\u2715 / A / Enter)"));
+            ImGui::SameLine();
+            const bool no = ImGui::Button(L("No  (\u25CB / B / Esc)", "N\u00E3o  (\u25CB / B / Esc)"));
+            if (yes) dialog_answer(seq, 1); else if (no) dialog_answer(seq, 0);
+        } else if (ImGui::Button(L("OK  (\u2715 / A / Return)", "OK  (\u2715 / A / Enter)"))) {
+            dialog_answer(seq, 1);
+        }
+    }
+    ImGui::End();
+}
+
 static bool anything_to_draw(double now)
 {
-    return s_open || s_hud || s_notice_until > now;
+    return s_open || s_hud || s_notice_until > now || dialog_up();
 }
 
 extern "C" void ps3_overlay_notice(const char* text)
@@ -1540,7 +1625,7 @@ extern "C" void ps3_overlay_render(void* cbp, void* dstp)
         io.DisplayFramebufferScale = ImVec2(scale, scale);
         io.DeltaTime = (float)(dt > 0.0001 && dt < 1.0 ? dt : 1.0 / 30.0);
         io.MouseDrawCursor = false;      /* the window shows the system's cursor (released while open) */
-        if (s_open) feed_input(io, in);
+        if (s_open || dialog_up()) feed_input(io, in);
         else io.AddMousePosEvent(-FLT_MAX, -FLT_MAX);
 
         MTLRenderPassDescriptor* rp = [MTLRenderPassDescriptor renderPassDescriptor];
@@ -1552,6 +1637,7 @@ extern "C" void ps3_overlay_render(void* cbp, void* dstp)
         if (s_open) draw_menu();
         if (s_hud && !s_open) draw_hud();
         if (notices) draw_notices(now);
+        if (!s_open) draw_dialog(in);
         ImGui::Render();
         id<MTLRenderCommandEncoder> enc = [cb renderCommandEncoderWithDescriptor:rp];
         if (enc) {

@@ -232,6 +232,24 @@ elseif(APPLE)
         MACOSX_BUNDLE_ICON_FILE "${FOLKLORE_ICNS_NAME}"
         MACOSX_BUNDLE_SHORT_VERSION_STRING "0.5"
         MACOSX_BUNDLE_BUNDLE_VERSION "0.5")
+    # The window the player sees (ps3recomp's tools/host_window, from the
+    # Resistance / inFAMOUS 2 ports): it runs the game with
+    # PS3RECOMP_HOST_SURFACES set, the game renders into IOSurfaces it shares,
+    # and this process presents them -- with MetalFX upscaling, macOS
+    # fullscreen / borderless / windowed, a display of choice and vsync
+    # (PS3_UPSCALE, PS3_WINDOW_MODE, PS3_WINDOW_SIZE, PS3_DISPLAY, PS3_VSYNC).
+    # It sits inside folklore.app, so it is the game for Game Mode too.
+    # run_mac.sh starts the game through it unless FOLKLORE_HOST_WINDOW=0.
+    enable_language(OBJC)
+    add_executable(folklore-window "${PS3RECOMP_DIR}/tools/host_window/host_window.m")
+    target_include_directories(folklore-window PRIVATE "${PS3RECOMP_DIR}/libs/video")
+    target_compile_definitions(folklore-window PRIVATE HOST_WINDOW_TITLE="Folklore")
+    target_compile_options(folklore-window PRIVATE -fobjc-arc)
+    target_link_libraries(folklore-window PRIVATE
+        "-framework AppKit" "-framework Metal" "-framework QuartzCore" "-framework IOSurface")
+    set_target_properties(folklore-window PROPERTIES
+        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/folklore.app/Contents/MacOS")
+    add_dependencies(folklore folklore-window)
     add_custom_command(TARGET folklore POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E rm -f "${CMAKE_BINARY_DIR}/folklore"
         COMMAND ${CMAKE_COMMAND} -E create_symlink "folklore.app/Contents/MacOS/folklore"

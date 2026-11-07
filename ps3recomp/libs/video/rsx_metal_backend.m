@@ -6175,9 +6175,17 @@ static void dialog_release_pad_when_idle(void)
     [[NSRunLoop mainRunLoop] addTimer:s_dialog_timer forMode:NSRunLoopCommonModes];
 }
 
+extern int  ps3_overlay_show_dialog(const char* text, int yes_no, int default_no, int seq,
+                                    void (*done)(int seq, int yes));
+extern void ps3_overlay_dismiss_dialog(int seq);
+
 int rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
                           void (*done)(int seq, int yes))
 {
+    /* Inside the host window (PS3RECOMP_HOST_SURFACES) this process has no
+     * window to hang a sheet on: the in-game menu draws the prompt instead. */
+    if (!s_headless && s_ready && !s_window && done)
+        return ps3_overlay_show_dialog(text, yes_no, default_no, seq, done);
     if (s_headless || !s_ready || !s_window || !done) return -1;
     NSString* message = [NSString stringWithUTF8String:text ? text : ""];
     if (!message) message = @"";
@@ -6227,6 +6235,7 @@ int rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
 /* The game closed or aborted its dialog itself: take the sheet down unanswered. */
 void rsx_metal_dismiss_dialog(int seq)
 {
+    ps3_overlay_dismiss_dialog(seq);
     if (s_headless || !s_ready) return;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (s_dialog_alert && s_dialog_seq == seq) {
