@@ -19,7 +19,16 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-### New in v0.5: the launcher
+### New in v0.6: save slots
+
+The launcher's new **Saves** page lets you keep as many saves as you like and
+choose which one the game plays before you press Play. Each slot shows the
+picture of the area it was saved in, the character and place, both
+characters' chapters, the play time and when it was saved. Start a **New
+slot**, **Import** saves (RPCS3's too), **Duplicate**, **Export** (ready for
+RPCS3) or **Delete** one. See [*Save slots*](#save-slots).
+
+### v0.5: the launcher
 
 ![Folklore launcher, Game page](docs/images/launcher_game.png)
 
