@@ -42,7 +42,17 @@ commented in the code; the notable ones:
   rock meshes lost about a quarter of their triangles);
 - the Metal draw engine samples convolution-filtered textures bilinearly and
   applies the kernel in the shader (patches 0035/0036: the bloom), and passes
-  SET_BLEND_COLOR on for the CONSTANT_* blend factors (patch 0038).
+  SET_BLEND_COLOR on for the CONSTANT_* blend factors (patch 0038);
+- the macOS toolkit of the Resistance and inFAMOUS 2 ports, merged in three
+  ways from its own base (a6d76c8, v0.17.0): the in-game menu, internal
+  resolution, MetalFX and window modes through the host window, colour LUTs,
+  input remapping, audio volume, the vertex cache and the encoder state
+  cache, texture packs, the shader cache and the quit gate. Its SPU
+  scheduler, lifter output and FPCR changes are left out (Folklore's lifted
+  code and SPURS depend on this side's), and VSCR[NJ] at thread start, the
+  policy module's kernel writes and the event-queue retry stay as before;
+- macOS: the PS3's yes/no and OK prompts are drawn by the in-game menu when
+  the game runs inside the host window.
 
 `v0.15-39a36296/` keeps the earlier series (0001-0085), one fix per patch,
 in the order they applied on top of upstream commit
