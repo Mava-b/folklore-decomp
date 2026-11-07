@@ -1612,6 +1612,16 @@ What 0006 fixes in ps3recomp to make that run:
     the originals from earlier runs, mixed in with those still to make.
     patches/0092: with both on, dumps the pack now replaces are moved once
     per run into <dump>\replaced.
+116. Player select arrows, found (capture-20261107-173348): not a big mesh
+    (114 guessed wrong; 0091 stays, harmless). The names and arrows are
+    plain 2D quads in one program: Ellen 464-592, Keats 688-816, then the
+    right arrow 648-680 and the left arrow 600-632 (x of 1280, y 312-408).
+    The arrows came right after Keats, overlapped its line and were within
+    0.04 of it, so they "continued" Keats's line and went right with it.
+    patches/0093: a line runs left to right -- a piece starting left of
+    the previous one does not continue it. Checked on that frame: the
+    arrows now stay in the middle, and all 381 letter-to-letter
+    continuations of its text are kept.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
