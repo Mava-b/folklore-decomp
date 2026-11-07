@@ -47,7 +47,15 @@ extern u32 ppu_vm_size;
 #define ENG_MAX_PIPELINES  8192
 #define ENG_PIPELINE_INDEX 16384u        /* open-addressed key index, 2x the table */
 #define ENG_VP_MEMO        8
-#define ENG_MAX_BATCHES    256
+/* One BEGIN/END can carry far more than 256 packets: each DRAW_ARRAYS /
+ * DRAW_INDEX_ARRAY word covers at most 256 vertices, so a big mesh arrives as
+ * hundreds of them. At 256 the rest was dropped without a word: Folklore's
+ * cliff and rock meshes (one 22,770-vertex list) lost about a quarter of their
+ * triangles, sky showing through. Contiguous packets are merged on arrival
+ * (eng_queue_batch: the primitive stream is their concatenation, so this is
+ * exact), and the queue is sized for meshes that are not contiguous
+ * (Folklore's D3D12 patch 0019, same fix). */
+#define ENG_MAX_BATCHES    4096
 #define ENG_VERT_STRIDE    (RSX_DSP_NUM_VERTEX_ATTR * 16u)
 #define ENG_INVALID        0xFFFFFFFFu
 /* Guest textures larger than this are a misdecoded register, not an image;
@@ -2649,14 +2657,32 @@ static void sink_immediate_vertex(void* user, const rsx_dispatch* r)
     dc.n_immediate++;
 }
 
+/* Queue a (first, count) range, extending the last one when this one starts
+ * where it ended. Returns 0 when the queue is full (logged once). */
+static int eng_queue_batch(eng_batch* q, u32* n, u32 first, u32 count)
+{
+    if (*n && q[*n - 1].first + q[*n - 1].count == first) {
+        q[*n - 1].count += count;
+        return 1;
+    }
+    if (*n >= ENG_MAX_BATCHES) {
+        static int said;
+        if (!said) { said = 1;
+            fprintf(stderr, "[rsx engine] more than %u separate draw ranges in one "
+                    "BEGIN/END: the rest are dropped\n", (unsigned)ENG_MAX_BATCHES); }
+        return 0;
+    }
+    q[*n].first = first;
+    q[*n].count = count;
+    (*n)++;
+    return 1;
+}
+
 static void sink_draw_arrays(void* user, const rsx_dispatch* r, u32 first, u32 count)
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_arr >= ENG_MAX_BATCHES) return;
-    dc.arr[dc.n_arr].first = first;
-    dc.arr[dc.n_arr].count = count;
-    dc.n_arr++;
+    eng_queue_batch(dc.arr, &dc.n_arr, first, count);
 }
 
 /* INLINE_ARRAY delivers one finished stream rather than a (first, count)
@@ -2683,10 +2709,7 @@ static void sink_draw_index(void* user, const rsx_dispatch* r, u32 first, u32 co
 {
     (void)user; (void)r;
     dc.n_packets++;
-    if (dc.n_idx >= ENG_MAX_BATCHES) return;
-    dc.idx[dc.n_idx].first = first;
-    dc.idx[dc.n_idx].count = count;
-    dc.n_idx++;
+    eng_queue_batch(dc.idx, &dc.n_idx, first, count);
 }
 
 /* Which texture units this draw binds, and from where: a unit naming a
