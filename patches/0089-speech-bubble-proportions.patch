@@ -1,0 +1,210 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8465,17 +8465,32 @@
+ #define LD_HUD_CENTRE 1
+ #define LD_HUD_LEFT   2
+ #define LD_HUD_RIGHT  3
+-#define LD_HUD_IN_PICTURE 4               /* inside a speech bubble: left as the game draws it */
++#define LD_HUD_IN_PICTURE 4               /* inside a speech bubble (internal; see LD_HUD_ANCHORED) */
++#define LD_HUD_ANCHORED 5                 /* own proportions, pinned at g_ld_hud_anchor */
+ #define LD_HUD_MAX_PANELS 32
+ 
++/* Speech bubbles (story scenes, capture-20261031-161917): each is a tail
++ * (a 3-vertex triangle, outline then fill, depth tested) pointing at the
++ * speaker and a body quad, then its text. The game aims the tail's tip at
++ * the speaker through the widened (Hor+) camera, so the tip is right where
++ * the picture is stretched; but the stretch also made each bubble wider by
++ * the aspect ratio's gain, so in a scene the bubbles crowded over the
++ * characters, the text stretched with them. Now a bubble and its text keep
++ * the game's proportions, pinned at its tail's tip (or its middle without
++ * one): as at 16:9, beside the same character. */
+ typedef struct {
+     u32 frame;
+     u32 target;
+     u32 count;
+     float rects[LD_HUD_MAX_PANELS][4];    /* left, right, top, bottom (screen fractions) */
++    float tails[LD_HUD_MAX_PANELS][4];    /* each bubble's tail, the same; left 2 when none */
++    float anchors[LD_HUD_MAX_PANELS];     /* the tail's tip, or the middle (screen fraction) */
+ } ld_hud_panel_list;
+ static ld_hud_panel_list g_ld_hud_panels;
+ 
++/* For an LD_HUD_ANCHORED draw: where (screen fraction) it stays put. */
++static float g_ld_hud_anchor = 0.5f;
++
+ /* Menus (the folk / character select, capture-20261031-163543): a window
+  * built from pieces -- one of them a large on-screen panel -- with lines of
+  * text across it. Split between the left and right zones it tears apart, so
+@@ -8496,6 +8511,7 @@
+     u64 key;
+     float left, right, top, bottom;   /* screen fractions, 0-1 from the top left */
+     int place;
++    float anchor;                     /* for a line of a speech bubble's text */
+ } ld_hud_previous;
+ static ld_hud_previous g_ld_hud_previous;
+ 
+@@ -8596,6 +8612,8 @@
+     float lowestY = 1e30f;
+     float highestY = -1e30f;
+     float firstW = 0.0f;
++    float cornerX[3] = {0.0f, 0.0f, 0.0f};    /* a triangle's corners (clip space), for a tail's tip */
++    float cornerY[3] = {0.0f, 0.0f, 0.0f};
+     for (u32 occurrence = 0; occurrence < vertexCount; occurrence++)
+     {
+         const u32 vertex = dc.refs_remapped ? rsx_vertex_remap_index(&dc.ref_remap, occurrence) : occurrence;
+@@ -8644,6 +8662,11 @@
+         }
+         const float screenX = clipX / clipW * viewportTransform[0] + viewportTransform[4];
+         const float screenY = clipY / clipW * viewportTransform[1] + viewportTransform[5];
++        if (occurrence < 3u)
++        {
++            cornerX[occurrence] = screenX;
++            cornerY[occurrence] = screenY;
++        }
+         if (screenX < lowestX)
+         {
+             lowestX = screenX;
+@@ -8685,15 +8708,82 @@
+     }
+     if (depthTested)
+     {
+-        if (g_ld_hud_panels.count < LD_HUD_MAX_PANELS)
++        /* A piece of a speech bubble. A triangle starts a new bubble (its
++         * tail outline) unless it is the fill of the latest bubble's tail
++         * (the same corners); anything else joins the latest bubble when it
++         * overlaps it, or starts one. */
++        const int isTriangle = vertexCount == 3u;
++        int bubble = (int)g_ld_hud_panels.count - 1;
++        if (bubble >= 0)
++        {
++            const float* rect = g_ld_hud_panels.rects[bubble];
++            const float* tail = g_ld_hud_panels.tails[bubble];
++            const float slack = 0.004f;
++            if (isTriangle)
++            {
++                const int sameTail = fabsf(tail[0] - left) < slack && fabsf(tail[1] - right) < slack &&
++                                     fabsf(tail[2] - top) < slack && fabsf(tail[3] - bottom) < slack;
++                if (!sameTail)
++                {
++                    bubble = -1;
++                }
++            }
++            else if (!(left <= rect[1] && right >= rect[0] && top <= rect[3] && bottom >= rect[2]))
++            {
++                bubble = -1;
++            }
++        }
++        if (bubble < 0)
+         {
+-            float* panel = g_ld_hud_panels.rects[g_ld_hud_panels.count++];
+-            panel[0] = left;
+-            panel[1] = right;
+-            panel[2] = top;
+-            panel[3] = bottom;
++            if (g_ld_hud_panels.count >= LD_HUD_MAX_PANELS)
++            {
++                return 0;
++            }
++            bubble = (int)g_ld_hud_panels.count++;
++            float* rect = g_ld_hud_panels.rects[bubble];
++            float* tail = g_ld_hud_panels.tails[bubble];
++            rect[0] = left;
++            rect[1] = right;
++            rect[2] = top;
++            rect[3] = bottom;
++            tail[0] = 2.0f;
++            tail[1] = tail[2] = tail[3] = 0.0f;
++            g_ld_hud_panels.anchors[bubble] = (left + right) * 0.5f;
++            if (isTriangle)
++            {
++                /* The tip: the corner furthest from the middle of the other two. */
++                int tip = 0;
++                float furthest = -1.0f;
++                for (int corner = 0; corner < 3; corner++)
++                {
++                    const int other = (corner + 1) % 3;
++                    const int third = (corner + 2) % 3;
++                    const float deltaX = cornerX[corner] - (cornerX[other] + cornerX[third]) * 0.5f;
++                    const float deltaY = cornerY[corner] - (cornerY[other] + cornerY[third]) * 0.5f;
++                    const float distance = deltaX * deltaX + deltaY * deltaY;
++                    if (distance > furthest)
++                    {
++                        furthest = distance;
++                        tip = corner;
++                    }
++                }
++                g_ld_hud_panels.anchors[bubble] = (cornerX[tip] + 1.0f) * 0.5f;
++                tail[0] = left;
++                tail[1] = right;
++                tail[2] = top;
++                tail[3] = bottom;
++            }
+         }
+-        return 0;
++        else
++        {
++            float* rect = g_ld_hud_panels.rects[bubble];
++            rect[0] = left < rect[0] ? left : rect[0];
++            rect[1] = right > rect[1] ? right : rect[1];
++            rect[2] = top < rect[2] ? top : rect[2];
++            rect[3] = bottom > rect[3] ? bottom : rect[3];
++        }
++        g_ld_hud_anchor = g_ld_hud_panels.anchors[bubble];
++        return LD_HUD_ANCHORED;
+     }
+     if (g_ld_hud_menu.frame != g_ld_frames)
+     {
+@@ -8712,6 +8802,7 @@
+     }
+     const int menuShown = g_ld_hud_menu.panelThisFrame || g_ld_hud_menu.panelLastFrame;
+     int place = LD_HUD_CENTRE;
++    float anchor = 0.5f;
+     const float middleX = (left + right) * 0.5f;
+     const float middleY = (top + bottom) * 0.5f;
+     for (u32 panelIndex = 0; panelIndex < g_ld_hud_panels.count; panelIndex++)
+@@ -8720,7 +8811,7 @@
+         if (middleX >= panel[0] && middleX <= panel[1] && middleY >= panel[2] && middleY <= panel[3])
+         {
+             place = LD_HUD_IN_PICTURE;
+-            break;
++            anchor = g_ld_hud_panels.anchors[panelIndex];
+         }
+     }
+     const ld_hud_previous* previous = &g_ld_hud_previous;
+@@ -8754,6 +8845,7 @@
+     if (continuesLine)
+     {
+         place = previous->place;
++        anchor = previous->anchor;
+     }
+     else if (place == LD_HUD_IN_PICTURE || layout != 2 || menuShown)
+     {
+@@ -8798,7 +8890,13 @@
+     g_ld_hud_previous.top = top;
+     g_ld_hud_previous.bottom = bottom;
+     g_ld_hud_previous.place = place;
+-    return place == LD_HUD_IN_PICTURE ? 0 : place;
++    g_ld_hud_previous.anchor = anchor;
++    if (place == LD_HUD_IN_PICTURE)
++    {
++        g_ld_hud_anchor = anchor;
++        return LD_HUD_ANCHORED;
++    }
++    return place;
+ }
+ 
+ /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
+@@ -11863,7 +11961,12 @@
+         const float centredLeft = (dvp.Width - hudWidth) * 0.5f;
+         const float edgeAmount = (float)InterlockedCompareExchange(&g_ld_hud_edge, 0, 0) / 100.0f;
+         float placedLeft = centredLeft;
+-        if (hudPlace == LD_HUD_LEFT)
++        if (hudPlace == LD_HUD_ANCHORED)
++        {
++            /* x' = anchor + (x - anchor) * shrink, the anchor staying put. */
++            placedLeft = g_ld_hud_anchor * (dvp.Width - hudWidth);
++        }
++        else if (hudPlace == LD_HUD_LEFT)
+         {
+             placedLeft = centredLeft * (1.0f - edgeAmount);
+         }

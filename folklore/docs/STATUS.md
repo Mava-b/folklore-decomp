@@ -1578,6 +1578,18 @@ What 0006 fixes in ps3recomp to make that run:
     screen or more) are kept per frame with where they went; a draw that
     starts a line over one (its middle within the box's height, overlapping
     it with 5% of the screen to spare, half its width or less) goes with it.
+112. Speech bubbles in ultrawide (patches/0089). The story scenes' bubbles
+    were left stretched with the picture (87): the game aims each tail's
+    tip at its speaker through the Hor+ camera, so the tip was right, but
+    every bubble was wider by the aspect's gain and crowded over the
+    characters, its text stretched. Now (layouts centred and edges) a
+    bubble's pieces (tail outline, body, tail fill: depth-tested 2D,
+    grouped as they come -- a triangle starts a bubble unless it repeats
+    the latest tail's corners, a quad joins the latest bubble it overlaps)
+    and its text are drawn at the game's proportions, pinned at the tail's
+    tip (the corner furthest from the middle of the other two): viewport
+    left = tip x (1 - shrink). Simulated on capture-20261031-161917: three
+    bubbles, each with all its letters (18, 19, 33).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
