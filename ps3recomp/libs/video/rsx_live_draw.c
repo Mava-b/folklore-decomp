@@ -8499,6 +8499,27 @@ typedef struct {
 } ld_hud_previous;
 static ld_hud_previous g_ld_hud_previous;
 
+/* Boxes: the HUD's backgrounds drawn so far this frame and where each went.
+ * A place name pops up as a dark bubble (one mesh, centred around x 560-790
+ * of 1280) with its name written over it starting at its left end
+ * (capture-20261107-111421, "Dr. Lester's home" at x 536-746, y 246-282):
+ * the first letter, centred at x 545, went left on its own while the bubble
+ * stayed centred. A draw that starts a line over a box -- overlapping it,
+ * its middle within the box's height, the box at least twice as wide --
+ * goes where the box went. The box is widened by 5% of the screen on each
+ * side, as text can start on a bubble's soft rounded end. */
+#define LD_HUD_MAX_BOXES 16
+#define LD_HUD_BOX_MARGIN 0.05f
+
+typedef struct {
+    u32 frame;
+    u32 target;
+    u32 count;
+    float rects[LD_HUD_MAX_BOXES][4];     /* left, right, top, bottom (screen fractions) */
+    int places[LD_HUD_MAX_BOXES];
+} ld_hud_box_list;
+static ld_hud_box_list g_ld_hud_boxes;
+
 static int ld_hud_draw_place(const surface_t* surface, u32 target, const float viewportTransform[8])
 {
     const LONG layout = InterlockedCompareExchange(&g_ld_hud_layout, 0, 0);
@@ -8566,9 +8587,9 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
             return 0;
         }
     }
-    else if (vertexCount > 1024u)
+    else if (vertexCount > 4096u)
     {
-        return 0;                        /* not a small overlay */
+        return 0;                        /* not a small overlay (the place-name bubble has 1050) */
     }
     float lowestX = 1e30f;
     float highestX = -1e30f;
@@ -8713,6 +8734,23 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
                               previous->key == g_ld_current_pso.key && top < previous->bottom &&
                               bottom > previous->top && left <= previous->right + 0.04f &&
                               right >= previous->left - 0.04f;
+    if (g_ld_hud_boxes.frame != g_ld_frames || g_ld_hud_boxes.target != target)
+    {
+        g_ld_hud_boxes.frame = g_ld_frames;
+        g_ld_hud_boxes.target = target;
+        g_ld_hud_boxes.count = 0;
+    }
+    int overBox = -1;
+    for (u32 boxIndex = 0; boxIndex < g_ld_hud_boxes.count && !continuesLine; boxIndex++)
+    {
+        const float* box = g_ld_hud_boxes.rects[boxIndex];
+        const float boxWidth = box[1] - box[0];
+        if (middleY >= box[2] && middleY <= box[3] && left <= box[1] + LD_HUD_BOX_MARGIN &&
+            right >= box[0] - LD_HUD_BOX_MARGIN && (right - left) * 2.0f <= boxWidth)
+        {
+            overBox = (int)boxIndex;
+        }
+    }
     if (continuesLine)
     {
         place = previous->place;
@@ -8720,6 +8758,10 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     else if (place == LD_HUD_IN_PICTURE || layout != 2 || menuShown)
     {
         /* As decided above: with its bubble, or centred (also while a menu is up). */
+    }
+    else if (overBox >= 0)
+    {
+        place = g_ld_hud_boxes.places[overBox];
     }
     else
     {
@@ -8735,6 +8777,18 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
         {
             place = LD_HUD_RIGHT;
         }
+    }
+    /* A background big enough to carry text or icons (at least 10% of the
+     * width, 3% of the height) is a box for the draws after it. */
+    if (right - left >= 0.10f && bottom - top >= 0.03f && g_ld_hud_boxes.count < LD_HUD_MAX_BOXES)
+    {
+        float* box = g_ld_hud_boxes.rects[g_ld_hud_boxes.count];
+        box[0] = left;
+        box[1] = right;
+        box[2] = top;
+        box[3] = bottom;
+        g_ld_hud_boxes.places[g_ld_hud_boxes.count] = place;
+        g_ld_hud_boxes.count++;
     }
     g_ld_hud_previous.frame = g_ld_frames;
     g_ld_hud_previous.target = target;

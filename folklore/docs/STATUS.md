@@ -1569,6 +1569,15 @@ What 0006 fixes in ps3recomp to make that run:
     so it is gitignored like launcher_art.jpg). The launcher's window class
     already loaded icon 1; patches/0087 makes the game window's class load
     it too.
+111. Ultrawide place-name popup (capture-20261107-111421): the dark bubble
+    is one 1050-vertex mesh, over ld_hud_draw_place's 1024 limit, so it was
+    stretched with the picture; and its text, which starts on the bubble's
+    left end (first letter centred at x 545 of 1280), went to the left
+    edge in the "edges" layout while the bubble stayed in the middle.
+    patches/0088: the limit is 4096, and HUD backgrounds (10% x 3% of the
+    screen or more) are kept per frame with where they went; a draw that
+    starts a line over one (its middle within the box's height, overlapping
+    it with 5% of the screen to spare, half its width or less) goes with it.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
