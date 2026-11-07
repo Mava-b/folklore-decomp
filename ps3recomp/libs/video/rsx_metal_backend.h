@@ -49,6 +49,12 @@ void rsx_metal_backend_export_window_state(void);
 int  rsx_metal_backend_pump_messages(void);
 /* macOS: set NSApp up on the main thread before other threads start (boot harness). */
 void rsx_metal_backend_prepare_app(void);
+/* macOS: show a cellMsgDialog prompt as a sheet on the game window. Returns 0
+ * when shown (done(seq, yes) runs later on the main thread), -1 without a
+ * window. rsx_metal_dismiss_dialog takes prompt `seq` down unanswered. */
+int  rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
+                           void (*done)(int seq, int yes));
+void rsx_metal_dismiss_dialog(int seq);
 
 /* Present one frame: clear the drawable to the colour last received through the
  * RSX clear method, then hand it to the compositor. */

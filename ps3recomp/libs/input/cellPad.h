@@ -214,6 +214,8 @@ s32 cellPadSetSensorMode(u32 port_no, u32 mode);
  * state function's name is kept from when it was the DS3 only. */
 int cellPad_host_ds3_state(u16* buttons, u8* stickLeftX, u8* stickLeftY, int* psButton);
 const char* cellPad_host_pad_name(void);
+/* Bit 0: a controller holds Cross / A; bit 1: Circle / B (SDL backend; 0 elsewhere). */
+int cellPad_host_confirm_buttons(void);
 int cellPad_set_motion_mode(int mode);
 int cellPad_motion_live(void);
 /* Stop any rumble the guest left running (the process is ending). */

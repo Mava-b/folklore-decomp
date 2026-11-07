@@ -2130,6 +2130,24 @@ const char* cellPad_host_pad_name(void)
     return NULL;
 }
 
+/* For a host window drawn over the game (macOS: the system dialogs): bit 0
+ * while any connected controller holds its south face button (Cross / A),
+ * bit 1 its east one (Circle / B). Read straight from SDL, so it works while
+ * g_cellpad_block_guest_input hides the pad from the game. */
+int cellPad_host_confirm_buttons(void)
+{
+    int mask = 0;
+#if PAD_BACKEND_SDL2
+    for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
+        SDL_GameController* gc = s_sdl_controllers[i];
+        if (!gc) continue;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_A)) mask |= 1;
+        if (SDL_GameControllerGetButton(gc, SDL_CONTROLLER_BUTTON_B)) mask |= 2;
+    }
+#endif
+    return mask;
+}
+
 /* Sensor source, as the Windows cellPad_set_motion_mode (0 automatic,
  * 1 motion only, 2 automatic capture). Here nothing supplies motion, so
  * 0 and 2 both mean "automatic capture" (every sensor word 0). -1, never

@@ -431,6 +431,27 @@ void rsx_draw_engine_decode_render_state(const rsx_dispatch* rsx,
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(rsx, &sf);
     rs->alpha_ref_format = sf.color_format;
+    /* Alpha to coverage (ANTI_ALIASING_CONTROL 0x1D7C: bit 0 enable, bit 4
+     * alpha-to-coverage). Foliage and wire fences are drawn with it and no
+     * alpha test, so without it their cut-out texels came out solid: grass as
+     * opaque cards, fences as black panels. An antialiased surface is held at
+     * its sample resolution here, not as Metal MSAA, so coverage cannot come
+     * from alpha; a fragment whose alpha is under one half covers no sample in
+     * the common case, so it is emulated as an alpha test GEQUAL 0.5 when the
+     * title's own test is off (Folklore's D3D12 patch 0020, same rule).
+     * PS3_RSX_NO_A2C=1 turns the emulation off. */
+    {
+        static int a2c_off = -1;
+        if (a2c_off < 0) a2c_off = getenv("PS3_RSX_NO_A2C") ? 1 : 0;
+        const u32 aa_control = rsx_dsp_reg(rsx, 0x1D7C);
+        if (!a2c_off && !rs->alpha_test_enable && (aa_control & 0x11u) == 0x11u && sf.antialias != 0) {
+            rs->alpha_test_enable = 1;
+            rs->alpha_func = 0x0206u;                                  /* GEQUAL */
+            rs->alpha_ref_raw = sf.color_format == 14u ? 0x3800u       /* half 0.5 */
+                              : (sf.color_format == 15u || sf.color_format == 16u) ? 0x3F000000u
+                              : 0x80u;                                 /* 128/255 */
+        }
+    }
     rs->rt_fp16 = sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
     rs->blend_enable = rsx_dsp_reg(rsx, M_BLEND_ENABLE) & 1;
     const u32 sfac = rsx_dsp_reg(rsx, M_BLEND_SFACTOR);

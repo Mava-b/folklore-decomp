@@ -4953,6 +4953,94 @@ static int pump_messages_impl(void)
     return atomic_load(&s_closed) ? -1 : 0;
 }
 
+/* ---- The PS3's system dialogs (cellMsgDialog), as a sheet on the window ----
+ * Headless the runtime answers yes/no and OK prompts by itself; with a window
+ * the player answers. The sheet is asynchronous like the console's dialog: the
+ * game keeps drawing and waits for its callback. Answers: the buttons, Return /
+ * Escape, or the controller's Cross/A (yes, OK) and Circle/B (no). While it is
+ * up the game does not see the pad, and it gets the pad back only once the
+ * answering button is released, so the press does not reach the game too. */
+#if !TARGET_OS_IPHONE
+extern volatile int g_cellpad_block_guest_input;
+extern int cellPad_host_confirm_buttons(void);
+static NSAlert* s_dialog_alert;
+static NSTimer* s_dialog_timer;
+static int      s_dialog_seq;
+
+static void dialog_release_pad_when_idle(void)
+{
+    /* Poll until Cross and Circle are both up, then hand the pad back. */
+    if (s_dialog_timer) [s_dialog_timer invalidate];
+    s_dialog_timer = [NSTimer timerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer* t) {
+        if (cellPad_host_confirm_buttons() == 0) {
+            g_cellpad_block_guest_input = 0;
+            [t invalidate];
+            if (s_dialog_timer == t) s_dialog_timer = nil;
+        }
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:s_dialog_timer forMode:NSRunLoopCommonModes];
+}
+
+int rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
+                          void (*done)(int seq, int yes))
+{
+    if (s_headless || !s_ready || !s_window || !done) return -1;
+    NSString* message = [NSString stringWithUTF8String:text ? text : ""];
+    if (!message) message = @"";
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (s_dialog_alert) {   /* a newer prompt replaces one still up */
+            [s_window endSheet:[s_dialog_alert window] returnCode:NSModalResponseAbort];
+            s_dialog_alert = nil;
+        }
+        NSAlert* alert = [NSAlert new];
+        [alert setMessageText:message];
+        [alert setInformativeText:yes_no ? @"Controller: ✕ / A = Yes, ○ / B = No"
+                                         : @"Controller: ✕ / A = OK"];
+        NSButton* first = [alert addButtonWithTitle:yes_no ? @"Yes" : @"OK"];
+        if (yes_no) {
+            NSButton* second = [alert addButtonWithTitle:@"No"];
+            [second setKeyEquivalent:@"\033"];
+            if (default_no) { [first setKeyEquivalent:@""]; [second setKeyEquivalent:@"\r"]; }
+        }
+        s_dialog_alert = alert;
+        s_dialog_seq = seq;
+        g_cellpad_block_guest_input = 1;
+        /* The controller: wait for the buttons that opened the prompt to be
+         * released, then the next press of Cross or Circle answers. */
+        __block int armed = 0;
+        if (s_dialog_timer) [s_dialog_timer invalidate];
+        s_dialog_timer = [NSTimer timerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer* t) {
+            if (s_dialog_alert != alert) { [t invalidate]; return; }
+            int b = cellPad_host_confirm_buttons();
+            if (!armed) { armed = (b == 0); return; }
+            if (b & 1)                 [s_window endSheet:[alert window] returnCode:NSAlertFirstButtonReturn];
+            else if ((b & 2) && yes_no) [s_window endSheet:[alert window] returnCode:NSAlertSecondButtonReturn];
+        }];
+        [[NSRunLoop mainRunLoop] addTimer:s_dialog_timer forMode:NSRunLoopCommonModes];
+        [alert beginSheetModalForWindow:s_window completionHandler:^(NSModalResponse r) {
+            if (s_dialog_alert == alert) s_dialog_alert = nil;
+            dialog_release_pad_when_idle();
+            if (r == NSModalResponseAbort) return;   /* taken down by the game, or replaced */
+            done(seq, r == NSAlertFirstButtonReturn);
+        }];
+    });
+    return 0;
+}
+
+/* The game closed or aborted its dialog itself: take the sheet down unanswered. */
+void rsx_metal_dismiss_dialog(int seq)
+{
+    if (s_headless || !s_ready) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (s_dialog_alert && s_dialog_seq == seq) {
+            NSAlert* alert = s_dialog_alert;
+            s_dialog_alert = nil;
+            [s_window endSheet:[alert window] returnCode:NSModalResponseAbort];
+        }
+    });
+}
+#endif
+
 int rsx_metal_backend_pump_messages(void)
 {
     if (s_headless || !s_ready) return 0;
