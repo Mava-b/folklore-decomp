@@ -16,6 +16,7 @@
  */
 #include "engine_settings.h"
 #include "engine_saves.h"
+#include "engine_save_slots.h"
 #include "engine_portable.h"
 #include "engine_dlc.h"
 #include "engine_motion_watch.h"
@@ -136,6 +137,7 @@ namespace
         std::vector<SaveSnapshot> snapshots;
         int gameSaveCount = 0;
         std::string saveMessage;
+        std::string saveSlotText;   /* which slot this run uses */
         std::string pendingRestore;
         std::string gameFolderMessage;
     };
@@ -1302,6 +1304,19 @@ namespace
     {
         menu.snapshots = saveSnapshotList();
         menu.gameSaveCount = saveDataCount();
+        const char* selected = std::getenv("PS3_SAVEDATA_SELECT");
+        const std::string directory = selected ? selected : "";
+        const size_t digits = directory.find_last_not_of("0123456789");
+        if (directory.empty() || digits == std::string::npos || digits + 1 >= directory.size())
+        {
+            menu.saveSlotText.clear();
+            return;
+        }
+        const int number = std::atoi(directory.c_str() + digits + 1);
+        const SaveSlot slot = engineSaveSlotRead(number);
+        menu.saveSlotText = "This run loads and saves slot " + std::to_string(number) +
+                            (slot.exists ? " (" + slot.subtitle + ")" : std::string(" (empty: a new game)")) +
+                            ". Choose another slot in the launcher's Saves page before starting.";
     }
 
     /* Snapshots of the game's own save data: take one at a save point, come
@@ -1310,6 +1325,10 @@ namespace
     void drawSaveSnapshots()
     {
         ImGui::SeparatorText("Save data snapshots");
+        if (!menu.saveSlotText.empty())
+        {
+            ImGui::TextWrapped("%s", menu.saveSlotText.c_str());
+        }
         ImGui::TextDisabled("Copies of the game's own saves (a full save state is not possible in this port).");
         ImGui::Text("The game has %d save%s.", menu.gameSaveCount, menu.gameSaveCount == 1 ? "" : "s");
         if (ImGui::Button("Snapshot the game's saves now"))

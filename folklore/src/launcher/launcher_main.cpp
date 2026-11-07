@@ -30,6 +30,7 @@
 #include "engine_dlc.h"
 #include "engine_portable.h"
 #include "engine_region.h"
+#include "engine_save_slots.h"
 #include "engine_settings.h"
 
 #include "imgui.h"
@@ -183,22 +184,19 @@ namespace
         return std::string();
     }
 
-    void loadArt()
+    /* A JPEG or PNG as a texture ImGui can draw; nullptr when it cannot be
+     * read. */
+    ID3D11ShaderResourceView* loadImageTexture(const std::string& path, int* imageWidth, int* imageHeight)
     {
-        const std::string path = findArt();
-        if (path.empty())
-        {
-            return;
-        }
         int channels = 0;
-        unsigned char* pixels = stbi_load(path.c_str(), &artWidth, &artHeight, &channels, 4);
+        unsigned char* pixels = stbi_load(path.c_str(), imageWidth, imageHeight, &channels, 4);
         if (!pixels)
         {
-            return;
+            return nullptr;
         }
         D3D11_TEXTURE2D_DESC description = {};
-        description.Width = (UINT)artWidth;
-        description.Height = (UINT)artHeight;
+        description.Width = (UINT)*imageWidth;
+        description.Height = (UINT)*imageHeight;
         description.MipLevels = 1;
         description.ArraySize = 1;
         description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -207,14 +205,26 @@ namespace
         description.BindFlags = D3D11_BIND_SHADER_RESOURCE;
         D3D11_SUBRESOURCE_DATA initial = {};
         initial.pSysMem = pixels;
-        initial.SysMemPitch = (UINT)artWidth * 4u;
+        initial.SysMemPitch = (UINT)*imageWidth * 4u;
         ID3D11Texture2D* texture = nullptr;
+        ID3D11ShaderResourceView* view = nullptr;
         if (SUCCEEDED(device->CreateTexture2D(&description, &initial, &texture)))
         {
-            device->CreateShaderResourceView(texture, nullptr, &artView);
+            device->CreateShaderResourceView(texture, nullptr, &view);
             texture->Release();
         }
         stbi_image_free(pixels);
+        return view;
+    }
+
+    void loadArt()
+    {
+        const std::string path = findArt();
+        if (path.empty())
+        {
+            return;
+        }
+        artView = loadImageTexture(path, &artWidth, &artHeight);
     }
 
     /* ---- Fonts ------------------------------------------------------------ */
@@ -343,6 +353,121 @@ namespace
     };
 
     DlcWork dlcWork;
+
+    /* The Saves page: the slots on disk (re-read after any change) and the
+     * import/export running on a worker thread (the folder picker blocks). */
+    struct SaveWork
+    {
+        std::mutex lock;
+        bool running = false;
+        bool refresh = true;
+        std::string report;
+        int selectAfterImport = -1;
+    };
+
+    SaveWork saveWork;
+    std::vector<SaveSlot> saveSlots;
+    int deleteConfirmSlot = -1;
+
+    /* Each save's picture (its ICON0.PNG: the area it was saved in), loaded
+     * once per file and time. */
+    struct SlotPicture
+    {
+        std::string path;
+        long long savedAtSeconds = 0;
+        ID3D11ShaderResourceView* view = nullptr;
+        int width = 0;
+        int height = 0;
+    };
+
+    std::vector<SlotPicture> slotPictures;
+
+    void releaseSlotPictures()
+    {
+        for (SlotPicture& picture : slotPictures)
+        {
+            if (picture.view)
+            {
+                picture.view->Release();
+            }
+        }
+        slotPictures.clear();
+    }
+
+    const SlotPicture* slotPicture(const SaveSlot& slot)
+    {
+        if (slot.iconPath.empty())
+        {
+            return nullptr;
+        }
+        for (const SlotPicture& picture : slotPictures)
+        {
+            if (picture.path == slot.iconPath && picture.savedAtSeconds == slot.savedAtSeconds)
+            {
+                return picture.view ? &picture : nullptr;
+            }
+        }
+        SlotPicture picture;
+        picture.path = slot.iconPath;
+        picture.savedAtSeconds = slot.savedAtSeconds;
+        picture.view = loadImageTexture(slot.iconPath, &picture.width, &picture.height);
+        slotPictures.push_back(picture);
+        return slotPictures.back().view ? &slotPictures.back() : nullptr;
+    }
+
+    void startSaveImport()
+    {
+        {
+            std::lock_guard<std::mutex> guard(saveWork.lock);
+            if (saveWork.running)
+            {
+                return;
+            }
+            saveWork.running = true;
+            saveWork.report = "Choosing a folder...";
+        }
+        std::thread([]() {
+            const std::string picked = enginePickFolder(
+                std::string(), "Folklore: choose a save, a folder of saves, or RPCS3's folder to import from");
+            std::string report;
+            int firstSlot = -1;
+            if (!picked.empty())
+            {
+                report = engineSaveSlotImport(picked, &firstSlot);
+            }
+            std::lock_guard<std::mutex> guard(saveWork.lock);
+            saveWork.report = report;
+            saveWork.selectAfterImport = firstSlot;
+            saveWork.running = false;
+            saveWork.refresh = true;
+        }).detach();
+    }
+
+    void startSaveExport(int number)
+    {
+        {
+            std::lock_guard<std::mutex> guard(saveWork.lock);
+            if (saveWork.running)
+            {
+                return;
+            }
+            saveWork.running = true;
+            saveWork.report = "Choosing a folder...";
+        }
+        std::thread([number]() {
+            const std::string picked = enginePickFolder(
+                std::string(), "Folklore: choose where to export save slot " + std::to_string(number) + " to");
+            std::string report;
+            if (!picked.empty())
+            {
+                report = engineSaveSlotExport(number, picked);
+            }
+            std::lock_guard<std::mutex> guard(saveWork.lock);
+            saveWork.report = report;
+            saveWork.running = false;
+            saveWork.refresh = true;
+        }).detach();
+    }
 
     void checkFolders()
     {
@@ -692,6 +817,241 @@ namespace
         }
     }
 
+    /* One slot as a card: the area picture, where and when it was saved,
+     * and Use. True when the player chose it (Use, or a click on the card). */
+    bool drawSaveSlotCard(const SaveSlot& slot, bool inUse)
+    {
+        const float scale = ImGui::GetIO().FontGlobalScale;
+        const float pictureWidth = 208.0f * scale;
+        const float pictureHeight = 114.0f * scale;
+        const float padding = 10.0f * scale;
+        const float useWidth = 120.0f * scale;
+        bool chosen = false;
+        ImGui::PushID(slot.number);
+        ImGui::PushStyleColor(ImGuiCol_ChildBg,
+                              inUse ? ImVec4(0.29f, 0.14f, 0.26f, 0.96f) : ImVec4(0.15f, 0.09f, 0.19f, 0.92f));
+        ImGui::PushStyleColor(ImGuiCol_Border, inUse ? kAccent : ImVec4(0.27f, 0.18f, 0.32f, 1.0f));
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, inUse ? 2.0f : 1.0f);
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
+        ImGui::BeginChild("##slot", ImVec2(0.0f, pictureHeight + padding * 2.0f),
+                          ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
+                          ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+        {
+            const SlotPicture* picture = slotPicture(slot);
+            if (picture)
+            {
+                ImGui::Image((ImTextureID)(intptr_t)picture->view, ImVec2(pictureWidth, pictureHeight));
+            }
+            else
+            {
+                /* No picture: an empty slot, or a save without ICON0.PNG. */
+                const ImVec2 corner = ImGui::GetCursorScreenPos();
+                ImDrawList* drawList = ImGui::GetWindowDrawList();
+                drawList->AddRectFilled(corner, ImVec2(corner.x + pictureWidth, corner.y + pictureHeight),
+                                        ImGui::GetColorU32(ImVec4(0.09f, 0.05f, 0.12f, 1.0f)), 4.0f * scale);
+                const char* label = slot.exists ? "No picture" : "New game";
+                const ImVec2 labelSize = ImGui::CalcTextSize(label);
+                drawList->AddText(ImVec2(corner.x + (pictureWidth - labelSize.x) * 0.5f,
+                                         corner.y + (pictureHeight - labelSize.y) * 0.5f),
+                                  ImGui::GetColorU32(kTextDim), label);
+                ImGui::Dummy(ImVec2(pictureWidth, pictureHeight));
+            }
+            ImGui::SameLine(0.0f, padding * 1.6f);
+            const float textWidth = ImGui::GetContentRegionAvail().x - useWidth - padding;
+            ImGui::BeginGroup();
+            ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + textWidth);
+            ImGui::TextColored(kAccentHover, "Slot %d", slot.number);
+            ImGui::SameLine();
+            if (slot.exists)
+            {
+                ImGui::TextColored(kText, "%s", slot.subtitle.empty() ? "Saved game" : slot.subtitle.c_str());
+            }
+            else
+            {
+                ImGui::TextColored(kTextDim, "Empty");
+            }
+            if (slot.exists)
+            {
+                /* DETAIL: each character's chapter, then the play time. */
+                std::string chapters;
+                std::string playTime;
+                for (const std::string& line : slot.detailLines)
+                {
+                    if (line.rfind("Play time", 0) == 0)
+                    {
+                        playTime = line;
+                    }
+                    else
+                    {
+                        chapters += (chapters.empty() ? "" : "   \xC2\xB7   ") + line;
+                    }
+                }
+                if (!chapters.empty())
+                {
+                    ImGui::TextColored(kText, "%s", chapters.c_str());
+                }
+                std::string when = playTime;
+                if (!slot.savedAt.empty())
+                {
+                    when += (when.empty() ? "Saved " : "   \xC2\xB7   Saved ") + slot.savedAt;
+                }
+                if (!when.empty())
+                {
+                    ImGui::TextColored(kTextDim, "%s", when.c_str());
+                }
+                if (!slot.otherRelease.empty())
+                {
+                    ImGui::TextColored(kWarning, "Made with the %s release: it may not load in this one.",
+                                       slot.otherRelease.c_str());
+                }
+            }
+            else
+            {
+                ImGui::TextColored(kTextDim, "Play starts a new game here, and the game saves into this slot.");
+            }
+            ImGui::PopTextWrapPos();
+            ImGui::EndGroup();
+            ImGui::SameLine(ImGui::GetWindowWidth() - useWidth - padding);
+            if (inUse)
+            {
+                ImGui::TextColored(kGood, "In use");
+            }
+            else if (ImGui::Button("Use", ImVec2(useWidth, 0.0f)))
+            {
+                chosen = true;
+            }
+            if (!inUse && ImGui::IsWindowHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Left) &&
+                !ImGui::IsAnyItemHovered())
+            {
+                chosen = true;
+            }
+        }
+        ImGui::EndChild();
+        ImGui::PopStyleVar(3);
+        ImGui::PopStyleColor(2);
+        ImGui::PopID();
+        ImGui::Spacing();
+        return chosen;
+    }
+
+    bool drawSavesPage()
+    {
+        EngineSettings& settings = engineSettings();
+        bool changed = false;
+        bool running = false;
+        std::string report;
+        {
+            std::lock_guard<std::mutex> guard(saveWork.lock);
+            if (saveWork.refresh && !saveWork.running)
+            {
+                releaseSlotPictures();
+                saveSlots = engineSaveSlotList();
+                saveWork.refresh = false;
+                if (saveWork.selectAfterImport >= 0)
+                {
+                    settings.saveSlot = saveWork.selectAfterImport;
+                    saveWork.selectAfterImport = -1;
+                    changed = true;
+                }
+            }
+            running = saveWork.running;
+            report = saveWork.report;
+        }
+
+        sectionHeading("Save slots");
+        note("The game loads and saves only the slot chosen here: choose one, then press Play. An empty slot starts "
+             "a new game. Changing slot takes effect the next time the game starts.");
+        bool selectedHasSave = false;
+        for (const SaveSlot& slot : saveSlots)
+        {
+            selectedHasSave = selectedHasSave || slot.number == settings.saveSlot;
+        }
+        ImGui::BeginDisabled(running);
+        if (ImGui::Button("New slot"))
+        {
+            settings.saveSlot = engineSaveSlotNextFree();
+            deleteConfirmSlot = -1;
+            changed = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Import..."))
+        {
+            deleteConfirmSlot = -1;
+            startSaveImport();
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!selectedHasSave);
+        const std::string exportLabel = "Export slot " + std::to_string(settings.saveSlot) + "...";
+        if (ImGui::Button(exportLabel.c_str()))
+        {
+            deleteConfirmSlot = -1;
+            startSaveExport(settings.saveSlot);
+        }
+        ImGui::SameLine();
+        if (deleteConfirmSlot == settings.saveSlot)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.22f, 0.20f, 1.0f));
+            ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kBad);
+            const std::string confirmLabel = "Confirm: delete slot " + std::to_string(settings.saveSlot);
+            if (ImGui::Button(confirmLabel.c_str()))
+            {
+                const std::string result = engineSaveSlotDelete(settings.saveSlot);
+                std::lock_guard<std::mutex> guard(saveWork.lock);
+                saveWork.report = result;
+                saveWork.refresh = true;
+                deleteConfirmSlot = -1;
+            }
+            ImGui::PopStyleColor(2);
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel"))
+            {
+                deleteConfirmSlot = -1;
+                std::lock_guard<std::mutex> guard(saveWork.lock);
+                saveWork.report.clear();
+            }
+        }
+        else
+        {
+            const std::string deleteLabel = "Delete slot " + std::to_string(settings.saveSlot) + "...";
+            if (ImGui::Button(deleteLabel.c_str()))
+            {
+                deleteConfirmSlot = settings.saveSlot;
+                std::lock_guard<std::mutex> guard(saveWork.lock);
+                saveWork.report = "Delete slot " + std::to_string(settings.saveSlot) +
+                                  "? It is moved to the deleted_saves folder, not erased. Press Confirm to go ahead.";
+            }
+        }
+        ImGui::EndDisabled();
+        ImGui::EndDisabled();
+        if (!report.empty())
+        {
+            ImGui::Spacing();
+            ImGui::TextWrapped("%s", report.c_str());
+        }
+        ImGui::Spacing();
+        if (!selectedHasSave)
+        {
+            /* The chosen slot is empty (New slot, or its save was deleted):
+             * first, so it is seen. */
+            drawSaveSlotCard(engineSaveSlotRead(settings.saveSlot), true);
+        }
+        for (const SaveSlot& slot : saveSlots)
+        {
+            if (drawSaveSlotCard(slot, slot.number == settings.saveSlot))
+            {
+                settings.saveSlot = slot.number;
+                deleteConfirmSlot = -1;
+                changed = true;
+            }
+        }
+
+        note("Import takes one save folder, a folder of them (an export, or RPCS3's dev_hdd0\\home\\00000001\\"
+             "savedata) or RPCS3's own folder; each save gets the next free slot. Export writes the slot as a PS3 "
+             "save folder that RPCS3 can use as it is.");
+        return changed;
+    }
+
     bool drawGraphicsPage()
     {
         EngineSettings& settings = engineSettings();
@@ -1006,8 +1366,8 @@ namespace
             ImGui::TextColored(kTextDim, "  %s release, v%s build", FOLKLORE_RELEASE_NAME, FOLKLORE_VERSION_NAME);
             ImGui::Spacing();
 
-            const char* pages[5] = {"Game", "DLC", "Graphics", "Display", "Gameplay"};
-            for (int pageIndex = 0; pageIndex < 5; pageIndex++)
+            const char* pages[6] = {"Game", "Saves", "DLC", "Graphics", "Display", "Gameplay"};
+            for (int pageIndex = 0; pageIndex < 6; pageIndex++)
             {
                 if (pageIndex > 0)
                 {
@@ -1016,7 +1376,7 @@ namespace
                 const bool selected = pageIndex == currentPage;
                 ImGui::PushStyleColor(ImGuiCol_Button, selected ? kAccent : ImVec4(0.17f, 0.10f, 0.21f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHover);
-                if (ImGui::Button(pages[pageIndex], ImVec2(118.0f * scale, 0.0f)))
+                if (ImGui::Button(pages[pageIndex], ImVec2(106.0f * scale, 0.0f)))
                 {
                     currentPage = pageIndex;
                 }
@@ -1033,13 +1393,17 @@ namespace
             }
             else if (currentPage == 1)
             {
-                drawDlcPage();
+                changed = drawSavesPage();
             }
             else if (currentPage == 2)
             {
-                changed = drawGraphicsPage();
+                drawDlcPage();
             }
             else if (currentPage == 3)
+            {
+                changed = drawGraphicsPage();
+            }
+            else if (currentPage == 4)
             {
                 changed = drawDisplayPage();
             }

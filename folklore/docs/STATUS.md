@@ -1548,6 +1548,20 @@ What 0006 fixes in ps3recomp to make that run:
     first version of the patch also rewrote four CRLF lines of
     rsx_live_draw.c and git on Windows refused it; edit those files as
     bytes.)
+109. Save slots. Folklore saves through cellSaveDataListSave2/ListLoad2
+    into <title id>-SAVEDATA-NNNN directories; a PS3 shows the list and
+    the player picks. Headless, dispatch_func_select took the first listed
+    entry (the game passes the existing saves as its fixed list, plus a
+    new-save name), so every load and save went to -0000. patches/0086:
+    PS3_SAVEDATA_SELECT names one directory; listings hide the others of
+    its family (name up to the trailing digits), and a List save writes it
+    (created when new). engine_save_slots sets it from save_slot at boot
+    and reads each slot's PARAM.SFO (SUB_TITLE: character, realm, area;
+    DETAIL: both chapters and play time) and ICON0.PNG (the area, 320x176)
+    for the launcher's Saves page; import/export/delete are folder copies
+    (CopyFileA keeps the file times the "saved" date comes from), and an
+    imported save of this release gets its SFO SAVEDATA_DIRECTORY renamed
+    to its slot.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

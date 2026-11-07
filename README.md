@@ -229,6 +229,11 @@ ones `run.ps1` uses).
 - **Game**: your disc dump and, for a 1.10 build, the installed 1.10 update,
   each checked the way the game checks them; where saves and installed data
   go; optional firmware fonts.
+- **Saves**: your save slots, each with the picture of the area it was saved
+  in, the character and place, both characters' chapters, the play time and
+  when it was saved. Choose the slot the game plays, start a **New slot**,
+  **Import...** saves (from RPCS3 too), **Export...** or **Delete...** one;
+  see [*Save slots*](#save-slots).
 - **DLC**: the packs installed, **Add DLC from RPCS3...** and **Add licences
   (.rap)...**, and any pack still missing its licence.
 - **Graphics**, **Display**, **Gameplay**: every setting of the in-game
@@ -247,6 +252,29 @@ shows the plain panel in the screenshots above.
 
 **From a package**: unzip, double-click `run_launcher.bat`, choose your disc
 dump (and the 1.10 update for a 1.10 build) on the Game page, press Play.
+
+### Save slots
+
+Folklore keeps each save in its own folder (`BCUS98147-SAVEDATA-0000`,
+`-0001`, ...; `BCES00050-...` for the European release). On a PS3 the game
+shows them in a list and you pick one; the port has no such list, so it used
+to load and overwrite the first. Now the **Saves** page of the launcher picks
+the slot before the game starts, and the game loads and saves only that one
+(`save_slot` in `folklore_settings.ini`). An empty slot starts a new game,
+which then saves into it. The in-game engine menu shows the slot in use.
+
+- **New slot**: the next free number; press Play for a new game in it.
+- **Import...**: one save folder, a folder of them (an export, or RPCS3's
+  `dev_hdd0\home\00000001\savedata`), or RPCS3's own folder. Each save gets
+  the next free slot; one already in a slot is skipped. A save made with the
+  other release is marked, as it may not load.
+- **Export slot N...**: copies the slot to a folder you choose, as a PS3
+  save folder: it can go straight into RPCS3's `savedata` folder.
+- **Delete slot N...** (press Confirm): moves the slot to `deleted_saves\`,
+  from where Import brings it back.
+
+The saves live in `gamedata\dev_hdd0\home\00000001\savedata` in the data
+folder (the project folder, or the one set on the Game page).
 
 ### Engine menu
 

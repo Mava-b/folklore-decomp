@@ -87,6 +87,10 @@ struct EngineSettings
      * that is empty. Read when the renderer starts: next launch. */
     bool texturePack = false;
     std::string texturePackDir;
+    /* Save slot: which of the game's save directories (<title id>-SAVEDATA-
+     * NNNN) it loads and saves, chosen in the launcher (engine_save_slots).
+     * Read when the game starts. */
+    int saveSlot = 0;
     /* Menus and HUD wider than 16:9: stretched across the screen (as the
      * game draws them), centred at their own proportions, or centred with
      * the map, gauges and hints moved out towards the edges (hudEdge: 0-100

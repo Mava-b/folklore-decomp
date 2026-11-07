@@ -432,6 +432,83 @@ static s32 dispatch_func_select(uint32_t func_opd, const CellSaveDataDirList* di
     return result;
 }
 
+/* Save slots. With no system dialog to pick from, a List call used to load
+ * and overwrite whichever directory came first. PS3_SAVEDATA_SELECT names the
+ * one directory to use instead (e.g. BCUS98147-SAVEDATA-0003, set by the
+ * host from its save-slot setting): directories of the same family (the
+ * name up to its trailing digits) other than that one are hidden from every
+ * listing, and a List save writes that directory, creating it when it is
+ * new. Directories of other families are listed as before. */
+static const char* savedata_selected_dir(void)
+{
+    const char* selected = getenv("PS3_SAVEDATA_SELECT");
+    if (!selected || !selected[0] || strchr(selected, '/') || strchr(selected, '\\'))
+    {
+        return NULL;
+    }
+    if (strlen(selected) >= CELL_SAVEDATA_DIRNAME_SIZE)
+    {
+        return NULL;
+    }
+    return selected;
+}
+
+static size_t savedata_family_length(const char* name)
+{
+    size_t length = strlen(name);
+    while (length > 0 && name[length - 1] >= '0' && name[length - 1] <= '9')
+    {
+        length--;
+    }
+    return length;
+}
+
+/* 1 when a listing should leave `name` out: it is of the selected
+ * directory's family, but not the selected directory. */
+static int savedata_hidden_by_slot(const char* name)
+{
+    const char* selected = savedata_selected_dir();
+    if (!selected)
+    {
+        return 0;
+    }
+    const size_t familyLength = savedata_family_length(selected);
+    if (familyLength == 0 || strlen(name) <= familyLength || strncmp(name, selected, familyLength) != 0)
+    {
+        return 0;
+    }
+    if (savedata_family_length(name) != familyLength)
+    {
+        return 0;
+    }
+    return strcmp(name, selected) != 0;
+}
+
+/* For a List save: the selected directory, when the game's choice (or the
+ * listing prefix) is of its family. */
+static const char* savedata_slot_for_save(const char* gameChoice, const char* prefix)
+{
+    const char* selected = savedata_selected_dir();
+    if (!selected)
+    {
+        return NULL;
+    }
+    const size_t familyLength = savedata_family_length(selected);
+    if (gameChoice && gameChoice[0])
+    {
+        if (strncmp(gameChoice, selected, familyLength) == 0)
+        {
+            return selected;
+        }
+        return NULL;
+    }
+    if (prefix && prefix[0] && strncmp(selected, prefix, strlen(prefix)) == 0)
+    {
+        return selected;
+    }
+    return NULL;
+}
+
 /* Enumerate save directories matching a prefix. Returns count, fills dirList up to max. */
 static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList, u32 max)
 {
@@ -459,6 +536,10 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             if (prefix && prefix[0] && strncmp(fd.cFileName, prefix, strlen(prefix)) != 0)
                 continue;
+            if (savedata_hidden_by_slot(fd.cFileName))
+            {
+                continue;
+            }
             if (count < max && dirList) {
                 memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
                 strncpy(dirList[count].dirName, fd.cFileName,
@@ -486,6 +567,10 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
                 continue;
             if (prefix && prefix[0] && strncmp(de->d_name, prefix, strlen(prefix)) != 0)
                 continue;
+            if (savedata_hidden_by_slot(de->d_name))
+            {
+                continue;
+            }
             if (count < max && dirList) {
                 memset(&dirList[count], 0, sizeof(CellSaveDataDirList));
                 strncpy(dirList[count].dirName, de->d_name,
@@ -1065,6 +1150,16 @@ s32 cellSaveDataListSave2(u32 version, CellSaveDataSetList* setList,
         free(dirList);
         return CELL_SAVEDATA_ERROR_CBRESULT;
     }
+    {
+        const char* listPrefix = savedata_host_str((const char*)(uintptr_t)vm_read32((u32)(uintptr_t)setList + 8));
+        const char* slot = savedata_slot_for_save(selectedDir, listPrefix);
+        if (slot && strcmp(slot, selectedDir) != 0)
+        {
+            printf("[cellSaveData] save slot: writing '%s' (the game chose '%s')\n", slot, selectedDir);
+            strncpy(selectedDir, slot, sizeof selectedDir - 1);
+            selectedDir[sizeof selectedDir - 1] = '\0';
+        }
+    }
     if (!selectedDir[0] && dirCount > 0)
         strncpy(selectedDir, dirList[0].dirName, sizeof selectedDir - 1);
     if (!selectedDir[0]) {
@@ -1085,6 +1180,10 @@ s32 cellSaveDataListLoad2(u32 version, CellSaveDataSetList* setList,
                            u32 container, void* userdata)
 {
     printf("[cellSaveData] ListLoad2(version=%u)\n", version);
+    if (savedata_selected_dir())
+    {
+        printf("[cellSaveData] save slot: only '%s' is listed\n", savedata_selected_dir());
+    }
 
     if (!setList || !setBuf || !funcList || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;

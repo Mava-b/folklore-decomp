@@ -257,6 +257,11 @@ void engineSettingsLoad()
         {
             settingsInstance.texturePackDir = value;
         }
+        else if (std::strcmp(key, "save_slot") == 0)
+        {
+            const int slot = std::atoi(value);
+            settingsInstance.saveSlot = slot >= 0 && slot <= 9999 ? slot : 0;
+        }
         else if (std::strcmp(key, "bloom") == 0)
         {
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
@@ -444,6 +449,8 @@ void engineSettingsSave()
     std::fprintf(file, "# Replacement textures (next start); folder empty = textures\\replace next to this file\n");
     std::fprintf(file, "texture_pack = %d\n", current.texturePack ? 1 : 0);
     std::fprintf(file, "texture_pack_dir = %s\n", current.texturePackDir.c_str());
+    std::fprintf(file, "# The save slot the game loads and saves (0-9999; choose it in the launcher)\n");
+    std::fprintf(file, "save_slot = %d\n", current.saveSlot);
     std::fprintf(file, "# original (the game's two-tap blur) or smooth (next start)\n");
     std::fprintf(file, "depth_of_field = %s\n",
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
