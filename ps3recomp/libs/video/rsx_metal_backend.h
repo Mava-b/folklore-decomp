@@ -47,6 +47,8 @@ void rsx_metal_backend_export_window_state(void);
  * 0 otherwise. Always returns 0 in headless mode. In host-surface mode the
  * window is the launcher's: -1 once it is closing or the launcher is gone. */
 int  rsx_metal_backend_pump_messages(void);
+/* macOS: set NSApp up on the main thread before other threads start (boot harness). */
+void rsx_metal_backend_prepare_app(void);
 
 /* Present one frame: clear the drawable to the colour last received through the
  * RSX clear method, then hand it to the compositor. */

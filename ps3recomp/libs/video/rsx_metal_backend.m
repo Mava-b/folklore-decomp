@@ -851,6 +851,28 @@ static void window_close_observer_start(NSWindow* window)
 @end
 static RsxQuitTarget* s_quit_target;
 
+/* Make NSApp and finish launching it on the main thread, before any other
+ * thread starts. AppKit binds its main event queue to the thread that first
+ * sets the application up; when that happened anywhere else (SDL's
+ * GameController joystick driver, a background window animation), the first
+ * nextEventMatchingMask on the main thread died in
+ * _NSAssertMainEventQueueIsCurrentEventQueue (SIGTRAP), now and then, a
+ * second into the run. The boot harness calls this from the main thread
+ * before it starts the guest; calling it again is harmless. */
+void rsx_metal_backend_prepare_app(void)
+{
+#if !TARGET_OS_IPHONE
+    static int s_prepared;
+    if (s_prepared || ![NSThread isMainThread]) return;
+    s_prepared = 1;
+    @autoreleasepool {
+        [NSApplication sharedApplication];
+        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+        [NSApp finishLaunching];
+    }
+#endif
+}
+
 static int create_window_impl(const char* title)
 {
     [NSApplication sharedApplication];

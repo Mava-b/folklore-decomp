@@ -72,8 +72,12 @@ static void* boot_guest_thread(void* arg)
     CFRunLoopStop(CFRunLoopGetMain());
     return nullptr;
 }
+extern "C" void rsx_metal_backend_prepare_app(void);
 static int boot_run_guest(uint32_t entry, uint32_t stack_top)
 {
+    /* NSApp belongs to this (the main) thread before the guest can touch
+     * AppKit through SDL or the backend: see rsx_metal_backend.m. */
+    rsx_metal_backend_prepare_app();
     static boot_guest_run g;
     g.entry = entry; g.stack_top = stack_top; g.rc = 0; g.done = 0;
     pthread_attr_t attr;

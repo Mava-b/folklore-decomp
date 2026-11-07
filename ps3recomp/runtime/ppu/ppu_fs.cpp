@@ -321,7 +321,7 @@ static void cellFsOpen(ppu_context* ctx)
     }
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
-        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X)\n", gpath, hpath, flags);
+        fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X lr=0x%08X)\n", gpath, hpath, flags, (uint32_t)ctx->lr);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
     const char* fmode = (acc == CELL_FS_O_RDWR)
@@ -353,7 +353,7 @@ static void cellFsOpen(ppu_context* ctx)
           { const char* want = ps3_env_once("FS_STACK");
             if (want && *want && strstr(gpath, want)) ydkj_host_bt("fs-open");
           } }
-      else fprintf(stderr, "[fs] open '%s' -> fd %d\n", gpath, fd); }
+      else fprintf(stderr, "[fs] open '%s' -> fd %d lr=0x%08X\n", gpath, fd, (uint32_t)ctx->lr); }
     if (ps3_env_once("PS3_FSLOG_BT") && strstr(gpath, ".usm")) {
         /* Resolve to GUEST functions (raw host RVAs are useless here): this tells us
          * which criMv/criFs function opened the movie, so the reader-attach path
@@ -962,7 +962,7 @@ static void cellFsUnlink(ppu_context* ctx)
     size_t glen = strlen(gpath);
     struct stat ust;
     if (glen && gpath[glen - 1] == '/') {
-        fprintf(stderr, "[fs] unlink '%s' -> no file name (ENOENT)\n", gpath);
+        fprintf(stderr, "[fs] unlink '%s' -> no file name (ENOENT) lr=0x%08X\n", gpath, (uint32_t)ctx->lr);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT;
         return;
     }
