@@ -4969,11 +4969,17 @@ static int      s_dialog_seq;
 
 static void dialog_release_pad_when_idle(void)
 {
-    /* Poll until Cross and Circle are both up, then hand the pad back. */
+    /* Poll until Cross and Circle are both up, then hand the pad back; never
+     * hold it longer than 1.5 s (a stale button state must not lock the game
+     * out of its pad). */
     if (s_dialog_timer) [s_dialog_timer invalidate];
+    const CFAbsoluteTime until = CFAbsoluteTimeGetCurrent() + 1.5;
     s_dialog_timer = [NSTimer timerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer* t) {
-        if (cellPad_host_confirm_buttons() == 0) {
+        const int held = cellPad_host_confirm_buttons();
+        if (held == 0 || CFAbsoluteTimeGetCurrent() > until) {
             g_cellpad_block_guest_input = 0;
+            fprintf(stderr, "[cellMsgDialog] pad handed back to the game%s\n",
+                    held ? " (button still reported held)" : "");
             [t invalidate];
             if (s_dialog_timer == t) s_dialog_timer = nil;
         }
@@ -5018,8 +5024,11 @@ int rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
         }];
         [[NSRunLoop mainRunLoop] addTimer:s_dialog_timer forMode:NSRunLoopCommonModes];
         [alert beginSheetModalForWindow:s_window completionHandler:^(NSModalResponse r) {
-            if (s_dialog_alert == alert) s_dialog_alert = nil;
-            dialog_release_pad_when_idle();
+            /* A sheet replaced by a newer prompt must not touch the pad or
+             * the newer sheet's controller timer. */
+            const BOOL current = s_dialog_alert == alert;
+            if (current) s_dialog_alert = nil;
+            if (current || !s_dialog_alert) dialog_release_pad_when_idle();
             if (r == NSModalResponseAbort) return;   /* taken down by the game, or replaced */
             done(seq, r == NSAlertFirstButtonReturn);
         }];
