@@ -952,6 +952,25 @@ static void cellFsUnlink(ppu_context* ctx)
     char gpath[1024], hpath[1100];
     guest_strcpy(gpath, (uint32_t)ctx->gpr[3], sizeof gpath);
     host_path(hpath, sizeof hpath, gpath);
+    /* unlink never removes a directory. POSIX remove() would rmdir an empty
+     * one, and failed on a full one with ENOTEMPTY, which mapped to EIO.
+     * A path ending in '/' names no file at all: Folklore's download-data
+     * cleanup (func_0014FA80) unlinks "<bin>/" + an empty name when no pack
+     * is installed and accepts only OK or ENOENT; anything else ends in "An
+     * HDD access error occurred" (Windows' CRT answered ENOENT there). Any
+     * other directory answers EISDIR, as lv2 does. */
+    size_t glen = strlen(gpath);
+    struct stat ust;
+    if (glen && gpath[glen - 1] == '/') {
+        fprintf(stderr, "[fs] unlink '%s' -> no file name (ENOENT)\n", gpath);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT;
+        return;
+    }
+    if (stat(hpath, &ust) == 0 && (ust.st_mode & S_IFMT) == S_IFDIR) {
+        fprintf(stderr, "[fs] unlink '%s' -> '%s' is a directory (EISDIR)\n", gpath, hpath);
+        ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EISDIR;
+        return;
+    }
     int r = remove(hpath);
     fprintf(stderr, "[fs] unlink '%s' -> '%s' (%s)\n", gpath, hpath, r == 0 ? "OK" : "FAIL");
     ctx->gpr[3] = (r == 0) ? CELL_OK : (uint64_t)(int64_t)host_errno_to_cell(errno);
