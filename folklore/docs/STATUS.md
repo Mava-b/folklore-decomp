@@ -1606,6 +1606,12 @@ What 0006 fixes in ps3recomp to make that run:
     could join Keats's line or go by the zones. patches/0091: such a big
     CPU-evaluated mesh keeps its proportions but always stays in the middle
     and never continues a line.
+115. Dumping with a texture pack on: a texture the pack replaces was
+    already never dumped (the replacement is returned first, looked up by
+    the name's first 16 hex digits, size ignored), but the dump folder kept
+    the originals from earlier runs, mixed in with those still to make.
+    patches/0092: with both on, dumps the pack now replaces are moved once
+    per run into <dump>\replaced.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

@@ -556,6 +556,10 @@ their own subfolders.
   distant surfaces shimmer. Uncompressed files without them get them made
   as they load.
 - A cube map can only replace a cube map.
+- Dumping with the pack on: textures the pack replaces are not dumped, and
+  dumps from earlier runs that now have a replacement are moved into
+  `textures\dump\replaced` when the game starts, so `textures\dump` only
+  holds the textures still to be made.
 - The menu shows how many replacements were found and how many are in use.
   A file that cannot be used is skipped (the game's own texture shows) and
   the log says why (`[tex-pack]` lines).
