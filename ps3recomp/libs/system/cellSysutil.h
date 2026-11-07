@@ -187,6 +187,14 @@ s32 cellSysconfAbort(void);
 s32 cellSysutilGetLicenseArea(void);
 s32 cellSysutilIsMeetingApp(void);
 
+/* ---------------------------------------------------------------------------
+ * cellSysconf (exported by cellSysutil): the system accessory settings
+ * screen (Bluetooth headset and the like)
+ * -----------------------------------------------------------------------*/
+
+s32 cellSysconfOpen(u32 type, u32 func, u32 userdata, u32 extparam, u32 id);
+s32 cellSysconfAbort(void);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1301,7 +1301,43 @@ int spu_taskset_consume_wake(uint32_t taskset_ea)
     return 0;
 }
 
-/* Signal every task of `taskset_ea` currently parked. Returns how many. */
+/* Signal every task parked on `wait_obj` (whatever its taskset). If the task
+ * named no object (0 recorded), it matches anything.
+ *
+ * Resistance 2's Wws_Job path: the PPU enqueues a job with
+ * _cellSpursLFQueuePushBody, which knows only the queue EA, not the taskset --
+ * and the parked task's wait object (LS 0x2FD0 of the task-API argument) may
+ * or may not be the queue. The push handler tries this first and falls back
+ * to spu_taskset_signal_parked_force() when nothing matched. */
+int spu_taskset_signal_parked_obj_any(uint32_t wait_obj)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k) continue;
+        if (s_parked_obj[i] && s_parked_obj[i] != wait_obj) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
+/* Signal EVERY task parked in WAIT_SIGNAL, whatever object it named. The
+ * push handler's fallback: an unread job sitting in the queue while its only
+ * consumer sleeps is the worse state to be left in, and at bring-up there is
+ * exactly one parked task to overshoot on. */
+int spu_taskset_signal_parked_force(void)
+{
+    int n = 0;
+    for (int i = 0; i < SPU_PARKED_MAX; i++) {
+        uint64_t k = s_parked[i];
+        if (!k) continue;
+        spu_taskset_signal_task((uint32_t)(k >> 32), (uint32_t)(k & 0xFFFFFFFFu) - 1u);
+        n++;
+    }
+    return n;
+}
+
 /* Wake only the task parked on `wait_obj` (0 = any task of the taskset).
  * The guest names its wait object in the WAIT_SIGNAL argument, and for YDKJ`s
  * CRI tasks the flag the PPU sets is exactly wait_obj + 0x80 -- so a Set can

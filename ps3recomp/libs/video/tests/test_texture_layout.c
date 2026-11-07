@@ -657,6 +657,24 @@ static void test_remap_identity(void)
     for (int i = 0; i < 4; i++) CHECK_EQ(z[i], m[i]);
 }
 
+/* Depth formats read without comparison present the depth on every lane
+ * (RPCS3 maps them R,R,R,R before the crossbar), and so does X32_FLOAT. The
+ * resource holds it in component 0, so .w must not pick up the implicit
+ * alpha of 1.0. */
+static void test_remap_depth_formats_replicate(void)
+{
+    static const u32 fmts[5] = { 0x90u, 0x91u, 0x92u, 0x93u, FMT_X32F };
+    for (int f = 0; f < 5; f++) {
+        u8 m[4];
+        rsx_texture_component_remap(0xAAE4u, fmts[f], m);
+        for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+        rsx_texture_component_remap(0xAA1Bu, fmts[f] | 0x20u, m);
+        for (int i = 0; i < 4; i++) CHECK_EQ(m[i], 0);
+        rsx_texture_component_remap(0x55E4u, fmts[f], m);
+        for (int i = 0; i < 4; i++) CHECK_EQ(m[i], RSX_REMAP_ONE);
+    }
+}
+
 /* Packed the way D3D12 wants it, the identity must equal
  * D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING (0x1688). That constant is not
  * available here, so it is spelled out -- it is what makes this assertion
@@ -866,6 +884,7 @@ int main(void)
     test_decode_rejects_nonsense();
     test_remap_identity();
     test_remap_identity_packs_to_d3d_default();
+    test_remap_depth_formats_replicate();
     test_remap_b8_lanes();
     test_remap_x16_lanes();
     test_remap_y16x16_lanes();

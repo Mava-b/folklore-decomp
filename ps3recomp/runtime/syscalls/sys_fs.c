@@ -6,6 +6,7 @@
 #include "../../libs/filesystem/edat.h"
 #include "../memory/vm.h"
 #include "../platform/ps3_dev_flash.h"
+#include "../../include/ps3emu/hdd1_cache.h"   /* /dev_hdd1 -> the mounted system cache */
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -194,8 +195,12 @@ void sys_fs_translate_path(const char* ps3_path, char* host_path, int host_path_
     {
         static const char* hdd1_root = NULL; static int hdd1_init = 0;
         if (!hdd1_init) { hdd1_root = getenv("PS3_HDD1_ROOT"); hdd1_init = 1; }
-        if (hdd1_root && *hdd1_root && strncmp(ps3_path, "/dev_hdd1/", 10) == 0) {
-            snprintf(host_path, (size_t)host_path_size, "%s/%s", hdd1_root, ps3_path + 10);
+        /* /dev_hdd1 is the mounted cache folder: ps3emu/hdd1_cache.h. With no
+         * cache id published, /dev_hdd1/x -> <root>/x as before. */
+        if (host_path_size > 0 &&
+            (strncmp(ps3_path, "/dev_hdd1/", 10) == 0 ||
+             (strcmp(ps3_path, "/dev_hdd1") == 0 && getenv(PS3_SYSCACHE_ID_ENV))) &&
+            ps3_hdd1_host_path(ps3_path, hdd1_root, host_path, (size_t)host_path_size)) {
             fs_normalize_sep(host_path);
             return;
         }

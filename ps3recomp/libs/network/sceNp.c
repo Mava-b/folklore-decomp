@@ -288,6 +288,39 @@ s32 sceNpManagerGetOnlineId(SceNpOnlineId* onlineId) { return sceNpGetOnlineId(0
 s32 sceNpManagerGetOnlineName(SceNpOnlineName* name) { return sceNpGetOnlineName(0, name); }
 s32 sceNpManagerGetAccountAge(s32* age)              { return sceNpGetAccountAge(0, age); }
 
+/* Tickets: the signed proof of sign-in a title hands its own servers (Resistance
+ * requests one when Multiplayer > Online Game starts). There is no ticket
+ * service here. Offline -- the manager says OFFLINE -- RequestTicket fails with
+ * SCE_NP_ERROR_OFFLINE, as the console and RPCS3 do; unresolved it answered
+ * CELL_OK and the title waited for a GOT_TICKET event that never came. With a
+ * psnr server the request is still accepted, as before, for titles that do
+ * not wait on it. Either way no ticket ever arrives: GetTicket reports an empty
+ * one and GetTicketParam INVALID_STATE. */
+static s32 np_request_ticket(const char* fn, u32 npId, u32 serviceId, u32 cookieSize)
+{
+    if (!s_np_initialized)
+        return SCE_NP_ERROR_NOT_INITIALIZED;
+    if (!npId || !serviceId || cookieSize > SCE_NP_COOKIE_MAX_SIZE)
+        return SCE_NP_AUTH_EINVALID_ARGUMENT;
+    if (!np_psnr_enabled()) {
+        printf("[sceNp] %s(service='%s') -> OFFLINE\n", fn,
+               (const char*)(vm_base + serviceId));
+        return SCE_NP_ERROR_OFFLINE;
+    }
+    printf("[sceNp] %s(service='%s') -> accepted, no ticket service\n", fn,
+           (const char*)(vm_base + serviceId));
+    return CELL_OK;
+}
+
+s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
+                              const void* cookie, u32 cookieSize,
+                              const char* entitlementId, u32 consumedCount)
+{
+    (void)cookie; (void)entitlementId; (void)consumedCount;
+    return np_request_ticket("ManagerRequestTicket", (u32)(uintptr_t)npId,
+                             (u32)(uintptr_t)serviceId, cookieSize);
+}
+
 /* Parental controls: an unrestricted adult account. Unimplemented, these
  * returned OK without writing, and the title read whatever was in its stack. */
 s32 sceNpManagerGetContentRatingFlag(s32* isRestricted, s32* age)

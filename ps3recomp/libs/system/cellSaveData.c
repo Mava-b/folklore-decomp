@@ -8,6 +8,7 @@
 #include "cellSaveData.h"
 #include "ps3_psf.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/quit_gate.h"
 #include "../../runtime/ppu/ppu_memory.h"
 #include "../../runtime/memory/vm.h"
 #include <stdio.h>
@@ -858,10 +859,76 @@ void cellSaveDataHostSaveCounts(u32* done, u32* failed)
     }
 }
 
-/* Saves in flight, for a host-side quit (cellSysutil.c ps3_host_quit): it
- * waits for this to reach 0 so it never cuts a save file short. */
+/* Saves (and loads) in progress. A port's own quit path (the Resistance
+ * port's main.cpp, PS3_CLEAN_EXIT) can wait for this to reach 0 before it
+ * ends the process. */
 static volatile int s_savedata_busy;
-int ps3_savedata_busy(void) { return __atomic_load_n(&s_savedata_busy, __ATOMIC_ACQUIRE); }
+int cellSaveData_busy(void)
+{
+    return __atomic_load_n(&s_savedata_busy, __ATOMIC_ACQUIRE);
+}
+
+/* ---- the quit gate (include/ps3emu/quit_gate.h) ----------------------------
+ * Saves here and guest files opened for writing (runtime/ppu/ppu_fs.cpp)
+ * enter it; the quit path closes it and waits for them. */
+static volatile int s_quit_gate_inside;    /* writable files and saves under way */
+static volatile int s_quit_gate_closed;
+static void quit_gate_sleep_ms(int ms)
+{
+#ifdef _WIN32
+    Sleep((DWORD)ms);
+#else
+    usleep((useconds_t)ms * 1000u);
+#endif
+}
+/* Entries this thread made and has not left: a save that opens a file (or
+ * a file opened inside a save) must not park the thread the quit is
+ * waiting for. */
+#ifdef _MSC_VER
+static __declspec(thread) int t_quit_gate_depth;
+#else
+static __thread int t_quit_gate_depth;
+#endif
+void ps3_quit_gate_enter(void)
+{
+    __atomic_add_fetch(&s_quit_gate_inside, 1, __ATOMIC_SEQ_CST);
+    if (t_quit_gate_depth++ > 0 || !__atomic_load_n(&s_quit_gate_closed, __ATOMIC_SEQ_CST)) return;
+    t_quit_gate_depth--;
+    /* The process is ending: this save or write never starts, so the old
+     * file stays whole. The thread waits here for the exit. */
+    __atomic_sub_fetch(&s_quit_gate_inside, 1, __ATOMIC_SEQ_CST);
+    for (;;) quit_gate_sleep_ms(100);
+}
+void ps3_quit_gate_leave(void)
+{
+    t_quit_gate_depth--;
+    __atomic_sub_fetch(&s_quit_gate_inside, 1, __ATOMIC_SEQ_CST);
+}
+void ps3_quit_gate_close(void) { __atomic_store_n(&s_quit_gate_closed, 1, __ATOMIC_SEQ_CST); }
+int  ps3_quit_gate_closed(void) { return __atomic_load_n(&s_quit_gate_closed, __ATOMIC_SEQ_CST); }
+int  ps3_quit_gate_busy(void) { return __atomic_load_n(&s_quit_gate_inside, __ATOMIC_SEQ_CST); }
+int  ps3_quit_gate_wait(int ms)
+{
+    ps3_quit_gate_close();
+    int waited = 0;
+    while (ps3_quit_gate_busy() && waited < ms) { quit_gate_sleep_ms(10); waited += 10; }
+    const int left = ps3_quit_gate_busy();
+    if (waited)
+        fprintf(stderr, "[quit] waited %d ms for %s\n", waited,
+                left ? "a save or file write (still open)" : "a save or file write to finish");
+    return left;
+}
+
+/* For the host quit (cellSysutil.c ps3_host_quit), which asks only once it
+ * has given the title its grace period and is about to end the process:
+ * from the first call on the quit gate is closed -- no save or writable guest
+ * file starts any more, so none is cut short -- and the answer is how many
+ * saves and writable files are still open (it waits for 0). */
+int ps3_savedata_busy(void)
+{
+    ps3_quit_gate_close();
+    return ps3_quit_gate_busy();
+}
 
 static s32 savedata_execute_run(const char* dirName, int is_save,
                                 CellSaveDataSetBuf* setBuf,
@@ -871,13 +938,15 @@ static s32 savedata_execute_run(const char* dirName, int is_save,
 
 /* Core save/load implementation shared by List/Fixed/Auto variants. A save
  * the title itself cancels (its callback answering NODATA) is counted as
- * neither done nor failed. */
+ * neither done nor failed. Every save and load passes through the quit
+ * gate. */
 static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile,
                              void* userdata)
 {
+    ps3_quit_gate_enter();
     __atomic_add_fetch(&s_savedata_busy, 1, __ATOMIC_ACQ_REL);
     const s32 r = savedata_execute_run(dirName, is_save, setBuf, funcStat, funcFile, userdata);
     if (is_save)
@@ -892,6 +961,7 @@ static s32 savedata_execute(const char* dirName, int is_save,
         }
     }
     __atomic_sub_fetch(&s_savedata_busy, 1, __ATOMIC_ACQ_REL);
+    ps3_quit_gate_leave();
     return r;
 }
 

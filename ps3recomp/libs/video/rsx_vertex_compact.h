@@ -25,6 +25,15 @@ typedef struct rsx_vertex_layout_plan {
     u8 count;
     u8 attrs[RSX_DSP_NUM_VERTEX_ATTR];
     s8 slot_by_attr[RSX_DSP_NUM_VERTEX_ATTR];
+    /* Split vertex streams (the draw engine's per-stream vertex cache). 0/0,
+     * as _init leaves them: every slot is in the one interleaved buffer at
+     * slot * 16 with `stride`. Otherwise slot s reads stream
+     * (stream_map >> 4*s) & 0xF, at 16 bytes times its rank among that
+     * stream's slots (ascending), from a buffer whose stride is 16 times the
+     * stream's slot count. A host pipeline built for a split layout binds
+     * stream k as its own vertex buffer. */
+    u64 stream_map;
+    u8 n_streams;
 } rsx_vertex_layout_plan;
 
 typedef struct rsx_vertex_ref {
@@ -114,6 +123,13 @@ void rsx_vertex_fetch_plan_init(
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count);
 
+/* The same, told that refs[i].vertex_id == refs[0].vertex_id + i with one
+ * base_index (what rsx_vertex_remap_build_range leaves): the span of every
+ * ordinary per-vertex attribute is then its first and last reference. */
+void rsx_vertex_fetch_plan_prepare_ex(
+    rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    int consecutive);
+
 /* Fetch one compact vertex in layout order.  Disabled attributes use their
  * RSX current/default value.  Enabled non-position attributes retain the
  * legacy fallback-to-default behavior on an unsupported/invalid fetch; an
@@ -129,12 +145,36 @@ int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
     u8* out);
 
+/* The same for a subset of the layout's slots: slots[k] (a layout slot, not
+ * an ATTR number) is written at out + k * 16, with exactly the values
+ * rsx_vertex_fetch_one writes for that slot. Returns 0 under the same rule
+ * (an enabled ATTR0 that cannot be fetched), and only when ATTR0's slot is
+ * in the subset. */
+int rsx_vertex_fetch_slots(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref,
+    const u8* slots, u32 n_slots, u8* out);
+
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map
  * remains valid until the next call using the same remap object. */
 int rsx_vertex_remap_build(
     rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
     u32* unique_count);
+
+/* The draw's whole index range instead of its unique vertices: when every
+ * reference shares one base_index and the range lo..hi of vertex ids is no
+ * longer than the reference count, refs becomes lo, lo+1, ..., hi (*out_count
+ * = hi - lo + 1) and occurrence i maps to vertex_id - lo. Returns 0, leaving
+ * refs untouched, when that does not apply (use rsx_vertex_remap_build).
+ *
+ * A mesh's indices cover its vertex range almost exactly, so this fetches the
+ * same vertices without deduplicating, in address order -- and the result is
+ * one consecutive run, which is what the draw engine's vertex cache keys on.
+ * Occurrence i always satisfies
+ * refs[rsx_vertex_remap_index(remap, i)] == the original refs[i]. */
+int rsx_vertex_remap_build_range(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* out_count);
 
 u32 rsx_vertex_remap_index(
     const rsx_vertex_remap* remap, u32 occurrence);

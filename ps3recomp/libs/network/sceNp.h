@@ -30,6 +30,7 @@ extern "C" {
 #define SCE_NP_ERROR_OFFLINE                    0x8002aa0c
 #define SCE_NP_ERROR_INTERNAL                   0x8002aaff
 #define SCE_NP_AUTH_EINVALID_ARGUMENT           0x8002a015
+#define SCE_NP_COOKIE_MAX_SIZE                  1024
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -140,6 +141,9 @@ s32 sceNpManagerGetAccountAge(s32* age);
 
 /* Tickets, account region and network time. Every pointer is a guest
  * address. OFFLINE without a psnr server; see sceNp.c. */
+s32 sceNpManagerRequestTicket(const SceNpId* npId, const char* serviceId,
+                              const void* cookie, u32 cookieSize,
+                              const char* entitlementId, u32 consumedCount);
 s32 sceNpManagerRequestTicket2(u32 npId, u32 version, u32 serviceId, u32 cookie,
                                u32 cookieSize, u32 entitlementId, u32 consumedCount);
 s32 sceNpManagerGetTicket(u32 buffer, u32 bufferSize);

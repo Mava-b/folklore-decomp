@@ -206,12 +206,23 @@ void avconf_register_ctx(void)
 /* The display gamma for the presenter: what the title set (0.8..1.2, 1 by
  * default), or PS3_DISPLAY_GAMMA=<g> to override it. The video out applies
  * it as out = in^gamma, like RPCS3's calibration pass. */
+static volatile float s_gamma_override = -1.0f;   /* < 0: PS3_DISPLAY_GAMMA not read yet; 0 = none */
 float cellAvconfExt_display_gamma(void)
 {
-    static float env = -1.0f;
-    if (env < 0.0f) { const char* e = getenv("PS3_DISPLAY_GAMMA"); env = e ? (float)atof(e) : 0.0f; }
+    float env = s_gamma_override;
+    if (env < 0.0f) {
+        const char* e = getenv("PS3_DISPLAY_GAMMA");
+        env = e ? (float)atof(e) : 0.0f;
+        if (!(env > 0.0f)) env = 0.0f;
+        s_gamma_override = env;
+    }
     return env > 0.0f ? env : s_gamma;
 }
+/* The in-game menu (libs/video/ps3_overlay.mm, from the inFAMOUS 2 port):
+ * the override (0 = the title's own gamma) and the title's value. */
+float cellAvconfExt_display_gamma_override(void) { cellAvconfExt_display_gamma(); return s_gamma_override; }
+void  cellAvconfExt_set_display_gamma_override(float g) { s_gamma_override = g > 0.0f ? g : 0.0f; }
+float cellAvconfExt_title_gamma(void) { return s_gamma; }
 
 /* cellAudioOutConfigure(audioOut, config, option, waitForEvent) -- set the
  * audio output mode. We accept any config and report success (request id 0);

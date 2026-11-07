@@ -85,6 +85,13 @@ int rsx_fp_apply_alpha_test(char* hlsl, u32 out_size, u32 func, float ref);
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
 
+/* PS3_RES_SCALE (the Metal backend): the engine's render targets are `scale`
+ * times the guest's size, so SV_POSITION counts scaled pixels; WPOS is
+ * divided back to the guest's window coordinates. 1 (the default) leaves
+ * every program byte-identical. Set once, before the first decompile. */
+void  rsx_fp_set_wpos_scale(float scale);
+float rsx_fp_wpos_scale(void);
+
 /* Scale texel-space (RSX_TEX_FMT_UNNORM) coordinates into HLSL's 0..1 range.
  * unnorm_mask selects the units; dim[u] gives that unit's {width, height,
  * depth}; cube units are skipped and volume_mask units (Texture3D) are divided
@@ -118,10 +125,41 @@ int rsx_fp_apply_convolution(char* hlsl, u32 hlsl_size, u32 convolution_mask,
  * too small. */
 int rsx_fp_apply_zeta_alias(char* hlsl, u32 hlsl_size, u32 alias_mask, u32 cube_mask);
 
+/* WPOS on an antialiased surface held at its sample resolution (sx x sy
+ * samples a pixel, as in guest memory). The RSX runs the program once a pixel
+ * and WPOS is that pixel's window position; the host shades each sample and
+ * SV_POSITION counts samples. Rewrites the program's WPOS to the centre of the
+ * pixel its sample belongs to. Returns 1 when patched, 0 when there is nothing
+ * to do (a 1x1 grid, or no WPOS read), or -1 without mutation when the entry
+ * point is not found, the grid is already applied, or the buffer is short. */
+int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy);
+
+/* Does the program read WPOS (input 0) as an instruction source? Scans the
+ * ucode the way rsx_fp_texture_units does, so a caller can tell before
+ * decompiling whether the shader window belongs to the program's identity. */
+int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes);
+
+/* NV4097_SET_SHADER_WINDOW (height [0:11], origin [12:15], pixel centre
+ * [16:19]) applied to WPOS. SV_POSITION has its origin at the top left and
+ * its centres at .5; the RSX counts WPOS.y up from the bottom of a window of
+ * that height when the origin is BOTTOM (libgcm's default) and drops the .5
+ * when the centre is INTEGER (RPCS3 RSXDrawCommands.cpp: wpos_scale and
+ * wpos_bias). The line goes after rsx_fp_apply_wpos_grid's, so apply that
+ * first. Returns 1 when patched, 0 when there is nothing to do (top origin
+ * with half centres, or no WPOS read), or -1 without mutation when the entry
+ * point is not found, the window is already applied, or the buffer is short. */
+int rsx_fp_apply_wpos_window(char* hlsl, u32 capacity, u32 shader_window);
+
 /* Decode NV4097_SET_ALPHA_REF for the active surface color format. Ordinary
  * integer render targets use the low 8 bits as UNORM8; W16Z16Y16X16 uses a
  * half float and X32/W32Z32Y32X32 use a 32-bit float. */
 float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format);
+
+/* 1 when the alpha test compares quantised 8-bit values for this surface color
+ * format (every format but 14/15/16, the half and float ones): the value the
+ * buffered alpha test reads from fp_alpha.w (.y/.z carry the WPOS window). PS3RECOMP_FP_ALPHA_QUANT=0 turns
+ * it off (raw compare, the old behaviour). */
+int rsx_fp_alpha_quantised(u32 surface_color_format);
 
 /* Same as rsx_fp_decompile, plus per-texture-unit dimensionality.
  *

@@ -88,6 +88,8 @@ extern "C" void     vm_write64(uint64_t a, uint64_t v);
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
 #include "ps3emu/log_first.h"
 #include "ps3emu/ps3_env_once.h"   /* ps3_env_once: each switch looked up once */
+#include "ps3emu/hdd1_cache.h"     /* /dev_hdd1 -> the mounted system cache */
+#include "ps3emu/quit_gate.h"      /* a write to /dev_hdd0 is not cut by a quit */
 
 /* Host root that the PS3 mount points map into (dir containing PS3_GAME). */
 extern "C" const char* ppu_vfs_root = ".";
@@ -169,11 +171,15 @@ static void host_path(char* out, size_t cap, const char* guest)
      * mapping; upstream's is kept). */
     static const char* hdd1_root = nullptr; static int hdd1_init = 0;
     if (!hdd1_init) { hdd1_root = ps3_env_once("PS3_HDD1_ROOT"); hdd1_init = 1; }
-    if (hdd1_root && *hdd1_root && strncmp(guest, "/dev_hdd1/", 10) == 0) {
-        snprintf(out, cap, "%s/%s", hdd1_root, guest + 10);
-        for (char* p = out; *p; p++) if (*p == '\\') *p = '/';
+    /* With a cache mounted, /dev_hdd1 is the title's cache folder (see
+     * ps3emu/hdd1_cache.h): /dev_hdd1/x -> <root>/cache/<id>/x. With no cache
+     * id published (PS3_SYSCACHE_ID unset) it is /dev_hdd1/x -> <root>/x as
+     * before, and the bare "/dev_hdd1" keeps falling through to the mapping
+     * below. */
+    if ((strncmp(guest, "/dev_hdd1/", 10) == 0 ||
+         (strcmp(guest, "/dev_hdd1") == 0 && getenv(PS3_SYSCACHE_ID_ENV))) &&
+        ps3_hdd1_host_path(guest, hdd1_root, out, cap))
         return;
-    }
 
     /* /dev_flash is FIRMWARE, not game data — mapping it into the game root (the
      * old behaviour) makes every firmware lookup miss. YDKJ's FMOD asks for
@@ -223,6 +229,11 @@ static void host_path(char* out, size_t cap, const char* guest)
 #define FS_MAX 256
 static FILE* g_files[FS_MAX];
 static uint8_t g_fd_usm[FS_MAX];
+/* The fd holds a place in the quit gate (include/ps3emu/quit_gate.h): a file
+ * on /dev_hdd0 -- saves, checkpoints such as Resistance's quick.sav --
+ * opened for writing, from its open (which may truncate it) to its close. A
+ * quit waits for it; once the quit has begun, such an open never happens. */
+static uint8_t g_fd_gate[FS_MAX];
 static char    g_fd_path[FS_MAX][192];   /* guest path per fd (diagnostics) */
 static char    g_fd_host_path[FS_MAX][512];   /* host path per fd (AIO reads it on its own handle) */   /* 1 if this fd is an open .usm movie (read tracker) */
 static DIR*  g_dirs[FS_MAX];
@@ -323,8 +334,12 @@ static void cellFsOpen(ppu_context* ctx)
             return;
         }
     }
+    const bool gate = (acc != CELL_FS_O_RDONLY || (flags & (CELL_FS_O_CREAT | CELL_FS_O_TRUNC))) &&
+                      !strncmp(gpath, "/dev_hdd0", 9);
+    if (gate) ps3_quit_gate_enter();         /* before open(): it may truncate */
     int hfd = open(hpath, oflags | O_BINARY, 0666);
     if (hfd < 0) {
+        if (gate) ps3_quit_gate_leave();
         fprintf(stderr, "[fs] open FAIL '%s' -> '%s' (flags=0x%X lr=0x%08X)\n", gpath, hpath, flags, (uint32_t)ctx->lr);
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_ENOENT; return;
     }
@@ -336,12 +351,14 @@ static void cellFsOpen(ppu_context* ctx)
     FILE* f = fdopen(hfd, fmode);
     if (!f) {
         close(hfd);
+        if (gate) ps3_quit_gate_leave();
         ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EIO; return;
     }
     int fd = fd_alloc_file(f);
-    if (fd < 0) { fclose(f); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
+    if (fd < 0) { fclose(f); if (gate) ps3_quit_gate_leave(); ctx->gpr[3] = (uint64_t)(int64_t)CELL_FS_EMFILE; return; }
     if (fd_ptr) vm_write32(fd_ptr, (uint32_t)fd);
     g_fd_usm[fd] = (strstr(gpath, ".usm") != nullptr) ? 1 : 0;
+    g_fd_gate[fd] = gate ? 1 : 0;
     /* FS_CALLER=1: name the guest function that opened each file. A title whose
      * streaming layer opens a file and never reads it (You Don't Know Jack's
      * movies) is diagnosed from the opener: its sibling read path is the one
@@ -461,6 +478,7 @@ static void cellFsClose(ppu_context* ctx)
     if (ps3_env_once("FS_CALLER")) { char w[64]="?"; ppu_guest_caller(w,sizeof w);
         fprintf(stderr, "[fs] close fd=%d  (by %s)\n", fd, w); }
     FILE* f = nullptr;
+    bool gate = false;
     if (fd >= 0 && fd < FS_MAX) {
         std::lock_guard<std::mutex> hold(g_fd_lock);
         f = g_files[fd];
@@ -468,9 +486,11 @@ static void cellFsClose(ppu_context* ctx)
             if (g_fd_usm[fd] && ps3_env_once("PS3_FSLOG_READS")) fprintf(stderr, "[USMRD] CLOSE usm fd=%d\n", fd);
             __atomic_store_n(&g_files[fd], (FILE*)nullptr, __ATOMIC_RELEASE);
             g_fd_usm[fd] = 0; g_fd_dir[fd] = 0;
+            gate = g_fd_gate[fd] != 0; g_fd_gate[fd] = 0;
         }
     }
     if (f) fclose(f);
+    if (gate) ps3_quit_gate_leave();         /* after fclose: the data is out */
     ctx->gpr[3] = CELL_OK;
 }
 

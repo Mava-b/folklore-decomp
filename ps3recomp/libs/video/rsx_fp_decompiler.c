@@ -387,6 +387,11 @@ static const char* input_expr(u32 input_src)
     }
 }
 
+/* PS3_RES_SCALE: see rsx_fp_set_wpos_scale. */
+static float s_fp_wpos_scale = 1.0f;
+void  rsx_fp_set_wpos_scale(float scale) { s_fp_wpos_scale = (scale > 0.0f) ? scale : 1.0f; }
+float rsx_fp_wpos_scale(void) { return s_fp_wpos_scale; }
+
 /* Build the swizzled/negated/abs'd HLSL for one source into `buf`. */
 static void emit_src(const Src* s, u32 input_src, int persp, const float* k, int has_k,
                      int buffered, u32 constant_slot, char* buf, u32 bufsz)
@@ -1326,12 +1331,30 @@ static int rsx_fp_decompile_internal(
      * uv = wpos * (1/W, -1/H) + (0, 1), mirrored its source when it read the host y.
      * The draw engine passes the window height in fp_alpha.y when the origin is
      * BOTTOM (0 otherwise) and a pixel-center bias in fp_alpha.z (-0.5 for INTEGER
-     * centers, 0 for HALF). A backend that leaves both 0 gets the host position. */
-    if (strstr(o.p, "_rsx_wpos("))
-        out_puts(&p, buffered
-            ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
-              "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
-            : "#define _rsx_wpos(p) (p)\n");
+     * centers, 0 for HALF). A backend that leaves both 0 gets the host position.
+     * PS3_RES_SCALE: SV_POSITION counts the scaled target's pixels; WPOS is the
+     * guest's window coordinate, so x and y are divided back first (the window
+     * height and bias are in guest pixels). Scale 1 keeps the exact legacy text. */
+    if (strstr(o.p, "_rsx_wpos(")) {
+        char wpos[320];
+        if (s_fp_wpos_scale == 1.0f)
+            snprintf(wpos, sizeof wpos, "%s", buffered
+                ? "#define _rsx_wpos(p) float4((p).x + fp_alpha.z, "
+                  "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y : (p).y) + fp_alpha.z, (p).z, (p).w)\n"
+                : "#define _rsx_wpos(p) (p)\n");
+        else {
+            const double k = 1.0 / (double)s_fp_wpos_scale;
+            if (buffered)
+                snprintf(wpos, sizeof wpos,
+                    "#define _rsx_wpos(p) float4((p).x * %.9g + fp_alpha.z, "
+                    "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * %.9g : (p).y * %.9g) + fp_alpha.z, (p).z, (p).w)\n",
+                    k, k, k);
+            else
+                snprintf(wpos, sizeof wpos,
+                    "#define _rsx_wpos(p) float4((p).x * %.9g, (p).y * %.9g, (p).zw)\n", k, k);
+        }
+        out_puts(&p, wpos);
+    }
     /* Texture bank. With no cube units (the default) emit the exact legacy
      * array declaration so 2D-only programs are byte-identical. When any unit
      * is a cubemap, declare each unit individually at its t-register so the
@@ -1508,6 +1531,17 @@ float rsx_fp_alpha_ref(u32 raw, u32 surface_color_format)
     return (float)(raw & 0xFFu) / 255.0f;
 }
 
+int rsx_fp_alpha_quantised(u32 surface_color_format)
+{
+    static int off = -1;
+    if (off < 0) {
+        const char* e = getenv("PS3RECOMP_FP_ALPHA_QUANT");
+        off = e && *e == '0';
+    }
+    return !off && surface_color_format != 14u && surface_color_format != 15u &&
+           surface_color_format != 16u;
+}
+
 /* The comparison the alpha test has to pass. The alpha it tests is colour
  * target 0's, which for a single-target program is the returned value itself
  * and for an MRT one is the returned struct's first member -- the NV40 alpha
@@ -1638,15 +1672,28 @@ int rsx_fp_apply_alpha_test_buffered(
 
     const int mrt = fp_returns_struct(hlsl);
     char pass[96];
-    fp_alpha_pass_expr(cmp, mrt ? "_rsx_out.t0" : "_rsx_out", pass, sizeof(pass));
-    char suffix[512];
+    fp_alpha_pass_expr(cmp, "_rsx_alpha", pass, sizeof(pass));
+    /* The RSX tests the alpha the colour buffer would store: for a UNORM8
+     * target clamped to [0,1] and quantised to 8 bits, against the 8-bit ref
+     * (fp_alpha.w = 1, rsx_fp_alpha_quantised; .y and .z carry the WPOS
+     * window, see _rsx_wpos). Resistance's grass returns
+     * 0.5 - coverage and tests EQUAL 0: clamped, every covered pixel stores 0
+     * and passes; compared raw (negative) nearly all of it failed, leaving the
+     * foliage speckled. Float targets (fp_alpha.w = 0) compare the raw value.
+     * From the Resistance PC port by Psyykosis (MIT). */
+    char suffix[768];
     const int n = snprintf(
         suffix, sizeof(suffix),
         "    %s _rsx_out = %s;\n"
-        "    const float _rsx_alpha_ref = fp_alpha.x;\n"
+        "    float4 _rsx_alpha = %s;\n"
+        "    float _rsx_alpha_ref = fp_alpha.x;\n"
+        "    if (fp_alpha.w > 0.5) {\n"
+        "        _rsx_alpha.a = round(saturate(_rsx_alpha.a) * 255.0);\n"
+        "        _rsx_alpha_ref = round(_rsx_alpha_ref * 255.0);\n"
+        "    }\n"
         "    if (!(%s)) discard;\n"
         "    return _rsx_out;\n}\n",
-        mrt ? "PSOutput" : "float4", output, pass);
+        mrt ? "PSOutput" : "float4", output, mrt ? "_rsx_out.t0" : "_rsx_out", pass);
     if (n < 0 || (u32)n >= sizeof(suffix))
         return -1;
     const size_t prefix = (size_t)(marker - hlsl);
@@ -2025,6 +2072,95 @@ int rsx_fp_apply_wpos_grid(char* hlsl, u32 capacity, u32 sx, u32 sy)
     char line[128];
     const int n = snprintf(line, sizeof line,
         "    input.position.xy = floor(input.position.xy / float2(%u, %u)) + 0.5;\n", sx, sy);
+    if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
+    memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
+    memcpy(body, line, (size_t)n);
+    return 1;
+}
+
+int rsx_fp_reads_wpos(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    for (u32 off = 0; off + 16 <= max_bytes;) {
+        const u32 w0 = rsx_fp_read_word(ucode + off);
+        const u32 w1 = rsx_fp_read_word(ucode + off + 4);
+        const u32 w2 = rsx_fp_read_word(ucode + off + 8);
+        const u32 w3 = rsx_fp_read_word(ucode + off + 12);
+        const int branch = (w2 & FP_BRANCH) != 0;
+        if (!branch && ((w0 & FP_INPUT_SRC_MASK) >> FP_INPUT_SRC_SHIFT) == 0 &&
+            ((w1 & FP_REG_TYPE_MASK) == FP_REG_TYPE_INPUT ||
+             (w2 & FP_REG_TYPE_MASK) == FP_REG_TYPE_INPUT ||
+             (w3 & FP_REG_TYPE_MASK) == FP_REG_TYPE_INPUT))
+            return 1;
+        off += 16;
+        if (!branch && ((w1 & FP_REG_TYPE_MASK) == FP_REG_TYPE_CONST ||
+                        (w2 & FP_REG_TYPE_MASK) == FP_REG_TYPE_CONST ||
+                        (w3 & FP_REG_TYPE_MASK) == FP_REG_TYPE_CONST))
+            off += 16;
+        if (w0 & FP_END) break;
+    }
+    return 0;
+}
+
+/*
+ * WPOS in the guest's window convention (see the header).
+ *
+ * Resistance: Fall of Man sets a BOTTOM origin on every surface and its water
+ * and soft-particle programs turn WPOS back into a top-down row with
+ * (height - WPOS.y) before they look the scene's depth up. Fed SV_POSITION
+ * as is, that row came out mirrored: the river showed the trees above it as a
+ * false reflection, clamped into vertical streaks where the mirrored row left
+ * the screen. The flip is written in SV_POSITION's units, before any
+ * _rsx_wpos (PS3_RES_SCALE) division, so the height is scaled to match.
+ *
+ * The shared draw engine does not use this post-pass: it applies the window
+ * per draw through fp_alpha.y/.z, which _rsx_wpos reads in buffered mode
+ * (upstream #589), so the program stays out of the pipeline key. A backend
+ * that bakes the window with this pass must leave fp_alpha.y and .z at 0.
+ */
+int rsx_fp_apply_wpos_window(char* hlsl, u32 capacity, u32 shader_window)
+{
+    static const char wpos_read[] = "(input.position).";
+    static const char grid_line[] = "    input.position.xy = floor(";
+    static const char* const entries[] = { "main(PSInput input) : SV_TARGET {\n",
+                                           "main(PSInput input) {\n" };
+    if (!hlsl || !capacity) return -1;
+    const u32 height = shader_window & 0xFFFu;
+    const int bottom = ((shader_window >> 12) & 0xFu) == 1u;    /* CELL_GCM_WINDOW_ORIGIN_BOTTOM */
+    const int integer = ((shader_window >> 16) & 0xFu) == 1u;   /* CELL_GCM_WINDOW_PIXEL_CENTER_INTEGER */
+    if (!bottom && !integer) return 0;
+    size_t len = 0;
+    while (len < capacity && hlsl[len]) ++len;
+    if (len == capacity) return -1;
+    if (!strstr(hlsl, wpos_read) && !strstr(hlsl, "_rsx_wpos(input.position)")) return 0;
+    if (strstr(hlsl, "/* rsx shader window */")) return -1;
+    char* body = NULL;
+    for (size_t i = 0; i < sizeof entries / sizeof entries[0] && !body; ++i) {
+        char* at = strstr(hlsl, entries[i]);
+        if (at) body = at + strlen(entries[i]);
+    }
+    if (!body) return -1;
+    /* After the grid line when there is one: it rebuilds x and y from the
+     * sample position, which would undo a flip placed before it. */
+    if (!strncmp(body, grid_line, sizeof grid_line - 1)) {
+        char* eol = strchr(body, '\n');
+        if (!eol) return -1;
+        body = eol + 1;
+    }
+    const double k = (double)s_fp_wpos_scale;
+    char line[256];
+    int n;
+    if (bottom && integer)
+        n = snprintf(line, sizeof line,
+            "    /* rsx shader window */ input.position.xy = float2(input.position.x - %.9g, %.9g - input.position.y);\n",
+            0.5 * k, ((double)height - 0.5) * k);
+    else if (bottom)
+        n = snprintf(line, sizeof line,
+            "    /* rsx shader window */ input.position.y = %.9g - input.position.y;\n",
+            (double)height * k);
+    else
+        n = snprintf(line, sizeof line,
+            "    /* rsx shader window */ input.position.xy -= %.9g;\n", 0.5 * k);
     if (n < 0 || (size_t)n >= sizeof line || len + (size_t)n + 1 > capacity) return -1;
     memmove(body + n, body, len - (size_t)(body - hlsl) + 1);
     memcpy(body, line, (size_t)n);

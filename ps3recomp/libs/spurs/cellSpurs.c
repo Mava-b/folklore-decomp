@@ -2187,7 +2187,11 @@ s32 cellSpursReadyCountStore(CellSpurs* spurs, CellSpursWorkloadId wid,
     /* The real store: the instance byte the kernel (poll thread) watches. */
     vm_write8(si->ea + wkl_ready_off(wid), (u8)value);
     {   static int _n = 0;
-        if (_n < 32)
+        /* SPURS_RC_LOG=1: every store, not just the first 32 (a title's audio
+         * workload alone spends those in the first second). */
+        static int s_all = -1;
+        if (s_all < 0) s_all = getenv("SPURS_RC_LOG") ? 1 : 0;
+        if (_n < 32 || s_all)
             printf("[cellSpurs] ReadyCountStore(wid=%u, value=%u)\n", wid, value);
         else if (_n == 32)
             printf("[cellSpurs] ReadyCountStore further logs suppressed\n");
@@ -2420,7 +2424,9 @@ s32 cellSpursEventFlagWait(CellSpursEventFlag* eventFlag, u16* bits,
     vm_write16(bits_ea, current);
     u16 received = (mode == CELL_SPURS_EVENT_FLAG_AND) ? pattern
                                                        : (u16)(current & pattern);
-    { static int _n = 0; if (PS3_LOG_FIRST(_n, 40))
+    { static int _n = 0; static int _cap = -1;
+      if (_cap < 0) { const char* e = getenv("PS3_LFQ_LOG"); _cap = e ? atoi(e) : 40; }
+      if (PS3_LOG_FIRST(_n, _cap))
         fprintf(stderr, "[cellSpurs] EventFlagWait WAKE tid=%lu flagEA=0x%08X "
                 "pattern=0x%04X got=0x%04X (waits=%u)\n",
                 (unsigned long)GetCurrentThreadId(), ea, pattern, current, waits); }
@@ -3766,6 +3772,103 @@ s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
     if (PS3_LOG_FIRST(_n, 8))
         printf("[cellSpurs] _LFQueueInitialize(owner=0x%08X q=0x%08X buf=0x%08X size=%u depth=%u dir=%u) -> BE line written\n",
                (u32)owner_ea, (u32)queue_ea, (u32)buffer_ea, size, depth, direction);
+    return CELL_OK;
+}
+
+/* _cellSpursLFQueuePushBody(lfqueue, data, isBlocking) -- NID 0x8A85674D.
+ *
+ * The Wws_Job producer side for Resistance 2: the PPU builds a job entry on
+ * its own stack (caller at 0x008757F0: r4 = sp+0x70, r5 = 0, and it tolerates
+ * CELL_OK or CELL_SPURS_CORE_ERROR_AGAIN, i.e. a TryPush that may report a
+ * full queue) and hands it to the queue the SPU task consumes. The queue is
+ * GUEST BE state: the game built it itself (no HLE init trace), and the SPU
+ * consumer reads the header straight out of main memory -- so, exactly as
+ * _cellSpursLFQueueInitialize documents above, the bytes in guest memory ARE
+ * the interface and this must write the big-endian ring state, not a host
+ * struct.
+ *
+ * Bring-up is facts-first: log the args and the queue's whole header line,
+ * then push with the canonical CellSyncLFQueue ring (see below -- the
+ * Resistance 1 derivation was superseded when the first boot test showed the
+ * SPU kernel spinning on GETLLAR with a u32-written push index: the consumer
+ * decodes the RPCS3 cellSync.h layout) and wake the parked WAIT_SIGNAL task.
+ * If the printed header disagrees, fix HERE first -- the SPU consumer is real
+ * code and cannot be negotiated with. */
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking)
+{
+    const uint32_t q = (uint32_t)queue_ea;
+    if (!q || !data_ea) return CELL_SPURS_CORE_ERROR_NULL_POINTER;
+
+    /* PS3_LFQ_LOG=<n>: trace the first n pushes, uncapped by the default 8.
+     * The default cap once hid pushes 9+ entirely, which read as "the
+     * producer stopped" when the producer may have been early-returning or
+     * never called at all -- the cycle trace needs every attempt. */
+    static int _n = 0;
+    static int _cap = -1;
+    if (_cap < 0) { const char* e = getenv("PS3_LFQ_LOG"); _cap = e ? atoi(e) : 8; }
+    const int log = PS3_LOG_FIRST(_n, _cap);
+
+    /* Canonical CellSyncLFQueue groups (RPCS3 cellSync.h -- the layout the
+     * SPU consumer decodes): pop1 u32 @+0x00 (h1 completed-pop @0x00,
+     * h4 reserved-pop @+0x06), push1/push3 u32 @+0x08 (m_h5 completed-push
+     * u16 @+0x08, m_h6 pending-signal bitmap u16 @+0x0A, h7 flag @+0x0C,
+     * h8 reserved-push @+0x0E), size @+0x10, depth @+0x14, buffer @+0x18.
+     * The consumer's has-work test is (m_h5 - h4) mod 2*depth > 0, so the
+     * producer's completed-push counter is what must advance -- a 32-bit
+     * write of 1 to +0x08 lands the low half in h6 (BE) and h5 stays 0:
+     * the first boot test spun the kernel on GETLLAR exactly so. */
+    const u32 size     = vm_read32(q + 0x10);
+    const u32 depth    = vm_read32(q + 0x14);
+    const u32 buffer   = (u32)vm_read64(q + 0x18);
+    const u32 span     = depth * 2;
+    const s32 pop_h4   = (s32)(vm_read16(q + 0x06));
+    const u32 push_h5  = vm_read16(q + 0x08);
+
+    if (log) {
+        printf("[cellSpurs] _LFQueuePushBody tid=%lu (q=0x%08X data=0x%08X block=%u) pop_h1=%u pop_h4=%u push_h5=%u push_h8=%u size=%u depth=%u buf=0x%08X dir=%08X\n",
+               (unsigned long)GetCurrentThreadId(),
+               q, (u32)data_ea, isBlocking,
+               vm_read16(q + 0x00), pop_h4, push_h5, vm_read16(q + 0x0E),
+               size, depth, buffer, vm_read32(q + 0x24));
+        for (int w = 0; w < 32; w++)
+            printf("  +%02X:%08X%s", w * 4, vm_read32(q + w * 4),
+                   (w % 8 == 7) ? "\n" : " ");
+    }
+
+    /* Header sanity: if the ring fields are not the ring we know, refuse
+     * rather than corrupt guest state the consumer owns. AGAIN keeps the
+     * tolerated-error path of the TryPush caller alive without lying. */
+    if (!size || !depth || span > 0x10000 || size > 256 || depth > 4096) {
+        if (log) printf("[cellSpurs] _LFQueuePushBody tid=%lu: header is not the canonical ring (size=%u depth=%u) -> AGAIN\n",
+                        (unsigned long)GetCurrentThreadId(), size, depth);
+        return CELL_SPURS_CORE_ERROR_AGAIN;
+    }
+
+    s32 count = (s32)push_h5 - pop_h4;
+    if (count < 0) count += (s32)span;
+    if ((u32)count >= depth) {
+        /* Full: TryPush semantics (the caller at 0x8757F0 retries on AGAIN). */
+        if (log) printf("[cellSpurs] _LFQueuePushBody tid=%lu: full (count=%d depth=%u) -> AGAIN\n",
+                        (unsigned long)GetCurrentThreadId(), count, depth);
+        return CELL_SPURS_CORE_ERROR_AGAIN;
+    }
+
+    const u32 slot = push_h5 >= depth ? push_h5 - depth : push_h5;
+    memcpy(vm_base + buffer + slot * size, vm_base + (u32)data_ea, size);
+    /* Completed-push counter, wrapped at 2*depth (RPCS3 CompletePushPointer:
+     * var3 = m_h5 + var9; if (var3 >= depth*2) var3 -= depth*2). */
+    const u16 next_h5 = (u16)((push_h5 + 1 >= span) ? 0 : push_h5 + 1);
+    vm_write16(q + 0x08, next_h5);
+
+    { extern int spu_taskset_signal_parked_obj_any(uint32_t);
+      extern int spu_taskset_signal_parked_force(void);
+      int woke = spu_taskset_signal_parked_obj_any(q);
+      if (!woke) woke = spu_taskset_signal_parked_force();
+      if (log) {
+          printf("[cellSpurs] _LFQueuePushBody tid=%lu: pushed %u bytes to slot %u (push_h5 %u -> %u), woke %d parked task(s)\n",
+                 (unsigned long)GetCurrentThreadId(), size, slot, push_h5, next_h5, woke);
+          printf("  entry: "); for (int w = 0; w < 8; w++) printf("%08X ", vm_read32((u32)data_ea + w * 4)); printf("\n");
+      } }
     return CELL_OK;
 }
 

@@ -1,5 +1,6 @@
-/* cellPadSetActDirect -> host rumble: the motor levels, the per-port state,
- * and the renewal from the pad poll that keeps a long rumble going.
+/* cellPadSetActDirect -> host rumble: PS3_RUMBLE / PS3_RUMBLE_STRENGTH, the
+ * motor levels, the per-port state, the renewal from the pad poll that keeps
+ * a long rumble going, and a request made while another thread polls.
  *
  *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
  *         libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -o /tmp/test_pad_rumble && /tmp/test_pad_rumble
@@ -35,20 +36,50 @@ int SDL_GameControllerRumble(SDL_GameController* gc, Uint16 lo, Uint16 hi, Uint3
     return 0;
 }
 void SDL_GameControllerUpdate(void) {}
+int SDL_NumJoysticks(void) { return 0; }
+int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction a, Uint32 lo, Uint32 hi)
+{ (void)ev; (void)n; (void)a; (void)lo; (void)hi; return 0; }
 SDL_bool SDL_IsGameController(int i) { (void)i; return SDL_FALSE; }
 SDL_bool SDL_GameControllerGetAttached(SDL_GameController* gc) { return gc == (SDL_GameController*)&s_fake_gc; }
 Uint8 SDL_GameControllerGetButton(SDL_GameController* gc, SDL_GameControllerButton b) { (void)gc; (void)b; return 0; }
 Sint16 SDL_GameControllerGetAxis(SDL_GameController* gc, SDL_GameControllerAxis a) { (void)gc; (void)a; return 0; }
 void SDL_GameControllerClose(SDL_GameController* gc) { (void)gc; }
 
+static void test_strength(void)
+{
+    assert(pad_rumble_strength_from(NULL, NULL) == 100);
+    assert(pad_rumble_strength_from("1", NULL) == 100);
+    assert(pad_rumble_strength_from("0", NULL) == 0);
+    assert(pad_rumble_strength_from("0", "80") == 0);    /* off wins */
+    assert(pad_rumble_strength_from(NULL, "50") == 50);
+    assert(pad_rumble_strength_from(NULL, "0") == 0);
+    assert(pad_rumble_strength_from(NULL, "250") == 200);
+    assert(pad_rumble_strength_from(NULL, "-3") == 0);
+    assert(pad_rumble_strength_from(NULL, "abc") == 100);
+    assert(pad_rumble_strength_from(NULL, "") == 100);
+    /* read from the environment once */
+    s_rumble_pct = -1;
+    setenv("PS3_RUMBLE_STRENGTH", "40", 1);
+    assert(pad_rumble_strength() == 40);
+    setenv("PS3_RUMBLE_STRENGTH", "90", 1);
+    assert(pad_rumble_strength() == 40);
+    unsetenv("PS3_RUMBLE_STRENGTH");
+    s_rumble_pct = -1;
+    assert(pad_rumble_strength() == 100);
+}
+
 static void test_levels(void)
 {
     u16 lo, hi;
-    pad_rumble_levels(0, 0, &lo, &hi);     assert(lo == 0 && hi == 0);
-    pad_rumble_levels(1, 255, &lo, &hi);   assert(lo == 65535 && hi == 65535);
-    pad_rumble_levels(1, 0, &lo, &hi);     assert(lo == 0 && hi == 65535);   /* small motor: on is full, not 1/255 */
-    pad_rumble_levels(255, 0, &lo, &hi);   assert(hi == 65535);              /* any non-zero is on */
-    pad_rumble_levels(0, 128, &lo, &hi);   assert(lo == 128 * 257 && hi == 0);
+    pad_rumble_levels(0, 0, 100, &lo, &hi);   assert(lo == 0 && hi == 0);
+    pad_rumble_levels(1, 255, 100, &lo, &hi); assert(lo == 65535 && hi == 65535);
+    pad_rumble_levels(1, 0, 100, &lo, &hi);   assert(lo == 0 && hi == 65535);  /* small motor: on is full, not 1/255 */
+    pad_rumble_levels(255, 0, 100, &lo, &hi); assert(hi == 65535);            /* any non-zero is on */
+    pad_rumble_levels(0, 128, 100, &lo, &hi); assert(lo == 128 * 257 && hi == 0);
+    pad_rumble_levels(1, 128, 50, &lo, &hi);  assert(lo == 16448 && hi == 32767);
+    pad_rumble_levels(0, 100, 200, &lo, &hi); assert(lo == 51400 && hi == 0);
+    pad_rumble_levels(1, 255, 200, &lo, &hi); assert(lo == 65535 && hi == 65535); /* capped */
+    pad_rumble_levels(1, 255, 0, &lo, &hi);   assert(lo == 0 && hi == 0);
 }
 
 static void set_act(u32 port, u8 small, u8 large, s32 want)
@@ -64,6 +95,7 @@ static void test_set_act_direct(void)
     vm_base = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     assert(vm_base != MAP_FAILED);
     s_pad_initialized = 1;
+    s_rumble_pct = 100;
 
     /* No controller on port 0: the state is kept, nothing is sent. */
     set_act(0, 1, 200, CELL_OK);
@@ -77,6 +109,11 @@ static void test_set_act_direct(void)
     assert(s_calls == 1 && s_lo == 0 && s_hi == 65535);
     assert(s_ms == PAD_RUMBLE_HOLD_MS && PAD_RUMBLE_RENEW_MS < PAD_RUMBLE_HOLD_MS);
     assert(s_rumble[0].sent_ms != 0);
+
+    /* The same request again (a title that calls every frame): nothing new
+     * goes out, the renewal keeps it running. */
+    set_act(0, 1, 0, CELL_OK);
+    assert(s_calls == 1);
 
     /* The poll renews it once PAD_RUMBLE_RENEW_MS has passed, not before. */
     pad_poll_sdl2();
@@ -93,9 +130,27 @@ static void test_set_act_direct(void)
     pad_poll_sdl2();
     assert(s_calls == 3);
 
+    /* A request while another thread is in the poll: it does not wait for
+     * the controller, the poll sends it. */
+    assert(pad_lock_try());
+    set_act(0, 0, 128, CELL_OK);
+    assert(s_calls == 3 && s_rumble[0].dirty);
+    pad_unlock();
+    pad_poll_sdl2();
+    assert(s_calls == 4 && s_lo == 128 * 257 && s_hi == 0 && !s_rumble[0].dirty);
+
+    /* PS3_RUMBLE_STRENGTH scales what goes out. */
+    s_rumble_pct = 50;
+    set_act(0, 1, 255, CELL_OK);
+    assert(s_calls == 5 && s_lo == 32767 && s_hi == 32767);
+    s_rumble_pct = 0;                                  /* PS3_RUMBLE=0 */
+    set_act(0, 1, 255, CELL_OK);
+    assert(s_calls == 6 && s_lo == 0 && s_hi == 0 && s_ms == 0);
+    s_rumble_pct = 100;
+
     /* A controller that goes away drops its port's rumble. */
     set_act(0, 0, 255, CELL_OK);
-    assert(s_calls == 4 && s_lo == 65535 && s_hi == 0);
+    assert(s_calls == 7 && s_lo == 65535 && s_hi == 0);
     s_sdl_controllers[0] = (SDL_GameController*)&s_gone_gc;   /* GetAttached says no */
     pad_poll_sdl2();
     assert(s_sdl_controllers[0] == NULL && s_rumble[0].lo == 0 && s_rumble[0].sent_ms == 0);
@@ -110,6 +165,9 @@ static void test_set_act_direct(void)
 
 int main(void)
 {
+    unsetenv("PS3_PAD_SDL");
+    unsetenv("PS3_INPUT_MAP");
+    test_strength();
     test_levels();
     test_set_act_direct();
     printf("test_pad_rumble: ok\n");

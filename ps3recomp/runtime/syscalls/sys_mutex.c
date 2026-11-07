@@ -130,6 +130,19 @@ int64_t sys_mutex_create(ppu_context* ctx)
         } else {
             pthread_mutexattr_settype(&mattr, PTHREAD_MUTEX_ERRORCHECK);
         }
+#if defined(__APPLE__)
+        /* lv2 hands an unlocked mutex to a waiter (FIFO or priority order);
+         * macOS's default first-fit policy does not, and lets whoever asks
+         * next take it. A title whose worker threads lock, poll and unlock
+         * the same mutex in a loop then starves a thread blocked on it for
+         * good: Resistance's movie player never finished its intro, so the
+         * level behind it never loaded. Fair-share queues the waiters.
+         * PS3_MUTEX_FAIRSHARE=1 turns it on; off by default, as Folklore's
+         * lock-heavy threads were tuned on the default policy. */
+        static int s_fair = -1;
+        if (s_fair < 0) { const char* e = getenv("PS3_MUTEX_FAIRSHARE"); s_fair = e && *e && *e != '0'; }
+        if (s_fair) pthread_mutexattr_setpolicy_np(&mattr, PTHREAD_MUTEX_POLICY_FAIRSHARE_NP);
+#endif
         pthread_mutex_init(&m->mtx, &mattr);
         pthread_mutexattr_destroy(&mattr);
     }

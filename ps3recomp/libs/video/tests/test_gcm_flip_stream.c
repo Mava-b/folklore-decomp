@@ -72,6 +72,9 @@ void rsx_draw_engine_method(u32 method, u32 arg)
 {
     if ((method & 0x1FFCu) == 0x1D8Cu && g_n_zs_engine < 4) g_zs_engine[g_n_zs_engine++] = arg;
 }
+int  rsx_draw_engine_zpass_supported(void) { return 0; }
+u32  rsx_draw_engine_zpass_report(void) { return 0; }
+int  rsx_draw_engine_zpass_result(u32 t, int m, u32* v) { (void)t; (void)m; (void)v; return -1; }
 
 /* No microcode or constant runs here: the walker hands every word to
  * rsx_process_method instead (#554). */

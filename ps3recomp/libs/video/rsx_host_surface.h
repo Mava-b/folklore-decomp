@@ -35,6 +35,20 @@
  * launcher: when every surface is busy it reclaims the oldest READY one
  * (that frame is dropped, a newer one is coming).
  *
+ * The page also carries the keyboard and mouse (`input`, a ps3_host_input,
+ * ps3emu/host_input.h): the window is the launcher's, so its key and mouse
+ * events arrive there, and the launcher records them in the page for the
+ * game's cellPad to read on its next poll. The game writes back what it
+ * wants done with the mouse (game_flags: capture it on a click or not). An
+ * older launcher leaves the block zero, which reads as nothing pressed.
+ *
+ * The page carries the display options too, which belong to the window:
+ * the game's in-game menu (libs/video/ps3_overlay.mm) asks for vsync, a
+ * display mode or MetalFX upscaling (want_*, -1 = nothing asked) and the
+ * launcher applies the request on its next tick and reports what is in
+ * effect (now_*). display_caps is 0 from a launcher that predates them, and
+ * the menu then shows them as not available.
+ *
  * Header-only and plain C so the launcher, the backend and the tests share the
  * one implementation of the protocol.
  */
@@ -44,6 +58,8 @@
 #include <mach/mach.h>
 #include <stdatomic.h>
 #include <stdint.h>
+
+#include "../../include/ps3emu/host_input.h"
 
 /* The launcher's bootstrap service name. Its presence is what puts the Metal
  * backend in host-surface mode. */
@@ -85,7 +101,38 @@ typedef struct {
     _Atomic uint32_t state[RSX_HOST_SLOTS];
     _Atomic uint64_t seq[RSX_HOST_SLOTS];
     _Atomic uint64_t publish_time[RSX_HOST_SLOTS];   /* mach_absolute_time() */
+    ps3_host_input   input;            /* launcher: keys and mouse; game: game_flags */
+    /* the display options (see above) */
+    _Atomic uint32_t display_caps;     /* launcher: RSX_HOST_DISPLAY_* it applies */
+    _Atomic int32_t  want_vsync, want_window_mode, want_upscale;   /* game; -1 = nothing asked */
+    _Atomic int32_t  now_vsync, now_window_mode, now_upscale;      /* launcher; now_upscale -1 = no MetalFX */
 } rsx_host_control;
+
+/* display_caps */
+#define RSX_HOST_DISPLAY_VSYNC       0x1u
+#define RSX_HOST_DISPLAY_WINDOW_MODE 0x2u   /* 0 window, 1 fullscreen (macOS), 2 borderless */
+#define RSX_HOST_DISPLAY_UPSCALE     0x4u
+
+/* Game: ask for a display option (one of the want_* fields). */
+static inline void rsx_host_display_ask(_Atomic int32_t* want, int32_t v)
+{
+    atomic_store(want, v);
+}
+
+/* Launcher: the request in one want_* field, taken (-1 = none). */
+static inline int32_t rsx_host_display_take(_Atomic int32_t* want)
+{
+    return atomic_exchange(want, -1);
+}
+
+/* Launcher, when it creates the page: nothing asked yet. */
+static inline void rsx_host_display_init(rsx_host_control* c, uint32_t caps)
+{
+    atomic_store(&c->want_vsync, -1);
+    atomic_store(&c->want_window_mode, -1);
+    atomic_store(&c->want_upscale, -1);
+    atomic_store(&c->display_caps, caps);
+}
 
 _Static_assert(sizeof(rsx_host_control) <= RSX_HOST_CONTROL_BYTES, "control page");
 

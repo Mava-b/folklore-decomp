@@ -185,12 +185,20 @@ void rsx_vertex_fetch_plan_set_inline(
 void rsx_vertex_fetch_plan_prepare(
     rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count)
 {
+    rsx_vertex_fetch_plan_prepare_ex(plan, refs, count, 0);
+}
+
+void rsx_vertex_fetch_plan_prepare_ex(
+    rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
+    int consecutive)
+{
     if (!plan)
         return;
-    /* Ordinary per-vertex attributes (rsx_vertex_freq_plain) all span the same
-     * elements: find them once for the draw instead of once per attribute.
-     * The per-attribute walk was 2.2 ms of the RSX thread a frame in
-     * inFAMOUS 2's New Marais. */
+    /* Ordinary per-vertex attributes (rsx_vertex_freq_plain) all span the
+     * same elements: find them once for the draw instead of once per attribute,
+     * and not at all for a consecutive run that does not wrap the 20-bit
+     * element index. The per-attribute walk was 2.2 ms of the RSX thread a
+     * frame in inFAMOUS 2's New Marais. */
     int plain_known = 0;
     u32 plain_first = UINT_MAX, plain_last = 0;
     for (u32 slot = 0; slot < plan->layout.count; slot++) {
@@ -232,11 +240,18 @@ void rsx_vertex_fetch_plan_prepare(
                                   (plan->divider_mask >> attr) & 1u)) {
             if (!plain_known) {
                 plain_known = 1;
-                for (u32 i = 0; i < count; i++) {
-                    const u32 element = rsx_vertex_element_index(
-                        refs[i].vertex_id, refs[i].base_index, 0, 0);
-                    if (element < plain_first) plain_first = element;
-                    if (element > plain_last) plain_last = element;
+                const u32 e0 = rsx_vertex_element_index(
+                    refs[0].vertex_id, refs[0].base_index, 0, 0);
+                if (consecutive && (u64)e0 + count - 1u <= 0x000FFFFFu) {
+                    plain_first = e0;
+                    plain_last = e0 + count - 1u;
+                } else {
+                    for (u32 i = 0; i < count; i++) {
+                        const u32 element = rsx_vertex_element_index(
+                            refs[i].vertex_id, refs[i].base_index, 0, 0);
+                        if (element < plain_first) plain_first = element;
+                        if (element > plain_last) plain_last = element;
+                    }
                 }
             }
             first = plain_first;
@@ -403,6 +418,22 @@ int rsx_vertex_fetch_many(
 }
 #undef RSX_FETCH_LOOP
 
+int rsx_vertex_fetch_slots(
+    const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref,
+    const u8* slots, u32 n_slots, u8* out)
+{
+    if (!plan || !ref || (n_slots && (!slots || !out)))
+        return 0;
+    for (u32 k = 0; k < n_slots; k++) {
+        if (slots[k] >= plan->layout.count)
+            return 0;
+        if (!rsx_vertex_fetch_attr_value(plan, plan->layout.attrs[slots[k]],
+                                         ref, (float*)(out + k * 16u)))
+            return 0;
+    }
+    return 1;
+}
+
 static u64 rsx_vertex_remap_hash(u64 value)
 {
     value ^= value >> 33;
@@ -411,6 +442,42 @@ static u64 rsx_vertex_remap_hash(u64 value)
     value *= 0xc4ceb9fe1a85ec53ull;
     value ^= value >> 33;
     return value;
+}
+
+int rsx_vertex_remap_build_range(
+    rsx_vertex_remap* remap, rsx_vertex_ref* refs, u32 count,
+    u32* out_count)
+{
+    if (!remap || !refs || !count || !out_count)
+        return 0;
+    const u32 base = refs[0].base_index;
+    u32 lo = refs[0].vertex_id, hi = lo;
+    for (u32 i = 1; i < count; i++) {
+        const u32 v = refs[i].vertex_id;
+        if (refs[i].base_index != base) return 0;
+        if (v < lo) lo = v;
+        if (v > hi) hi = v;
+    }
+    const u64 span = (u64)hi - lo + 1u;
+    if (span > count)
+        return 0;
+    if (count > remap->occurrence_capacity) {
+        u32* occurrences = (u32*)realloc(
+            remap->occurrence_to_unique, (size_t)count * sizeof(u32));
+        if (!occurrences)
+            return 0;
+        remap->occurrence_to_unique = occurrences;
+        remap->occurrence_capacity = count;
+    }
+    u32* map = remap->occurrence_to_unique;
+    for (u32 i = 0; i < count; i++)
+        map[i] = refs[i].vertex_id - lo;
+    for (u32 i = 0; i < (u32)span; i++) {
+        refs[i].vertex_id = lo + i;
+        refs[i].base_index = base;
+    }
+    *out_count = (u32)span;
+    return 1;
 }
 
 int rsx_vertex_remap_build(

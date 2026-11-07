@@ -67,6 +67,15 @@ int main(void)
     assert(set_gamma(0.5) == (int32_t)0x8002b223);
     assert(cellAvconfExt_display_gamma() == 1.1f);
     assert(set_gamma(0.8) == 0 && cellAvconfExt_display_gamma() == 0.8f);
+
+    /* The in-game menu's override (ps3_overlay.mm): on, the title's value
+     * kept underneath, off again. */
+    assert(cellAvconfExt_display_gamma_override() == 0.0f && cellAvconfExt_title_gamma() == 0.8f);
+    cellAvconfExt_set_display_gamma_override(1.15f);
+    assert(cellAvconfExt_display_gamma() == 1.15f && cellAvconfExt_title_gamma() == 0.8f);
+    assert(set_gamma(0.9) == 0 && cellAvconfExt_display_gamma() == 1.15f);
+    cellAvconfExt_set_display_gamma_override(0.0f);
+    assert(cellAvconfExt_display_gamma() == 0.9f && cellAvconfExt_display_gamma_override() == 0.0f);
     puts("test_avconf_gamma: OK");
     return 0;
 }

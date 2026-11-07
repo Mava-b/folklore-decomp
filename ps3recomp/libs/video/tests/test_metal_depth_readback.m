@@ -7,6 +7,7 @@
 #include "../rsx_metal_backend.m"
 #include <math.h>
 #include <stdio.h>
+float cellAvconfExt_display_gamma(void) { return 1.0f; }   /* the present pass (cellSysutil) */
 static int failures, checks;
 #define CHECK(v, name) do { checks++; if (!(v)) { failures++; fprintf(stderr,"FAIL %s\n",name); } } while (0)
 static const char* fixture =

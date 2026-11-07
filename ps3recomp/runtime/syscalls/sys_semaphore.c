@@ -10,6 +10,7 @@
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
 #include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"   /* getenv("...") once per call site: SEMTID and SEMCHAIN are tested on every wait and post */
 
 /* ---------------------------------------------------------------------------
  * Globals

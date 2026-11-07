@@ -121,6 +121,9 @@ set(PS3RECOMP_SCAFFOLD
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_hle.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_fs.cpp"
     "${PS3RECOMP_DIR}/runtime/ppu/ppu_sysprx.cpp"
+    # Host side of the lifter's --sjlj (a title's setjmp/longjmp); unused
+    # without it.
+    "${PS3RECOMP_DIR}/runtime/ppu/ppu_sjlj.c"
 )
 
 # ---------------------------------------------------------------------------

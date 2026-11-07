@@ -12,6 +12,7 @@
  */
 /* Syscall 14's classifier (#341) lives in lv2_lock_line.c, which pulls in the
  * VM map table; nothing here issues syscall 14. */
+#include <stdint.h>
 int64_t lv2_spu_lock_line_classify(uint32_t a, uint64_t f) { (void)a; (void)f; return 0; }
 #include "../../syscalls/lv2_register.c"
 #include <assert.h>
@@ -28,9 +29,12 @@ int64_t sys_event_flag_set(ppu_context* c) { (void)c; return 0; }
 /* What the delivery pushes at the queue, recorded instead of sent. */
 static uint32_t pushed_queue, pushed_data;
 static int pushes;
+static int full_for;   /* the queue is full for this many more pushes (-1: for ever) */
+static int busy_pushes;
 int sys_event_queue_push_by_id(uint32_t queue_id, uint64_t source, uint64_t d1, uint64_t d2, uint64_t d3)
 {
     (void)source; (void)d1; (void)d2;
+    if (full_for) { if (full_for > 0) full_for--; busy_pushes++; return (int)CELL_EBUSY; }
     pushed_queue = queue_id; pushed_data = (uint32_t)d3; pushes++;
     return 0;
 }
@@ -69,6 +73,7 @@ static void reset(void)
     memset(&grp->user_event_ports, 0, sizeof grp->user_event_ports);
     thr->evt_bind_n = 0;
     pushes = 0; pushed_queue = 0;
+    full_for = 0; busy_pushes = 0;
 }
 
 typedef struct { int ms; int via_group; uint32_t queue, port; } late_bind;
@@ -129,6 +134,18 @@ int main(void)
     r = send_event(0x11, &ms);
     CHECK(r == CELL_ENOTCONN && pushes == 0, "a port nobody binds: answer 0x%08X, %d pushes", r, pushes);
     CHECK(ms >= 150.0 && ms < 1000.0, "the wait for a port nobody binds took %.0f ms (bounded, about 200)", ms);
+
+    /* A full queue: the event waits for the consumer to make room, bounded. */
+    reset(); bind_thread(0x77, 0x2A); full_for = 20;
+    r = send_event(0x2A, &ms);
+    CHECK(r == CELL_OK && pushes == 1 && busy_pushes == 20,
+          "a queue full for 20 pushes: answer 0x%08X, %d pushes, %d refused", r, pushes, busy_pushes);
+    CHECK(ms < 200.0, "the event waited %.0f ms for a queue that freed after 20 tries", ms);
+    reset(); bind_thread(0x77, 0x2A); full_for = -1;
+    r = send_event(0x2A, &ms);
+    CHECK(r == CELL_EBUSY && pushes == 0 && busy_pushes > 1,
+          "a queue that stays full: answer 0x%08X, %d pushes, %d refused", r, pushes, busy_pushes);
+    CHECK(ms >= 200.0 && ms < 1000.0, "the wait on a queue that stays full took %.0f ms (bounded, about 250)", ms);
 
     reset();
     spu.spu_id = 0x7FFFFF;                       /* no such thread: nothing will ever bind its port */

@@ -62,6 +62,10 @@ void rsx_vp_set_branch_base(u32 start_slot);
  * program that rsx_vp_uses_branch_bits() must be keyed on them too. */
 void rsx_vp_set_branch_bits(u32 bits);
 int rsx_vp_uses_branch_bits(const u8* ucode, u32 max_bytes);
+/* 1 when the program has a flow instruction (BRA BRI CAL CLI RET BRB CLB):
+ * its targets are absolute VP slots, so it decompiles differently for each
+ * rsx_vp_set_branch_base() and must be keyed on the slot it starts at. */
+int rsx_vp_has_flow(const u8* ucode, u32 max_bytes);
 
 /* Bit N in vtex_mask declares NV40 2D vertex-texture unit N at t(16+N),
  * sampler sN, and turns TXL for that unit into SampleLevel(..., LOD 0).

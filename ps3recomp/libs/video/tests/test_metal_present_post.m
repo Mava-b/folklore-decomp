@@ -1,7 +1,8 @@
-/* The draw engine's present pass with PS3_AA=fxaa / smaa, PS3_SHARPEN,
- * PS3_VIBRANCE and PS3_CONTRAST: what each one does to a small synthetic
- * display buffer, and that with all of them off the present is still an
- * exact copy. Needs a Metal device; no window.
+/* The draw engine's present pass with PS3_AA=fxaa or smaa, PS3_SHARPEN and the
+ * colour filters (PS3_VIBRANCE, PS3_CONTRAST, PS3_LUT, PS3_VIGNETTE,
+ * PS3_GRAIN): what each one does to a small synthetic display buffer, and
+ * that with all of them off the present is still an exact copy. Needs a
+ * Metal device; no window.
  *
  *   clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_present_post.m \
  *     -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
@@ -26,10 +27,17 @@ static id<MTLTexture> tex(MTLTextureUsage usage)
     return t;
 }
 
-/* One present of `in` with the given options (aa: 0 off, 1 FXAA, 2 SMAA);
- * the result in `out`. */
+/* The colour filters, as eng_post_options would have read them. */
+static void filters(float vib, float con, float vig, float grain)
+{
+    s_eng_post_read = 1;
+    s_eng_vibrance = vib; s_eng_contrast = con; s_eng_vignette = vig; s_eng_grain = grain;
+}
+
+/* One present of `in` with the given options (aa: 0 off, 1 FXAA, 2 SMAA) and
+ * the colour filters as filters() last set them; the result in `out`. */
 enum { AA_OFF, AA_FXAA, AA_SMAA };
-static void present_ex(const px4* in, px4* out, int aa, float sharpen, float vibrance, float contrast)
+static void present(const px4* in, px4* out, int aa, float sharpen)
 {
     id<MTLTexture> src = tex(MTLTextureUsageShaderRead);
     id<MTLTexture> dst = tex(MTLTextureUsageRenderTarget);
@@ -37,8 +45,6 @@ static void present_ex(const px4* in, px4* out, int aa, float sharpen, float vib
     s_eng_fxaa = aa == AA_FXAA;
     s_eng_smaa = aa == AA_SMAA;
     s_eng_sharpen = sharpen;
-    s_eng_vibrance = vibrance;
-    s_eng_contrast = contrast;
     id<MTLCommandBuffer> cb = [s_queue commandBuffer];
     eng_blit_to_display(cb, src, dst);
     [cb commit];
@@ -46,9 +52,11 @@ static void present_ex(const px4* in, px4* out, int aa, float sharpen, float vib
     assert(cb.status == MTLCommandBufferStatusCompleted);
     [dst getBytes:out bytesPerRow:W * 4 fromRegion:MTLRegionMake2D(0, 0, W, H) mipmapLevel:0];
 }
-static void present(const px4* in, px4* out, int aa, float sharpen)
+/* The same with vibrance and contrast (vignette and grain off). */
+static void present_ex(const px4* in, px4* out, int aa, float sharpen, float vibrance, float contrast)
 {
-    present_ex(in, out, aa, sharpen, 0.0f, 1.0f);
+    filters(vibrance, contrast, 0.0f, 0.0f);
+    present(in, out, aa, sharpen);
 }
 
 /* Pixels of the staircase rows (1..14) that took an in-between value; every
@@ -75,6 +83,29 @@ static int staircase_blended(const px4* in, const px4* out)
 
 static void grey(px4 p, unsigned v, unsigned a) { p[0] = p[1] = p[2] = (unsigned char)v; p[3] = (unsigned char)a; }
 
+/* A ReShade-layout LUT of n^3 (n*n x n), identity or inverted. */
+static void make_lut(int n, int invert)
+{
+    MTLTextureDescriptor* d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+                                                                                  width:n * n height:n mipmapped:NO];
+    d.usage = MTLTextureUsageShaderRead;
+    id<MTLTexture> t = [s_dev newTextureWithDescriptor:d];
+    unsigned char* px = malloc((size_t)n * n * n * 4);
+    for (int g = 0; g < n; g++)
+        for (int b = 0; b < n; b++)
+            for (int r = 0; r < n; r++) {
+                unsigned char* q = px + ((size_t)g * n * n + b * n + r) * 4;
+                const int R = r * 255 / (n - 1), G = g * 255 / (n - 1), B = b * 255 / (n - 1);
+                q[0] = (unsigned char)(invert ? 255 - R : R); q[1] = (unsigned char)(invert ? 255 - G : G);
+                q[2] = (unsigned char)(invert ? 255 - B : B); q[3] = 255;
+            }
+    [t replaceRegion:MTLRegionMake2D(0, 0, n * n, n) mipmapLevel:0 withBytes:px bytesPerRow:n * n * 4];
+    free(px);
+    s_eng_lut = t;
+    s_eng_lut_size = (float)n;
+    s_eng_lut_strength = 1.0f;
+}
+
 int main(void)
 {
     @autoreleasepool {
@@ -83,6 +114,7 @@ int main(void)
         s_queue = [s_dev newCommandQueue];
         assert(s_queue);
         assert(eng_init(NULL, W, H) == 0);
+        filters(0.0f, 1.0f, 0.0f, 0.0f);      /* every colour filter off */
 
         static px4 in[W * H], out[W * H];
 
@@ -177,6 +209,70 @@ int main(void)
         printf("contrast 0.5: 140 -> %u, 100 -> %u\n", out[0][2], out[0][0]);
         assert(abs((int)out[0][2] - 134) <= 1 && abs((int)out[0][0] - 114) <= 1);
         assert(abs((int)out[2][0] - 128) <= 1);
+
+        /* ---- the colour filters ---- */
+        /* a dull colour (B 100, G 120, R 140) left half, mid grey right half */
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) {
+                unsigned char* q = in[y * W + x];
+                if (x < W / 2) { q[0] = 100; q[1] = 120; q[2] = 140; q[3] = 0xFF; }
+                else grey(q, 128, 0xFF);
+            }
+        filters(0.0f, 1.0f, 0.0f, 0.0f);
+        present(in, out, 0, 0.0f);
+        assert(!memcmp(in, out, sizeof in));                 /* all neutral: exact copy */
+
+        /* vibrance: the dull colour spreads away from its grey, grey stays */
+        filters(1.0f, 1.0f, 0.0f, 0.0f);
+        present(in, out, 0, 0.0f);
+        printf("vibrance 1: (140,120,100) -> (%u,%u,%u)\n", out[row + 4][2], out[row + 4][1], out[row + 4][0]);
+        assert(out[row + 4][2] > 140 + 10 && out[row + 4][0] < 100 - 10);
+        assert(abs((int)out[row + 24][0] - 128) <= 1 && abs((int)out[row + 24][2] - 128) <= 1);
+        filters(-1.0f, 1.0f, 0.0f, 0.0f);                   /* negative mutes it */
+        present(in, out, 0, 0.0f);
+        assert(out[row + 4][2] < 140 && out[row + 4][0] > 100);
+
+        /* contrast 1.5: away from mid grey; mid grey stays */
+        filters(0.0f, 1.5f, 0.0f, 0.0f);
+        present(in, out, 0, 0.0f);
+        assert(out[row + 4][2] > 140 && out[row + 4][0] < 100);
+        assert(abs((int)out[row + 24][0] - 128) <= 1);
+
+        /* vignette: the corners darker, the middle as it was */
+        for (int i = 0; i < W * H; i++) grey(in[i], 200, 0xFF);
+        filters(0.0f, 1.0f, 1.0f, 0.0f);
+        present(in, out, 0, 0.0f);
+        printf("vignette 1: corner %u, middle %u\n", out[0][0], out[(H / 2) * W + W / 2][0]);
+        assert(out[0][0] < 120 && out[(H / 2) * W + W / 2][0] == 200);
+
+        /* grain: a flat picture gets noise around its level */
+        filters(0.0f, 1.0f, 0.0f, 1.0f);
+        present(in, out, 0, 0.0f);
+        { int changed = 0; long sum = 0;
+          for (int i = 0; i < W * H; i++) { changed += out[i][0] != 200; sum += out[i][0]; }
+          printf("grain 1: %d of %d pixels moved, mean %.1f\n", changed, W * H, (double)sum / (W * H));
+          assert(changed > W * H / 2 && labs(sum / (W * H) - 200) <= 3); }
+
+        /* LUT: identity keeps the picture, an inverted one inverts it */
+        for (int y = 0; y < H; y++)
+            for (int x = 0; x < W; x++) { unsigned char* q = in[y * W + x];
+                q[0] = (unsigned char)(x * 8); q[1] = (unsigned char)(y * 8); q[2] = 77; q[3] = 0xFF; }
+        filters(0.0f, 1.0f, 0.0f, 0.0f);
+        make_lut(16, 0);
+        present(in, out, 0, 0.0f);
+        { int worst = 0;
+          for (int i = 0; i < W * H; i++)
+              for (int c = 0; c < 3; c++) { const int d = abs((int)out[i][c] - (int)in[i][c]); if (d > worst) worst = d; }
+          printf("identity LUT 16^3: worst error %d\n", worst);
+          assert(worst <= 3); }
+        make_lut(16, 1);
+        present(in, out, 0, 0.0f);
+        assert(abs((int)out[row + 5][0] - (255 - in[row + 5][0])) <= 3);
+        assert(abs((int)out[row + 5][2] - (255 - 77)) <= 3);
+        s_eng_lut_strength = 0.5f;                           /* half strength: half way */
+        present(in, out, 0, 0.0f);
+        assert(abs((int)out[row + 5][2] - (77 + (255 - 77)) / 2) <= 3);
+        s_eng_lut = nil;
 
         puts("test_metal_present_post: ok");
     }

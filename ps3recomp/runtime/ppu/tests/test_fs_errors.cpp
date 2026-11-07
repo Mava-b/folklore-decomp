@@ -33,6 +33,8 @@ void ppu_guest_caller(char* out, size_t n) { if (n) out[0] = 0; }
 void ps3_vfs_ps3game_fallback(char* path, size_t cap) { (void)path; (void)cap; }
 void ydkj_host_bt(const char* tag) { (void)tag; }
 void ps3_hle_register_ctx(uint32_t, const char*, void (*)(ppu_context*)) {}
+void ps3_quit_gate_enter(void) {}   /* include/ps3emu/quit_gate.h, in cellSaveData.c */
+void ps3_quit_gate_leave(void) {}
 }
 ps3_guest_caller_fn g_ps3_guest_caller = nullptr;
 const char* edat_resolve(const char* host_path, char* buf, size_t cap) { (void)buf; (void)cap; return host_path; }

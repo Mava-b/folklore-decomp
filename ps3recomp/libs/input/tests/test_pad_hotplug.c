@@ -2,16 +2,18 @@
  * (a DualSense over Bluetooth comes back with a new instance id) is opened
  * again without a restart, into the port it had; a new one goes into a free
  * port, also when nobody delivered its device event; the ports report the
- * change once (CELL_PAD_STATUS_ASSIGN_CHANGES), and no rumble is left over.
+ * change once (CELL_PAD_STATUS_ASSIGN_CHANGES), no rumble is left over, and
+ * the input map and input mode apply to it.
  *
  *   clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" \
- *         libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -o /tmp/test_pad_hotplug && /tmp/test_pad_hotplug
+ *         libs/input/tests/test_pad_hotplug.c -o /tmp/test_pad_hotplug && /tmp/test_pad_hotplug
  *
- * No controller is opened: the test defines every SDL call the backend makes
- * (they take precedence over libSDL2's), over a fake device list that behaves
- * like Homebrew's SDL2 (sdl2-compat on SDL3): a device index resolves through
- * a list refreshed only by SDL_NumJoysticks, so code that never calls it
- * keeps seeing the switched-off controller.
+ * Nothing links SDL (linking it changes nothing either: the definitions here
+ * take precedence over libSDL2's). No controller is opened: the test defines
+ * every SDL call the backend makes, over a fake device list that behaves like
+ * Homebrew's SDL2 (sdl2-compat on SDL3): a device index resolves through a
+ * list refreshed only by SDL_NumJoysticks, so code that never calls it keeps
+ * seeing the switched-off controller.
  */
 #include "../cellPad.c"
 #include <assert.h>
@@ -86,6 +88,7 @@ SDL_GameController* SDL_GameControllerOpen(int idx)
 void SDL_GameControllerClose(SDL_GameController* gc) { ((FakePad*)gc)->closed = 1; }
 SDL_bool SDL_GameControllerGetAttached(SDL_GameController* gc) { return ((FakePad*)gc)->present ? SDL_TRUE : SDL_FALSE; }
 const char* SDL_GameControllerName(SDL_GameController* gc) { (void)gc; return "Fake DualSense"; }
+SDL_GameControllerType SDL_GameControllerGetType(SDL_GameController* gc) { (void)gc; return SDL_CONTROLLER_TYPE_PS5; }
 SDL_bool SDL_GameControllerHasRumble(SDL_GameController* gc) { (void)gc; return SDL_TRUE; }
 int SDL_GameControllerRumble(SDL_GameController* gc, Uint16 lo, Uint16 hi, Uint32 ms)
 {
@@ -118,6 +121,7 @@ int SDL_PeepEvents(SDL_Event* ev, int n, SDL_eventaction action, Uint32 lo, Uint
 }
 Uint32 SDL_WasInit(Uint32 flags) { (void)flags; return flags; }
 int SDL_InitSubSystem(Uint32 flags) { (void)flags; return 0; }
+SDL_bool SDL_SetHint(const char* name, const char* value) { (void)name; (void)value; return SDL_TRUE; }
 const char* SDL_GetError(void) { return "fake"; }
 
 /* ---- helpers ---------------------------------------------------------------- */
@@ -143,12 +147,25 @@ static unsigned data_digital2(u32 port)
     const uint8_t* b = vm_base + ea + 4 + CELL_PAD_BTN_OFFSET_DIGITAL2 * 2;
     return (unsigned)b[0] << 8 | b[1];
 }
+static unsigned data_digital1(u32 port)
+{
+    const uint32_t ea = 0x2000;
+    usleep((PAD_POLL_INTERVAL_MS + 2) * 1000);
+    assert(cellPadGetData(port, (CellPadData*)(uintptr_t)ea) == CELL_OK);
+    const uint8_t* b = vm_base + ea + 4 + CELL_PAD_BTN_OFFSET_DIGITAL1 * 2;
+    return (unsigned)b[0] << 8 | b[1];
+}
 #define CROSS_BIT  0x40u   /* in DIGITAL2 */
 #define CIRCLE_BIT 0x20u
 
 /* ---- the tests -------------------------------------------------------------- */
 int main(void)
 {
+    unsetenv("PS3_PAD_SDL");
+    unsetenv("PS3_INPUT_MAP");
+    unsetenv("PS3_INPUT_MODE");
+    unsetenv("PS3_RUMBLE");
+    unsetenv("PS3_RUMBLE_STRENGTH");
     vm_base = mmap(NULL, 0x10000, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
     assert(vm_base != MAP_FAILED);
 
@@ -228,6 +245,28 @@ int main(void)
     fake_event(SDL_CONTROLLERDEVICEADDED);
     poll_once();
     assert(s_sdl_controllers[2] == (SDL_GameController*)c);
+
+    /* The map ([controller] in PS3_INPUT_MAP) applies to the reconnected
+     * pad: Circle (SDL "b") bound to Cross. */
+    pim_rebind(&s_map, PIM_SEC_CONTROLLER, PIM_CROSS, 1);
+    a3->buttons = 1u << SDL_CONTROLLER_BUTTON_B;
+    { const unsigned d2 = data_digital2(0);
+      assert((d2 & CROSS_BIT) && !(d2 & CIRCLE_BIT)); }      /* b left circle: it was moved */
+    pim_defaults(&s_map);
+
+    /* Input mode: keyboard and mouse only hides the controllers from the
+     * title; controller only hides the keys. */
+    s_input_mode = PAD_MODE_KEYBOARD;
+    a3->buttons = 1u << SDL_CONTROLLER_BUTTON_A;
+    assert(!(data_digital2(0) & CROSS_BIT));
+    s_input_mode = PAD_MODE_CONTROLLER;
+    a3->buttons = 0;
+    ps3_host_input_key(ps3_pad_host_input(), 0x31, 1);     /* Space: Cross on the keyboard */
+    assert(!(data_digital2(0) & CROSS_BIT));
+    s_input_mode = PAD_MODE_BOTH;
+    assert(data_digital2(0) & CROSS_BIT);
+    ps3_host_input_release_all(ps3_pad_host_input());
+    (void)data_digital1;
 
     assert(cellPadEnd() == CELL_OK);
     assert(a3->closed && b2->closed && c->closed);

@@ -381,7 +381,10 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
      * (RPCS3 VKFormats.cpp get_component_mapping: R,R,R,R): a retail title
      * reads its DEPTH16 shadow maps through crossbar 0xA900, R, G and B from A,
      * which through lanes_argb was the resource's opaque alpha -- every
-     * shadow compare saw depth 1.0. */
+     * shadow compare saw depth 1.0. X32_FLOAT is one 32-bit channel uploaded
+     * as R32F and presented the same way (RPCS3's {R,R,R,R}); a title that
+     * copies depth into an X32_FLOAT target and reads it back through another
+     * lane got 0 or 1 instead. */
     static const u8 lanes_argb[4]  = {3, 0, 1, 2};
     static const u8 lanes_g8b8[4]  = {1, 0, 1, 0};
     static const u8 lanes_b8[4]    = {RSX_REMAP_ONE, 0, 0, 0};
@@ -389,7 +392,8 @@ void rsx_texture_component_remap(u32 control1, u32 rsx_fmt, u8 out[4])
     const u32 base = rsx_fmt & 0x9Fu;
     const u8* src2res = (base == 0x8Bu) ? lanes_g8b8
                       : (base == 0x81u || base == 0x94u) ? lanes_b8
-                      : (base >= 0x90u && base <= 0x93u) ? lanes_depth : lanes_argb;
+                      : ((base >= 0x90u && base <= 0x93u) || base == 0x9Cu) ? lanes_depth
+                      : lanes_argb;
 
     if (!(control1 & 0xFFFFu)) control1 = 0xAAE4u;   /* unset -> identity */
 

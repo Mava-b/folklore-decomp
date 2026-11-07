@@ -29,6 +29,7 @@ static u32 s_gcm_context_ea = 0;
 #include <stdint.h>
 #include "ps3emu/log_first.h"
 #include "../../runtime/ps3_log.h"   /* ps3_log_verbose: the per-call tile/zcull lines */
+#include "ps3emu/env_cache.h"   /* ps3_env_flag: debug switches read once */
 
 #ifdef _WIN32
 #include <windows.h>
@@ -353,6 +354,10 @@ static u32 s_second_v_handler_opd = 0;
  * before each invocation if it's been clobbered. */
 extern u32 vm_read32(unsigned int);
 static u32 s_flip_handler_code    = 0;
+/* FLIP_DBG: flip and flip-status tracing (the status query is polled in
+ * wait loops, so the switch is read once). */
+static int s_flip_dbg = -1;
+#define GCM_FLIP_DBG() ps3_env_flag(&s_flip_dbg, "FLIP_DBG")
 static u32 s_vblank_handler_code  = 0;
 static void ydkj_restore_handler_opd(u32 opd, u32 code) {
     static int fix = -1; if (fix < 0) fix = getenv("YDKJ_HANDLERFIX") ? 1 : 0;
@@ -450,6 +455,8 @@ static CellGcmReportData s_report_data[CELL_GCM_MAX_REPORT_COUNT];
  * guest memory at gcm_io2ea(offset), where the title reads it itself.
  * Killzone 3 sets 0xFEED0001 and keeps its reports in its own frame data. */
 static u32 s_report_dma = 0xFEED0000u;
+/* The deferred report queue's ends (gcm_dq_* below). */
+static u32 s_dq_head, s_dq_tail;
 static u64 s_report_last_ts;
 
 /* GET_REPORT timestamp in nanoseconds, strictly rising: two reports in one
@@ -634,6 +641,7 @@ s32 cellGcmInit(u32 cmdSize, u32 ioSize, u32 ioAddress)
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
     s_report_dma = 0xFEED0000u;
+    s_dq_head = s_dq_tail = 0;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));
@@ -973,8 +981,7 @@ void cellGcmSetWaitFlipUnsafe(void) { cellGcmSetWaitFlip(); }
 void cellGcmResetFlipStatus(void)
 {
     { static int n = 0;
-      static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
-      if (fd && PS3_LOG_FIRST(n, 12))
+      if (GCM_FLIP_DBG() && PS3_LOG_FIRST(n, 12))
           fprintf(stderr, "[FLIP] ResetFlipStatus%c", 10); }
     FLIP_LOCK();
     s_flip_status = CELL_GCM_FLIP_STATUS_WAITING;
@@ -993,8 +1000,7 @@ u32 cellGcmGetFlipStatus(void)
      * every wait-for-flip loop exit on its first poll, so titles ran
      * completely unpaced (wave: 95 fps with a fixed-dt simulation). */
     { static int n = 0;
-      static int fd = -1; if (fd < 0) fd = getenv("FLIP_DBG") ? 1 : 0;
-      if (fd && PS3_LOG_FIRST(n, 24))
+      if (GCM_FLIP_DBG() && PS3_LOG_FIRST(n, 24))
           fprintf(stderr, "[FLIP] GetFlipStatus -> %u (0=DONE 1=WAITING)%c",
                   s_flip_status, 10); }
     return s_flip_status;
@@ -1276,6 +1282,39 @@ void cellGcm_note_frame_presented(void)
     }
 }
 
+/* PS3_FLIP_MAX_HZ=<hz>: complete flips no closer together than 1/hz, on top of
+ * the vblank ticks. With an uncapped title (Resistance's unlock-fps patch)
+ * running on 16 ms ticks, a frame that takes 17 ms waits for the tick after
+ * next and shows for 32 ms; on 120 Hz ticks with a 60 Hz cap it waits 25 ms
+ * instead, so the rate degrades smoothly rather than halving. Unset or 0: off. */
+#ifdef _WIN32
+static uint64_t host_monotonic_ns(void) { return (uint64_t)GetTickCount64() * 1000000ull; }
+#else
+extern uint64_t host_monotonic_ns(void);   /* runtime/syscalls/sys_timer.c */
+#endif
+static uint64_t s_flip_cap_period_ns = (uint64_t)-1, s_flip_cap_last_ns;
+
+static int gcm_flip_cap_due(uint64_t now)
+{
+    if (s_flip_cap_period_ns == (uint64_t)-1) {
+        const char* e = getenv("PS3_FLIP_MAX_HZ");
+        const double hz = e ? atof(e) : 0.0;
+        s_flip_cap_period_ns = (hz >= 10.0 && hz <= 1000.0) ? (uint64_t)(1e9 / hz) : 0;
+        if (s_flip_cap_period_ns) fprintf(stderr, "[cellGcmSys] flips capped at %.2f Hz\n", hz);
+    }
+    /* Against the ideal schedule, not the late completion, so a cap of 60
+     * averages 60 even though completions land on tick boundaries. */
+    return !s_flip_cap_period_ns ||
+           now + s_flip_cap_period_ns / 8 >= s_flip_cap_last_ns + s_flip_cap_period_ns;
+}
+
+static void gcm_flip_cap_commit(uint64_t now)
+{
+    const uint64_t p = s_flip_cap_period_ns;
+    if (!p || p == (uint64_t)-1) return;
+    s_flip_cap_last_ns = now > s_flip_cap_last_ns + 2 * p ? now : s_flip_cap_last_ns + p;
+}
+
 void cellGcmTickFlip(void)
 {
     /* One flip reaches the screen per vblank, once the drain has reached it
@@ -1288,8 +1327,11 @@ void cellGcmTickFlip(void)
     }
     /* Same rule as cellGcm_request_tick: a flip still ahead of the drain has
      * not happened yet. */
+    const uint64_t now = host_monotonic_ns();
     FLIP_LOCK();
-    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING && gcm_flip_executed_take();
+    const int waiting = s_flip_status == CELL_GCM_FLIP_STATUS_WAITING &&
+                        gcm_flip_cap_due(now) && gcm_flip_executed_take();
+    if (waiting) gcm_flip_cap_commit(now);
     if (waiting) s_flip_tick_seq = s_flip_req_seq;
     FLIP_UNLOCK();
     if (waiting) GCM_PENDING_SET(2);
@@ -2261,6 +2303,146 @@ static void gcm_ref_push_at(u32 v, u32 getoff)
     s_ref_qtail = t + 1;
 }
 
+/* ---- ZPASS reports, and the label writes ordered behind them ------------
+ *
+ * GET_REPORT of type 1 (ZPASS_PIXEL_CNT) reports how many samples passed the
+ * depth and stencil tests since the last CLEAR_REPORT_VALUE. The walker used
+ * to answer 0xFFFF ("visible") on the spot, so every query-gated effect drew
+ * even when it was hidden. With the draw engine on a backend that counts
+ * (rsx_draw_engine_zpass_*), the count is measured on the host GPU -- but
+ * the walker reaches GET_REPORT long before the GPU has run the draws it
+ * counts, so the report is queued with a ticket and stored once the count
+ * exists. On the RSX a report lands when the pipeline gets there, and a
+ * semaphore release, back-end label or reference after it lands after it: a
+ * title that waits for a label and then reads its reports (Resistance writes
+ * its frame labels right after the frame that issued its 16 queries) must
+ * never see the label first. So while a report is pending, every later
+ * report, label/semaphore write and SET_REFERENCE joins the queue behind it,
+ * in FIFO order.
+ *
+ * Nothing waits for ever: the queue is pumped at both ends of every walker
+ * pass; when the walker has nothing left to do (or sits on an acquire) and a
+ * label is queued behind a report whose draws are still only recorded, the
+ * engine submits them (RSX_ZPASS_KICK); and a report older than
+ * GCM_ZPASS_WAIT_MS (default 100) is forced (RSX_ZPASS_WAIT) and, if its
+ * count still is not there, answered with the old constant.
+ *
+ * Host counting is off unless PS3RECOMP_ENG_ZPASS=1 (otherwise the constant
+ * answer, nothing queued). GCM_ZPASS_LOG=<n> prints the first n measured
+ * reports. */
+enum { GCM_DQ_REPORT, GCM_DQ_LABEL, GCM_DQ_METHOD, GCM_DQ_REF };
+typedef struct {
+    u8  kind;
+    u8  main_mem;          /* report: dest is a guest EA, else a s_report_data index */
+    u32 dest;              /* report destination / label EA / method / ref getoff */
+    u32 value;             /* report fallback / label value / method data / ref value */
+    u32 ticket;            /* report: rsx_draw_engine_zpass_report, 0 = fixed value */
+    u64 ts;                /* report timestamp */
+    unsigned long long t0; /* when it was queued (ms) */
+} gcm_dq_entry;
+#define GCM_DQ_LEN 512u
+static gcm_dq_entry s_dq[GCM_DQ_LEN];
+static rsx_state* s_dq_state;      /* the walker's, for a deferred semaphore method */
+
+static int gcm_dq_active(void) { return s_dq_head != s_dq_tail; }
+
+/* Is GET_REPORT(ZPASS) measured on the host? */
+static int gcm_zpass_host(void)
+{
+    return rsx_draw_engine_enabled() && rsx_draw_engine_zpass_supported();
+}
+
+static void gcm_report_store(int main_mem, u32 dest, u64 ts, u32 val)
+{
+    if (main_mem) {
+        /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
+        vm_write32(dest, (u32)(ts >> 32));
+        vm_write32(dest + 4u, (u32)ts);
+        vm_write32(dest + 8u, val);
+        vm_write32(dest + 12u, 0u);
+    } else if (dest < CELL_GCM_MAX_REPORT_COUNT) {
+        s_report_data[dest].timestamp = ts;
+        s_report_data[dest].value = val;
+    }
+}
+
+static void gcm_dq_run(const gcm_dq_entry* e, u32 report_value)
+{
+    switch (e->kind) {
+    case GCM_DQ_REPORT: gcm_report_store(e->main_mem, e->dest, e->ts, report_value); break;
+    case GCM_DQ_LABEL:  atomic_thread_fence(memory_order_release); vm_write32(e->dest, e->value); break;
+    case GCM_DQ_METHOD: if (s_dq_state) rsx_process_method(s_dq_state, e->dest, e->value); break;
+    case GCM_DQ_REF:    gcm_ref_push_at(e->value, e->dest); break;
+    }
+}
+
+/* Store what can be stored, in order. `mode`: RSX_ZPASS_POLL looks only;
+ * RSX_ZPASS_KICK also submits recorded work when a label waits behind the
+ * head report; RSX_ZPASS_WAIT resolves the head whatever it takes. */
+static void gcm_dq_pump(int mode)
+{
+    static int wait_ms = -1, log_n = -1;
+    if (wait_ms < 0) { const char* e = getenv("GCM_ZPASS_WAIT_MS"); wait_ms = e ? atoi(e) : 100;
+                       if (wait_ms < 0) wait_ms = 0; }
+    if (log_n < 0) { const char* e = getenv("GCM_ZPASS_LOG"); log_n = e ? atoi(e) : 0; }
+    while (gcm_dq_active()) {
+        const gcm_dq_entry* e = &s_dq[s_dq_head % GCM_DQ_LEN];
+        u32 v = e->value;
+        if (e->kind == GCM_DQ_REPORT && e->ticket) {
+            int m = mode;
+            if (m == RSX_ZPASS_KICK) {          /* only for a waiter behind it */
+                int behind = 0;
+                for (u32 i = s_dq_head + 1u; i != s_dq_tail && !behind; i++)
+                    behind = s_dq[i % GCM_DQ_LEN].kind != GCM_DQ_REPORT;
+                if (!behind) m = RSX_ZPASS_POLL;
+            }
+            const int aged = ps3_ms_now() - e->t0 >= (unsigned long long)wait_ms;
+            if (aged) m = RSX_ZPASS_WAIT;
+            u32 n = 0;
+            int r = rsx_draw_engine_zpass_result(e->ticket, m, &n);
+            if (r == 0 && m != RSX_ZPASS_WAIT) break;          /* not yet */
+            if (r > 0) {
+                v = n;
+                if (log_n > 0) { log_n--;
+                    fprintf(stderr, "[GET_REPORT] zpass ticket %u: %u samples%s\n",
+                            e->ticket, n, aged ? " (forced)" : ""); }
+            } else {
+                static int ln = 0;
+                if (PS3_LOG_FIRST(ln, 8))
+                    fprintf(stderr, "[GET_REPORT] zpass ticket %u: count %s, reporting 0x%X\n",
+                            e->ticket, r == 0 ? "late" : "lost", e->value);
+            }
+        }
+        gcm_dq_run(e, v);
+        s_dq_head++;
+    }
+}
+
+static void gcm_dq_push(const gcm_dq_entry* e)
+{
+    if (s_dq_tail - s_dq_head >= GCM_DQ_LEN) gcm_dq_pump(RSX_ZPASS_WAIT);
+    if (s_dq_tail - s_dq_head >= GCM_DQ_LEN) {      /* cannot happen: WAIT resolves the head */
+        gcm_dq_run(&s_dq[s_dq_head % GCM_DQ_LEN], s_dq[s_dq_head % GCM_DQ_LEN].value);
+        s_dq_head++;
+    }
+    gcm_dq_entry* d = &s_dq[s_dq_tail % GCM_DQ_LEN];
+    *d = *e;
+    d->t0 = ps3_ms_now();
+    s_dq_tail++;
+}
+
+/* A label, semaphore method or reference the walker meets: run it now, or
+ * queue it behind a pending report. Returns 1 when it was queued. */
+static int gcm_dq_defer(u8 kind, u32 dest, u32 value)
+{
+    if (!gcm_dq_active()) return 0;
+    gcm_dq_entry e;
+    memset(&e, 0, sizeof e);
+    e.kind = kind; e.dest = dest; e.value = value;
+    gcm_dq_push(&e);
+    return 1;
+}
+
 /* Global fence-publication counter: lets the lwmutex convoy trace correlate a
  * long lock hold with the number of paced fence publications inside it (the
  * 200us pacing x hundreds of one-ahead fences = the ~156ms holds). */
@@ -2600,16 +2782,25 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
      * The gate lives here rather than at the call sites because #554 funnelled
      * every 3D method through this function -- there are two callers, and a
      * gate at one of them only would be a silent half-measure. */
-    if (legacy_state_live || gcm_legacy_method_has_effect(m))
-        rsx_process_method(st, m, v);
+    /* The semaphore context, offset and back-end label writes
+     * (rsx_commands.c) wait behind a pending ZPASS report (gcm_dq_* above;
+     * nothing is ever pending unless PS3RECOMP_ENG_ZPASS=1). */
+    if (legacy_state_live || gcm_legacy_method_has_effect(m)) {
+        if (!((m == 0x1A4u || m == 0x1D6Cu || m == 0x1D70u || m == 0x1D74u) &&
+              gcm_dq_defer(GCM_DQ_METHOD, m, v)))
+            rsx_process_method(st, m, v);
+    }
     /* NV406E_SET_REFERENCE: queue the fence value for PACED
      * publication (gcm_ref_publish below) instead of letting a
      * later fence in the same batch overwrite it. */
-    if (m == 0x50) gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
+    if (m == 0x50 && !gcm_dq_defer(GCM_DQ_REF, s_fifo_getoff, g_rsx_last_reference))
+        gcm_ref_push_at(g_rsx_last_reference, s_fifo_getoff);
     /* NV4097_GET_REPORT: (type << 24) | offset into the report
-     * area. Sample counts are not measured, so a ZPASS query
-     * reports "visible" -- the conservative answer; reading 0
-     * tells the title every queried object is occluded. */
+     * area. A ZPASS count is measured on the host GPU when the
+     * draw engine's backend can and PS3RECOMP_ENG_ZPASS=1 (the queue
+     * above); otherwise a ZPASS query reports "visible" -- the
+     * conservative answer; reading 0 tells the title every queried
+     * object is occluded. The other types (ZCULL statistics) report 0. */
     if (m == 0x1A8) s_report_dma = v;
     if (m == 0x1800) {
         const u32 off = v & 0xFFFFFFu, idx = off / 16u;
@@ -2617,18 +2808,24 @@ static void gcm_3d_method(rsx_state* st, u32 m, u32 v, int legacy_state_live)
         const u64 ts = gcm_report_timestamp();
         const int main_mem = s_report_dma == 0xFEED0001u || s_report_dma == 0xBAD68000u;
         { static int rn = 0; if (PS3_LOG_FIRST(rn, 6)) printf("[GET_REPORT] type=%u off=0x%X dma=0x%08X%c", v >> 24, off, s_report_dma, 10); }
+        u32 dest = idx;
         if (main_mem) {
+            dest = gcm_io2ea(off);
+            if (!dest) { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
+        }
+        const u32 ticket = ((v >> 24) == 1u && gcm_zpass_host())
+                         ? rsx_draw_engine_zpass_report() : 0u;
+        if ((main_mem && !dest) || (!main_mem && idx >= CELL_GCM_MAX_REPORT_COUNT)) {
+            /* nowhere to write it */
+        } else if (ticket || gcm_dq_active()) {
+            gcm_dq_entry e;
+            memset(&e, 0, sizeof e);
+            e.kind = GCM_DQ_REPORT; e.main_mem = (u8)main_mem; e.dest = dest;
+            e.value = val; e.ticket = ticket; e.ts = ts;
+            gcm_dq_push(&e);
+        } else {
             /* CellGcmReportData, big-endian: u64 timer, u32 value, u32 padding. */
-            const u32 rea = gcm_io2ea(off);
-            if (rea) {
-                vm_write32(rea, (u32)(ts >> 32));
-                vm_write32(rea + 4u, (u32)ts);
-                vm_write32(rea + 8u, val);
-                vm_write32(rea + 12u, 0u);
-            } else { static int un = 0; if (PS3_LOG_FIRST(un, 4)) printf("[GET_REPORT] main-memory offset 0x%X is not IO-mapped%c", off, 10); }
-        } else if (idx < CELL_GCM_MAX_REPORT_COUNT) {
-            s_report_data[idx].timestamp = ts;
-            s_report_data[idx].value = val;
+            gcm_report_store(main_mem, dest, ts, val);
         }
     }
 }
@@ -2681,10 +2878,9 @@ static void gcm_rsx_process_fifo_unlocked(void)
 {
     { static unsigned _n = 0; static unsigned long long _t0 = 0;
       extern unsigned long long ps3_ms_now(void);
+      static int s_rate = -1;
       _n++;
-      static int rate = -1;
-      if (rate < 0) rate = getenv("GCM_RATE") ? 1 : 0;
-      if (rate) {
+      if (ps3_env_flag(&s_rate, "GCM_RATE")) {
           unsigned long long now = ps3_ms_now();
           if (_t0 == 0) _t0 = now;
           if (now - _t0 >= 2000) {
@@ -2714,6 +2910,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
     const int legacy_state_live = rsx_get_backend() != NULL || !rsx_draw_engine_enabled() ||
                                   s_rsx_trace;
 
+    s_dq_state = &s_state;
+    gcm_dq_pump(RSX_ZPASS_POLL);       /* reports whose counts have landed */
 
     /* Walk the FIFO exactly like the RSX: chase the guest-written `put` (an IO
      * offset in the control register), decoding method headers and following
@@ -3152,7 +3350,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
                         if (!gcm_get_eq_put())
                             vm_write32(GCM_CONTROL_GUEST_ADDR + 4, s_fifo_getoff + 4 + count * 4);
                         atomic_thread_fence(memory_order_release);
-                        vm_write32(la, v);
+                        if (!gcm_dq_defer(GCM_DQ_LABEL, la, v))   /* behind a ZPASS report */
+                            vm_write32(la, v);
                         { static int rn = 0; if (s_sema_offset != 0x400u && PS3_LOG_FIRST(rn, 40))   /* TEMP */
                             fprintf(stderr, "[SEMA-REL] get=0x%08X off=0x%X val=0x%08X\n", s_fifo_getoff, s_sema_offset, v); }
                     }
@@ -3417,6 +3616,10 @@ static void gcm_rsx_process_fifo_unlocked(void)
         s_fifo_getoff += 4;                    /* unknown word: skip */
     }
 
+    /* Nothing left to walk, or parked on an acquire: a label queued behind
+     * a report must not wait for a submit that only more FIFO work brings. */
+    const int dq_idle = s_fifo_getoff == put || s_sema_blocked_pass;
+
     /* Walker watchdog. Everything above recovers from a *recognised* stall --
      * a branch we cannot take, a park the title abandoned. A walker that stops
      * for any other reason simply freezes `get` for the rest of the run and
@@ -3636,6 +3839,8 @@ static void gcm_rsx_process_fifo_unlocked(void)
      * If the overflow survives this, `get` is not what it consults. */
     vm_write32(GCM_CONTROL_GUEST_ADDR + 4, gcm_get_eq_put() ? put : s_fifo_getoff);
 
+    gcm_dq_pump(dq_idle ? RSX_ZPASS_KICK : RSX_ZPASS_POLL);
+
     AcquireSRWLockExclusive(&s_ref_pub_lock);                           /* ref */
     gcm_ref_publish_one();
     ReleaseSRWLockExclusive(&s_ref_pub_lock);
@@ -3716,7 +3921,8 @@ void cellGcm_fifo_recycle(u32 ctx_ea)
     u32 current = vm_read32(ctx_ea + 0x8);
     if (current <= begin) return;                       /* nothing to recycle */
 
-    if (getenv("CELLMARK_BLINKDBG"))
+    static int s_blinkdbg = -1;
+    if (ps3_env_flag(&s_blinkdbg, "CELLMARK_BLINKDBG"))
         printf("[RECYCLE] ring wrap: current=0x%08X -> begin=0x%08X\n", current, begin);
 
     static int s_recdbg = -1;
@@ -3917,8 +4123,7 @@ static s32 gcm_flip_request(u32 bufferId, int in_fifo)
           }
       } }
 
-    { static int _n=0, _fd=-1; if (_fd < 0) _fd = getenv("FLIP_DBG") ? 1 : 0;
-      if (_fd && PS3_LOG_FIRST(_n, 20))
+    { static int _n=0; if (GCM_FLIP_DBG() && PS3_LOG_FIRST(_n, 20))
         fprintf(stderr, "[FLIP] SetFlipCommand(buf=%u) set=%d\n",
                 bufferId, bufferId < CELL_GCM_MAX_DISPLAY_BUFFER_NUM ? s_display_buffer_set[bufferId] : -1); }
     if (bufferId >= CELL_GCM_MAX_DISPLAY_BUFFER_NUM)
@@ -5277,6 +5482,7 @@ void cellGcmTerminate(void)
     memset(s_zcull, 0, sizeof(s_zcull));
     memset(s_report_data, 0, sizeof(s_report_data));
     s_report_dma = 0xFEED0000u;
+    s_dq_head = s_dq_tail = 0;
     memset(s_labels, 0, sizeof(s_labels));
     memset(s_io_address_table, 0xFF, sizeof(s_io_address_table));
     memset(s_ea_address_table, 0xFF, sizeof(s_ea_address_table));

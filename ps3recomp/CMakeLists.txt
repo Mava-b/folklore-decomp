@@ -181,6 +181,34 @@ if(APPLE)
         "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/rsx_metal_backend.m"
         PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     message(STATUS "  Metal:        RSX backend enabled (rsx_metal_backend.m)")
+
+    # The in-game menu / HUD (libs/video/ps3_overlay.mm, from the inFAMOUS 2
+    # port) on Dear ImGui (third_party/imgui, v1.92.9b, MIT): the core and its
+    # Metal renderer. The backend has only weak stand-ins for the menu's hooks
+    # (so its own tests build without it), and nothing else references the
+    # menu's object, so every executable that links the library is told to
+    # keep it (-u): an archive member nobody needs is otherwise left out.
+    enable_language(OBJCXX)
+    set(PS3_IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/third_party/imgui")
+    target_sources(ps3recomp_runtime PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/ps3_overlay.mm"
+        "${PS3_IMGUI_DIR}/imgui.cpp"
+        "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp"
+        "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_metal.mm")
+    # The include path only for these files (the folder holds a VERSION.txt
+    # and other names that must not shadow system headers elsewhere).
+    set_source_files_properties(
+        "${CMAKE_CURRENT_SOURCE_DIR}/libs/video/ps3_overlay.mm"
+        "${PS3_IMGUI_DIR}/backends/imgui_impl_metal.mm"
+        PROPERTIES COMPILE_OPTIONS "-fobjc-arc" INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")
+    set_source_files_properties(
+        "${PS3_IMGUI_DIR}/imgui.cpp" "${PS3_IMGUI_DIR}/imgui_draw.cpp"
+        "${PS3_IMGUI_DIR}/imgui_tables.cpp" "${PS3_IMGUI_DIR}/imgui_widgets.cpp"
+        PROPERTIES COMPILE_OPTIONS "-w" INCLUDE_DIRECTORIES "${PS3_IMGUI_DIR}")   # upstream code
+    target_link_options(ps3recomp_runtime INTERFACE "LINKER:-u,_ps3_overlay_link_anchor")
+    message(STATUS "  Overlay:      in-game menu enabled (ps3_overlay.mm, Dear ImGui)")
 endif()
 
 if(PS3RECOMP_RSX_VULKAN)
@@ -348,8 +376,9 @@ if(CMAKE_C_COMPILER_ID MATCHES "Clang|GNU")
         # and clang-cl with no /O flag compiles at /Od -- a "Release" runtime
         # was unoptimised without a word. Duplicating a default -O2 is harmless.
         # Every configuration but Debug, including none: a port configured
-        # without CMAKE_BUILD_TYPE matched neither name and compiled the whole
-        # runtime -- the FIFO walker, the draw engine, the MFC -- at -O0.
+        # without CMAKE_BUILD_TYPE (the game builds under build/<title>) matched
+        # neither name and compiled the whole runtime -- the FIFO walker, the
+        # draw engine, the MFC -- at -O0.
         $<$<NOT:$<CONFIG:Debug>>:-O2>
     )
     # SSE4.1 (any x86-64 since ~2008): pshufb/blendv for spu_shufb, the

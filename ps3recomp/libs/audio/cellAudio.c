@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <math.h>
+#include <ctype.h>
 #include "ps3emu/log_first.h"
 #include "ps3emu/thread_name.h"
 
@@ -128,6 +129,8 @@ typedef struct {
     /* For address reporting to guest */
     u64                  port_addr;      /* guest-visible buffer address */
     u64                  read_idx_addr;  /* guest-visible read index address */
+    int                  was_playing;    /* the last block mixed held sound */
+    int                  ever_started;   /* PortStart was called at least once */
 } AudioPortSlot;
 
 static int            s_audio_initialized = 0;
@@ -174,9 +177,100 @@ static float s_audio_deepest_gain = 1.0f;
  * Host audio output backend
  * -----------------------------------------------------------------------*/
 
+/* PS3_AUDIO_VOLUME=0..100: the host's master volume in percent (100 = the
+ * title's own mix, unchanged). Applied to the final mix just before the
+ * device, on a squared curve so the slider sounds even (50 is about -12 dB,
+ * 25 about -24 dB); 0 is silence. Like PS3_AUDIO_MUTE it only touches what the
+ * host plays, never what the title sees. */
+static float audio_volume_gain(const char* e)
+{
+    if (!e || !*e) return 1.0f;
+    char* end = NULL;
+    double v = strtod(e, &end);
+    if (end == e || v != v) return 1.0f;
+    if (v < 0) v = 0;
+    if (v > 100) v = 100;
+    return (float)((v / 100.0) * (v / 100.0));
+}
+
+/* The gain in use, file scope so the in-game menu (libs/video/ps3_overlay.mm,
+ * from the inFAMOUS 2 port) can set the volume live: < 0 until
+ * PS3_AUDIO_VOLUME is first read. */
+static volatile float s_host_gain = -1.0f;
+static volatile int   s_host_volume = -1;   /* percent, as the menu shows it */
+static float cellAudio_host_gain(void)
+{
+    float gain = s_host_gain;
+    if (gain < 0) {
+        const char* e = getenv("PS3_AUDIO_VOLUME");
+        gain = audio_volume_gain(e);
+        if (gain != 1.0f) printf("[cellAudio] PS3_AUDIO_VOLUME=%s: gain %.3f\n", e, gain);
+        s_host_volume = (int)(sqrt((double)gain) * 100.0 + 0.5);
+        s_host_gain = gain;
+    }
+    return gain;
+}
+int cellAudio_host_volume(void) { cellAudio_host_gain(); return s_host_volume; }
+void cellAudio_host_set_volume(int pct)
+{
+    char b[16];
+    snprintf(b, sizeof b, "%d", pct < 0 ? 0 : pct > 100 ? 100 : pct);
+    s_host_volume = pct < 0 ? 0 : pct > 100 ? 100 : pct;
+    s_host_gain = audio_volume_gain(b);
+}
+
 #if AUDIO_BACKEND_SDL2
 
 static SDL_AudioDeviceID s_sdl_audio_dev = 0;
+
+/* Case-insensitive strstr (ASCII), for audio_match_device. */
+static const char* audio_find_nocase(const char* hay, const char* needle)
+{
+    for (; *hay; hay++) {
+        size_t k = 0;
+        while (needle[k] && hay[k] &&
+               tolower((unsigned char)hay[k]) == tolower((unsigned char)needle[k])) k++;
+        if (!needle[k]) return hay;
+    }
+    return NULL;
+}
+
+/* PS3_AUDIO_DEVICE=<name>: which output device the host plays to. The name
+ * is matched exactly first, then ignoring case, then as a part of a device's
+ * name ("AirPods" finds "Erik's AirPods Pro"); unset or no match = the
+ * system default output (which SDL follows when it changes). SDL backend
+ * only; WASAPI keeps the default endpoint. Returns the index of the device
+ * in names[], or -1. */
+static int audio_match_device(const char* want, const char* const* names, int n)
+{
+    if (!want || !*want) return -1;
+    for (int i = 0; i < n; i++) if (names[i] && !strcmp(names[i], want)) return i;
+    for (int i = 0; i < n; i++)
+        if (names[i] && strlen(names[i]) == strlen(want) && audio_find_nocase(names[i], want) == names[i])
+            return i;
+    for (int i = 0; i < n; i++) if (names[i] && audio_find_nocase(names[i], want)) return i;
+    return -1;
+}
+
+/* The SDL output device PS3_AUDIO_DEVICE names, or NULL for the default. */
+static const char* audio_sdl_pick_device(void)
+{
+    static char picked[256];
+    const char* want = getenv("PS3_AUDIO_DEVICE");
+    if (!want || !*want) return NULL;
+    const char* names[32];
+    int n = SDL_GetNumAudioDevices(0);
+    if (n > 32) n = 32;
+    for (int i = 0; i < n; i++) names[i] = SDL_GetAudioDeviceName(i, 0);
+    const int k = audio_match_device(want, names, n < 0 ? 0 : n);
+    if (k < 0) {
+        printf("[cellAudio] PS3_AUDIO_DEVICE=%s: no such output, using the default. Outputs:\n", want);
+        for (int i = 0; i < n; i++) printf("[cellAudio]   %s\n", names[i] ? names[i] : "?");
+        return NULL;
+    }
+    snprintf(picked, sizeof picked, "%s", names[k]);
+    return picked;
+}
 
 static int audio_backend_init(void)
 {
@@ -195,11 +289,20 @@ static int audio_backend_init(void)
     want.samples  = CELL_AUDIO_BLOCK_SAMPLES;
     want.callback = NULL; /* We'll use SDL_QueueAudio */
 
-    s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    const char* dev = audio_sdl_pick_device();
+    s_sdl_audio_dev = SDL_OpenAudioDevice(dev, 0, &want, &have, 0);
+    if (s_sdl_audio_dev == 0 && dev) {
+        printf("[cellAudio] cannot open \"%s\" (%s), using the default output\n", dev, SDL_GetError());
+        dev = NULL;
+        s_sdl_audio_dev = SDL_OpenAudioDevice(NULL, 0, &want, &have, 0);
+    }
     if (s_sdl_audio_dev == 0) {
         printf("[cellAudio] SDL_OpenAudioDevice failed: %s\n", SDL_GetError());
         return -1;
     }
+    printf("[cellAudio] output: %s (%d Hz, %u ch, %u-frame device buffer)\n",
+           dev ? dev : "system default", have.freq, (unsigned)have.channels,
+           (unsigned)have.samples);
 
     SDL_PauseAudioDevice(s_sdl_audio_dev, 0); /* Start playback */
     return 0;
@@ -476,6 +579,258 @@ static inline float ld_be_f32(const float* p)
     return f;
 }
 
+/* PS3_AUDIO_DUMP=<file.wav>: the final mix (before PS3_AUDIO_MUTE and
+ * PS3_AUDIO_VOLUME, so a muted run still records what would have played) as
+ * a 48 kHz stereo 32-bit float WAV. The header's sizes are rewritten about
+ * once a second, so a run that is killed leaves a file that still opens. */
+static FILE* s_dump_wav = (FILE*)-1;
+static u64   s_dump_frames;
+
+static void audio_wav_header(unsigned char h[58], u64 frames)
+{
+    const u32 data = frames * 8u > 0xFFFFFF00ull ? 0xFFFFFF00u : (u32)(frames * 8u);
+    const u32 v[] = { 0x46464952u /* RIFF */, 50u + data, 0x45564157u /* WAVE */,
+                      0x20746D66u /* fmt  */, 18u };
+    memcpy(h, v, sizeof v);                        /* host order: little-endian */
+    const u16 fmt[] = { 3 /* IEEE float */, 2 };
+    memcpy(h + 20, fmt, 4);
+    const u32 rate[] = { CELL_AUDIO_SAMPLE_RATE, CELL_AUDIO_SAMPLE_RATE * 8u };
+    memcpy(h + 24, rate, 8);
+    const u16 blk[] = { 8, 32, 0 };
+    memcpy(h + 32, blk, 6);
+    const u32 fact[] = { 0x74636166u /* fact */, 4u, (u32)(data / 8u),
+                         0x61746164u /* data */, data };
+    memcpy(h + 38, fact, 20);
+}
+
+/* Opened by cellAudioInit. The first open in a run truncates; a later one --
+ * cellAudioInit after cellAudioQuit, or the process a title exitspawns into,
+ * which inherits PS3_AUDIO_DUMP_CONTINUE -- appends, so one file holds the
+ * whole session (Resistance's EBOOT and its game.self, for instance). */
+static void audio_dump_open(void)
+{
+    if (s_dump_wav != (FILE*)-1) return;
+    s_dump_wav = NULL;
+    s_dump_frames = 0;
+    const char* e = getenv("PS3_AUDIO_DUMP");
+    if (!e || !*e) return;
+    if (getenv("PS3_AUDIO_DUMP_CONTINUE")) {
+        FILE* f = fopen(e, "r+b");
+        unsigned char h[58], want[58];
+        audio_wav_header(want, 0);
+        if (f && fread(h, 1, sizeof h, f) == sizeof h &&
+            !memcmp(h, want, 4) && !memcmp(h + 8, want + 8, 30)) {
+            fseek(f, 0, SEEK_END);
+            const long end = ftell(f);
+            s_dump_frames = end > 58 ? (u64)(end - 58) / 8u : 0;
+            s_dump_wav = f;
+            printf("[cellAudio] PS3_AUDIO_DUMP=%s: appending at %.1f s\n", e,
+                   s_dump_frames / (double)CELL_AUDIO_SAMPLE_RATE);
+            return;
+        }
+        if (f) fclose(f);
+    }
+    s_dump_wav = fopen(e, "wb");
+    if (!s_dump_wav) return;
+    unsigned char h[58];
+    audio_wav_header(h, 0);
+    fwrite(h, 1, sizeof h, s_dump_wav);
+    fflush(s_dump_wav);
+#ifdef _WIN32
+    _putenv_s("PS3_AUDIO_DUMP_CONTINUE", "1");
+#else
+    setenv("PS3_AUDIO_DUMP_CONTINUE", "1", 1);
+#endif
+    printf("[cellAudio] PS3_AUDIO_DUMP=%s: recording the mix\n", e);
+}
+
+static void audio_dump_block(const float* stereo, u32 frames)
+{
+    if (!s_dump_wav || s_dump_wav == (FILE*)-1) return;
+    fwrite(stereo, sizeof(float), (size_t)frames * 2, s_dump_wav);
+    s_dump_frames += frames;
+    if ((s_dump_frames % (CELL_AUDIO_BLOCK_SAMPLES * 188u)) < frames) {
+        unsigned char h[58];
+        audio_wav_header(h, s_dump_frames);
+        fseek(s_dump_wav, 0, SEEK_SET);
+        fwrite(h, 1, sizeof h, s_dump_wav);
+        fseek(s_dump_wav, 0, SEEK_END);
+        fflush(s_dump_wav);
+    }
+}
+
+static void audio_dump_close(void)
+{
+    if (!s_dump_wav || s_dump_wav == (FILE*)-1) return;
+    unsigned char h[58];
+    audio_wav_header(h, s_dump_frames);
+    fseek(s_dump_wav, 0, SEEK_SET);
+    fwrite(h, 1, sizeof h, s_dump_wav);
+    fclose(s_dump_wav);
+    s_dump_wav = (FILE*)-1;
+    s_dump_frames = 0;
+}
+
+/* PS3_AUDIO_STATS=1: every ~5 s, the level of each running port and of the
+ * mix (RMS / peak over the interval, the share of blocks that were all zero,
+ * and how many mixed samples had to be clipped), so "which part is silent"
+ * and "is it clipping" can be read from the log. */
+typedef struct {
+    double sq;
+    float  peak;
+    u32    blocks, silent;
+    double ch_sq[8];   /* per channel, for an 8-channel port */
+} AudioLevel;
+static AudioLevel s_lvl_port[CELL_AUDIO_PORT_MAX], s_lvl_mix;
+/* Blocks handed to the device since cellAudioInit, continued across an
+ * exitspawn with the dump: the port lines below say where on the audio clock
+ * (and so where in PS3_AUDIO_DUMP's file) they happened. */
+static volatile u64 s_mixed_blocks;
+static double audio_clock_s(void)
+{
+    const u64 frames = (s_dump_wav && s_dump_wav != (FILE*)-1)
+                       ? s_dump_frames : s_mixed_blocks * CELL_AUDIO_BLOCK_SAMPLES;
+    return (double)frames / CELL_AUDIO_SAMPLE_RATE;
+}
+static u64 s_lvl_clipped;
+static int s_stats = -1;
+
+static void audio_level_add(AudioLevel* l, const float* s, u32 n, int be, u32 nch)
+{
+    double sq = 0.0;
+    float pk = 0.0f;
+    for (u32 i = 0; i < n; i++) {
+        const float v = be ? ld_be_f32(&s[i]) : s[i];
+        sq += (double)v * v;
+        if (nch == 8) l->ch_sq[i & 7] += (double)v * v / (n / 8);
+        const float a = v < 0 ? -v : v;
+        if (a > pk) pk = a;
+    }
+    l->sq += sq / (n ? n : 1);
+    if (pk > l->peak) l->peak = pk;
+    l->blocks++;
+    if (pk == 0.0f) l->silent++;
+}
+
+static void audio_level_print(const char* name, int idx, AudioLevel* l)
+{
+    if (!l->blocks) return;
+    const double rms = sqrt(l->sq / l->blocks);
+    char tag[16];
+    if (idx >= 0) snprintf(tag, sizeof tag, "%s %d", name, idx);
+    else snprintf(tag, sizeof tag, "%s", name);
+    printf("[audio-stats] %-6s rms %.4f (%6.1f dBFS) peak %.4f silent %5.1f%%",
+           tag, rms, rms > 0 ? 20.0 * log10(rms) : -999.0, l->peak,
+           100.0 * l->silent / l->blocks);
+    if (l->ch_sq[0] + l->ch_sq[1] + l->ch_sq[2] + l->ch_sq[3] > 0.0) {
+        static const char* nm[8] = { "L", "R", "C", "LFE", "Ls", "Rs", "Lb", "Rb" };
+        printf(" |");
+        for (int c = 0; c < 8; c++) printf(" %s %.4f", nm[c], sqrt(l->ch_sq[c] / l->blocks));
+    }
+    printf("\n");
+    memset(l, 0, sizeof(*l));
+}
+
+static void audio_stats_tick(void)
+{
+    if (s_stats < 0) s_stats = getenv("PS3_AUDIO_STATS") ? 1 : 0;
+    if (!s_stats) return;
+    if ((s_mixed_blocks % 938u) != 0) return;     /* 938 blocks = 5.0 s */
+    printf("[audio-stats] t=%.1fs (audio clock)\n", audio_clock_s());
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX; p++) audio_level_print("port", p, &s_lvl_port[p]);
+    audio_level_print("mix", -1, &s_lvl_mix);
+    if (s_lvl_clipped) printf("[audio-stats] clipped %llu samples\n", (unsigned long long)s_lvl_clipped);
+    s_lvl_clipped = 0;
+    fflush(stdout);
+}
+
+/* Hand one mixed block to the host device. Shared by the Windows and POSIX
+ * mixer loops so the debug taps behave the same on both:
+ *   PS3_AUDIO_DUMP=<file.wav>  the final mix as a float WAV (above)
+ *   AUDIO_WAV=<file>  append the final mix as raw f32le stereo 48 kHz
+ *                     (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>)
+ *   PS3_AUDIO_MUTE=1  silence the HOST output only; the title still sees a
+ *                     working device and every mix/pacing path runs as normal
+ *                     (unlike PS3_NO_AUDIO, which changes what the guest does).
+ *                     Both dumps still record the real mix.
+ *   PS3_AUDIO_VOLUME  0..100, the host's master volume (audio_volume_gain);
+ *                     the dumps record the mix before it too. */
+static void audio_submit_mix(void)
+{
+    s_mixed_blocks++;
+    audio_dump_block(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+    if (s_stats > 0) audio_level_add(&s_lvl_mix, s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES * 2, 0, 2);
+    audio_stats_tick();
+    { static FILE* _wf = (FILE*)-1;
+      if (_wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); _wf = e ? fopen(e, "wb") : NULL; }
+      if (_wf) { fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, _wf); fflush(_wf); } }
+    { static int mute = -1; if (mute < 0) mute = getenv("PS3_AUDIO_MUTE") ? 1 : 0;
+      if (mute) memset(s_mix_buffer, 0, sizeof(s_mix_buffer)); }
+    { const float gain = cellAudio_host_gain();
+      if (gain != 1.0f)
+          for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * 2; i++) s_mix_buffer[i] *= gain; }
+    audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+}
+
+/* Add one block of a port (nch big-endian floats a frame: 2, or 8 in the
+ * cellAudio order L R C LFE Ls Rs Lb Rb) to a stereo host mix, at `level`.
+ *
+ * The 8-channel fold is RPCS3's (Emu/Audio/AudioBackend.h downmix, 7.1 ->
+ * stereo): centre at -3 dB into both sides, each side's surround and back at
+ * -3 dB into it, LFE left out -- the usual stereo downmix. It was centre
+ * -3 dB, LFE -6 dB, surround -6 dB and back -10 dB into both, with the LFE
+ * summed into each side: the coefficients added up to 3x full scale where
+ * RPCS3's add up to 2.4x, and a movie's 5.1 bed (Resistance's are AC3 3/2 +
+ * LFE) came out bass-heavy and clipping on the louder passages. */
+static void audio_downmix_add(float* mix, const float* src, u32 nch, float level)
+{
+    const float k = 0.70710678f;
+    for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
+        float left, right;
+        if (nch >= 2) {
+            left  = ld_be_f32(&src[s * nch + 0]);
+            right = ld_be_f32(&src[s * nch + 1]);
+        } else {
+            /* Mono: duplicate to both channels */
+            left = right = ld_be_f32(&src[s]);
+        }
+        if (nch == 8) {
+            const float center = ld_be_f32(&src[s * 8 + 2]) * k;
+            left  += center + (ld_be_f32(&src[s * 8 + 4]) + ld_be_f32(&src[s * 8 + 6])) * k;
+            right += center + (ld_be_f32(&src[s * 8 + 5]) + ld_be_f32(&src[s * 8 + 7])) * k;
+        }
+        mix[s * 2 + 0] += left * level;
+        mix[s * 2 + 1] += right * level;
+    }
+}
+
+static int audio_block_is_zero(const float* src, u32 nch)
+{
+    const u32* w = (const u32*)src;
+    for (u32 i = 0; i < CELL_AUDIO_BLOCK_SAMPLES * nch; i++)
+        if (w[i] & 0x7FFFFFFFu) return 0;
+    return 1;
+}
+
+#ifndef _WIN32
+/* A running port that was playing and whose next block is still empty: its
+ * producer has not written it yet. */
+static int audio_port_starved(void)
+{
+    int starved = 0;
+    mutex_lock(&s_audio_mutex);
+    for (int p = 0; p < CELL_AUDIO_PORT_MAX && !starved; p++) {
+        const AudioPortSlot* port = &s_ports[p];
+        if (!port->in_use || !port->running || !port->buffer || !port->was_playing) continue;
+        const u32 nch = (u32)port->param.nChannel, nblock = (u32)port->param.nBlock;
+        const float* src = port->buffer + (u32)(port->read_index % nblock) * CELL_AUDIO_BLOCK_SAMPLES * nch;
+        starved = audio_block_is_zero(src, nch);
+    }
+    mutex_unlock(&s_audio_mutex);
+    return starved;
+}
+#endif
+
 /* Peak limiter for the final stereo mix.
  *
  * The ports are summed (and a 7.1 port folded down to stereo) in float, so
@@ -543,6 +898,8 @@ static void audio_limit_block(float* stereo)
             left = delayedLeft * gain;
             right = delayedRight * gain;
         }
+        if (left > 1.0f || left < -1.0f) s_lvl_clipped++;     /* PS3_AUDIO_STATS */
+        if (right > 1.0f || right < -1.0f) s_lvl_clipped++;
         stereo[sample * 2 + 0] = left > 1.0f ? 1.0f : (left < -1.0f ? -1.0f : left);
         stereo[sample * 2 + 1] = right > 1.0f ? 1.0f : (right < -1.0f ? -1.0f : right);
     }
@@ -568,7 +925,7 @@ static void audio_mix_one_block(void)
         /* Diagnostic: a port that HOLDS PCM but was never started is inaudible
          * by design -- flag it once so "no PortStart" vs "no data" is decidable
          * from the log (LBP's Bink movie audio port sat exactly there). */
-        if (port->in_use && !port->running && port->buffer) {
+        if (port->in_use && !port->running && !port->ever_started && port->buffer) {
             static u8 warned[CELL_AUDIO_PORT_MAX];
             if (!warned[p]) {
                 u32 probe = (u32)(port->param.nBlock * CELL_AUDIO_BLOCK_SAMPLES *
@@ -610,7 +967,7 @@ static void audio_mix_one_block(void)
             portHadSound[p] = blockHasSound;
         }
         float level = port->param.level;
-        if (level <= 0.0f) level = 1.0f;
+        if (!(level >= 0.0f)) level = 0.0f;
         if (level > 1.0f) level = 1.0f;
 
         /* Read one block at the current read_index */
@@ -647,32 +1004,11 @@ static void audio_mix_one_block(void)
             if (!nz && prev_nz[p]) g_audio_holes[p]++;
             prev_nz[p] = nz; } }
 #endif
+        if (s_stats > 0)
+            audio_level_add(&s_lvl_port[p], src, CELL_AUDIO_BLOCK_SAMPLES * nch, 1, nch);
+        port->was_playing = !audio_block_is_zero(src, nch);
 
-        for (u32 s = 0; s < CELL_AUDIO_BLOCK_SAMPLES; s++) {
-            float left, right;
-            if (nch >= 2) {
-                left  = ld_be_f32(&src[s * nch + 0]) * level;
-                right = ld_be_f32(&src[s * nch + 1]) * level;
-            } else {
-                /* Mono: duplicate to both channels */
-                left = right = ld_be_f32(&src[s]) * level;
-            }
-
-            /* If 7.1, mix center and other channels into stereo */
-            if (nch == 8) {
-                float center = ld_be_f32(&src[s * 8 + 2]) * level * 0.707f;
-                float lfe    = ld_be_f32(&src[s * 8 + 3]) * level * 0.5f;
-                float rl     = ld_be_f32(&src[s * 8 + 4]) * level * 0.5f;
-                float rr     = ld_be_f32(&src[s * 8 + 5]) * level * 0.5f;
-                float sl     = ld_be_f32(&src[s * 8 + 6]) * level * 0.3f;
-                float sr     = ld_be_f32(&src[s * 8 + 7]) * level * 0.3f;
-                left  += center + lfe + rl + sl;
-                right += center + lfe + rr + sr;
-            }
-
-            s_mix_buffer[s * 2 + 0] += left;
-            s_mix_buffer[s * 2 + 1] += right;
-        }
+        audio_downmix_add(s_mix_buffer, src, nch, level);
 
         /* Firmware clears a ring-buffer block after consuming it. Besides
          * preventing stale PCM from replaying when a producer stalls, the
@@ -720,15 +1056,6 @@ static float audio_mix_peak(void)
         if (a > pk) pk = a;
     }
     return pk;
-}
-
-/* AUDIO_WAV=<file>: append the final mix as raw f32le stereo 48 kHz
- * (ffmpeg -f f32le -ar 48000 -ac 2 -i <file>). */
-static void audio_dump_mix(void)
-{
-    static FILE* wf = (FILE*)-1;
-    if (wf == (FILE*)-1) { const char* e = getenv("AUDIO_WAV"); wf = e ? fopen(e, "wb") : NULL; }
-    if (wf) fwrite(s_mix_buffer, sizeof(float), CELL_AUDIO_BLOCK_SAMPLES * 2, wf);
 }
 
 #ifdef _WIN32
@@ -878,8 +1205,7 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
           if (_ap) { static unsigned _n = 0; const float pk = audio_mix_peak();
             if ((++_n % 200) == 0 || (pk > 0.001f && _n < 40))
                 fprintf(stderr, "[audio-peak] block#%u peak=%.4f\n", _n, pk); } }
-        audio_dump_mix();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        audio_submit_mix();
         /* AUDIO_RATE=1: blocks mixed vs real time, and frames dropped. */
         { static int on = -1; if (on < 0) on = getenv("AUDIO_RATE") ? 1 : 0;
           if (on) { static ULONGLONG t0; static unsigned n, z; static unsigned long long d0, u0;
@@ -906,16 +1232,105 @@ static unsigned __stdcall audio_mix_thread_func(void* arg)
     return 0;
 }
 #else
+/* Pacing of the POSIX mixer: one block every 5.33 ms on the monotonic clock,
+ * the way the console's audio hardware consumes them, nudged to follow the
+ * host device's own clock.
+ *
+ * A guest mixer (libmixer's cellSurMixer, which Resistance plays its movies
+ * through) writes the block after the one being played when the period event
+ * wakes it, so it needs those 5.33 ms between two reads. The previous loop
+ * mixed whenever the device queue fell under four blocks: each time the
+ * device took its buffer, the loop read two blocks back to back, the second
+ * before the guest had been woken to fill it, and every other block of a
+ * movie's soundtrack came out empty -- a 94 Hz buzz over half the audio.
+ *
+ * So blocks are due at t0 + n periods. With a device, the queue is kept
+ * between AUDIO_PACE_LOW and AUDIO_PACE_HIGH blocks by moving t0 a quarter
+ * period at most once a block (never two blocks closer than 0.75 periods),
+ * judged on the queue right after the previous block went out; with none
+ * (queued < 0) the clock alone paces. More than 100 ms behind (a debugger
+ * stop, a suspended machine) drops the backlog instead of mixing it in a
+ * burst. Returns 0 when the next block is due, else the nanoseconds to wait. */
+#define AUDIO_PACE_LOW   3u
+#define AUDIO_PACE_HIGH  10u
+typedef struct {
+    unsigned long long t0_ns;   /* when block 0 was due */
+    unsigned long long mixed;   /* blocks mixed so far  */
+    int                decided; /* the next block's nudge has been chosen */
+} AudioPace;
+
+static unsigned long long audio_pace_due(const AudioPace* p)
+{
+    /* 256 samples at 48 kHz = 16e6/3 ns, kept exact over a long run. */
+    return p->t0_ns + p->mixed * 16000000ull / 3ull;
+}
+
+static unsigned long long audio_pace_wait(AudioPace* p, unsigned long long now_ns, long queued)
+{
+    const unsigned long long period = 16000000ull / 3ull;
+    /* Once a block, on the first call after the previous one was mixed: a
+     * nudge chosen later, when the block is already due, would land on top
+     * of the next block's and bring two reads half a period apart. */
+    if (!p->decided) {
+        p->decided = 1;
+        if (queued >= 0 && p->mixed > 0) {
+            if ((unsigned long)queued < AUDIO_PACE_LOW * CELL_AUDIO_BLOCK_SAMPLES) p->t0_ns -= period / 4;
+            else if ((unsigned long)queued > AUDIO_PACE_HIGH * CELL_AUDIO_BLOCK_SAMPLES) p->t0_ns += period / 4;
+        }
+    }
+    const unsigned long long due = audio_pace_due(p);
+    if (now_ns < due) return due - now_ns;
+    if (now_ns - due > 100000000ull)
+        p->t0_ns = now_ns - p->mixed * 16000000ull / 3ull;
+    p->mixed++;
+    p->decided = 0;
+    return 0;
+}
+
+static unsigned long long audio_now_ns(void)
+{
+    struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t);
+    return (unsigned long long)t.tv_sec * 1000000000ull + (unsigned long long)t.tv_nsec;
+}
+
+/* Frames queued at the device, or -1 with no device open. */
+static long audio_backend_queue(void)
+{
+#if AUDIO_BACKEND_SDL2
+    if (!s_sdl_audio_dev) return -1;
+#endif
+    return (long)audio_backend_queued_samples();
+}
+
 static void* audio_mix_thread_func(void* arg)
 {
     (void)arg;
     printf("[cellAudio] Mixing thread started\n");
 
     unsigned long blocks = 0; float peak = 0.0f;
+    AudioPace pace = { audio_now_ns(), 0, 0 };   /* t0, mixed, decided */
     while (s_mix_thread_running) {
+        const unsigned long long wait = audio_pace_wait(&pace, audio_now_ns(), audio_backend_queue());
+        if (wait) {
+            /* Sleep most of the way, then poll: usleep overshoots by up to a
+             * few hundred microseconds. */
+            if (wait > 1500000ull) usleep((useconds_t)((wait - 1000000ull) / 1000ull));
+            else if (wait > 200000ull) usleep(100);
+            continue;
+        }
+        /* A producer that is a little late (the guest thread woken by the
+         * last period event has not been scheduled yet: a loaded host) gets
+         * up to 4 ms before its block is played as silence -- RPCS3 waits for
+         * "touched" buffers the same way. The clock does not move: the next
+         * block keeps its due time, and the device queue (3+ blocks) covers
+         * the delay. Under load (12 busy cores) this took the isolated empty
+         * blocks of a 45 s movie stretch from 49-82 to 0. */
+        { const unsigned long long g0 = audio_now_ns();
+          while (s_mix_thread_running && audio_port_starved() &&
+                 audio_now_ns() - g0 < 4000000ull)
+              usleep(100); }
         audio_mix_one_block();
-        audio_dump_mix();
-        audio_backend_submit(s_mix_buffer, CELL_AUDIO_BLOCK_SAMPLES);
+        audio_submit_mix();
         audio_notify_event_queues();
         /* AUDIO_PEAK=1: the loudest sample of every second of mixed output (187.5 blocks of 256). */
         { static int pk_on = -1; if (pk_on < 0) pk_on = getenv("AUDIO_PEAK") ? 1 : 0;
@@ -923,13 +1338,6 @@ static void* audio_mix_thread_func(void* arg)
               const float pk = audio_mix_peak(); if (pk > peak) peak = pk;
               if (++blocks % 188 == 0) { fprintf(stderr, "[audio-peak] %lu s: peak %.4f\n", blocks / 188, peak); peak = 0.0f; }
           } }
-
-        u32 queued = audio_backend_queued_samples();
-        if (queued > CELL_AUDIO_BLOCK_SAMPLES * 4) {
-            usleep(5000);
-        } else {
-            usleep(2000);
-        }
     }
 
     printf("[cellAudio] Mixing thread stopped\n");
@@ -1019,6 +1427,7 @@ s32 cellAudioInit(void)
     { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
       s_audio_start_us = (u64)ts.tv_sec * 1000000ULL + (u64)ts.tv_nsec / 1000ULL; }
 #endif
+    audio_dump_open();
     if (audio_start_mix_thread() < 0) {
         printf("[cellAudio] WARNING: Could not start mixing thread\n");
     }
@@ -1036,6 +1445,7 @@ s32 cellAudioQuit(void)
 
     audio_stop_mix_thread();
     audio_backend_shutdown();
+    audio_dump_close();
 
     /* Port buffers live in the guest vm_base arena (bump-allocated, not host
      * malloc) -- just drop the references; never free() them. */
@@ -1064,8 +1474,17 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
     u64 nch  = vm_read64(param_ea + 0);   /* nChannel */
     u64 nblk = vm_read64(param_ea + 8);   /* nBlock   */
-    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu)\n",
-           (unsigned long long)nch, (unsigned long long)nblk);
+    u64 attr = vm_read64(param_ea + 16);  /* attr     */
+    /* level is honoured only with CELL_AUDIO_PORTATTR_INITLEVEL, as on the
+     * console (RPCS3 cellAudioPortOpen); otherwise the port starts at 1.0. */
+    float level = 1.0f;
+    if (attr & 0x1000ull) {
+        u32 lv = vm_read32(param_ea + 24);
+        memcpy(&level, &lv, 4);
+    }
+    printf("[cellAudio] PortOpen(nChannel=%llu, nBlock=%llu, attr=0x%llX, level=%.3f) at t=%.2fs\n",
+           (unsigned long long)nch, (unsigned long long)nblk,
+           (unsigned long long)attr, level, audio_clock_s());
 
     if (nch != CELL_AUDIO_PORT_2CH && nch != CELL_AUDIO_PORT_8CH)
         return CELL_AUDIO_ERROR_PARAM;
@@ -1093,8 +1512,12 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
     port->running = 0;
     /* Store the decoded (host-endian) param values, not the raw BE guest bytes. */
     memset(&port->param, 0, sizeof(port->param));
+    port->was_playing  = 0;
+    port->ever_started = 0;
     port->param.nChannel = nch;
     port->param.nBlock   = nblk;
+    port->param.attr     = attr;
+    port->param.level    = level;
     port->read_index  = 0;
     port->write_index = 0;
 
@@ -1132,7 +1555,7 @@ s32 cellAudioPortOpen(const CellAudioPortParam* param, u32* portNum)
 
 s32 cellAudioPortClose(u32 portNum)
 {
-    printf("[cellAudio] PortClose(port=%u)\n", portNum);
+    printf("[cellAudio] PortClose(port=%u) at t=%.2fs\n", portNum, audio_clock_s());
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
@@ -1161,7 +1584,7 @@ s32 cellAudioPortClose(u32 portNum)
 
 s32 cellAudioPortStart(u32 portNum)
 {
-    printf("[cellAudio] PortStart(port=%u)\n", portNum);
+    printf("[cellAudio] PortStart(port=%u) at t=%.2fs\n", portNum, audio_clock_s());
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;
@@ -1174,6 +1597,7 @@ s32 cellAudioPortStart(u32 portNum)
 
     mutex_lock(&s_audio_mutex);
     s_ports[portNum].running = 1;
+    s_ports[portNum].ever_started = 1;
     mutex_unlock(&s_audio_mutex);
 
     return CELL_OK;
@@ -1181,7 +1605,7 @@ s32 cellAudioPortStart(u32 portNum)
 
 s32 cellAudioPortStop(u32 portNum)
 {
-    printf("[cellAudio] PortStop(port=%u)\n", portNum);
+    printf("[cellAudio] PortStop(port=%u) at t=%.2fs\n", portNum, audio_clock_s());
 
     if (!s_audio_initialized)
         return CELL_AUDIO_ERROR_NOT_INIT;

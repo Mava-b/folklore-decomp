@@ -161,6 +161,16 @@ static int vp_is_flow(u32 sca_op)
            sca_op == 0x0C || sca_op == 0x11 || sca_op == 0x12;
 }
 
+int rsx_vp_has_flow(const u8* ucode, u32 max_bytes)
+{
+    if (!ucode) return 0;
+    for (u32 off = 0; off + 16 <= max_bytes; off += 16) {
+        if (vp_is_flow((rd_le(ucode + off + 4) >> 27) & 0x1Fu)) return 1;
+        if (rd_le(ucode + off + 12) & 1u) break;          /* D3.end */
+    }
+    return 0;
+}
+
 /* Branch target (NV40 layout, RPCS3 as oracle): D0[23] << 9 | D2[0:5] << 3 |
  * D3[29:31], an absolute VP slot; made relative to the program start. */
 static u32 vp_branch_target(u32 d0, u32 d2, u32 d3)
@@ -464,6 +474,13 @@ static int rsx_vp_decompile_impl(
                 if ((vmx|vmy|vmz|vmw) && dst_tmp != 0x3F) {
                     char m[6]; mask_str(vmx,vmy,vmz,vmw,m);
                     char line[256];
+                    /* The destination address register is D0.dst_tmp's low
+                     * bit, not addr_sel: that bit picks the register an
+                     * indexed READ uses. Taking it here sent every a1 load
+                     * into a0, so a1-indexed reads (Resistance's particle
+                     * light grid, vc[83 + a1.y]) always used index 0 and the
+                     * fire lit itself white. From the Resistance PC port by
+                     * Psyykosis (MIT). */
                     snprintf(line,sizeof line,
                         "    { int4 _a = (int4)floor(%s); a%u.%s = _a.%s; }\n",
                         A, dst_tmp & 1u, m, m);

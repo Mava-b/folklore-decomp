@@ -13,6 +13,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+#include <sched.h>   /* sched_yield: the PS3_USLEEP_SPIN_US spin */
 #include "ps3emu/log_first.h"
 #ifdef __APPLE__
 #include <mach/mach_time.h>
@@ -329,6 +330,25 @@ int64_t sys_timer_usleep(ppu_context* ctx)
         } while (qpc_now.QuadPart < qpc_deadline);
     }
 #else
+    /* PS3_USLEEP_SPIN_US=<n>: a sleep of n microseconds or less spins to a
+     * CLOCK_MONOTONIC deadline, yielding each turn, instead of nanosleep.
+     * nanosleep of a few tens of microseconds on macOS returns after ~50 us
+     * at best and after a coalesced timer tick at worst, so a title that
+     * paces a poll loop with usleep(30) runs it slower than on the console.
+     * The Windows branch above has always done this for sub-millisecond
+     * sleeps. Off by default: spinning threads cost cores the SPUs may need. */
+    { static long spin_us = -1;
+      if (spin_us < 0) { const char* e = getenv("PS3_USLEEP_SPIN_US"); spin_us = e ? atol(e) : 0; if (spin_us < 0) spin_us = 0; }
+      if (usec > 0 && usec <= (uint64_t)spin_us) {
+          struct timespec t0, now;
+          clock_gettime(CLOCK_MONOTONIC, &t0);
+          const uint64_t deadline = (uint64_t)t0.tv_sec * 1000000000ull + (uint64_t)t0.tv_nsec + usec * 1000ull;
+          do {
+              sched_yield();
+              clock_gettime(CLOCK_MONOTONIC, &now);
+          } while ((uint64_t)now.tv_sec * 1000000000ull + (uint64_t)now.tv_nsec < deadline);
+          return CELL_OK;
+      } }
     if (usec > 0) {
         struct timespec ts;
         ts.tv_sec  = (time_t)(usec / 1000000);

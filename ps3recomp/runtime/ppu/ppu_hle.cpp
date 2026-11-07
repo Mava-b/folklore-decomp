@@ -284,8 +284,16 @@ static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx,
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" uint64_t gcm_perf_now_ns(void);            /* cellGcmSys.c */
 extern "C" volatile uint64_t g_gcm_perf_main_hle_ns;
+#include "ppu_tls.h"   /* PPU_THREAD_LOCAL, for headers generated before it */
+/* Nesting of ps3_hle_call on this host thread. runtime/ppu/ppu_sjlj.c refuses a
+ * guest longjmp that would jump over an HLE handler's frame (one that runs
+ * guest code on the caller's context): the guards below would never run. */
+static PPU_THREAD_LOCAL int g_hle_depth = 0;
+extern "C" int* ps3_hle_depth_slot(void) { return &g_hle_depth; }
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    struct _HleDepth { _HleDepth() { ++g_hle_depth; } ~_HleDepth() { --g_hle_depth; } } _hle_depth;
     /* [fps] breakdown: the main thread's time inside HLE library calls. */
     struct MainHleTimer {
         uint64_t begin;

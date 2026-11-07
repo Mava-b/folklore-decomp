@@ -16,6 +16,7 @@
 #include "spu_coherency.h" /* lock-line lock + PPU-write coherence bitmap */
 #include "spu_helpers.h"   /* spu_splat_u32 / spu_ls_read128 (SMC microstep) */
 #include "spu_lockstep.h"
+#include "spu_raw.h"       /* SPU_RAW_COUNT: raw SPUs are spu_id 0.. */
 #include "spu_interp.h"    /* spu_lifted_fn / spu_lifted_lookup -- defined below */
 #include "ps3emu/ps3_ftrace.h"
 #include "spu_overlay_residency.h"
@@ -1216,6 +1217,19 @@ void spu_ch_wake(spu_context* ctx)
     WakeAllConditionVariable((CONDITION_VARIABLE*)&ctx->ch_wait_cv);
 }
 
+/* Monotonic nanoseconds for spu_ch_wait's spin. */
+static uint64_t spu_ch_now_ns(void)
+{
+#ifdef _WIN32
+    LARGE_INTEGER f, q;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&q);
+    return (uint64_t)((double)q.QuadPart * 1e9 / (double)f.QuadPart);
+#else
+    return ps3__mono_ns();
+#endif
+}
+
 /* PS3_FTRACE: when this SPU thread last left a blocking wait. The time between
  * two waits is a busy span, tagged with the lifted image and the SPURS workload
  * id the kernel keeps at LS 0x1DC (SpursKernelContext.wklCurrentId) when it
@@ -1250,6 +1264,33 @@ static void spu_ch_wait(spu_context* ctx, uint32_t channel, const char* op)
 
     ctx->status = SPU_STATUS_WAITING_CHANNEL;
     yz_lockstep_block_begin(ctx);          /* release the run token before the OS wait */
+    /* Spin a little before sleeping. The main thread talks to the two raw SPUs
+     * (the sound engine, the draw sort) in tiny round trips: it pushes a
+     * command or flips a flag, then spins until the SPU answers. A sleeping
+     * SPU thread takes tens of microseconds to be scheduled again after the
+     * wake, and most of these waits are shorter than that, so the main thread
+     * sat through the wake-up latency. Poll the predicate for up to
+     * SPU_WAIT_SPIN_US first (the Resistance port runs with 100). Raw SPUs
+     * only; SPU_WAIT_SPIN_ALL=1 spins every SPU context. Off (0) by default:
+     * Folklore's SPU threads were tuned without it.
+     * From the Resistance PC port by Psyykosis (MIT). */
+    {
+        static int s_spin_us = -1, s_spin_all = 0;
+        if (s_spin_us < 0) {
+            const char* e = getenv("SPU_WAIT_SPIN_US"); const int v = e ? atoi(e) : 0;
+            const char* a = getenv("SPU_WAIT_SPIN_ALL"); s_spin_all = a ? atoi(a) : 0;
+            s_spin_us = v < 0 ? 0 : v;
+        }
+        if (s_spin_us > 0 && (s_spin_all || ctx->spu_id < SPU_RAW_COUNT)) {
+            const uint64_t lim = (uint64_t)s_spin_us * 1000u, t0 = spu_ch_now_ns();
+            for (;;) {
+                MemoryBarrier();
+                if (spu_ch_ready(ctx, channel)) break;
+                for (int k = 0; k < 24; k++) YieldProcessor();
+                if (spu_ch_now_ns() - t0 >= lim) break;
+            }
+        }
+    }
     {
         unsigned long long start = GetTickCount64(), next_hb = 2000;
         while (!spu_ch_ready(ctx, channel)) {
@@ -2797,6 +2838,20 @@ void spu_indirect_branch(spu_context* ctx)
      * and falls into branch-to-0. All lifted funcs live below SPU_LS_SIZE, so
      * masking is a no-op for already-valid targets. */
     ctx->pc &= SPU_LS_MASK;
+    /* ...and the low two bits: instructions are word aligned and bi/bisl ignore
+     * them. Resistance's collision job keeps flags in the low bits of its
+     * function-table entries (0x20203 -> code at 0x20200); looking the raw value
+     * up finds nothing and ends the job ("Physics SPU Collision Timed Out!").
+     * From the Resistance PC port by Psyykosis (MIT). SPU_BRANCH_ALIGN=0
+     * disables. */
+    { static int al = -1; if (al < 0) { const char* e = getenv("SPU_BRANCH_ALIGN"); al = e ? atoi(e) : 1; }
+      if (al && (ctx->pc & 3u)) {
+          static int _n = 0;
+          if (PS3_LOG_FIRST(_n, 8))
+              fprintf(stderr, "[spu] img=%d indirect branch to unaligned 0x%05X -> 0x%05X\n",
+                      ctx->image_id, ctx->pc, ctx->pc & ~3u);
+          ctx->pc &= ~3u;
+      } }
     /* Interrupt-return register restore (see spu_drain.c spu_irq_regs_save):
      * the WWS handler's save/restore shim lives at unlifted top-of-LS, so we
      * enforce the preserve-all-registers hardware contract here -- the first

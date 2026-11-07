@@ -1555,6 +1555,7 @@ static int vk_guest_draw(const rsx_state* st, u32 prim, u32 first, u32 count)
     if (s_g.consts.count) memcpy(fpc, s_g.consts.values, s_g.consts.count * 16u);
     float* alpha = (float*)(fpc + nslots * 16u);
     alpha[0] = rsx_fp_alpha_ref(st->alpha_ref, st->surface_format & 0x1Fu);
+    alpha[1] = rsx_fp_alpha_quantised(st->surface_format & 0x1Fu) ? 1.0f : 0.0f;
 
     /* Descriptors: rewritten per draw, which is safe because every submission
      * is waited on before the next one is recorded. */

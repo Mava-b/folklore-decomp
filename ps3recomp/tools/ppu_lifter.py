@@ -816,6 +816,55 @@ def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
     return out
 
 
+# --sjlj: the first words of newlib's PPC64 setjmp and longjmp (the libc the
+# PS3 SDK links): align the jmp_buf pointer to 16, then store / load r1 first.
+SJLJ_SIGNATURES = {
+    "setjmp":  (0x3863000F, 0x786306E4, 0xF8230000),   # addi r3,r3,15; rldicr r3,r3,0,59; std r1,0(r3)
+    "longjmp": (0x3863000F, 0x786306E4, 0xE8230000),   # addi r3,r3,15; rldicr r3,r3,0,59; ld r1,0(r3)
+}
+
+
+def load_sjlj_spec(path: str) -> dict[str, dict[int, tuple[int, ...]]]:
+    """Read an --sjlj file naming a title's setjmp and longjmp functions:
+
+        {"setjmp": ["0x0070FC3C"], "longjmp": ["0x0070FD60"]}
+
+    An entry may also be {"addr": "0x...", "expect": ["0x3863000F", ...]}: the
+    words the function must start with (newlib's are the default, see
+    SJLJ_SIGNATURES). -> {"setjmp": {addr: words}, "longjmp": {addr: words}}."""
+    with open(path) as f:
+        spec = json.load(f)
+    out: dict[str, dict[int, tuple[int, ...]]] = {"setjmp": {}, "longjmp": {}}
+    for kind in out:
+        for e in spec.get(kind, []):
+            if isinstance(e, dict):
+                addr = int(str(e["addr"]), 0)
+                words = tuple(int(str(w), 0) & 0xFFFFFFFF
+                              for w in e.get("expect", SJLJ_SIGNATURES[kind]))
+            else:
+                addr, words = int(str(e), 0), SJLJ_SIGNATURES[kind]
+            if addr & 3 or addr in out["setjmp"] or addr in out["longjmp"]:
+                sys.exit(f"[ppu_lifter] {path}: bad or duplicate {kind} address 0x{addr:08X}")
+            out[kind][addr] = words
+    if not out["setjmp"] or not out["longjmp"]:
+        sys.exit(f"[ppu_lifter] {path}: needs at least one setjmp and one longjmp")
+    return out
+
+
+def find_sjlj_candidates(read_u32, starts) -> dict[str, list[int]]:
+    """Function starts whose first words are newlib's setjmp / longjmp."""
+    found: dict[str, list[int]] = {"setjmp": [], "longjmp": []}
+    for a in sorted(starts):
+        try:
+            words = tuple(read_u32(a + 4 * i) for i in range(3))
+        except Exception:
+            continue
+        for kind, sig in SJLJ_SIGNATURES.items():
+            if words == sig:
+                found[kind].append(a)
+    return found
+
+
 def _crval_to_c(val: str, mask: int, decl_a: str, a_expr: str, b_expr: str) -> str:
     """Reconstruct a C condition from a cr_val ternary for the tested bits."""
     m = re.match(r"^\((?P<u>.+?)\) \? 1 : \((?P<lt>.+?)\) \? 8 : \((?P<gt>.+?)\) \? 4 : 2$", val)
@@ -1036,6 +1085,11 @@ class PPULifter:
         # {addr -> (original word, replacement word, guard symbol)}. See
         # _patched_translate.
         self.insn_patches: dict[int, tuple[int, int, str]] = {}
+        # Guest setjmp/longjmp functions (--sjlj): a direct call to one of
+        # sjlj_setjmp is lifted as a host setjmp site, a body in sjlj_longjmp
+        # ends in ppu_sjlj_longjmp. See runtime/ppu/ppu_sjlj.h.
+        self.sjlj_setjmp: set[int] = set()
+        self.sjlj_longjmp: set[int] = set()
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -1358,8 +1412,86 @@ class PPULifter:
                        for _n, _off in sorted(_mem_snap.items()) if _n not in _reg_snap]
             func.body_lines = _decls + func.body_lines
 
+        if self.sjlj_setjmp or self.sjlj_longjmp:
+            self._sjlj_finish(func)
         self.functions.append(func)
         return func
+
+    _SJLJ_SITE_TAG = "  /* sjlj setjmp site */"
+    _SJLJ_TRAMP_RE = re.compile(r"g_trampoline_fn = \(void\(\*\)\(void\*\)\)\w*?func_([0-9A-Fa-f]{8})")
+
+    def _sjlj_finish(self, func: "LiftedFunction") -> None:
+        """--sjlj: check a body with setjmp sites, and hook a longjmp body.
+
+        A setjmp site is a host setjmp in this host function's frame, so the
+        guest frame that made the setjmp must live and die with it. A body
+        that hands the rest of its guest frame to another host function (a
+        fall-through or a trampoline to an address that is not a function
+        entry) would leave the host frame dead while the guest jmp_buf is
+        still valid; such a site is lifted as a plain call, with a warning.
+
+        A longjmp body runs as lifted (it restores the guest registers from
+        the jmp_buf and computes the return value); its return becomes a call
+        to ppu_sjlj_longjmp, which does not come back when the setjmp site is
+        live."""
+        tag = self._SJLJ_SITE_TAG
+        # A fall-through after a final `blr` and its alignment nops is dead.
+        live_fallthrough = func.fallthrough_to
+        if live_fallthrough:
+            for l in reversed(func.body_lines):
+                st = l.strip()
+                if st in ("", "/* nop */;"):
+                    continue
+                if st == "return;":
+                    live_fallthrough = 0
+                break
+        if any(tag in l for l in func.body_lines):
+            why = None
+            if live_fallthrough:
+                why = f"it falls through to 0x{func.fallthrough_to:08X}"
+            else:
+                for l in func.body_lines:
+                    for m in self._SJLJ_TRAMP_RE.finditer(l):
+                        t = int(m.group(1), 16)
+                        if t not in self.function_entries:
+                            why = f"it continues in func_{t:08X}"
+                            break
+                    if why:
+                        break
+            if why:
+                print(f"  WARNING: sjlj: {func.name} keeps its setjmp call(s) plain: "
+                      f"{why}, so its frame outlives the host function", flush=True)
+                for i, l in enumerate(func.body_lines):
+                    if tag in l:
+                        func.body_lines[i] = re.sub(
+                            r"if \(PPU_SJLJ_ENTER\(ctx, 0x[0-9A-F]{8}u\) == 0\) ", "",
+                            l).replace(tag, "")
+            else:
+                # Every exit frees this frame's setjmps (ppu_sjlj_leave): a
+                # longjmp through a jmp_buf whose function has returned must
+                # not land in a dead host frame.
+                leave = "ppu_sjlj_leave(PPU_SJLJ_FRAME());"
+                for i, l in enumerate(func.body_lines):
+                    if "return;" in l:
+                        func.body_lines[i] = re.sub(r"\breturn;", f"{{ {leave} return; }}", l)
+                func.body_lines.append(f"    {leave}  /* sjlj: end of body */")
+        if func.start_addr in self.sjlj_longjmp:
+            if live_fallthrough:
+                raise ValueError(f"sjlj: longjmp {func.name} falls through to "
+                                 f"0x{func.fallthrough_to:08X}")
+            hooked = 0
+            for i, l in enumerate(func.body_lines):
+                st = l.strip()
+                if st == "return;":
+                    func.body_lines[i] = l.replace(
+                        "return;", "ppu_sjlj_longjmp(ctx, _sjlj_buf); return;  /* sjlj longjmp */")
+                    hooked += 1
+                elif "return" in st or "g_trampoline_fn" in st:
+                    raise ValueError(f"sjlj: longjmp {func.name} has an exit the hook "
+                                     f"cannot follow: {st!r}")
+            if not hooked:
+                raise ValueError(f"sjlj: longjmp {func.name} has no return")
+            func.body_lines.insert(0, "    const uint64_t _sjlj_buf = ctx->gpr[3];  /* sjlj longjmp: jmp_buf */")
 
     # ------------------------------------------------------------------ #
     # Per-instruction translation
@@ -2126,6 +2258,12 @@ class PPULifter:
                 # PPC `bl` sets LR = return address (next instr). Emit it so mflr
                 # reads the correct value AND stack-saved LRs are real return
                 # addresses -> reliable back-chain unwinding for diagnostics.
+                if tgt in self.sjlj_setjmp:
+                    # A host setjmp in THIS frame, then the guest setjmp; a guest
+                    # longjmp to it resumes here with the call "returning" again.
+                    return (f"ctx->lr = 0x{insn.addr + 4:08X}; "
+                            f"if (PPU_SJLJ_ENTER(ctx, 0x{insn.addr + 4:08X}u) == 0) "
+                            f"{self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);  /* sjlj setjmp site */")
                 return f"ctx->lr = 0x{insn.addr + 4:08X}; {self.prefix}func_{tgt:08X}(ctx); DRAIN_TRAMPOLINE(ctx);"
             except ValueError:
                 return f"/* bl {target} */;"
@@ -4164,6 +4302,8 @@ class PPULifter:
         for g in guards:
             lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
                       f"extern int {g};", "#endif"]
+        if any("PPU_SJLJ_ENTER(" in bl or "ppu_sjlj_longjmp(" in bl for bl in func.body_lines):
+            lines.append('#include "ppu_sjlj.h"  /* --sjlj; runtime/ppu */')
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
         lines.append("    PPU_MM_SNAP")
         for bline in _fuse_cr(func.body_lines):
@@ -4893,7 +5033,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0, insn_patches=None):
+                 toc_base=0, insn_patches=None, sjlj=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4909,6 +5049,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
     _WORKER_STATE["insn_patches"] = insn_patches or {}
+    _WORKER_STATE["sjlj"] = sjlj or (set(), set())
 
 
 def _worker_lift(task):
@@ -4925,6 +5066,7 @@ def _worker_lift(task):
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
     lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
+    lifter.sjlj_setjmp, lifter.sjlj_longjmp = _WORKER_STATE.get("sjlj", (set(), set()))
     results = []
     for start, end in bounds:
         blob = b""
@@ -4960,7 +5102,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
                              getattr(lifter, "toc_base", 0),
-                             lifter.insn_patches))
+                             lifter.insn_patches,
+                             (lifter.sjlj_setjmp, lifter.sjlj_longjmp)))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -5052,6 +5195,15 @@ def main() -> None:
                              "is emitted as `if (guard) {new} else {orig}`, guard "
                              "being an int the port defines. The input must hold "
                              "`orig` at `addr` or the lift stops.")
+    parser.add_argument("--sjlj", metavar="FILE", default=None,
+                        help="JSON {setjmp: [addr], longjmp: [addr]} naming the "
+                             "title's own setjmp/longjmp functions. Direct calls "
+                             "to the setjmp become host setjmp sites and the "
+                             "longjmp ends in a host longjmp to them, so a guest "
+                             "longjmp unwinds the host stack "
+                             "(runtime/ppu/ppu_sjlj.h). Each function must start "
+                             "with newlib's setjmp/longjmp words, or the "
+                             "entry's `expect` list.")
     args = parser.parse_args()
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
@@ -5569,6 +5721,41 @@ def main() -> None:
     if args.insn_patches:
         lifter.insn_patches = load_insn_patches(args.insn_patches)
         print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
+    if args.sjlj:
+        _sj = load_sjlj_spec(args.sjlj)
+
+        def _sj_u32(a):
+            for _va, _d in seg_blobs:
+                if _va <= a and a + 4 <= _va + len(_d):
+                    return int.from_bytes(_d[a - _va:a - _va + 4],
+                                          "big" if big_endian else "little")
+            raise KeyError(a)
+        _starts = {s for s, _ in func_bounds}
+        for _kind, _ents in _sj.items():
+            for _a, _words in _ents.items():
+                if _a not in _starts:
+                    sys.exit(f"[ppu_lifter] --sjlj: {_kind} 0x{_a:08X} is not a "
+                             f"function start of this lift")
+                try:
+                    _have = tuple(_sj_u32(_a + 4 * _i) for _i in range(len(_words)))
+                except KeyError:
+                    _have = ()
+                if _have != _words:
+                    sys.exit(f"[ppu_lifter] --sjlj: {_kind} 0x{_a:08X} starts with "
+                             + " ".join(f"{_w:08X}" for _w in _have) + ", expected "
+                             + " ".join(f"{_w:08X}" for _w in _words)
+                             + " (wrong binary for this spec?)")
+        lifter.sjlj_setjmp = set(_sj["setjmp"])
+        lifter.sjlj_longjmp = set(_sj["longjmp"])
+        print(f"  sjlj: setjmp " + ", ".join(f"0x{_a:08X}" for _a in sorted(_sj["setjmp"]))
+              + "; longjmp " + ", ".join(f"0x{_a:08X}" for _a in sorted(_sj["longjmp"]))
+              + f" from {args.sjlj}")
+        # Say so when the binary has a newlib setjmp/longjmp the spec leaves out.
+        for _kind, _found in find_sjlj_candidates(_sj_u32, _starts).items():
+            for _a in _found:
+                if _a not in _sj[_kind]:
+                    print(f"  WARNING: sjlj: 0x{_a:08X} starts like newlib's {_kind} "
+                          f"but is not in {args.sjlj}", flush=True)
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -5625,6 +5812,16 @@ def main() -> None:
         if missing:
             sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
                      ", ".join(f"0x{a:08X}" for a in missing))
+
+    if args.sjlj:
+        _sites = sum(bl.count("PPU_SJLJ_ENTER(") for f in lifter.functions for bl in f.body_lines)
+        _hooks = {f.start_addr for f in lifter.functions
+                  if any("ppu_sjlj_longjmp(" in bl for bl in f.body_lines)}
+        print(f"  sjlj: {_sites} setjmp call site(s), {len(_hooks)} longjmp body(ies) hooked")
+        _missing = sorted(lifter.sjlj_longjmp - _hooks)
+        if _missing:
+            sys.exit("[ppu_lifter] --sjlj: longjmp not lifted: " +
+                     ", ".join(f"0x{a:08X}" for a in _missing))
 
     os.makedirs(args.output, exist_ok=True)
 

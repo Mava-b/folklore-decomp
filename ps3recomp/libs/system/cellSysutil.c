@@ -7,6 +7,7 @@
 
 #include "cellSysutil.h"
 #include "ps3emu/guest_call.h"
+#include "ps3emu/hdd1_cache.h"   /* PS3_SYSCACHE_ID_ENV */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -21,6 +22,7 @@
 #  ifndef mkdir
 #    define mkdir(p, m) _mkdir(p)
 #  endif
+#  define setenv(n, v, o) _putenv_s((n), (v))
 #endif
 
 /* Guest-memory stores — out-params from the recompiled title are guest VM
@@ -570,7 +572,15 @@ s32 cellSysCacheMount(char* param)
     cache_id[32] = '\0';
     printf("[cellSysutil] SysCacheMount(id='%s')\n", cache_id);
 
-    snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1/cache/%s", cache_id);
+    /* The console answers "/dev_hdd1": the title's cache folder IS the root of
+     * /dev_hdd1 (ps3emu/hdd1_cache.h). The fs layers map /dev_hdd1/x to
+     * <PS3_HDD1_ROOT>/cache/<cacheId>/x, the folder created below, through the
+     * id published here. Resistance's file layer finds the cache device only
+     * under this exact name: with "/dev_hdd1/cache/<id>" its in-level movie
+     * stash never opened and the game froze (level 30). */
+    snprintf(s_cache_path, CELL_SYSCACHE_PATH_MAX, "/dev_hdd1");
+    if (cache_id[0] && !strchr(cache_id, '/') && strcmp(cache_id, ".") && strcmp(cache_id, ".."))
+        setenv(PS3_SYSCACHE_ID_ENV, cache_id, 1);
     size_t n = strlen(s_cache_path);
     if (n > 135) n = 135;
     memcpy(vm_base + ea + 0x20, s_cache_path, n);
@@ -723,11 +733,13 @@ s32 cellSysutilIsMeetingApp(void)
  * callback gets CELL_SYSUTIL_REQUEST_EXITGAME, and the title tidies up and
  * calls sys_process_exit, which ends the process here (exit()). A title that
  * has not done so within PS3_QUIT_GRACE_MS (default 3000) is ended for it,
- * as the console does: once no save is being written (cellSaveData.c
- * ps3_savedata_busy, waited on for up to 10 s), with stdio flushed and the
- * atexit handlers run, exit(0) -- a normal end for whatever launched the
- * game. Runs on its own thread, so the caller (the main thread, the frame
- * clock) returns at once; a second request is ignored.
+ * as the console does: once no save or writable guest file is open
+ * (cellSaveData.c ps3_savedata_busy, which also closes the quit gate of
+ * include/ps3emu/quit_gate.h so nothing new starts; waited on for up to
+ * 10 s), with stdio flushed and the atexit handlers run, exit(0) -- a normal
+ * end for whatever launched the game. Runs on its own thread, so the caller
+ * (the main thread, the frame clock, the in-game menu's "Quit game") returns
+ * at once; a second request is ignored.
  * -----------------------------------------------------------------------*/
 #ifdef _WIN32
 static DWORD WINAPI host_quit_thread(LPVOID unused)

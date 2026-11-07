@@ -33,6 +33,8 @@ int main(void){vm_base=calloc(1,GUEST_BYTES);ppu_vm_size=GUEST_BYTES;
  up();m(M_TEX_UNIT+4,1|(2<<4)|(0xA6<<8)|(1<<16));m(M_TEX_UNIT+0x18,(16<<16)|16);draw_triangle();T(copies==0&&stub.n_draw==1,"DXT1 at the target's offset uploads from memory instead of dropping the draw");down();
  /* Independently newer depth at the same address keeps its established route. */
  up();nt=eng_current_target_set(targets);u32 zs=eng_zdepth_get(RSX_LOCATION_LOCAL,0x40000,256,256);g.zdepths[zs].depth_serial=2;g.zdepths[zs].had_write=1;g.zdepths[zs].snapshot_valid=0;m(M_TEX_UNIT+4,1|(2<<4)|(0xB0<<8)|(1<<16));memset(tx,0,sizeof tx);T(sink_bind_textures(targets,nt,ENG_INVALID,1,tx,ss)==1&&copies==0&&stub.n_depth_snapshot==1,"newer depth wins over own color metadata");down();
+ /* A compressed texture over the current target is memory, not feedback. */
+ up();m(M_TEX_UNIT+4,1|(2<<4)|(0xA6<<8)|(1<<16));m(M_TEX_UNIT+0x18,(16<<16)|16);draw_triangle();T(copies==0&&stub.n_draw==1,"DXT1 at the target's offset uploads from memory instead of dropping the draw");down();
  /* The zeta is canvas-sized; the snapshot covers only the texture's region. */
  up();nt=eng_current_target_set(targets);zs=eng_zdepth_get(RSX_LOCATION_LOCAL,0x40000,256,256);g.zdepths[zs].depth_serial=2;g.zdepths[zs].had_write=1;g.zdepths[zs].snapshot_valid=0;m(M_TEX_UNIT+4,1|(2<<4)|(0xB0<<8)|(1<<16));m(M_TEX_UNIT+0x18,(128<<16)|160);memset(tx,0,sizeof tx);T(g.zdepths[zs].w>128&&sink_bind_textures(targets,nt,ENG_INVALID,1,tx,ss)==1&&stub.snapshot_w==128&&stub.snapshot_h==160,"depth snapshot cropped to the sampled texture");down();
  /* Full physical layouts and matching formats, without reinterpretation. */

@@ -520,6 +520,42 @@ int main(void)
         check_absent("persp_off_no_helper", hlsl, "_rsx_inv_w");
     }
 
+    /* PS3_RES_SCALE: with the render targets twice the guest's size, WPOS is
+     * SV_POSITION halved back; at 1 the program is exactly what it was. The
+     * read is always _rsx_wpos(...) (the window convention, upstream #589):
+     * at scale 1 the unbuffered helper is the identity. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0) | END);   /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        char base[sizeof hlsl];
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, base, sizeof(base));
+        check("wpos_native", base, "((_rsx_wpos(input.position)).xyzw)");
+        check("wpos_native_helper", base, "#define _rsx_wpos(p) (p)\n");
+        rsx_fp_set_wpos_scale(2.0f);
+        check_true("wpos_scale_set", rsx_fp_wpos_scale() == 2.0f);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("wpos_scaled", hlsl, "((_rsx_wpos(input.position)).xyzw)");
+        check("wpos_scaled_helper", hlsl, "#define _rsx_wpos(p) float4((p).x * 0.5, (p).y * 0.5, (p).zw)");
+        rsx_fp_set_wpos_scale(1.5f);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check("wpos_scaled_1_5", hlsl, "(p).x * 0.666666667");
+        /* Buffered, the window convention applies to the scaled-back value. */
+        {
+            u32 nk = 0;
+            rsx_fp_set_wpos_scale(2.0f);
+            rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+            check("wpos_scaled_buffered_helper", hlsl,
+                  "#define _rsx_wpos(p) float4((p).x * 0.5 + fp_alpha.z, "
+                  "(fp_alpha.y != 0.0 ? fp_alpha.y - (p).y * 0.5 : (p).y * 0.5) + fp_alpha.z, (p).z, (p).w)");
+        }
+        rsx_fp_set_wpos_scale(0.0f);                      /* nonsense: back to 1 */
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        check_true("wpos_back_to_native", !strcmp(hlsl, base));
+    }
+
     /* WPOS on an antialiased target held at its sample grid: every sample
      * reads the centre of its pixel. A perspective-corrected texcoord keeps
      * reading w from the same SV_POSITION, which the rewrite leaves alone. */
@@ -675,6 +711,110 @@ int main(void)
         rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
         check("soft_particle_no_mod", hlsl, "(((r[1]).xyzw) * (abs((r[5]).xyzw)))");
         check_absent("soft_particle_no_mod_clamp", hlsl, "clamp(");
+    }
+
+    /* The same under PS3_RES_SCALE, where the read is _rsx_wpos(...): the grid
+     * line still goes first, and the macro then scales the pixel centre. */
+    {
+        u8 prog[16];
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0) | END);   /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        rsx_fp_set_wpos_scale(2.0f);
+        rsx_fp_decompile(prog, sizeof(prog), CTRL_32BIT, hlsl, sizeof(hlsl));
+        rsx_fp_set_wpos_scale(1.0f);
+        check_true("wpos_grid_res_scale", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 1) == 1);
+        check("wpos_grid_res_scale_line", hlsl,
+              "    input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;\n");
+        check("wpos_grid_res_scale_read", hlsl, "((_rsx_wpos(input.position)).xyzw)");
+    }
+
+    /* SET_SHADER_WINDOW: a BOTTOM origin counts WPOS.y up from the window's
+     * bottom edge. Resistance's water reads its depth at (720 - WPOS.y); with
+     * SV_POSITION's top-down y that row was mirrored. */
+    {
+        u8 prog[32];
+        u32 nk = 0;
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(0));            /* MOV r0, WPOS */
+        put_word(prog + 4, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(prog + 8, 0);
+        put_word(prog + 12, 0);
+        put_word(prog + 16, OPC(0x17) | OUTMASK_ALL | OUTREG(1) | INSRC(6) | TEXU(0) | END);
+        put_word(prog + 20, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);              /* TEX r1, TC2 */
+        put_word(prog + 24, 0);
+        put_word(prog + 28, 1u << 31);
+        check_true("reads_wpos", rsx_fp_reads_wpos(prog, sizeof prog) == 1);
+
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        char before[sizeof hlsl];
+        memcpy(before, hlsl, sizeof hlsl);
+        check_true("wpos_window_top_noop",
+                   rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000002D0u) == 0 &&
+                   !strcmp(before, hlsl));
+        check_true("wpos_window_short_buffer",
+                   rsx_fp_apply_wpos_window(hlsl, (u32)strlen(hlsl) + 8, 0x000012D0u) == -1 &&
+                   !strcmp(before, hlsl));
+        check_true("wpos_window_bottom", rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000012D0u) == 1);
+        check("wpos_window_bottom_line", hlsl,
+              "float4 main(PSInput input) : SV_TARGET {\n"
+              "    /* rsx shader window */ input.position.y = 720 - input.position.y;\n");
+        check("wpos_window_inv_w_kept", hlsl, "_rsx_inv_w(input.position)");
+        check_true("wpos_window_once", rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000012D0u) == -1);
+
+        /* On an antialiased target the flip follows the grid line, which
+         * rebuilds y from the sample position. */
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_true("wpos_window_grid", rsx_fp_apply_wpos_grid(hlsl, sizeof hlsl, 2, 1) == 1 &&
+                                       rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000012D0u) == 1);
+        check("wpos_window_after_grid", hlsl,
+              "    input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;\n"
+              "    /* rsx shader window */ input.position.y = 720 - input.position.y;\n");
+
+        /* INTEGER centres drop the half on both axes (RPCS3 wpos_bias). */
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_true("wpos_window_bottom_integer", rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000112D0u) == 1);
+        check("wpos_window_bottom_integer_line", hlsl,
+              "input.position.xy = float2(input.position.x - 0.5, 719.5 - input.position.y);\n");
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_true("wpos_window_top_integer", rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000102D0u) == 1);
+        check("wpos_window_top_integer_line", hlsl, "input.position.xy -= 0.5;\n");
+
+        /* Under PS3_RES_SCALE SV_POSITION counts scaled pixels and _rsx_wpos
+         * divides afterwards, so the flip uses the scaled height. */
+        rsx_fp_set_wpos_scale(2.0f);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        check_true("wpos_window_res_scale", rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000012D0u) == 1);
+        rsx_fp_set_wpos_scale(1.0f);
+        check("wpos_window_res_scale_line", hlsl, "input.position.y = 1440 - input.position.y;\n");
+        check("wpos_window_res_scale_read", hlsl, "_rsx_wpos(input.position)");
+
+        /* No WPOS read: nothing to do, and the scanner agrees. The
+         * perspective-corrected texcoord's 1/w is not a WPOS read. */
+        put_word(prog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1));            /* MOV r0, COL0 */
+        check_true("reads_wpos_none", rsx_fp_reads_wpos(prog, sizeof prog) == 0);
+        rsx_fp_decompile_buffered_ex(prog, sizeof prog, CTRL_32BIT, 0, hlsl, sizeof hlsl, &nk);
+        memcpy(before, hlsl, sizeof hlsl);
+        check_true("wpos_window_no_wpos_noop",
+                   rsx_fp_apply_wpos_window(hlsl, sizeof hlsl, 0x000012D0u) == 0 &&
+                   !strcmp(before, hlsl));
+
+        /* An inline constant's 16 bytes are data, not an instruction: a
+         * constant whose words look like a WPOS read is skipped. */
+        u8 kprog[48];
+        put_word(kprog + 0, OPC(0x01) | OUTMASK_ALL | INSRC(1));           /* MOV r0, c */
+        put_word(kprog + 4, T_CONST | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(kprog + 8, 0);
+        put_word(kprog + 12, 0);
+        put_word(kprog + 16, OPC(0x01) | INSRC(0));                        /* looks like MOV WPOS */
+        put_word(kprog + 20, T_INPUT);
+        put_word(kprog + 24, 0);
+        put_word(kprog + 28, 0);
+        put_word(kprog + 32, OPC(0x01) | OUTMASK_ALL | INSRC(1) | END);    /* MOV r0, COL0 */
+        put_word(kprog + 36, T_INPUT | SWZ_IDENT | EXEC_ALWAYS);
+        put_word(kprog + 40, 0);
+        put_word(kprog + 44, 0);
+        check_true("reads_wpos_skips_constant", rsx_fp_reads_wpos(kprog, sizeof kprog) == 0);
     }
 
     printf("\n===========================================\n");

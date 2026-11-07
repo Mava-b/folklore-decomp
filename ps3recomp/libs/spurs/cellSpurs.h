@@ -318,6 +318,7 @@ s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
 s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
 
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);
