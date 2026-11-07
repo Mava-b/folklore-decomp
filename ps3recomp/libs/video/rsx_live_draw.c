@@ -8836,8 +8836,14 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     {
         const float* box = g_ld_hud_boxes.rects[boxIndex];
         const float boxWidth = box[1] - box[0];
-        if (middleY >= box[2] && middleY <= box[3] && left <= box[1] + LD_HUD_BOX_MARGIN &&
-            right >= box[0] - LD_HUD_BOX_MARGIN && (right - left) * 2.0f <= boxWidth)
+        /* Only a box left in the middle pulls text to it: one moved out
+         * (the gauges' panel, the map) needs no help for its own contents,
+         * and a moved-out effect drawn near world-placed text (the "Search"
+         * prompt over Ellen, capture-20261107-122656) dragged that text to
+         * the edge whenever the camera turned it past the middle. */
+        if (g_ld_hud_boxes.places[boxIndex] == LD_HUD_CENTRE && middleY >= box[2] && middleY <= box[3] &&
+            left <= box[1] + LD_HUD_BOX_MARGIN && right >= box[0] - LD_HUD_BOX_MARGIN &&
+            (right - left) * 2.0f <= boxWidth)
         {
             overBox = (int)boxIndex;
         }

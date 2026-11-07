@@ -1590,6 +1590,15 @@ What 0006 fixes in ps3recomp to make that run:
     tip (the corner furthest from the middle of the other two): viewport
     left = tip x (1 - shrink). Simulated on capture-20261031-161917: three
     bubbles, each with all its letters (18, 19, 33).
+113. "Search" prompt jumping right (capture-20261107-122656, after 0088):
+    the prompt is world-placed text over Ellen (x 604-676, y 194-230 of
+    1280x720, the same every frame); in some frames it went to the right
+    edge while its pill stayed. Nothing but a box (111) could send it
+    there: a CPU-evaluated effect drawn before it (e062172c, its extent
+    changing with the camera) was recorded as a box moved right. patches/
+    0090: only boxes left in the middle pull text to them -- 111 needs no
+    more (the place-name bubble is in the middle), and a moved-out box's own
+    contents already go its way by the zones.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
