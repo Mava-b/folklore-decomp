@@ -834,8 +834,12 @@ namespace
         ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, 6.0f * scale);
         ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, inUse ? 2.0f : 1.0f);
         ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(padding, padding));
-        ImGui::BeginChild("##slot", ImVec2(0.0f, pictureHeight + padding * 2.0f),
-                          ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding,
+        /* As tall as its contents: the picture, or the text when that is
+         * taller (Windows' fonts at a high display scale make it so, and a
+         * fixed height cut off the play time line). */
+        ImGui::BeginChild("##slot", ImVec2(0.0f, 0.0f),
+                          ImGuiChildFlags_Borders | ImGuiChildFlags_AlwaysUseWindowPadding |
+                              ImGuiChildFlags_AutoResizeY,
                           ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
         {
             const SlotPicture* picture = slotPicture(slot);
