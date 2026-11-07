@@ -162,3 +162,56 @@ s32 cellVoiceSetCallback(CellVoiceEventCallback callback, void* arg)
     if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
     return CELL_OK;
 }
+
+/* Port control: Sony PS3 SDK libvoice Reference 4.0.0, pp. 33, 41, 53.
+ *
+ * These stubs report TOPOLOGY for an unknown port; the older calls above
+ * retain PORT_NOT_FOUND. No voice data flows here, so there is nothing to
+ * flush on reset and no microphone signal to measure. Each call logs once
+ * so the missing audio path stays visible. */
+
+static int voice_port_valid(CellVoicePortId portId)
+{
+    return portId < CELL_VOICE_PORT_MAX && s_ports[portId].in_use;
+}
+
+s32 cellVoiceResetPort(CellVoicePortId portId)
+{
+    static int logged = 0;
+    if (!logged) { logged = 1; printf("[cellVoice] ResetPort(%u): no voice buffers to flush (stub)\n", portId); }
+    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
+    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
+    return CELL_OK;
+}
+
+s32 cellVoiceUpdatePort(CellVoicePortId portId, const CellVoicePortParam* param)
+{
+    static int logged = 0;
+    if (!logged) { logged = 1; printf("[cellVoice] UpdatePort(%u): parameters stored, no voice processing\n", portId); }
+    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
+    if (!param) return (s32)CELL_VOICE_ERROR_ARGUMENT_INVALID;
+    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
+    /* s_ports[].param holds the guest's bytes as CreatePort copied them.
+     * SDK libvoice Reference pp. 8 and 53: update threshold, bMute and
+     * volume (bytes 4..11) and, for voice ports (IN_VOICE 2 / OUT_VOICE 4),
+     * bitrate (bytes 12..15). Preserve portType, device and PCM fields. */
+    uint8_t* dst = (uint8_t*)&s_ports[portId].param;
+    const uint8_t* src = GUEST_PTR(param, const uint8_t*);
+    u32 type = ((u32)dst[0] << 24) | ((u32)dst[1] << 16) | ((u32)dst[2] << 8) | dst[3];
+    memcpy(dst + 4, src + 4, 8);
+    if (type == 2 || type == 4)
+        memcpy(dst + 12, src + 12, 4);
+    return CELL_OK;
+}
+
+s32 cellVoiceGetSignalState(CellVoicePortId portId, u32 attr, void* attrValue)
+{
+    static int logged = 0;
+    if (!logged) { logged = 1; printf("[cellVoice] GetSignalState(%u, attr=%u): no microphone -> DEVICE_NOT_PRESENT\n", portId, attr); }
+    (void)attrValue;
+    if (!s_initialized) return (s32)CELL_VOICE_ERROR_NOT_INITIALIZED;
+    if (!voice_port_valid(portId)) return (s32)CELL_VOICE_ERROR_TOPOLOGY;
+    /* SDK libvoice Reference p. 33 defines the missing-microphone error.
+     * This stub leaves attrValue untouched because no sample is available. */
+    return (s32)CELL_VOICE_ERROR_DEVICE_NOT_PRESENT;
+}

@@ -17,13 +17,17 @@ void spu_lockline_unlock(void) { std::abort(); }
 int spu_raw_reg_load(uint32_t, uint32_t*) { std::abort(); }
 void spu_raw_reg_store(uint32_t, uint32_t, unsigned) { std::abort(); }
 void cellGcm_ref_on_poll(void) { std::abort(); }
+// ppu_run buffers host stdio first (runtime/platform/ps3_stdio.c, which has its
+// own test); how this fixture's output is buffered does not matter here.
+void ps3_stdio_init(void) {}
 HANDLE CreateThread(void*, SIZE_T, PS3_THREAD_FN, LPVOID, DWORD, DWORD*) { std::abort(); }
 BOOL CloseHandle(HANDLE) { std::abort(); }
 DWORD GetFileAttributesA(const char*) { std::abort(); }
 uint32_t ppu_load_elf(const char*);
 int ppu_run(uint32_t, uint32_t);
 extern uint32_t ppu_vm_size;
-uint64_t ppu_thread_register_main(void) { return 1; }
+uint64_t ppu_thread_register_main_priority(int32_t) { return 1; }
+void ppu_thread_set_main_stack(uint32_t, uint32_t) {}
 void (*g_ppu_thread_entry_trampoline)(uint32_t, uint64_t, uint32_t, uint64_t);
 }
 static unsigned failures;

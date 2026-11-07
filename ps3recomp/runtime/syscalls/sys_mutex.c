@@ -8,6 +8,10 @@
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>   /* getenv */
+#ifndef _WIN32
+#include <unistd.h>   /* sleep: MUTEX_WATCH=2 reporter */
+#endif
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -107,8 +111,10 @@ int64_t sys_mutex_create(ppu_context* ctx)
 #endif
         m->recursive = (rec_be == SYS_SYNC_RECURSIVE) ? 1 : 0;
 
-        /* name at offset 24 */
-        memcpy(m->name, attr_raw + 24, 8);
+        /* name at offset 0x20: sys_mutex_attribute_t is protocol, recursive,
+         * pshared, adaptive (4 x u32), ipc_key u64 @0x10, flags @0x18, pad
+         * @0x1C, name[8] @0x20. Offset 24 read flags + pad. */
+        memcpy(m->name, attr_raw + 0x20, 8);
     }
 
     /* Initialize host mutex */
@@ -159,6 +165,22 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* lv2 refuses to destroy a mutex that is held or has waiters (EBUSY).
+     * Destroying it anyway freed the host mutex under a thread blocked on it,
+     * and the next sys_mutex_create in the same slot initialised a new one
+     * over it: everyone else then used the new mutex and the blocked thread
+     * waited on the dead one for good. */
+    if (m->lock_count > 0 || __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST) > 0) {
+        static int n = 0;
+        if (n++ < 16)
+            fprintf(stderr, "[mutex] destroy of mutex %u '%.8s' refused: owner tid=%llu "
+                    "count=%d waiters=%d (EBUSY)\n", mutex_id, m->name,
+                    (unsigned long long)m->owner_tid, m->lock_count,
+                    __atomic_load_n(&m->waiters, __ATOMIC_SEQ_CST));
+        mtx_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+
 #ifdef _WIN32
     DeleteCriticalSection(&m->cs);
     if (m->wait_handle) CloseHandle(m->wait_handle);
@@ -177,10 +199,69 @@ int64_t sys_mutex_destroy(ppu_context* ctx)
  * r3 = mutex_id
  * r4 = timeout_usec (0 = infinite)
  * -----------------------------------------------------------------------*/
+#ifndef _WIN32
+/* MUTEX_WATCH=2 bookkeeping: who is blocked on which mutex since when. */
+#define MUTEX_WATCH_SLOTS 64
+static struct { volatile int used; uint64_t tid; uint32_t id, lr; struct timespec t0; }
+    s_mw[MUTEX_WATCH_SLOTS];
+
+static void* mutex_watch_reporter(void* arg)
+{
+    (void)arg;
+    for (;;) {
+        sleep(5);
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        for (int i = 0; i < MUTEX_WATCH_SLOTS; i++) {
+            if (!s_mw[i].used) continue;
+            long waited = (long)(now.tv_sec - s_mw[i].t0.tv_sec);
+            if (waited < 5) continue;
+            const sys_mutex_info* m = &g_sys_mutexes[s_mw[i].id - 1];
+            fprintf(stderr, "[mutex] tid=%llu blocked %lds on mutex %u '%.8s' lr=0x%08X; "
+                    "owner tid=%llu count=%d\n",
+                    (unsigned long long)s_mw[i].tid, waited, s_mw[i].id, m->name,
+                    s_mw[i].lr, (unsigned long long)m->owner_tid, m->lock_count);
+        }
+    }
+    return NULL;
+}
+
+static int mutex_watch_enter(uint64_t tid, uint32_t id, uint32_t lr)
+{
+    static int started = 0;
+    if (!__atomic_exchange_n(&started, 1, __ATOMIC_SEQ_CST)) {
+        pthread_t t;
+        if (pthread_create(&t, NULL, mutex_watch_reporter, NULL) == 0) pthread_detach(t);
+    }
+    for (int i = 0; i < MUTEX_WATCH_SLOTS; i++) {
+        int expected = 0;
+        if (__atomic_compare_exchange_n(&s_mw[i].used, &expected, 2, 0,
+                                        __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST)) {
+            s_mw[i].tid = tid; s_mw[i].id = id; s_mw[i].lr = lr;
+            clock_gettime(CLOCK_MONOTONIC, &s_mw[i].t0);
+            __atomic_store_n(&s_mw[i].used, 1, __ATOMIC_SEQ_CST);
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void mutex_watch_leave(int slot)
+{
+    if (slot >= 0) __atomic_store_n(&s_mw[slot].used, 0, __ATOMIC_SEQ_CST);
+}
+#endif
+
 int64_t sys_mutex_lock(ppu_context* ctx)
 {
     uint32_t mutex_id    = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us  = LV2_ARG_U64(ctx, 1);
+    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits, which wraps
+     * for a timeout past about 1.8e12 us (21 days at 10 MHz) and lands on an
+     * arbitrary deadline: 2^63, say, comes out as "already passed" and times
+     * out at once. Anything beyond 2^40 us (12.7 days) is indistinguishable
+     * from waiting forever, so treat it as that. */
+    if (timeout_us > (1ull << 40)) timeout_us = 0;
     if (mutex_id == 0 || mutex_id > SYS_MUTEX_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -195,6 +276,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_EDEADLK;
     }
 
+    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);   /* see sys_mutex_destroy */
 #ifdef _WIN32
     if (timeout_us == 0) {
         /* Infinite wait */
@@ -210,6 +292,7 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         int64_t deadline = lv2_usec_deadline(timeout_us);
         while (!TryEnterCriticalSection(&m->cs)) {
             if (lv2_deadline_passed(deadline)) {
+                __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
             if (timeout_us < 1000) SwitchToThread();
@@ -217,7 +300,32 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         }
     }
 #else
-    if (timeout_us == 0) {
+    static int s_watch = -1;
+    if (s_watch < 0) { const char* e = getenv("MUTEX_WATCH"); s_watch = e ? atoi(e) : 0; }
+    if (timeout_us == 0 && s_watch == 2) {
+        /* MUTEX_WATCH=2: the wait stays a real blocking lock (the polling of
+         * =1 changes the timing enough to hide some hangs), and a reporter
+         * thread names every waiter older than 5 s and the mutex's owner. */
+        int slot = mutex_watch_enter(caller_tid, mutex_id, (uint32_t)ctx->lr);
+        pthread_mutex_lock(&m->mtx);
+        mutex_watch_leave(slot);
+    } else if (timeout_us == 0 && s_watch) {
+        /* MUTEX_WATCH=1: an infinite lock waits in 5 s slices and says who it
+         * is waiting on, so a guest deadlock names its two threads. */
+        unsigned waited = 0;
+        for (;;) {
+            struct timespec ts;
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;
+            if (pthread_mutex_timedlock(&m->mtx, &ts) == 0) break;
+            waited += 5;
+            fprintf(stderr, "[mutex] tid=%llu waiting %us on mutex %u '%.8s' "
+                    "owner tid=%llu count=%u lr=0x%08X\n",
+                    (unsigned long long)caller_tid, waited, mutex_id, m->name,
+                    (unsigned long long)m->owner_tid, (unsigned)m->lock_count,
+                    (uint32_t)ctx->lr);
+        }
+    } else if (timeout_us == 0) {
         pthread_mutex_lock(&m->mtx);
     } else {
         struct timespec ts;
@@ -230,10 +338,12 @@ int64_t sys_mutex_lock(ppu_context* ctx)
         }
         int rc = pthread_mutex_timedlock(&m->mtx, &ts);
         if (rc == ETIMEDOUT) {
+            __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     }
 #endif
+    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
 
     m->owner_tid = caller_tid;
     m->lock_count++;
@@ -284,6 +394,14 @@ int64_t sys_mutex_trylock(ppu_context* ctx)
         m->lock_count++;
         return CELL_OK;
     }
+
+    /* A non-recursive mutex the caller already holds is EDEADLK, as in
+     * sys_mutex_lock above. Without this the host try-acquire below SUCCEEDS --
+     * a CRITICAL_SECTION (and a recursive pthread mutex) is always re-enterable
+     * by its owner -- so the guest was told it had taken a second level of a
+     * mutex that has none. */
+    if (!m->recursive && m->owner_tid == caller_tid && m->lock_count > 0)
+        return (int64_t)(int32_t)CELL_EDEADLK;
 
 #ifdef _WIN32
     if (!TryEnterCriticalSection(&m->cs)) {

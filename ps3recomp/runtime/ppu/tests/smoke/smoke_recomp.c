@@ -498,7 +498,7 @@ void func_00010000(ppu_context* ctx)
     ctx->gpr[5]  = SMOKE_THREAD_ARG;      /* the new thread's r3 */
     ctx->gpr[6]  = 1000;                  /* priority            */
     ctx->gpr[7]  = 0x10000;               /* stack size          */
-    ctx->gpr[8]  = 0;                     /* flags               */
+    ctx->gpr[8]  = 1;                     /* flags: JOINABLE (joined below) */
     ctx->gpr[9]  = SMOKE_THREAD_NAME;
     lv2_syscall(ctx);
     smoke_check((int32_t)ctx->gpr[3] == 0, "sys_ppu_thread_create failed");

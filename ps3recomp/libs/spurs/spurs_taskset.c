@@ -30,6 +30,46 @@ void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
     vm_write32(taskset_ea + CSTS_EVENT_FLAG_ID2, evf2);
 }
 
+/* Set or clear one task's bit in a taskset bitset (ready/pending/enabled at +0x10/+0x20/+0x30) from a host thread.
+ *
+ * These bitsets share the taskset's first 128-byte line with the SPU task library, which updates them with
+ * GETLLAR/PUTLLC, and with the host's task exit (spu_taskset_task_exited). spurs_bitset_set/_clear read the word
+ * with vm_read32 outside the lock-line lock and write it back with vm_write32, so a change committed between the
+ * two was undone. Do the read-modify-write on the raw guest bytes under the lock-line lock (vm_write32 takes that
+ * lock itself when the line is reserved, and it does not nest), then drop every reservation on the line. */
+void spurs_taskset_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set)
+{
+    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_coh_notify_write(uint32_t);
+    extern uint8_t* vm_base;
+    uint8_t* p = vm_base + bitset_ea + taskId / 8;
+    const uint8_t m = (uint8_t)(0x80u >> (taskId % 8));
+    spu_lockline_lock();
+    if (set) *p |= m; else *p &= (uint8_t)~m;
+    spu_coh_notify_write(bitset_ea);
+    spu_lockline_unlock();
+}
+
+/* Take the lowest free task id of a taskset: find the first clear bit of the enabled bitset and set it, as one
+ * step under the lock-line lock, so a task exit clearing its bit at the same time is never undone and two callers
+ * never get the same id. Returns `max_tasks` when every id is taken. */
+uint32_t spurs_taskset_take_slot(uint32_t taskset_ea, uint32_t max_tasks)
+{
+    extern void spu_lockline_lock(void); extern void spu_lockline_unlock(void);
+    extern void spu_coh_notify_write(uint32_t);
+    extern uint8_t* vm_base;
+    uint8_t* en = vm_base + taskset_ea + CSTS_ENABLED;
+    uint32_t slot = max_tasks;
+    spu_lockline_lock();
+    for (uint32_t t = 0; t < max_tasks; t++) {
+        const uint8_t m = (uint8_t)(0x80u >> (t % 8));
+        if (!(en[t / 8] & m)) { en[t / 8] |= m; slot = t; break; }
+    }
+    if (slot < max_tasks) spu_coh_notify_write(taskset_ea + CSTS_ENABLED);
+    spu_lockline_unlock();
+    return slot;
+}
+
 /* Register a task: write task_info[taskId] (args/elf/context/ls_pattern) and mark the
  * task enabled + ready so the PM's SELECT_TASK picks it. arg/ls_pattern may be NULL. */
 void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_ea,
@@ -42,8 +82,8 @@ void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_e
     vm_write64(ti + TI_CONTEXT, context);
     for (int i = 0; i < 4; i++)
         vm_write32(ti + TI_LS_PATTERN + i * 4, ls_pattern ? ls_pattern[i] : 0);
-    spurs_bitset_set(taskset_ea + CSTS_ENABLED, taskId);
-    spurs_bitset_set(taskset_ea + CSTS_READY,   taskId);
+    spurs_taskset_bitset_update(taskset_ea + CSTS_ENABLED, taskId, 1);
+    spurs_taskset_bitset_update(taskset_ea + CSTS_READY,   taskId, 1);
 }
 
 /* Set the taskset's on-task-exit handler EA (CellSpursTaskset.x78). */

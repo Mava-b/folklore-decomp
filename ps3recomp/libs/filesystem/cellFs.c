@@ -14,6 +14,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* GUEST_PTR, vm_write*: guest EA -> host */
+#include "ps3emu/log_first.h"
 
 /* glibc's <sys/stat.h> exposes st_atime/st_mtime/st_ctime as macros that expand
  * to st_atim.tv_sec etc.  They collide with the identically named members of the
@@ -530,7 +531,7 @@ s32 cellFsRead(CellFsFd fd, void* buf, u64 nbytes, u64* nread)
     }
 
     { static int _n = 0;
-      if (_n++ < 32)
+      if (PS3_LOG_FIRST(_n, 32))
           { printf("[cellFs] Read(fd=%d, buf=0x%08X, %llu bytes) -> %llu", fd,
                    (uint32_t)(uintptr_t)buf,
                    (unsigned long long)nbytes, (unsigned long long)bytes_read);

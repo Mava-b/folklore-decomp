@@ -815,18 +815,22 @@ Producer-consumer pipeline framework for streaming data between PPU and SPU. Unl
 ### cellFiber
 
 **File:** `libs/spurs/cellFiber.c`
-**Purpose:** Cooperative multitasking (PPU fibers)
+**Purpose:** Cooperative multitasking (PPU fibers), the SDK's scheduler API
 
 **Backend:**
-- Windows: `CreateFiber()` / `SwitchToFiber()` / `ConvertThreadToFiber()`
+- Windows: `CreateFiberEx()` / `SwitchToFiber()` / `ConvertThreadToFiber()`
 - POSIX: `makecontext()` / `swapcontext()` (`ucontext_t`)
 
 **Features:**
-- Up to 64 concurrent fibers
-- Create/delete/switch/yield
-- Sleep with wakeup (fiber suspends until explicitly woken)
-- Per-fiber user data pointer
-- Stack size configuration
+- `cellFiberPpuInitializeScheduler` / `FinalizeScheduler`, `CreateFiber(scheduler, fiber, entry, arg, priority, eaStack, sizeStack, attr)`
+- `RunFibers` runs the scheduler's fibers on the calling thread until every one has ended; lowest priority number
+  first, creation order among equals
+- `WaitSignal` / `SendSignal` (a signal sent early is kept; any host thread may send), `JoinFiber` (from a fiber or
+  from any thread), `Yield`, `Exit`, `Self`
+- Each fiber has its own guest stack (the caller's `eaStack`) and its own host stack and `ppu_context`; the entry runs
+  through the PPU thread trampoline
+- The SDK's error codes (`0x8076xxxx`) and structure sizes; the attribute contents are not modelled
+- Not implemented: the `cellFiberPpuUtil*` worker-control functions
 
 ---
 

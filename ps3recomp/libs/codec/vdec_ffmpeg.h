@@ -26,6 +26,7 @@ typedef struct VdecFfPicture {
     u32 token;        /* the token passed with the AU this picture came from */
     int pict_type;    /* 1 I, 2 P, 3 B, 0 unknown (FFmpeg's AVPictureType) */
     int key;          /* keyframe (IDR for H.264) */
+    u32 frame_ticks;  /* one frame at the stream's rate, 90 kHz; 0 unknown */
 } VdecFfPicture;
 
 typedef void (*vdec_ff_emit_fn)(void* ctx, const VdecFfPicture* pic);

@@ -53,6 +53,19 @@
 
 static char s_save_root[1024] = "./gamedata/dev_hdd0/home/00000001/savedata";
 
+/* $PS3_GAMEDATA_ROOT replaces the cwd-relative "./gamedata", so a port can keep
+ * the player's saves in one fixed place (e.g. ~/Library/Application Support/...)
+ * no matter which directory the game was launched from. */
+static void adopt_gamedata_root(void)
+{
+    static int s_done = 0;
+    if (s_done) return;
+    s_done = 1;
+    const char* env = getenv("PS3_GAMEDATA_ROOT");
+    if (env && *env)
+        snprintf(s_save_root, sizeof(s_save_root), "%s/dev_hdd0/home/00000001/savedata", env);
+}
+
 /* Ensure directory (and parents) exist */
 static void ensure_dirs(const char* path)
 {
@@ -73,6 +86,7 @@ static void ensure_dirs(const char* path)
 
 static void build_save_path(char* buf, size_t buf_size, const char* dirName)
 {
+    adopt_gamedata_root();
     snprintf(buf, buf_size, "%s/%s", s_save_root, dirName);
 #ifdef _WIN32
     for (char* p = buf; *p; p++) {
@@ -437,6 +451,7 @@ static u32 enumerate_save_dirs(const char* prefix, CellSaveDataDirList* dirList,
 {
     u32 count = 0;
 
+    adopt_gamedata_root();
     ensure_dirs(s_save_root);
 
 #ifdef _WIN32
@@ -843,41 +858,48 @@ void cellSaveDataHostSaveCounts(u32* done, u32* failed)
     }
 }
 
-static s32 savedata_execute_core(const char* dirName, int is_save,
-                                 CellSaveDataSetBuf* setBuf,
-                                 CellSaveDataStatCallback funcStat,
-                                 CellSaveDataFileCallback funcFile,
-                                 void* userdata);
+/* Saves in flight, for a host-side quit (cellSysutil.c ps3_host_quit): it
+ * waits for this to reach 0 so it never cuts a save file short. */
+static volatile int s_savedata_busy;
+int ps3_savedata_busy(void) { return __atomic_load_n(&s_savedata_busy, __ATOMIC_ACQUIRE); }
+
+static s32 savedata_execute_run(const char* dirName, int is_save,
+                                CellSaveDataSetBuf* setBuf,
+                                CellSaveDataStatCallback funcStat,
+                                CellSaveDataFileCallback funcFile,
+                                void* userdata);
 
 /* Core save/load implementation shared by List/Fixed/Auto variants. A save
  * the title itself cancels (its callback answering NODATA) is counted as
- * neither. */
+ * neither done nor failed. */
 static s32 savedata_execute(const char* dirName, int is_save,
                              CellSaveDataSetBuf* setBuf,
                              CellSaveDataStatCallback funcStat,
                              CellSaveDataFileCallback funcFile,
                              void* userdata)
 {
-    const s32 result = savedata_execute_core(dirName, is_save, setBuf, funcStat, funcFile, userdata);
+    __atomic_add_fetch(&s_savedata_busy, 1, __ATOMIC_ACQ_REL);
+    const s32 r = savedata_execute_run(dirName, is_save, setBuf, funcStat, funcFile, userdata);
     if (is_save)
     {
-        if (result == CELL_OK)
+        if (r == CELL_OK)
         {
             g_savedata_saves_done++;
         }
-        else if (result != CELL_SAVEDATA_ERROR_NODATA)
+        else if (r != CELL_SAVEDATA_ERROR_NODATA)
         {
             g_savedata_saves_failed++;
         }
     }
-    return result;
+    __atomic_sub_fetch(&s_savedata_busy, 1, __ATOMIC_ACQ_REL);
+    return r;
 }
 
-static s32 savedata_execute_core(const char* dirName, int is_save,
-                                 CellSaveDataSetBuf* setBuf,
-                                 CellSaveDataStatCallback funcStat,
-                                 CellSaveDataFileCallback funcFile,
-                                 void* userdata)
+static s32 savedata_execute_run(const char* dirName, int is_save,
+                                CellSaveDataSetBuf* setBuf,
+                                CellSaveDataStatCallback funcStat,
+                                CellSaveDataFileCallback funcFile,
+                                void* userdata)
 {
     if (!dirName || !funcStat)
         return CELL_SAVEDATA_ERROR_PARAM;

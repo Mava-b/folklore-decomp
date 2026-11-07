@@ -161,6 +161,7 @@ static inline void vm_raw_st16(uint64_t ea, const void* src) {
     uint64_t lo, hi; memcpy(&lo, src, 8); memcpy(&hi, (const uint8_t*)src + 8, 8);
     VM_RAW_ST(uint64_t, ea, lo); VM_RAW_ST(uint64_t, ea + 8, hi); }
 extern int      vm_inline_ok;
+extern int      vm_inline_st_ok;
 extern uint32_t ppu_vm_size;
 extern uint32_t ppu_hle_inject_base;
 /* One byte per 128-byte guest line (runtime/spu/spu_coherency.c). Bit 0 sends
@@ -168,149 +169,141 @@ extern uint32_t ppu_hle_inject_base;
  * everything the out-of-line accessors treat specially -- the null page, the
  * raw-SPU register windows at 0xE0000000 and up, the gcm ref-poll word, the
  * end of the mapping, every line an SPU has reserved (stores), the whole table
- * while a memory diagnostic is armed -- and the line in front of each of
- * those, so an access that starts one line early and runs into it is caught
- * too. That folds four compares and three global loads per access into one
- * byte test. */
+ * while a memory diagnostic is armed (vm_inline_ok / vm_inline_st_ok clear,
+ * which covers the barrier watch and the null-page sweep too) -- and the line
+ * in front of each of those, so an access that starts one line early and
+ * runs into it is caught too. That folds the range compares, the gcm
+ * ref-poll compare, the store-watch globals and the SPU-reservation bitmap
+ * into one byte test per access (Folklore patch 0028). */
 extern unsigned char g_vm_slow_lines[];
 #ifdef __cplusplus
 }
 #endif
-static inline int vm_inl_ok(uint32_t ea, uint32_t n)
+/* The memory-model globals that are set before any guest code runs, copied
+ * into a local. A guest store goes through a byte pointer the compiler cannot
+ * tell apart from these globals, so code that reads them directly reloads
+ * them after every store. Each lifted function takes one copy at entry
+ * (PPU_MM_SNAP, emitted by the lifter) and its loads and stores use that.
+ * What can change while a function runs -- which lines are slow -- is still
+ * read from g_vm_slow_lines, whose address is a link-time constant. */
+typedef struct ppu_mm { uint8_t* vb; } ppu_mm;
+static inline ppu_mm ppu_mm_take(void)
 {
-    (void)n;
-    return __builtin_expect(!(g_vm_slow_lines[ea >> 7] & 1u), 1);
+    ppu_mm m;
+    m.vb = vm_base;
+    return m;
 }
-static inline uint8_t vm_read8_inl(uint64_t a)
+/* The fast path is allowed for [ea, ea + n): n is covered by the marked line
+ * in front of every slow range (an access is at most 16 bytes). */
+static inline int vm_mm_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    (void)m; (void)n;
+    return !(g_vm_slow_lines[ea >> 7] & 1u);
+}
+static inline int vm_mm_st_ok(const ppu_mm* m, uint32_t ea, uint32_t n)
+{
+    (void)m; (void)n;
+    return !(g_vm_slow_lines[ea >> 7] & 2u);
+}
+static inline uint8_t vm_read8_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 1)) return __atomic_load_n(vm_base + ea, __ATOMIC_RELAXED);
+    if (__builtin_expect(vm_mm_ok(m, ea, 1), 1)) return __atomic_load_n(m->vb + ea, __ATOMIC_RELAXED);
     return vm_read8(a);
 }
-static inline uint16_t vm_read16_inl(uint64_t a)
+static inline uint16_t vm_read16_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 2)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint16_t v;
-        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 2);
+        if (!(ea & 1u)) v = __atomic_load_n((const uint16_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 2);
         return __builtin_bswap16(v); }
     return vm_read16(a);
 }
-static inline uint32_t vm_read32_inl(uint64_t a)
+static inline uint32_t vm_read32_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 4)) {   /* aligned: single-copy atomic, as on Cell */
+    /* The gcm ref-poll word's line is marked for loads (vm_slow_lines_refresh). */
+    if (__builtin_expect(vm_mm_ok(m, ea, 4), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint32_t v;
-        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 4);
+        if (!(ea & 3u)) v = __atomic_load_n((const uint32_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 4);
         return __builtin_bswap32(v); }
     return vm_read32(a);
 }
-static inline uint64_t vm_read64_inl(uint64_t a)
+static inline uint64_t vm_read64_mm(const ppu_mm* m, uint64_t a)
 {
     const uint32_t ea = (uint32_t)a;
-    if (vm_inl_ok(ea, 8)) {   /* aligned: single-copy atomic, as on Cell */
+    if (__builtin_expect(vm_mm_ok(m, ea, 8), 1)) {   /* aligned: single-copy atomic, as on Cell */
         uint64_t v;
-        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(vm_base + ea), __ATOMIC_RELAXED);
-        else memcpy(&v, vm_base + ea, 8);
+        if (!(ea & 7u)) v = __atomic_load_n((const uint64_t*)(m->vb + ea), __ATOMIC_RELAXED);
+        else memcpy(&v, m->vb + ea, 8);
         return __builtin_bswap64(v); }
     return vm_read64(a);
 }
+/* Inline guest-store fast paths, the store side of the loads above: every
+ * lifted store was an out-of-line call (a quarter of Folklore's main thread at
+ * the beach, a fifth of God of War HD's). A store the out-of-line path treats
+ * specially still goes there: the out-of-line vm_write* run the store
+ * diagnostics (PPU_WWATCH, PPU_WVAL, the barrier watch, a null-page sweep),
+ * the null-page and end-of-mapping checks, the raw-SPU register side effects,
+ * and a store to a line an SPU holds a reservation on, which has to take the
+ * lock-line lock and raise the lost-reservation event. All of those lines are
+ * marked bit 1 in g_vm_slow_lines. PPU_NO_INLINE_STORES=1 (at run time) turns
+ * this off. */
+static inline void vm_write8_mm(const ppu_mm* m, uint64_t a, uint8_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 1), 1)) { __atomic_store_n(m->vb + ea, v, __ATOMIC_RELAXED); return; }
+    vm_write8(a, v);
+}
+static inline void vm_write16_mm(const ppu_mm* m, uint64_t a, uint16_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 2), 1)) {   /* aligned: single-copy atomic, as on Cell */
+        const uint16_t be = __builtin_bswap16(v);
+        if (!(ea & 1u)) __atomic_store_n((uint16_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 2);
+        return; }
+    vm_write16(a, v);
+}
+static inline void vm_write32_mm(const ppu_mm* m, uint64_t a, uint32_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 4), 1)) {
+        const uint32_t be = __builtin_bswap32(v);
+        if (!(ea & 3u)) __atomic_store_n((uint32_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 4);
+        return; }
+    vm_write32(a, v);
+}
+static inline void vm_write64_mm(const ppu_mm* m, uint64_t a, uint64_t v)
+{
+    const uint32_t ea = (uint32_t)a;
+    if (__builtin_expect(vm_mm_st_ok(m, ea, 8), 1)) {
+        const uint64_t be = __builtin_bswap64(v);
+        if (!(ea & 7u)) __atomic_store_n((uint64_t*)(m->vb + ea), be, __ATOMIC_RELAXED);
+        else memcpy(m->vb + ea, &be, 8);
+        return; }
+    vm_write64(a, v);
+}
+/* Outside a lifted function: a fresh copy per access. */
+static inline uint8_t  vm_read8_inl (uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read8_mm(&m, a); }
+static inline uint16_t vm_read16_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read16_mm(&m, a); }
+static inline uint32_t vm_read32_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read32_mm(&m, a); }
+static inline uint64_t vm_read64_inl(uint64_t a) { const ppu_mm m = ppu_mm_take(); return vm_read64_mm(&m, a); }
+static inline void vm_write8_inl (uint64_t a, uint8_t  v) { const ppu_mm m = ppu_mm_take(); vm_write8_mm(&m, a, v); }
+static inline void vm_write16_inl(uint64_t a, uint16_t v) { const ppu_mm m = ppu_mm_take(); vm_write16_mm(&m, a, v); }
+static inline void vm_write32_inl(uint64_t a, uint32_t v) { const ppu_mm m = ppu_mm_take(); vm_write32_mm(&m, a, v); }
+static inline void vm_write64_inl(uint64_t a, uint64_t v) { const ppu_mm m = ppu_mm_take(); vm_write64_mm(&m, a, v); }
 #ifndef PPU_NO_INLINE_LOADS
 #define vm_read8(a)  vm_read8_inl(a)
 #define vm_read16(a) vm_read16_inl(a)
 #define vm_read32(a) vm_read32_inl(a)
 #define vm_read64(a) vm_read64_inl(a)
 #endif
-
-/* Inline guest-store fast paths, the store side of the loads above. The
- * out-of-line vm_write* run the store diagnostics (PPU_WWATCH, PPU_WVAL, ...),
- * the null-page and end-of-mapping checks, the raw-SPU register side effects
- * and the PPU<->SPU lock-line coherence -- for every store, through a call.
- * In Folklore that was a quarter of the main thread at the beach. The runtime
- * sets vm_store_inline_ok once it knows no store diagnostic is armed; a store
- * to a line an SPU holds a reservation on still goes out of line, which
- * serializes it with the SPU and raises the lock-line event, so the result is
- * the same. PPU_NO_INLINE_STORES=1 (at run time) turns this off. */
-#ifdef __cplusplus
-extern "C" {
-#endif
-extern int vm_store_inline_ok;
-extern const unsigned char* const g_spu_coh_bitmap;
-#ifdef __cplusplus
-}
-#endif
-static inline int vm_store_inl_ok(uint32_t ea, uint32_t n)
-{
-    (void)n;
-    return __builtin_expect(!(g_vm_slow_lines[ea >> 7] & 2u), 1);
-}
-static inline void vm_write8_inl(uint64_t a, uint8_t v)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_store_inl_ok(ea, 1))
-    {
-        __atomic_store_n(vm_base + ea, v, __ATOMIC_RELAXED);
-        return;
-    }
-    vm_write8(a, v);
-}
-static inline void vm_write16_inl(uint64_t a, uint16_t v)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_store_inl_ok(ea, 2))
-    {
-        const uint16_t raw = __builtin_bswap16(v);
-        if (!(ea & 1u))
-        {
-            __atomic_store_n((uint16_t*)(vm_base + ea), raw, __ATOMIC_RELAXED);
-        }
-        else
-        {
-            memcpy(vm_base + ea, &raw, 2);
-        }
-        return;
-    }
-    vm_write16(a, v);
-}
-static inline void vm_write32_inl(uint64_t a, uint32_t v)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_store_inl_ok(ea, 4))
-    {
-        const uint32_t raw = __builtin_bswap32(v);
-        if (!(ea & 3u))
-        {
-            __atomic_store_n((uint32_t*)(vm_base + ea), raw, __ATOMIC_RELAXED);
-        }
-        else
-        {
-            memcpy(vm_base + ea, &raw, 4);
-        }
-        return;
-    }
-    vm_write32(a, v);
-}
-static inline void vm_write64_inl(uint64_t a, uint64_t v)
-{
-    const uint32_t ea = (uint32_t)a;
-    if (vm_store_inl_ok(ea, 8))
-    {
-        const uint64_t raw = __builtin_bswap64(v);
-        if (!(ea & 7u))
-        {
-            __atomic_store_n((uint64_t*)(vm_base + ea), raw, __ATOMIC_RELAXED);
-        }
-        else
-        {
-            memcpy(vm_base + ea, &raw, 8);
-        }
-        return;
-    }
-    vm_write64(a, v);
-}
-#ifndef PPU_NO_INLINE_STORES
+#if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES)
 #define vm_write8(a, v)  vm_write8_inl(a, v)
 #define vm_write16(a, v) vm_write16_inl(a, v)
 #define vm_write32(a, v) vm_write32_inl(a, v)
@@ -400,6 +393,12 @@ static inline double ppu_fp_default_qnan(void)
     memcpy(&d, &q, 8);
     return d;
 }
+/* PPU_FAST_FP drops the NaN checks below and takes the host's NaN instead:
+ * the same value when one operand is a NaN, but the host picks which of two
+ * NaN operands propagates, the negating fmadd forms flip a NaN's sign, and a
+ * new NaN (inf - inf, 0 * inf) has its sign bit set. Only for a title whose
+ * output does not depend on NaN bits. */
+#ifndef PPU_FAST_FP
 static inline double ppu_fp_bin(double a, double b, double r)
 {
     if (a != a) return ppu_fp_quiet(a);
@@ -407,6 +406,9 @@ static inline double ppu_fp_bin(double a, double b, double r)
     if (r != r) return ppu_fp_default_qnan();
     return r;
 }
+#else
+static inline double ppu_fp_bin(double a, double b, double r) { (void)a; (void)b; return r; }
+#endif
 static inline double ppu_fadd(double a, double b) { return ppu_fp_bin(a, b, a + b); }
 static inline double ppu_fsub(double a, double b) { return ppu_fp_bin(a, b, a - b); }
 static inline double ppu_fmul(double a, double b) { return ppu_fp_bin(a, b, a * b); }
@@ -415,11 +417,15 @@ static inline double ppu_fdiv(double a, double b) { return ppu_fp_bin(a, b, a / 
  * NaN priority: FRA, FRB, FRC (negations never apply to propagated NaNs). */
 static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int neg_res)
 {
+#ifndef PPU_FAST_FP
     if (a != a) return ppu_fp_quiet(a);
     if (b != b) return ppu_fp_quiet(b);
     if (c != c) return ppu_fp_quiet(c);
     double r = fma(a, c, neg_b ? -b : b);
     if (r != r) return ppu_fp_default_qnan();
+#else
+    double r = fma(a, c, neg_b ? -b : b);
+#endif
     return neg_res ? -r : r;
 }
 /* Round to single: the result must be representable in single format, NaNs
@@ -588,6 +594,30 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
         _tf((void*)(ctx)); \\
     } \\
 } while(0)
+
+/* Each lifted function opens with PPU_MM_SNAP; its loads and stores use that
+ * copy of the memory model (ppu_mm in ppu_recomp.h). */
+#define PPU_MM_SNAP const ppu_mm _mm = ppu_mm_take(); (void)_mm;
+#ifndef PPU_NO_INLINE_LOADS
+#undef vm_read8
+#undef vm_read16
+#undef vm_read32
+#undef vm_read64
+#define vm_read8(a)  vm_read8_mm(&_mm, a)
+#define vm_read16(a) vm_read16_mm(&_mm, a)
+#define vm_read32(a) vm_read32_mm(&_mm, a)
+#define vm_read64(a) vm_read64_mm(&_mm, a)
+#endif
+#if !defined(PPU_NO_INLINE_LOADS) && !defined(PPU_NO_INLINE_STORES)
+#undef vm_write8
+#undef vm_write16
+#undef vm_write32
+#undef vm_write64
+#define vm_write8(a, v)  vm_write8_mm(&_mm, a, v)
+#define vm_write16(a, v) vm_write16_mm(&_mm, a, v)
+#define vm_write32(a, v) vm_write32_mm(&_mm, a, v)
+#define vm_write64(a, v) vm_write64_mm(&_mm, a, v)
+#endif
 
 """
 
@@ -759,6 +789,31 @@ _CRSET_RE = re.compile(
     r"ctx->cr = \(ctx->cr & ~\(0xFu << (?P<shift>\d+)\)\) \| \(cr_val << (?P<shift2>\d+)\); \}$")
 _CRBR_RE = re.compile(
     r"^(?P<ind>\s*)if \((?P<neg>!)?\(+ctx->cr >> (?P<shift>\d+)\) & (?P<mask>0x[0-9A-Fa-f]+|\d+)\)+\) (?P<rest>.*)$")
+# A line PPULifter._patched_translate wrote; group 1 is its guard symbol.
+_INSN_PATCH_RE = re.compile(r"^if \(([A-Za-z_]\w*)\) \{ .* /\* insn patch 0x[0-9A-F]{8}: ")
+
+
+def load_insn_patches(path: str) -> dict[int, tuple[int, int, str]]:
+    """Read an --insn-patches file:
+
+        {"patches": [{"addr": "0x001E6F68", "orig": "0x419DFFDC",
+                      "new": "0x60000000", "guard": "g_port_unlock_fps",
+                      "note": "..."}, ...]}
+
+    -> {addr: (orig, new, guard)}."""
+    with open(path) as f:
+        spec = json.load(f)
+    out: dict[int, tuple[int, int, str]] = {}
+    for e in spec.get("patches", []):
+        addr = int(str(e["addr"]), 0)
+        guard = str(e["guard"])
+        if not re.fullmatch(r"[A-Za-z_]\w*", guard):
+            sys.exit(f"[ppu_lifter] {path}: guard {guard!r} is not a C identifier")
+        if addr & 3 or addr in out:
+            sys.exit(f"[ppu_lifter] {path}: bad or duplicate address 0x{addr:08X}")
+        out[addr] = (int(str(e["orig"]), 0) & 0xFFFFFFFF,
+                     int(str(e["new"]), 0) & 0xFFFFFFFF, guard)
+    return out
 
 
 def _crval_to_c(val: str, mask: int, decl_a: str, a_expr: str, b_expr: str) -> str:
@@ -977,6 +1032,10 @@ class PPULifter:
         # Module primary TOC (r2). Set by main() only when the ELF yields exactly
         # one TOC candidate; enables the `ld r2, N(r1)` restore lowering below.
         self.toc_base: int = 0
+        # Runtime-switchable instruction patches (--insn-patches):
+        # {addr -> (original word, replacement word, guard symbol)}. See
+        # _patched_translate.
+        self.insn_patches: dict[int, tuple[int, int, str]] = {}
         # addr(int) -> recovered name label (from Ghidra analysis). Emitted as a
         # comment above func_ADDR so dispatch stays address-based.
         self.name_map: dict[int, str] = {}
@@ -1082,7 +1141,11 @@ class PPULifter:
                 func.body_lines.append(f"loc_{insn.addr:08X}:")
                 emitted_labels.add(insn.addr)
 
-            c_line = self._translate(insn, func)
+            patch = self.insn_patches.get(insn.addr)
+            if patch is not None:
+                c_line = self._patched_translate(insn, func, patch)
+            else:
+                c_line = self._translate(insn, func)
             if c_line:
                 func.body_lines.append(f"    {c_line}")
 
@@ -1426,6 +1489,39 @@ class PPULifter:
         alt = Instruction(insn.addr, raw, base, insn.operands, insn.comment)
         code2 = self._translate_op(alt, func)
         return code if code2.startswith("/* TODO") else code2
+
+    def _patched_translate(self, insn: Instruction, func: LiftedFunction,
+                           patch: tuple[int, int, str]) -> str:
+        """Both forms of a patched instruction, chosen at run time.
+
+        A static recompilation never executes the guest's code words, so a
+        patch that rewrites an instruction word in .text at run time does
+        nothing to the lifted title. This lifts the original
+        word and the replacement and emits
+
+            if (<guard>) { <replacement> } else { <original> }
+
+        so one build serves both, switched by an int the port defines and sets
+        before the guest starts. The original word must match what the spec
+        expects: a patch for one build of a title must never land on another.
+        The replacement may not branch -- it would need labels and call targets
+        this function was not lifted with; a nop, an immediate or a compare is
+        the shape these patches have."""
+        # Raised, not sys.exit: this runs in pool workers, where a SystemExit
+        # kills the worker and leaves the parent waiting for its result.
+        orig, new, guard = patch
+        if insn.raw != orig:
+            raise ValueError(f"insn patch at 0x{insn.addr:08X}: the input has "
+                             f"0x{(insn.raw or 0):08X}, the patch expects 0x{orig:08X} "
+                             f"(wrong binary for this patch set?)")
+        if (new >> 26) in (16, 17, 18, 19):
+            raise ValueError(f"insn patch at 0x{insn.addr:08X}: the replacement "
+                             f"0x{new:08X} is a branch/sc/CR op; not supported")
+        alt = disassemble_bytes(new.to_bytes(4, "big"), insn.addr, True)[0]
+        alt_c = self._translate(alt, func) or "/* nop */;"
+        orig_c = self._translate(insn, func) or ";"
+        return (f"if ({guard}) {{ {alt_c} }} else {{ {orig_c} }}"
+                f"  /* insn patch 0x{insn.addr:08X}: {orig:08X} -> {new:08X} */")
 
     def _translate(self, insn: Instruction, func: LiftedFunction) -> str:
         code = self._oe_wrap(insn, self._translate_xo_base(insn, func))
@@ -4062,7 +4158,14 @@ class PPULifter:
         if label:
             lines.append(f"/* {label} */")
         weak = "__attribute__((weak)) " if getattr(self, "weak_emit", False) else ""
+        # The guard of each --insn-patches line in this body: the port defines it.
+        guards = sorted({m.group(1) for bl in func.body_lines
+                         for m in [_INSN_PATCH_RE.match(bl.strip())] if m})
+        for g in guards:
+            lines += ["#ifdef __cplusplus", f'extern "C" int {g};', "#else",
+                      f"extern int {g};", "#endif"]
         lines.append(f"void {weak}{func.name}(ppu_context* ctx) {{")
+        lines.append("    PPU_MM_SNAP")
         for bline in _fuse_cr(func.body_lines):
             lines.append(f"    {bline}" if not bline.endswith(":") else bline)
 
@@ -4541,13 +4644,46 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
             # Widening is safe for the cases that already worked: the walk stops
             # at the NEAREST definition of `cand`, so when one exists inside the
             # window the result is unchanged.
-            for w in reversed(win_cand):
+            # Only definitions BEFORE the table load: `add r11, r0, r11` after
+            # `lwzx r0, r9, r11` reuses the base register for the case address,
+            # and is not the base's definition.
+            for w in reversed([x for x in win_cand if x.addr < lwzx.addr]):
                 a = [x.strip() for x in w.operands.split(',')]
                 if not a or a[0] != cand or w.mnemonic.startswith(('st', 'lf')):
                     continue                    # not a GPR def: a store READS it; ppu_disasm names lfs/lfd's FPR target rN
                 if w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r2)' in a[1]:
                     disp = mem_disp(a[1]); r_base = cand
                     base_is_ld = (w.mnemonic == 'ld')
+                elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(r1)' in a[1]:
+                    # SPILLED base: the table address was TOC-loaded earlier,
+                    # stored to a stack slot, and reloaded at the dispatch
+                    # (`lwz r10,d(r2); std r10,s(r1)` ... `ld r11,s(r1);
+                    # lwzx; add; mtctr; bctr`). A loop around the dispatch in a
+                    # function with high register pressure does this; the reload
+                    # read as a non-TOC definition, the dispatcher was dropped
+                    # and its bctr lifted to an unresolved indirect call, so no
+                    # case of the switch ever ran. Follow the slot to the
+                    # nearest preceding store of it, and that register to its
+                    # TOC load.
+                    _slot, _at = mem_disp(a[1]), w.addr
+                    _src = None
+                    for w2 in reversed([x for x in win_cand if x.addr < _at]):
+                        b = [x.strip() for x in w2.operands.split(',')]
+                        if w2.mnemonic in ('std', 'stw') and len(b) == 2 and '(r1)' in b[1] \
+                                and mem_disp(b[1]) == _slot:
+                            _src = (b[0], w2.addr)
+                            break
+                        if b and b[0] == 'r1' and w2.mnemonic not in ('std', 'stw'):
+                            break               # the frame moved: another slot
+                    if _src is not None:
+                        for w2 in reversed([x for x in win_cand if x.addr < _src[1]]):
+                            b = [x.strip() for x in w2.operands.split(',')]
+                            if not b or b[0] != _src[0] or w2.mnemonic.startswith(('st', 'lf')):
+                                continue
+                            if w2.mnemonic in ('lwz', 'ld') and len(b) == 2 and '(r2)' in b[1]:
+                                disp = mem_disp(b[1]); r_base = cand
+                                base_is_ld = (w2.mnemonic == 'ld')
+                            break               # nearest definition wins, TOC load or not
                 elif w.mnemonic in ('lwz', 'ld') and len(a) == 2 and '(' in a[1]:
                     # TWO-LEVEL base: `lwz r30, d1(r2); lwz r11, d2(r30)`. The
                     # table address is not in the TOC itself but in a global the
@@ -4635,6 +4771,23 @@ def discover_jump_tables(all_insns, read_u32, toc, text_lo, text_hi, func_starts
                             continue
                         if count is None or _c > count:
                             count = _c
+            # No compare in the 30-insn window: look for it in the function-bounded
+            # window the base search already uses. The bound can sit further from
+            # the bctr (Toro Lets Party func_000A2EC8: `cmplwi r29,0x123` 33 insns
+            # before its bctr), and the 256 fallback then cut that 292-entry table:
+            # cases 256+ lifted to unresolved indirect calls.
+            if count is None:
+                for w in reversed(win_cand):
+                    if w.mnemonic in ('cmplwi', 'cmpwi'):
+                        a = [x.strip() for x in w.operands.split(',')]
+                        _cmp_reg = a[1] if (a and a[0].startswith('cr')) else (a[0] if a else None)
+                        if _cmp_reg == _raw_idx:
+                            try:
+                                _c = int(a[-1], 0)
+                            except ValueError:
+                                continue
+                            if count is None or _c > count:
+                                count = _c
             if count is None or count < 0 or count > 4096:
                 count = 256
             # The cmp-derived count is a HINT, never a hard cap. It keeps UNDER-
@@ -4740,7 +4893,7 @@ _WORKER_STATE: dict = {}
 
 def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
                  function_entries=None, code_lo=0, code_hi=None, jump_tables=None,
-                 toc_base=0):
+                 toc_base=0, insn_patches=None):
     _WORKER_STATE["segs"] = segs
     _WORKER_STATE["be"] = big_endian
     _WORKER_STATE["names"] = name_map
@@ -4755,6 +4908,7 @@ def _worker_init(segs, big_endian, name_map, prefix, hle_stub_nids=None,
     _WORKER_STATE["code_lo"] = code_lo
     _WORKER_STATE["code_hi"] = code_hi
     _WORKER_STATE["jump_tables"] = jump_tables or {}
+    _WORKER_STATE["insn_patches"] = insn_patches or {}
 
 
 def _worker_lift(task):
@@ -4770,6 +4924,7 @@ def _worker_lift(task):
     lifter.code_hi = _WORKER_STATE.get("code_hi", None)
     lifter.jump_tables = _WORKER_STATE.get("jump_tables", {})
     lifter.toc_base = _WORKER_STATE.get("toc_base", 0)
+    lifter.insn_patches = _WORKER_STATE.get("insn_patches", {})
     results = []
     for start, end in bounds:
         blob = b""
@@ -4804,7 +4959,8 @@ def _parallel_lift(lifter, func_bounds, segs, big_endian, jobs):
                    initargs=(segs, big_endian, lifter.name_map, lifter.prefix,
                              lifter.hle_stub_nids, lifter.function_entries,
                              lifter.code_lo, lifter.code_hi, lifter.jump_tables,
-                             getattr(lifter, "toc_base", 0)))
+                             getattr(lifter, "toc_base", 0),
+                             lifter.insn_patches))
     try:
         for idx0, results, ct, bt in pool.imap_unordered(_worker_lift, tasks):
             results_by_idx[idx0] = results
@@ -4890,6 +5046,12 @@ def main() -> None:
                              "instead of its literal .lib.stub trampoline, and "
                              "split out as its own 0x20-byte function so direct "
                              "calls to it dispatch to the HLE handler.")
+    parser.add_argument("--insn-patches", metavar="FILE", default=None,
+                        help="JSON list of instruction patches to lift as "
+                             "run-time switches: each {addr, orig, new, guard} "
+                             "is emitted as `if (guard) {new} else {orig}`, guard "
+                             "being an int the port defines. The input must hold "
+                             "`orig` at `addr` or the lift stops.")
     args = parser.parse_args()
 
     # Load firmware-import stubs (addr -> NID) up front; applied to func_bounds
@@ -5166,6 +5328,47 @@ def main() -> None:
                 if got_addr:
                     toc = (got_addr + 0x8000) & 0xFFFFFFFF
                     print(f"  TOC: entry descriptor bogus, using .got+0x8000 = 0x{toc:X}")
+                else:
+                    # Stripped homebrew ELFs (e.g. PSL1GHT EBOOT.BIN with an
+                    # emptied shstrtab) carry no usable section names, so the
+                    # .got lookup finds nothing and the bogus entry toc-word
+                    # (which repeats the code address) would be kept as THE
+                    # module TOC -- every `ld r2, N(r1)` restore lowering then
+                    # hardcodes that garbage and the guest spins in the first
+                    # OPD-hook poll (TanakaDOOM: 0x103F8 vs true 0xA3328).
+                    # Recover the TOC from the OPD instead: scan data segments
+                    # for descriptor pairs {known-function-start, toc} and take
+                    # the most frequent toc. The code half must be a detected
+                    # function start, so incidental pointer data can't vote.
+                    from collections import Counter
+                    _starts = set(s for s, _ in func_bounds)
+                    _toc_freq = Counter()
+                    for v0, v1, d in seg_map:
+                        if v0 <= text_lo < v1:
+                            continue    # skip the text segment itself
+                        # OPD descriptors are 16 bytes in ELF64:
+                        # {code(8), toc(8)}. Reading two consecutive
+                        # DWORDs instead would pair code_lo with
+                        # code_hi==0 and elect 0x0 as the "majority
+                        # TOC" (TanakaDOOM: 1832 bogus votes).
+                        _bo = 'big' if big_endian else 'little'
+                        for off in range(0, len(d) - 16, 4):
+                            c = int.from_bytes(d[off:off + 8], _bo)
+                            t = int.from_bytes(d[off + 8:off + 16], _bo)
+                            if c in _starts and (t & 3) == 0 and t != c:
+                                _toc_freq[t] += 1
+                    if _toc_freq:
+                        _t_best, _n_best = _toc_freq.most_common(1)[0]
+                        if _n_best >= 8:
+                            toc = _t_best
+                            print(f"  TOC: entry descriptor bogus, no .got; "
+                                  f"OPD-majority toc = 0x{toc:X} ({_n_best} descriptors)")
+                        else:
+                            print(f"  TOC: entry descriptor bogus, no .got; "
+                                  f"OPD scan inconclusive (best 0x{_t_best:X} x{_n_best})")
+                    else:
+                        print("  TOC: entry descriptor bogus, no .got; "
+                              "OPD scan found no descriptors")
             # Multi-TOC executables (large Sony-toolchain builds like LBP carry
             # two or more TOCs): harvest candidates by scanning the data
             # segments for OPD descriptor pairs {code-in-text, toc} and keeping
@@ -5363,6 +5566,9 @@ def main() -> None:
     lifter.hle_stub_nids = hle_stubs
     lifter.function_entries = _func_entries
     lifter.jump_tables = jt_dispatchers
+    if args.insn_patches:
+        lifter.insn_patches = load_insn_patches(args.insn_patches)
+        print(f"  insn-patches: {len(lifter.insn_patches)} from {args.insn_patches}")
 
     # Optional: load a recovered-name map (from Ghidra analysis) to annotate
     # generated functions with meaningful names as comments.
@@ -5409,6 +5615,16 @@ def main() -> None:
         print(f"  Mid-function pass {pass_num}: generated {n} tail-entry wrappers ({total_mid} total)")
     if total_mid:
         print(f"  Generated {total_mid} mid-function tail-entry wrappers total")
+
+    # Every patch must have landed in a lifted function: one at an address no
+    # function covers would otherwise vanish without a word.
+    if lifter.insn_patches:
+        landed = {int(m.group(1), 16) for f in lifter.functions for bl in f.body_lines
+                  for m in [re.search(r"/\* insn patch 0x([0-9A-F]{8}): ", bl)] if m}
+        missing = sorted(set(lifter.insn_patches) - landed)
+        if missing:
+            sys.exit("[ppu_lifter] insn patches at no lifted instruction: " +
+                     ", ".join(f"0x{a:08X}" for a in missing))
 
     os.makedirs(args.output, exist_ok=True)
 

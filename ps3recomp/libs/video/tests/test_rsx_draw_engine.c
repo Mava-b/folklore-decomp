@@ -14,6 +14,8 @@
  */
 #include "rsx_draw_engine.h"
 #include "rsx_primitives.h"   /* RSX_PRIMITIVE_* */
+#include "rsx_test_programs.h"
+#include "rsx_tiling.c"        /* the engine looks the bound tiles up there */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -67,11 +69,14 @@ void cellGcm_replay_display_buffers_to_engine(void) {}
 typedef struct {
     u32 next_handle;
     u8  alive[STUB_MAX_OBJECTS];
+    u8  n_released[STUB_MAX_OBJECTS];   /* release calls per handle: each object is released once */
 
     int n_texture_create, n_texture_release, n_texture_upload;
     int n_color_create, n_color_release, n_color_seeded;
     int n_depth_create, n_depth_snapshot;
+    u32 snapshot_w, snapshot_h;        /* the last depth snapshot request */
     int n_pipeline_create;
+    rsx_be_render_state pipeline_rs;   /* the last pipeline's render state */
     int n_draw, n_clear_color, n_clear_ds, n_present;
     u32 cleared[STUB_MAX_CLEARED];
 
@@ -123,18 +128,22 @@ static u32 stub_texture_create(void* u, rsx_be_format f, u32 w, u32 h, u32 mips,
     return stub.last_created_texture;
 }
 
+/* The first 16 bytes of the last upload: four R,G,B,A texels. */
+static u8 g_upload_first[16];
+
 static void stub_texture_upload(void* u, u32 t, u32 face, u32 mip, u32 w, u32 h,
                                 const void* src, u32 row, u32 rows)
 {
     (void)u; (void)t; (void)face; (void)mip; (void)w; (void)h;
-    (void)src; (void)row; (void)rows;
+    (void)row; (void)rows;
+    if (src) memcpy(g_upload_first, src, sizeof g_upload_first);
     stub.n_texture_upload++;
 }
 
 static void stub_release(void* u, u32 handle)
 {
     (void)u;
-    if (handle && handle < STUB_MAX_OBJECTS) stub.alive[handle] = 0;
+    if (handle && handle < STUB_MAX_OBJECTS) { stub.alive[handle] = 0; stub.n_released[handle]++; }
     stub.last_released = handle;
 }
 
@@ -162,7 +171,7 @@ static u32 stub_depth_create(void* u, u32 w, u32 h)
 { (void)u; (void)w; (void)h; stub.n_depth_create++; return stub_handle(); }
 
 static u32 stub_depth_snapshot(void* u, u32 d, u32 w, u32 h)
-{ (void)u; (void)d; (void)w; (void)h; stub.n_depth_snapshot++; return stub_handle(); }
+{ (void)u; (void)d; stub.snapshot_w = w; stub.snapshot_h = h; stub.n_depth_snapshot++; return stub_handle(); }
 
 static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
                                 const rsx_be_render_state* rs,
@@ -173,6 +182,7 @@ static u32 stub_pipeline_create(void* u, const char* vs, const char* ps,
     if (!vs || !ps || !*vs || !*ps) return 0;
     stub.n_pipeline_create++;
     stub.pipeline_rt_count = rt_count;
+    stub.pipeline_rs = *rs;
     return stub_handle();
 }
 
@@ -266,17 +276,34 @@ static void stub_present(void* u, u32 s) { (void)u; presented_surface = s; stub.
 /* One pixel of a surface, in the R,G,B,A order rsx_texture_decode produces:
  * the readback hook has to put those back into the guest's A8R8G8B8. */
 static u8 g_stub_pixel[4] = { 0x11, 0x22, 0x33, 0x44 };
+/* An FP16 surface's pixel: R,G,B,A halves 1.0, 2.0, 3.0, 4.0, little-endian
+ * as a host GPU hands them back. */
+static const u8 g_stub_pixel16[8] = { 0x00, 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44 };
 
+/* With g_stub_ramp set, pixel (c, r) reads back as R,G,B,A = 4c+1, 4c+2,
+ * 4c+3, 0x80+r instead, so every byte of a row is distinct. */
+static int g_stub_ramp;
+
+/* The engine asks for rows packed at the surface's own pixel size, so the
+ * pitch tells the two formats apart. */
 static void stub_readback(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                           void* out, u32 pitch)
 {
     (void)u; (void)s; (void)x; (void)y;
+    const u32 bpp = pitch >= w * 8u ? 8u : 4u;
     for (u32 r = 0; r < h; r++)
-        for (u32 c = 0; c < w; c++)
-            memcpy((u8*)out + (size_t)r * pitch + c * 4u, g_stub_pixel, 4);
+        for (u32 c = 0; c < w; c++) {
+            u8* p = (u8*)out + (size_t)r * pitch + c * bpp;
+            if (bpp == 8u) { memcpy(p, g_stub_pixel16, 8); continue; }
+            if (!g_stub_ramp) { memcpy(p, g_stub_pixel, 4); continue; }
+            p[0] = (u8)(4u * c + 1u); p[1] = (u8)(4u * c + 2u); p[2] = (u8)(4u * c + 3u);
+            p[3] = (u8)(0x80u + r);
+        }
 }
 
-/* Every depth target reads back as 0.5, which Z24S8 stores as 0x800000. */
+/* Every depth target reads back as g_readback_depth, 0.5 unless a test sets
+ * it, which Z24S8 stores as 0x800000. */
+static float g_readback_depth = 0.5f;
 static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
                                float* out, u32 pitch)
 {
@@ -284,12 +311,13 @@ static int stub_depth_readback(void* u, u32 d, u32 x, u32 y, u32 w, u32 h,
     stub.n_depth_readback++;
     for (u32 r = 0; r < h; r++)
         for (u32 c = 0; c < w; c++)
-            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = 0.5f;
+            *(float*)((u8*)out + (size_t)r * pitch + c * 4u) = g_readback_depth;
     return 0;
 }
 
-/* The last rectangle pushed into a colour target, and its first pixel. */
-static struct { int n; u32 surface, x, y, w, h; u8 first[4]; } g_written;
+/* The last rectangle pushed into a colour target, its first pixel and the
+ * first 64 bytes of its first row. */
+static struct { int n; u32 surface, x, y, w, h; u8 first[4]; u8 row[64]; } g_written;
 
 static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
                              const void* rows, u32 row_bytes)
@@ -299,6 +327,7 @@ static void stub_color_write(void* u, u32 s, u32 x, u32 y, u32 w, u32 h,
     g_written.surface = s; g_written.x = x; g_written.y = y;
     g_written.w = w; g_written.h = h;
     memcpy(g_written.first, rows, 4);
+    memcpy(g_written.row, rows, w * 4u < sizeof g_written.row ? w * 4u : sizeof g_written.row);
 }
 
 static const rsx_draw_backend g_stub_backend = {
@@ -382,10 +411,10 @@ static const rsx_draw_backend g_stub_backend = {
 
 static void m(u32 method, u32 arg) { rsx_draw_engine_method(method, arg); }
 
-static void engine_up(void)
+static void engine_up_with(const rsx_draw_backend* be)
 {
     memset(&stub, 0, sizeof stub);
-    rsx_draw_engine_set_backend(&g_stub_backend);
+    rsx_draw_engine_set_backend(be);
     if (rsx_draw_engine_init(1280, 720) != 0) {
         printf("[FAIL] engine init\n");
         exit(1);
@@ -399,6 +428,8 @@ static void engine_up(void)
     m(M_VTXFMT, 2u | (4u << 4) | (16u << 8));
     m(M_VTXBUF_OFFSET, 0x80000000u | VTX_OFFSET);
 }
+
+static void engine_up(void) { engine_up_with(&g_stub_backend); }
 
 static void engine_down(void)
 {
@@ -648,7 +679,256 @@ static void test_texture_cache(void)
     engine_down();
 }
 
+/* The cache remembers where each key was last found. Two keys that share a
+ * remembered slot (these two offsets do, with every other field equal) must
+ * still each find their own entry, however their binds interleave. */
+#define TEX_OFFSET_SHARING_MEMO 0x00120100u
+static void test_texture_lookup_memo(void)
+{
+    printf("-- texture lookup memo\n");
+    engine_up();
+    memset(vm_base + TEX_OFFSET, 0x11, 4 * 4 * 4);
+    memset(vm_base + TEX_OFFSET_SHARING_MEMO, 0x33, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    const u32 a = stub.bound_tex[0];
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET_SHARING_MEMO);
+    draw_triangle();
+    const u32 b = stub.bound_tex[0];
+    CHECK(stub.n_texture_create == 2 && a && b && a != b,
+          "two keys sharing a memo slot are two entries (%d creates)",
+          stub.n_texture_create);
+
+    int wrong = 0;
+    for (int i = 0; i < 6; i++) {
+        if (i == 3) rsx_draw_engine_present();
+        bind_texture_unit(RSX_LOCATION_MAIN, (i & 1) ? TEX_OFFSET_SHARING_MEMO : TEX_OFFSET);
+        draw_triangle();
+        if (stub.bound_tex[0] != ((i & 1) ? b : a)) wrong++;
+    }
+    CHECK(stub.n_texture_create == 2 && wrong == 0,
+          "interleaved binds each find their own entry (%d creates, %d wrong)",
+          stub.n_texture_create, wrong);
+
+    /* A change to one is still seen through the memo. */
+    rsx_draw_engine_present();
+    memset(vm_base + TEX_OFFSET_SHARING_MEMO, 0x44, 4 * 4 * 4);
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET_SHARING_MEMO);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 3 && stub.alive[b] == 0,
+          "changed bytes behind a memoized entry are re-decoded");
+    engine_down();
+}
+
+/* A 128x128 A8R8G8B8 linear texture on unit 0: 64 KB, past the size that is
+ * hashed in full every frame. */
+#define BIG_TEX_OFFSET 0x00100000u
+#define BIG_TEX_DIM    128u
+#define BIG_TEX_BYTES  (BIG_TEX_DIM * BIG_TEX_DIM * 4u)
+static void bind_big_texture(void)
+{
+    m(M_TEX_UNIT + 0x00, BIG_TEX_OFFSET);
+    m(M_TEX_UNIT + 0x04, 2u | (2u << 4) | ((0x85u | 0x20u) << 8) | (1u << 16));
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (BIG_TEX_DIM << 16) | BIG_TEX_DIM);
+    m(0x1840 /* control3: pitch */, BIG_TEX_DIM * 4u);
+}
+
+/* Draw once a frame until the cache re-decodes the texture: how many
+ * presents that took, or -1 if not within `limit`. */
+static int frames_to_notice(int limit)
+{
+    const int before = stub.n_texture_create;
+    for (int f = 0; f <= limit; f++) {
+        draw_triangle();
+        if (stub.n_texture_create != before) return f;
+        rsx_draw_engine_present();
+    }
+    return -1;
+}
+
+static void test_texture_sparse_rehash(void)
+{
+    printf("-- texture re-hash\n");
+    u8* tex = vm_base + BIG_TEX_OFFSET;
+    engine_up();
+    bind_big_texture();
+    memset(tex, 0x11, BIG_TEX_BYTES);
+    draw_triangle();
+    CHECK(stub.n_texture_create == 1, "the big texture is uploaded");
+
+    /* What the per-frame sparse check sees is noticed in the next frame:
+     * a whole rewrite, a byte inside one of the sampled 64-byte blocks (one
+     * per 2 KB), a byte of the tail. */
+    rsx_draw_engine_present();
+    memset(tex, 0x22, BIG_TEX_BYTES);
+    CHECK(frames_to_notice(0) == 0, "a rewrite of the whole texture is noticed at once");
+    rsx_draw_engine_present();
+    tex[3 * 2048 + 5] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "a write in a sampled block is noticed at once");
+    rsx_draw_engine_present();
+    tex[BIG_TEX_BYTES - 1] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "a write to the last 64 bytes is noticed at once");
+
+    /* A byte between the sampled blocks waits for the full hash, which comes
+     * 8 frames after the last one: the last full hash was the frame above,
+     * so this one is seen 7 presents later, and not before. */
+    rsx_draw_engine_present();
+    tex[3 * 2048 + 100] ^= 0xFF;
+    const int late = frames_to_notice(10);
+    CHECK(late == 7, "a write between the sampled blocks is noticed by the full hash (%d frames)", late);
+
+    /* A small texture is still hashed in full every frame. */
+    rsx_draw_engine_present();
+    bind_texture_unit(RSX_LOCATION_MAIN, TEX_OFFSET);
+    draw_triangle();
+    rsx_draw_engine_present();
+    vm_base[TEX_OFFSET + 37] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "a small texture is hashed in full every frame");
+    engine_down();
+
+    /* PS3RECOMP_ENG_TEXHASH_FULL=1: the full hash every frame, as before. */
+    setenv("PS3RECOMP_ENG_TEXHASH_FULL", "1", 1);
+    engine_up();
+    bind_big_texture();
+    draw_triangle();
+    rsx_draw_engine_present();
+    tex[5 * 2048 + 100] ^= 0xFF;
+    CHECK(frames_to_notice(0) == 0, "PS3RECOMP_ENG_TEXHASH_FULL=1 hashes everything every frame");
+    engine_down();
+    unsetenv("PS3RECOMP_ENG_TEXHASH_FULL");
+}
+
 /* ---- 4. the pipeline key ------------------------------------------------- */
+
+/* A block-compressed volume (dimension 3, DXT) goes up slice by slice as a
+ * 3D texture. A retail title's explosion smoke is a 256x256x16 DXT5 volume;
+ * uploaded as the 2D image its first 64 KB make, it drew dark squares. */
+#define VOL_MIPS 3
+#define VOL_SLICES 8
+static struct {
+    int n_create, n_upload;
+    u32 depth, row_bytes[VOL_MIPS];
+    u8 slice[VOL_MIPS][VOL_SLICES][128];   /* the first bytes of each slice's upload */
+} g_vol;
+
+static u32 stub_texture_create_3d(void* u, rsx_be_format f, u32 w, u32 h, u32 depth,
+                                  u32 mips, u32 remap, u32 rsx_fmt)
+{
+    g_vol.n_create++;
+    g_vol.depth = depth;
+    return stub_texture_create(u, f, w, h, mips, 1, remap, rsx_fmt);
+}
+
+static void stub_texture_upload_3d(void* u, u32 t, u32 z, u32 mip, u32 w, u32 h,
+                                   const void* src, u32 row_bytes)
+{
+    (void)u; (void)t; (void)w;
+    g_vol.n_upload++;
+    if (mip >= VOL_MIPS || z >= VOL_SLICES || !src) return;
+    g_vol.row_bytes[mip] = row_bytes;
+    const u32 bytes = row_bytes * ((h + 3u) / 4u);   /* one slice of block rows */
+    memcpy(g_vol.slice[mip][z], src, bytes < 128u ? bytes : 128u);
+}
+
+/* Block i of slice z of level m, as the volume's guest bytes mark it. */
+static int volume_block_is(u32 m, u32 z, u32 i, u32 block_bytes)
+{
+    const u8* b = g_vol.slice[m][z] + i * block_bytes;
+    return b[0] == (u8)(0xA0u + m * 0x10u + z) && b[1] == (u8)i;
+}
+
+/* Lay level m (w x h blocks, d slices) out at `at` in VTC order (power-of-two
+ * sides) or slice after slice, each block marked with its level, slice and
+ * index. Returns the level's size. */
+static u32 volume_level(u32 at, u32 m, u32 blocks, u32 d, u32 block_bytes, int vtc)
+{
+    const u32 full = d & ~3u;
+    for (u32 z = 0; z < d; z++)
+        for (u32 i = 0; i < blocks; i++) {
+            u32 n = z * blocks + i;
+            if (vtc) {
+                const u32 group = z < full ? z & ~3u : full, stride = z < full ? 4u : d - full;
+                n = group * blocks + i * stride + (z - group);
+            }
+            vm_base[at + n * block_bytes]      = (u8)(0xA0u + m * 0x10u + z);
+            vm_base[at + n * block_bytes + 1u] = (u8)i;
+        }
+    return blocks * d * block_bytes;
+}
+
+static void bind_volume(u32 fmt, u32 w, u32 h, u32 depth, u32 mips)
+{
+    m(M_TEX_UNIT + 0x00, TEX_OFFSET);
+    m(M_TEX_UNIT + 0x04, 2u | (3u << 4) | (fmt << 8) | (mips << 16));   /* main, 3D */
+    m(M_TEX_UNIT + 0x0C, 0x80000000u);
+    m(M_TEX_UNIT + 0x10, 0xAAE4u);
+    m(M_TEX_UNIT + 0x18, (w << 16) | h);
+    m(0x1840 /* control3 */, depth << 20);
+}
+
+static void test_compressed_volume(void)
+{
+    printf("-- compressed volume\n");
+    rsx_draw_backend be = g_stub_backend;
+    be.texture_create_3d = stub_texture_create_3d;
+    be.texture_upload_3d = stub_texture_upload_3d;
+
+    /* 8x8x6 DXT5: four blocks a slice. Power-of-two sides, so VTC order:
+     * slices 0-3 interleaved block by block, then 4-5 the same way. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    volume_level(TEX_OFFSET, 0, 4, 6, 16, 1);
+    bind_volume(0x88, 8, 8, 6, 1);
+    draw_triangle();
+    int ok = g_vol.n_create == 1 && g_vol.depth == 6 && g_vol.n_upload == 6 && g_vol.row_bytes[0] == 32;
+    for (u32 z = 0; z < 6 && ok; z++)
+        for (u32 i = 0; i < 4; i++) ok &= volume_block_is(0, z, i, 16);
+    CHECK(ok, "a power-of-two DXT5 volume goes up as 6 slices out of VTC order "
+              "(%d created, depth %u, %d uploads, row %u)",
+          g_vol.n_create, g_vol.depth, g_vol.n_upload, g_vol.row_bytes[0]);
+    engine_down();
+
+    /* 12x4x2: not a power of two, so slice after slice as they lie. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    volume_level(TEX_OFFSET, 0, 3, 2, 16, 0);
+    bind_volume(0x88, 12, 4, 2, 1);
+    draw_triangle();
+    ok = g_vol.n_create == 1 && g_vol.n_upload == 2 && g_vol.row_bytes[0] == 48;
+    for (u32 z = 0; z < 2 && ok; z++)
+        for (u32 i = 0; i < 3; i++) ok &= volume_block_is(0, z, i, 16);
+    CHECK(ok, "a non-power-of-two DXT5 volume goes up slice after slice "
+              "(%d created, %d uploads, row %u)",
+          g_vol.n_create, g_vol.n_upload, g_vol.row_bytes[0]);
+    engine_down();
+
+    /* 16x16x8 DXT1 with three levels: 16 blocks x 8 slices (two groups of
+     * four), 4 blocks x 4 slices (one group), 1 block x 2 slices (a group of
+     * two), each level in VTC order after the one before. */
+    engine_up_with(&be);
+    memset(&g_vol, 0, sizeof g_vol);
+    memset(vm_base + TEX_OFFSET, 0, 0x1000);
+    u32 at = TEX_OFFSET;
+    at += volume_level(at, 0, 16, 8, 8, 1);
+    at += volume_level(at, 1, 4, 4, 8, 1);
+    volume_level(at, 2, 1, 2, 8, 1);
+    bind_volume(0x86, 16, 16, 8, 3);
+    draw_triangle();
+    static const u32 blocks[VOL_MIPS] = {16, 4, 1}, slices[VOL_MIPS] = {8, 4, 2}, rows[VOL_MIPS] = {32, 16, 8};
+    ok = g_vol.n_create == 1 && g_vol.n_upload == 8 + 4 + 2;
+    for (u32 lv = 0; lv < VOL_MIPS && ok; lv++) {
+        ok &= g_vol.row_bytes[lv] == rows[lv];
+        for (u32 z = 0; z < slices[lv]; z++)
+            for (u32 i = 0; i < blocks[lv]; i++) ok &= volume_block_is(lv, z, i, 8);
+    }
+    CHECK(ok, "a DXT1 volume's every level goes up out of its own VTC order "
+              "(%d created, %d uploads)", g_vol.n_create, g_vol.n_upload);
+    engine_down();
+}
 
 static void test_pipeline_key(void)
 {
@@ -689,6 +969,18 @@ static void test_pipeline_key(void)
     b = a; b.depth_bounds_test = 1;
     CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
           "so is the depth bounds test");
+
+    /* MRT targets 1..3 carry their own colour mask (COLOR_MASK_MRT, 0x0370)
+     * and blend enable (BLEND_ENABLE_MRT, 0x036C). inFAMOUS 2's light volumes
+     * add into target 0 with targets 1 and 2 masked off; giving them target
+     * 0's state added every light into the G-buffer. */
+    b = a; b.color_mask_mrt = 0x0DF0u;
+    CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
+          "so is the MRT colour mask");
+
+    b = a; b.blend_mrt = 0x2u;
+    CHECK(rsx_draw_engine_hash_render_state(&b, 1469598103934665603ull) != base,
+          "so is the MRT blend enable");
 
     /* And through the engine: transform constants change every draw of every
      * frame, and must not multiply pipelines. */
@@ -734,6 +1026,13 @@ static void test_pipeline_key(void)
           "and moving them does not build a pipeline (%d)",
           stub.n_pipeline_create);
     m(M_DEPTH_BOUNDS_ENABLE, 0u);
+
+    /* The decode carries the two MRT registers through to the backend. */
+    m(0x0370, 0x0DF0);
+    m(0x036C, 0x2);
+    draw_triangle();
+    CHECK(stub.pipeline_rs.color_mask_mrt == 0x0DF0u && stub.pipeline_rs.blend_mrt == 0x2u,
+          "the pipeline is built with COLOR_MASK_MRT and BLEND_ENABLE_MRT");
 
     engine_down();
 }
@@ -1040,6 +1339,293 @@ static void test_transfer_coherence(void)
     engine_down();
 }
 
+/* A tile bound over main memory: the RSX's reads and writes of it go through the tiling, the guest's bytes lie
+ * where the tiling puts them. A retail title downsamples its scene into such a region with NV3089 for an SPU
+ * depth-of-field job and samples the job's output; read linearly it showed as bands over the scene. */
+#define TILE_OFF 0x00200000u
+static void test_tiled_main_memory(void)
+{
+    printf("-- tiled main memory\n");
+    const rsx_tile tile = { TILE_OFF, 0x80000u, 1024u, 2u };
+    memset(vm_base + TILE_OFF, 0, tile.size);
+    engine_up();
+    rsx_tiling_set(0, RSX_LOCATION_MAIN, tile.offset, tile.size, tile.pitch, tile.bank);
+    rsx_tiling_set(1, RSX_LOCATION_LOCAL, 0x40000u, 0x80000u, 1024u, 0u);   /* local: transparent */
+    m(M_CONTEXT_DMA_COLOR_A, DMA_MAIN);
+    m(M_COLOR_A_OFFSET, TILE_OFF);
+    m(M_COLOR_A_PITCH, 1024u);
+    draw_triangle();
+    const u32 surface = stub.bound_rt[0];
+
+    /* A surface stored to guest memory lands where the tiling puts each byte. */
+    g_stub_ramp = 1;
+    const u32 row5 = TILE_OFF + 5u * 1024u;
+    rsx_draw_engine_guest_read(RSX_LOCATION_MAIN, row5, 1024u, 16u, 1u);
+    g_stub_ramp = 0;
+    int placed = 1, moved = 0;
+    for (u32 c = 0; c < 16u; c++) {
+        const u8* p = vm_base + rsx_tile_address(&tile, row5 + c * 4u);
+        placed &= p[0] == 0x80 && p[1] == (u8)(4u * c + 1u) && p[2] == (u8)(4u * c + 2u) && p[3] == (u8)(4u * c + 3u);
+        moved |= rsx_tile_address(&tile, row5 + c * 4u) != row5 + c * 4u;
+    }
+    CHECK(placed && moved, "a stored row lands at its tiled addresses (%s)", moved ? "they differ from the linear ones" : "same");
+
+    /* Guest bytes pushed into the surface are read through the tiling. */
+    const u32 px = TILE_OFF + 3u * 1024u + 2u * 4u;
+    u8* t = vm_base + rsx_tile_address(&tile, px);
+    t[0] = 0x80; t[1] = 0x01; t[2] = 0x02; t[3] = 0x03;
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_MAIN, px, 1024u, 5u, 4u);
+    CHECK(g_written.n == 1 && g_written.surface == surface &&
+          g_written.first[0] == 0x01 && g_written.first[1] == 0x02 && g_written.first[2] == 0x03 &&
+          g_written.first[3] == 0x80, "a transfer into it pushes the pixel from its tiled address");
+
+    /* A texture in the tile decodes the tiled bytes. */
+    const u32 tex = TILE_OFF + 0x40000u;           /* past the 256x256 target */
+    for (u32 c = 0; c < 4u; c++) {
+        u8* q = vm_base + rsx_tile_address(&tile, tex + c * 4u);
+        q[0] = 0xF0; q[1] = (u8)(0x10u + c); q[2] = (u8)(0x20u + c); q[3] = (u8)(0x30u + c);
+    }
+    bind_texture_unit(RSX_LOCATION_MAIN, tex);
+    draw_triangle();
+    CHECK(g_upload_first[0] == 0x10 && g_upload_first[3] == 0xF0 && g_upload_first[12] == 0x13 &&
+          g_upload_first[14] == 0x33, "a texture in the tile reads its texels through the tiling");
+
+    /* Unbound, the memory is linear again. */
+    rsx_tiling_set(0, 0, 0, 0, 0, 0);
+    memset(vm_base + row5, 0, 64);
+    rsx_draw_engine_guest_read(RSX_LOCATION_MAIN, row5, 1024u, 16u, 1u);
+    CHECK(vm_base[row5] == 0x44 && vm_base[row5 + 63] == 0x33, "an unbound tile is stored linearly");
+    rsx_tiling_set(1, 0, 0, 0, 0, 0);
+    engine_down();
+}
+
+/* Vertex, index and fragment program fetches out of a tile bound over main memory read through the tiling too:
+ * every RSX client sees the region that way. Each byte is put only at its tiled address. */
+static void tile_put_be(u8* p, u32 v, u32 bytes)
+{
+    for (u32 i = 0; i < bytes; i++) p[i] = (u8)(v >> (8u * (bytes - 1u - i)));
+}
+static char g_tiled_ps[65536];
+static u32 tiled_fp_pipeline(void* u, const char* vs, const char* ps, const rsx_be_render_state* rs,
+                             const rsx_vertex_layout_plan* layout, u32 stride, rsx_be_format rt, u32 rt_count)
+{
+    snprintf(g_tiled_ps, sizeof g_tiled_ps, "%s", ps ? ps : "");
+    return stub_pipeline_create(u, vs, ps, rs, layout, stride, rt, rt_count);
+}
+static void test_tiled_fetches(void)
+{
+    printf("-- vertex, index and program fetches from tiled main memory\n");
+    const rsx_tile tile = { TILE_OFF, 0x80000u, 1024u, 2u };
+    const u32 vtx = TILE_OFF + 0x1000u, idx = TILE_OFF + 0x3000u + 8u, fp = TILE_OFF + 0x5000u;
+    memset(vm_base + TILE_OFF, 0, tile.size);
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { (float)i, 0.0f, 0.0f, 1.0f };
+        for (u32 c = 0; c < 4; c++) {
+            u32 w; memcpy(&w, &f[c], 4);
+            tile_put_be(vm_base + rsx_tile_address(&tile, vtx + i * 16u + c * 4u), w, 4);
+        }
+    }
+    static const u32 tris[] = { 3, 1, 2, 7, 0, 5 };
+    for (u32 i = 0; i < 6; i++) tile_put_be(vm_base + rsx_tile_address(&tile, idx + i * 2u), tris[i], 2);
+    engine_up();
+    rsx_tiling_set(0, RSX_LOCATION_MAIN, tile.offset, tile.size, tile.pitch, tile.bank);
+    m(M_VTXBUF_OFFSET, 0x80000000u | vtx);
+    m(0x181C, idx - 8u);                                   /* index array offset */
+    m(0x1820, 1u | (1u << 4));                             /* main memory, 16-bit */
+    m(M_BEGIN_END, RSX_PRIMITIVE_TRIANGLES);
+    m(0x1824, 4u | (5u << 24));                            /* six indices past 8 bytes */
+    m(M_BEGIN_END, 0u);
+    u32 wrong = 0;
+    const u32 drawn = stub.draw_indices ? stub.draw_indices : stub.draw_vertices;
+    for (u32 k = 0; k < 6 && drawn == 6; k++) {
+        float x;
+        memcpy(&x, stub.captured_vertices[stub.draw_indices ? stub.captured_indices[k] : k], 4);
+        wrong += x != (float)tris[k];
+    }
+    CHECK(stub.n_draw == 1 && drawn == 6 && !wrong,
+          "an indexed draw reads its indices and vertices through the tiling (%u indices, %u vertices)",
+          stub.draw_indices, stub.draw_vertices);
+
+    rsx_draw_backend be = g_stub_backend;
+    be.pipeline_create = tiled_fp_pipeline;
+    rsx_draw_engine_set_backend(&be);
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);                                          /* TRANSFORM_PROGRAM_LOAD */
+    for (u32 i = 0; i < 4; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);                                          /* TRANSFORM_PROGRAM_START */
+    /* One 16-byte instruction (half of a 32-byte block, which the tiling keeps whole) reading COL1 at its tiled
+     * address; read linearly the program would be the one reading COL0 instead. */
+    rsx_test_fp_instr(vm_base + rsx_tile_address(&tile, fp),
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(2) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    rsx_test_fp_instr(vm_base + fp,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(1) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x08E4, fp | 2u);                                    /* SHADER_PROGRAM, main */
+    m(0x1D60, 0x40u);                                      /* SHADER_CONTROL: fp32 exports */
+    g_tiled_ps[0] = 0;
+    draw_triangle();
+    CHECK(stub.n_draw == 2 && strstr(g_tiled_ps, "input.col1") && !strstr(g_tiled_ps, "input.col0)"),
+          "a fragment program in the tile is read through the tiling");
+    m(0x08E4, 0);
+    rsx_tiling_set(0, 0, 0, 0, 0, 0);
+    engine_down();
+}
+
+/* Whole rows, every pixel different, both ways: a byte swapped between two
+ * pixels, or a row converted only in part, shows up here. */
+static void test_transfer_rows(void)
+{
+    printf("-- transfer rows\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 1024u);
+    draw_triangle();
+
+    /* Guest A,R,G,B -> surface R,G,B,A, 13 pixels (not a multiple of a vector). */
+    u8* px = vm_base + GUEST_LOCAL_EA + 0x40000u + 5u * 1024u;
+    for (u32 c = 0; c < 13; c++) {
+        px[4 * c + 0] = (u8)(0xA0 + c); px[4 * c + 1] = (u8)(4 * c + 1);
+        px[4 * c + 2] = (u8)(4 * c + 2); px[4 * c + 3] = (u8)(4 * c + 3);
+    }
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, 0x40000u + 5u * 1024u, 1024u, 13u, 2u);
+    int ok = g_written.n == 1 && g_written.w == 13;
+    for (u32 c = 0; ok && c < 13; c++)
+        ok = g_written.row[4 * c + 0] == 4 * c + 1 && g_written.row[4 * c + 1] == 4 * c + 2 &&
+             g_written.row[4 * c + 2] == 4 * c + 3 && g_written.row[4 * c + 3] == 0xA0 + c;
+    CHECK(ok, "13 distinct A8R8G8B8 pixels arrive as R,G,B,A in order");
+
+    /* Surface R,G,B,A -> guest A,R,G,B, 3 rows of 13 pixels, and nothing past them. */
+    u8* rd = vm_base + GUEST_LOCAL_EA + 0x40000u + 8u * 1024u;
+    for (u32 r = 0; r < 4; r++) memset(rd + r * 1024u, 0xEE, 14 * 4);
+    g_stub_ramp = 1;
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, 0x40000u + 8u * 1024u, 1024u, 13u, 3u);
+    g_stub_ramp = 0;
+    ok = 1;
+    for (u32 r = 0; ok && r < 3; r++)
+        for (u32 c = 0; ok && c < 13; c++) {
+            const u8* p = rd + r * 1024u + 4 * c;
+            ok = p[0] == 0x80 + r && p[1] == 4 * c + 1 && p[2] == 4 * c + 2 && p[3] == 4 * c + 3;
+        }
+    CHECK(ok, "3 rows of 13 distinct R,G,B,A pixels land as A8R8G8B8 in order");
+    CHECK(rd[13 * 4] == 0xEE && rd[3 * 1024u] == 0xEE,
+          "the pixel after each row and the row after the rectangle are untouched");
+    engine_down();
+}
+
+/* An HDR pass renders into an FP16 RGBA target, and the title copies it out
+ * with a 2D transfer that counts 32-bit pixels: Twisted Metal's bloom and
+ * flames reach its SPU post-FX that way. The copy has to get the GPU's
+ * pixels, as big-endian halves, and only the bytes it names. */
+static void test_transfer_reads_fp16(void)
+{
+    printf("-- transfer reads an FP16 surface\n");
+    engine_up();
+    m(M_SURFACE_FORMAT, 0xBu);                 /* F_W16Z16Y16X16 */
+    m(M_COLOR_A_PITCH, 2048u);                 /* 256 pixels of 8 bytes */
+    draw_triangle();
+
+    const u32 row = 0x40000u + 3u * 2048u;
+    u8* rd = vm_base + GUEST_LOCAL_EA + row;
+    static const u8 px[8] = { 0x3C, 0x00, 0x40, 0x00, 0x42, 0x00, 0x44, 0x00 };
+
+    /* Four 32-bit pixels from surface pixel 2: two FP16 pixels. */
+    memset(rd, 0xEE, 64);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 2u * 8u, 2048u, 4u, 1u);
+    CHECK(memcmp(rd + 16, px, 8) == 0 && memcmp(rd + 24, px, 8) == 0,
+          "two FP16 pixels land as big-endian R,G,B,A halves (%02X %02X %02X %02X)",
+          rd[16], rd[17], rd[18], rd[19]);
+    CHECK(rd[15] == 0xEE && rd[32] == 0xEE, "and nothing around them is written");
+
+    /* One 32-bit pixel starting half way into a surface pixel: its B,A. */
+    memset(rd, 0xEE, 64);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 5u * 8u + 4u, 2048u, 1u, 1u);
+    CHECK(memcmp(rd + 44, px + 4, 4) == 0 && rd[43] == 0xEE && rd[48] == 0xEE,
+          "a transfer starting mid-pixel gets exactly the bytes it names");
+
+    /* The last pixel of the row, asked for past the surface's width. */
+    memset(rd + 2040, 0xEE, 8);
+    rsx_draw_engine_guest_read(RSX_LOCATION_LOCAL, row + 255u * 8u, 2048u, 8u, 1u);
+    CHECK(memcmp(rd + 2040, px, 8) == 0, "a transfer past the width stops at the surface's edge");
+
+    /* Bytes copied INTO an FP16 target are not pushed as A8R8G8B8 rows. */
+    memset(&g_written, 0, sizeof g_written);
+    rsx_draw_engine_guest_wrote(RSX_LOCATION_LOCAL, row, 2048u, 4u, 1u);
+    CHECK(g_written.n == 0, "a transfer into an FP16 surface does not write it as A8R8G8B8");
+    engine_down();
+}
+
+/* ---- indexed draws: big-endian index runs, restart sentinels ------------ */
+
+#define IDX_OFFSET 0x00030000u
+static void put_be(u8* p, u32 v, u32 bytes)
+{
+    for (u32 i = 0; i < bytes; i++) p[i] = (u8)(v >> (8u * (bytes - 1u - i)));
+}
+/* The x of the draw's k-th vertex, through its index list when it has one
+ * (a list of distinct vertices is drawn without). */
+static float drawn_x(u32 k)
+{
+    float x;
+    memcpy(&x, stub.captured_vertices[stub.draw_indices ? stub.captured_indices[k] : k], 4);
+    return x;
+}
+static int triangles_are(const u32* want, u32 n)
+{
+    if ((stub.draw_indices ? stub.draw_indices : stub.draw_vertices) != n) return 0;
+    for (u32 k = 0; k < n; k++) if (drawn_x(k) != (float)want[k]) return 0;
+    return 1;
+}
+static void indexed_case(const u32* idx, u32 n, int u32_indices, int restart, u32 sentinel,
+                         u32 prim, const u32* want, u32 nwant, const char* what)
+{
+    engine_up();
+    u8 saved[8 * 16]; memcpy(saved, vm_base + VTX_OFFSET, sizeof saved);
+    for (u32 i = 0; i < 8; i++) {
+        const float f[4] = { (float)i, 0.0f, 0.0f, 1.0f };
+        for (u32 c = 0; c < 4; c++) { u32 w; memcpy(&w, &f[c], 4); put_be(vm_base + VTX_OFFSET + i * 16 + c * 4, w, 4); }
+    }
+    const u32 esz = u32_indices ? 4u : 2u;
+    for (u32 i = 0; i < n; i++) put_be(vm_base + IDX_OFFSET + 8 + i * esz, idx[i], esz);
+    m(0x181C, IDX_OFFSET);                                 /* index array offset */
+    m(0x1820, 1u | ((u32_indices ? 0u : 1u) << 4));       /* main memory, type */
+    m(0x1DAC, restart ? 1u : 0u);
+    m(0x1DB0, sentinel);
+    m(M_BEGIN_END, prim);
+    m(0x1824, (8u / esz) | ((n - 1u) << 24));             /* first index past 8 bytes */
+    m(M_BEGIN_END, 0u);
+    CHECK(stub.n_draw == 1 && triangles_are(want, nwant), "%s (%u indices, %u vertices drawn)", what, stub.draw_indices, stub.draw_vertices);
+    memcpy(vm_base + VTX_OFFSET, saved, sizeof saved);
+    memset(vm_base + IDX_OFFSET, 0, 64);
+    m(0x1DAC, 0u);
+    engine_down();
+}
+static void test_indexed_runs(void)
+{
+    printf("-- indexed runs\n");
+    static const u32 strip[] = { 0, 1, 2, 3, 0xFFFF, 4, 5, 6, 7 };
+    static const u32 strip_tris[] = { 0, 1, 2, 2, 1, 3, 4, 5, 6, 6, 5, 7 };
+    indexed_case(strip, 9, 0, 1, 0xFFFF, RSX_PRIMITIVE_TRIANGLE_STRIP, strip_tris, 12,
+                 "16-bit strip cut by its restart sentinel");
+    static const u32 strip32[] = { 0, 1, 2, 3, 0xFFFFFFFFu, 4, 5, 6, 7 };
+    indexed_case(strip32, 9, 1, 1, 0xFFFFFFFFu, RSX_PRIMITIVE_TRIANGLE_STRIP, strip_tris, 12,
+                 "32-bit strip cut by its restart sentinel");
+    static const u32 tris[] = { 3, 1, 2, 7, 0, 5 };
+    indexed_case(tris, 6, 0, 0, 0xFFFF, RSX_PRIMITIVE_TRIANGLES, tris, 6,
+                 "16-bit triangle list in index order");
+    static const u32 tris32[] = { 0x0003, 0x0001, 0x0002, 0x0007, 0x0000, 0x0005 };
+    indexed_case(tris32, 6, 1, 0, 0xFFFFFFFFu, RSX_PRIMITIVE_TRIANGLES, tris, 6,
+                 "32-bit triangle list in index order");
+    /* A 16-bit buffer ignores a sentinel that does not fit in 16 bits. */
+    static const u32 big_sentinel_tris[] = { 3, 1, 2 };
+    indexed_case(big_sentinel_tris, 3, 0, 1, 0x10002u, RSX_PRIMITIVE_TRIANGLES, big_sentinel_tris, 3,
+                 "16-bit restart off when the sentinel is wider than 16 bits");
+}
+
 static unsigned custom_reads;
 static const u8* custom_guest_read(void* user, u32 location, u32 offset, u32 bytes)
 {
@@ -1061,6 +1647,89 @@ static void test_custom_guest_mapping(void)
     rsx_draw_engine_set_guest_memory(NULL, NULL);
     draw_triangle();
     CHECK(custom_reads == calls, "clearing resolver restores default mapping");
+    engine_down();
+}
+
+/* ---- polygon offset ------------------------------------------------------ */
+
+#define M_POLY_OFFSET_POINT  0x0A60
+#define M_POLY_OFFSET_LINE   0x0A64
+#define M_POLY_OFFSET_FILL   0x0A68
+#define M_POLY_OFFSET_FACTOR 0x0A78
+#define M_POLY_OFFSET_BIAS   0x0A7C
+
+static u32 po_bits(float f) { u32 u; memcpy(&u, &f, 4); return u; }
+
+/* What the backend was told before the last draw. */
+static float po_slope = -99.0f, po_units = -99.0f;
+static u32 po_depth_bits, po_calls;
+static void stub_set_depth_bias(void* u, float slope, float units, u32 bits)
+{ (void)u; po_slope = slope; po_units = units; po_depth_bits = bits; po_calls++; }
+
+/* SET_POLY_OFFSET_FILL_ENABLE with SCALE_FACTOR and BIAS reaches the backend
+ * as set_depth_bias(slope, units, depth bits) before each draw, Z16 or Z24
+ * by the zeta format, and 0/0 while the offset is off. A title draws its
+ * shadow casters, decals and projected shadows with an offset so they do
+ * not fight the depth they sit on; the engine used to drop it. */
+static void test_polygon_offset(void)
+{
+    printf("-- polygon offset\n");
+    engine_up();
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.set_depth_bias = stub_set_depth_bias;
+    rsx_draw_engine_set_backend(&be);
+    po_calls = 0;
+
+    draw_triangle();
+    CHECK(stub.n_draw == 1, "the draw executed");
+    CHECK(po_calls == 1 && po_slope == 0.0f && po_units == 0.0f,
+          "no offset: the backend is told 0/0 (%u calls, slope %g units %g)",
+          po_calls, po_slope, po_units);
+
+    m(M_POLY_OFFSET_FACTOR, po_bits(-1.0f));
+    m(M_POLY_OFFSET_BIAS, po_bits(-256.0f));
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f,
+          "factor and bias alone change nothing while FILL is off");
+
+    m(M_POLY_OFFSET_FILL, 1u);
+    draw_triangle();
+    CHECK(po_slope == -1.0f && po_units == -256.0f && po_depth_bits == 24u,
+          "FILL on: -1/-256 against a Z24S8 zeta (slope %g units %g bits %u)",
+          po_slope, po_units, po_depth_bits);
+
+    m(M_SURFACE_FORMAT, 8u | (1u << 5));          /* A8R8G8B8, Z16 */
+    m(M_POLY_OFFSET_FACTOR, po_bits(0.25f));
+    m(M_POLY_OFFSET_BIAS, po_bits(200.0f));
+    draw_triangle();
+    CHECK(po_slope == 0.25f && po_units == 200.0f && po_depth_bits == 16u,
+          "a Z16 zeta says 16 bits (slope %g units %g bits %u)",
+          po_slope, po_units, po_depth_bits);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));          /* back to Z24S8 */
+
+    /* The enable for what the primitive rasterises as: LINE for lines. */
+    m(M_POLY_OFFSET_FILL, 0u);
+    m(M_POLY_OFFSET_LINE, 1u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f,
+          "LINE alone does not offset a triangle (slope %g units %g)", po_slope, po_units);
+    m(M_BEGIN_END, RSX_PRIMITIVE_LINES);
+    m(M_DRAW_ARRAYS, 0u | ((2u - 1u) << 24));
+    m(M_BEGIN_END, 0u);
+    CHECK(po_slope == 0.25f && po_units == 200.0f,
+          "LINE offsets a line list (slope %g units %g)", po_slope, po_units);
+    m(M_POLY_OFFSET_LINE, 0u);
+
+    /* A NaN factor is no offset, not a NaN bias. */
+    m(M_POLY_OFFSET_FILL, 1u);
+    m(M_POLY_OFFSET_FACTOR, 0x7FC00000u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 200.0f, "a NaN factor reads 0 (slope %g)", po_slope);
+
+    m(M_POLY_OFFSET_FILL, 0u);
+    draw_triangle();
+    CHECK(po_slope == 0.0f && po_units == 0.0f, "FILL off again: 0/0");
     engine_down();
 }
 
@@ -1131,6 +1800,13 @@ static void test_depth_clear_value(void)
     m(M_CLEAR_BUFFERS, 0x01u);
     CHECK(stub.last_clear_depth == 1.0f,
           "a Z24S8 zeta cleared with 0xFFFFFF00 clears to 1.0 (%g)", stub.last_clear_depth);
+
+    /* 0 is the near plane. It used to read as 1.0, standing in for the
+     * reset a flip does (the FIFO walker's job now). */
+    m(M_ZSTENCIL_CLEAR, 0u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    CHECK(stub.last_clear_depth == 0.0f,
+          "a zeta cleared with 0 clears to 0.0 (%g)", stub.last_clear_depth);
     engine_down();
 }
 
@@ -1184,6 +1860,106 @@ static void test_antialiased_surface(void)
     }
 }
 
+/* A smaller clip reuses the surface only on the same sample grid. An
+ * antialiased target is stored at sample resolution, so the same memory
+ * declared without antialiasing must not draw into the left part of it. */
+static void test_surface_reuse_antialias(void)
+{
+    printf("-- surface reuse across antialias modes\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 2048u);
+    m(M_SURFACE_FORMAT, 8u | (3u << 12));      /* DIAGONAL_CENTERED_2 */
+    m(M_SURFACE_CLIP_H, 128u << 16);
+    m(M_SURFACE_CLIP_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 1 && stub.color_w == 256 && stub.color_h == 64,
+          "the antialiased 128x64 target is created at 256x64 (%d, %ux%u)",
+          stub.n_color_create, stub.color_w, stub.color_h);
+
+    m(M_SURFACE_CLIP_H, 64u << 16);
+    m(M_SURFACE_CLIP_V, 32u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 1,
+          "a smaller clip on the same grid reuses the target (%d)", stub.n_color_create);
+
+    m(M_SURFACE_FORMAT, 8u);                   /* CENTER_1 */
+    m(M_SURFACE_CLIP_H, 128u << 16);
+    m(M_SURFACE_CLIP_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_color_create == 2 && stub.color_w == 128 && stub.color_h == 64,
+          "the same memory without antialiasing is a 128x64 target (%d, %ux%u)",
+          stub.n_color_create, stub.color_w, stub.color_h);
+    engine_down();
+}
+
+/* A guest program pair whose fragment program reads WPOS (MOV r0, WPOS), on
+ * targets of each sample grid: WPOS must count pixels, not the samples the
+ * target is held at. */
+#define WPOS_FP_OFFSET 0x00030000u       /* main memory */
+static char g_wpos_ps[65536];
+static u32 wpos_capture_pipeline(void* u, const char* vs, const char* ps,
+                                 const rsx_be_render_state* rs,
+                                 const rsx_vertex_layout_plan* layout,
+                                 u32 stride, rsx_be_format rt, u32 rt_count)
+{
+    snprintf(g_wpos_ps, sizeof g_wpos_ps, "%s", ps ? ps : "");
+    return stub_pipeline_create(u, vs, ps, rs, layout, stride, rt, rt_count);
+}
+
+static void test_antialiased_wpos(void)
+{
+    printf("-- WPOS on an antialiased surface\n");
+    static const struct { u32 aa; const char* line; } cases[] = {
+        { 0, NULL },
+        { 3, "    input.position.xy = floor(input.position.xy / float2(2, 1)) + 0.5;\n" },
+        { 4, "    input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;\n" },
+        { 5, "    input.position.xy = floor(input.position.xy / float2(2, 2)) + 0.5;\n" },
+    };
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.pipeline_create = wpos_capture_pipeline;
+    rsx_draw_engine_set_backend(&be);
+    u8 vp[16];
+    rsx_test_vp_mov_out(vp, 0, RSX_TEST_VP_SWZ_IDENT, 0, 1);
+    m(0x1E9C, 0);                                    /* TRANSFORM_PROGRAM_LOAD */
+    for (u32 i = 0; i < 4; i++) { u32 w; memcpy(&w, vp + i * 4, 4); m(0xB80 + i * 4, w); }
+    m(0x1EA0, 0);                                    /* TRANSFORM_PROGRAM_START */
+    rsx_test_fp_instr(vm_base + WPOS_FP_OFFSET,
+                      RSX_TEST_FP_OPC(RSX_TEST_FP_OP_MOV) | RSX_TEST_FP_MASK_XYZW |
+                      RSX_TEST_FP_INSRC(0) | RSX_TEST_FP_END,
+                      RSX_TEST_FP_SRC_INPUT | RSX_TEST_FP_SWZ_IDENT);
+    m(0x08E4, WPOS_FP_OFFSET | 2u);                  /* SHADER_PROGRAM, main */
+    m(0x1D60, 0x40u);                                /* SHADER_CONTROL: fp32 exports */
+    u32 handles[4];
+    for (u32 i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+        m(M_SURFACE_FORMAT, 8u | (cases[i].aa << 12));
+        const int before = stub.n_pipeline_create;
+        draw_triangle();
+        handles[i] = stub.bound_pipeline;
+        /* SQUARE_ROTATED_4 has SQUARE_CENTERED_4's 2x2 grid, and its pipeline. */
+        const int built = cases[i].aa == 5 ? 0 : 1;
+        CHECK(stub.n_pipeline_create == before + built && stub.n_draw &&
+              strstr(g_wpos_ps, "_rsx_wpos(input.position)"),
+              "antialias %u: the WPOS program draws (%d new pipeline)", cases[i].aa, built);
+        if (cases[i].line)
+            CHECK(strstr(g_wpos_ps, cases[i].line) != NULL,
+                  "antialias %u: WPOS is the centre of the pixel, not of the sample", cases[i].aa);
+        else
+            CHECK(strstr(g_wpos_ps, "input.position.xy =") == NULL,
+                  "antialias 0: WPOS is the host position as before");
+    }
+    CHECK(handles[0] != handles[1] && handles[1] != handles[2] && handles[2] == handles[3],
+          "the sample grid is part of the pipeline key");
+    m(M_SURFACE_FORMAT, 8u | (3u << 12));
+    const int before = stub.n_pipeline_create;
+    draw_triangle();
+    CHECK(stub.n_pipeline_create == before && stub.bound_pipeline == handles[1],
+          "back on the 2x1 grid, its pipeline is reused");
+    m(0x08E4, 0);
+
+    engine_down();
+}
+
 /* ---- 10. a zeta or a target read in a texture format of its own --------- */
 
 static void test_depth_read_as_color(void)
@@ -1230,6 +2006,308 @@ static void test_depth_read_as_color(void)
     engine_down();
 }
 
+/* A DEPTH24_D8 texture over a written depth target samples the backend's
+ * snapshot of it. A clear invalidates that snapshot and the next read takes a
+ * new one; the old one has to be released, or a shadow map cleared and read
+ * every frame leaks a backend texture a frame. */
+static void depth_pass(void)
+{
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_CLEAR_BUFFERS, 0x01u);
+    draw_triangle();
+}
+
+static u32 sample_depth(void)
+{
+    m(M_ZETA_OFFSET, 0x00200000u);            /* another zeta: not the one read */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x90u | 0x20u) << 8) | (1u << 16));
+    draw_triangle();
+    return stub.bound_tex[0];
+}
+
+static void test_depth_snapshot_release(void)
+{
+    printf("-- depth snapshot release\n");
+    engine_up();
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+
+    depth_pass();
+    const u32 first = sample_depth();
+    CHECK(stub.n_depth_snapshot == 1 && first && stub.alive[first],
+          "the first read samples a snapshot (%d, handle %u)", stub.n_depth_snapshot, first);
+    CHECK(sample_depth() == first && stub.n_depth_snapshot == 1,
+          "an unchanged depth target keeps its snapshot");
+
+    depth_pass();
+    const u32 second = sample_depth();
+    CHECK(stub.n_depth_snapshot == 2 && second && second != first,
+          "after a clear and a new depth pass the read takes a new snapshot (%d)",
+          stub.n_depth_snapshot);
+    CHECK(!stub.alive[first], "the stale snapshot was released");
+    CHECK(stub.alive[second], "the current one is alive");
+
+    /* A clip bigger than the canvas recreates the depth target; its
+     * snapshot goes too. */
+    m(M_SURFACE_CLIP_H, 2048u << 16);
+    m(M_SURFACE_CLIP_V, 1024u << 16);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    draw_triangle();
+    CHECK(stub.n_depth_create >= 3 && !stub.alive[second],
+          "a recreated depth target releases its old snapshot (%d depth targets)",
+          stub.n_depth_create);
+    CHECK(stub.n_released[second] == 1,
+          "and releases it once (%d calls)", stub.n_released[second]);
+    engine_down();
+}
+
+/* depth_as_color: the zeta's bytes made on the GPU, no store to guest memory. */
+static int g_argb_calls, g_argb_fail;
+static u32 g_argb_w, g_argb_h, g_argb_fmt;
+static u32 stub_depth_as_color(void* u, u32 d, u32 w, u32 h, u32 fmt)
+{
+    (void)u; (void)d;
+    g_argb_calls++;
+    g_argb_w = w; g_argb_h = h; g_argb_fmt = fmt;
+    return g_argb_fail ? 0 : stub_handle();
+}
+
+/* A pass at ZETA_OFFSET (256 x 256) through a zeta of SURFACE_FORMAT depth
+ * field `zfmt` (2 Z24S8, 1 Z16) at its natural pitch, then the zeta moved away
+ * (or, with `keep_zeta`, left bound with depth writes off) and the unit set to
+ * read it as a linear 4x4 texture of format `tex_fmt` and `pitch`. */
+static void depth_pass_then_read_as(u32 zfmt, u32 tex_fmt, u32 pitch, int keep_zeta)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (zfmt << 5));
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_ZETA_PITCH, 256u * (zfmt == 1u ? 2u : 4u));
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);                  /* the pass samples nothing */
+    draw_triangle();
+    if (!keep_zeta) m(M_ZETA_OFFSET, ZETA_OFFSET + 0x100000u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_OFFSET);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((tex_fmt | 0x20u) << 8) | (1u << 16));
+    m(0x1840 /* control3: pitch */, pitch);
+}
+
+static void depth_pass_then_read_ex(u32 pitch, int keep_zeta)
+{
+    depth_pass_then_read_as(2u, 0x85u, pitch, keep_zeta);
+}
+
+static void depth_pass_then_read(u32 pitch) { depth_pass_then_read_ex(pitch, 0); }
+
+static void test_depth_read_as_argb_on_gpu(void)
+{
+    printf("-- zeta read as A8R8G8B8, converted by the backend\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.depth_as_color = stub_depth_as_color;
+    rsx_draw_engine_set_backend(&be);
+    g_argb_calls = 0; g_argb_fail = 0;
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0x5A, 16);
+
+    depth_pass_then_read(256u * 4u);
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    CHECK(g_argb_calls == 1 && g_argb_w == 4 && g_argb_h == 4 && g_argb_fmt == 0x85u && first,
+          "the backend made the 4x4 A8R8G8B8 texture (%d calls, %ux%u, fmt %02X)",
+          g_argb_calls, g_argb_w, g_argb_h, g_argb_fmt);
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads && z[0] == 0x5A,
+          "nothing was read back, stored or uploaded (%d readbacks)", stub.n_depth_readback);
+
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.bound_tex[0] == first,
+          "no depth write since: the same texture (%d calls)", g_argb_calls);
+
+    depth_pass_then_read(256u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.bound_tex[0] != first && !stub.alive[first],
+          "a new depth write: a new texture, the old one released (%d calls)", g_argb_calls);
+
+    /* Another pitch is not the zeta's layout: guest memory as before. */
+    depth_pass_then_read(512u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.n_depth_readback == 1,
+          "a texture of another pitch goes through guest memory (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+
+    /* The zeta still bound, depth writes off: converted all the same, and
+     * kept while no draw writes depth. */
+    depth_pass_then_read_ex(256u * 4u, 1);
+    draw_triangle();
+    const u32 bound = stub.bound_tex[0];
+    CHECK(g_argb_calls == 3 && stub.n_depth_readback == 1 && bound,
+          "the bound zeta is converted too, not read back (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+    draw_triangle();
+    CHECK(g_argb_calls == 3 && stub.bound_tex[0] == bound,
+          "and reused while no draw wrote depth (%d calls)", g_argb_calls);
+
+    /* A backend that cannot: guest memory as before. */
+    g_argb_fail = 1;
+    depth_pass_then_read(256u * 4u);
+    draw_triangle();
+    CHECK(g_argb_calls == 4 && stub.n_depth_readback == 2 &&
+          stub.bound_tex[0] == stub.last_created_texture &&
+          z[0] == 0x80 && z[1] == 0x00 && z[2] == 0x00 && z[3] == 0x00,
+          "refused: depth 0.5 stored as Z24S8 and decoded (%d readbacks, %02X %02X %02X %02X)",
+          stub.n_depth_readback, z[0], z[1], z[2], z[3]);
+    engine_down();
+}
+
+static void test_z16_read_as_depth16_on_gpu(void)
+{
+    printf("-- Z16 zeta read as DEPTH16, converted by the backend\n");
+    engine_up();
+    rsx_draw_backend be = g_stub_backend;
+    be.depth_as_color = stub_depth_as_color;
+    rsx_draw_engine_set_backend(&be);
+    g_argb_calls = 0; g_argb_fail = 0;
+    u8* z = vm_base + GUEST_LOCAL_EA + ZETA_OFFSET;
+    memset(z, 0x5A, 16);
+
+    /* A shadow map: Z16 at pitch 512, read as DEPTH16 of that pitch. */
+    depth_pass_then_read_as(1u, 0x92u, 256u * 2u, 0);
+    const int uploads = stub.n_texture_create;
+    draw_triangle();
+    const u32 first = stub.bound_tex[0];
+    CHECK(g_argb_calls == 1 && g_argb_fmt == 0x92u && g_argb_w == 4 && g_argb_h == 4 && first,
+          "the backend made the 4x4 DEPTH16 texture (%d calls, fmt %02X)", g_argb_calls, g_argb_fmt);
+    CHECK(stub.n_depth_readback == 0 && stub.n_texture_create == uploads && z[0] == 0x5A,
+          "nothing was read back, stored or uploaded (%d readbacks)", stub.n_depth_readback);
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.bound_tex[0] == first,
+          "no depth write since: the same texture (%d calls)", g_argb_calls);
+
+    /* The other pairings are not what the hook makes: guest memory. */
+    depth_pass_then_read_as(1u, 0x85u, 256u * 2u, 0);
+    draw_triangle();
+    depth_pass_then_read_as(2u, 0x92u, 256u * 4u, 0);
+    draw_triangle();
+    CHECK(g_argb_calls == 1 && stub.n_depth_readback == 2,
+          "Z16 as A8R8G8B8 and Z24S8 as DEPTH16 go through guest memory (%d calls, %d readbacks)",
+          g_argb_calls, stub.n_depth_readback);
+
+    /* Refused: the store rounds d * 0xFFFF exactly, as the hook does. In
+     * float, 0.501953125 * 65535 rounds up to the half and stores 0x8080. */
+    g_argb_fail = 1;
+    g_readback_depth = 0.501953125f;
+    depth_pass_then_read_as(1u, 0x92u, 256u * 2u, 0);
+    draw_triangle();
+    CHECK(g_argb_calls == 2 && stub.n_depth_readback == 3 &&
+          stub.bound_tex[0] == stub.last_created_texture && z[0] == 0x80 && z[1] == 0x7F,
+          "refused: the depth stored as Z16 round(d * 0xFFFF) = 0x807F (%d readbacks, %02X %02X)",
+          stub.n_depth_readback, z[0], z[1]);
+    g_readback_depth = 0.5f;
+    engine_down();
+}
+
+/* A depth-writing draw through a 256x256 Z24S8 zeta at `offset`; returns the
+ * depth target it was given, or 0. */
+static u32 depth_draw_at(u32 offset)
+{
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));
+    m(M_ZETA_OFFSET, offset);
+    m(M_ZETA_PITCH, 256u * 4u);
+    m(M_COLOR_MASK, 0u);
+    m(M_DEPTH_TEST, 1u);
+    m(M_DEPTH_WRITE, 1u);
+    m(M_TEX_UNIT + 0x0C, 0u);
+    stub.bound_depth = 0;
+    draw_triangle();
+    return stub.bound_depth;
+}
+
+/* The zeta and surface tables used to keep every target forever: once 64
+ * addresses had been rendered to, a new one got no slot, and a level loaded
+ * after enough cutscenes rendered its shadow maps nowhere. A full table now
+ * gives up the entry used longest ago, but never one used this frame or the
+ * last, and a texture read counts as a use. */
+static void test_full_tables_evict_the_oldest(void)
+{
+    printf("-- full surface and zeta tables evict the least recently used\n");
+    engine_up();
+#define ZETA_AT(k) (0x00100000u + (u32)(k) * 0x1000u)
+    u32 h[64];
+    for (u32 k = 0; k < 64; k++) h[k] = depth_draw_at(ZETA_AT(k));
+    CHECK(h[0] && h[63], "64 zetas got depth targets");
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+
+    /* Zeta 1 is read as a texture this frame, through zeta 63. */
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, ZETA_AT(1));
+    m(0x1840 /* control3: pitch */, 256u * 4u);
+    draw_triangle();
+
+    int creates = stub.n_depth_create;
+    const u32 n64 = depth_draw_at(ZETA_AT(64));
+    CHECK(n64 && stub.n_depth_create == creates + 1 && !stub.alive[h[0]],
+          "a 65th zeta takes the oldest one's slot (%d creates, zeta 0 %s)",
+          stub.n_depth_create - creates, stub.alive[h[0]] ? "alive" : "released");
+    const u32 n65 = depth_draw_at(ZETA_AT(65));
+    CHECK(n65 && stub.alive[h[1]] && !stub.alive[h[2]] && stub.alive[h[63]],
+          "the next skips the zeta read this frame and the one bound (1 %d, 2 %d, 63 %d)",
+          stub.alive[h[1]], stub.alive[h[2]], stub.alive[h[63]]);
+
+    /* Zetas 3..62 are the only old ones left; after them nothing is evicted. */
+    u32 made = 0;
+    for (u32 k = 66; k < 66 + 61; k++) {
+        creates = stub.n_depth_create;
+        depth_draw_at(ZETA_AT(k));
+        if (stub.n_depth_create == creates + 1) made++;
+    }
+    CHECK(made == 60 && stub.alive[h[1]] && stub.alive[h[63]] && stub.alive[n64],
+          "60 more evict zetas 3..62, then a full table of this frame's zetas refuses (%u)", made);
+#undef ZETA_AT
+
+    /* Colour surfaces: the same rule, and the presented one stays. */
+    const u32 base_color = stub.bound_rt[0];
+    m(M_DEPTH_TEST, 0u);
+    m(M_DEPTH_WRITE, 0u);
+    m(M_COLOR_MASK, 0x01010101u);
+    m(M_CONTEXT_DMA_ZETA, 0u);
+    u32 c[64];
+    for (u32 k = 0; k < 63; k++) {
+        m(M_COLOR_A_OFFSET, 0x00200000u + k * 0x10000u);
+        draw_triangle();
+        c[k] = stub.bound_rt[0];
+    }
+    rsx_draw_engine_present();
+    rsx_draw_engine_present();
+    creates = stub.n_color_create;
+    m(M_COLOR_A_OFFSET, 0x00200000u + 63u * 0x10000u);
+    draw_triangle();
+    CHECK(stub.n_color_create == creates + 1 && !stub.alive[base_color] &&
+          stub.alive[c[62]] && stub.alive[c[0]],
+          "a 65th surface takes the oldest one's slot, not the presented one's (%d creates)",
+          stub.n_color_create - creates);
+    engine_down();
+}
+
 static void test_color_read_as_float(void)
 {
     printf("-- colour target read as X32_FLOAT\n");
@@ -1252,6 +2330,50 @@ static void test_color_read_as_float(void)
           p[0], p[1], p[2], p[3]);
     CHECK(stub.n_texture_create == uploads + 1 && stub.bound_tex[0] != surface,
           "the unit decodes those bytes instead of sampling the RGBA8 image");
+    engine_down();
+}
+
+/* A cached texture over a colour target the engine stores to guest memory
+ * again: the new bytes reach the texture at its next use, and once the
+ * stores stop the cache settles instead of re-decoding every frame. */
+static void test_engine_rewrite_reuploads(void)
+{
+    printf("-- texture over a re-stored colour target\n");
+    engine_up();
+    m(M_COLOR_A_PITCH, 256u * 4u);
+    m(M_CLEAR_BUFFERS, 0xF0u);                   /* a colour write at 0x40000 */
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    bind_texture_unit(RSX_LOCATION_LOCAL, 0x40000u);
+    m(M_TEX_UNIT + 0x04, 1u | (2u << 4) | ((0x9Cu | 0x20u) << 8) | (1u << 16));
+    draw_triangle();
+    const int first = stub.n_texture_create;
+    const u32 first_tex = stub.bound_tex[0];
+
+    /* The target is written again with other pixels and stored once more. */
+    rsx_draw_engine_present();
+    const u8 saved[4] = { g_stub_pixel[0], g_stub_pixel[1], g_stub_pixel[2], g_stub_pixel[3] };
+    g_stub_pixel[0] = 0x55;
+    m(M_COLOR_A_OFFSET, 0x40000u);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    m(M_COLOR_A_OFFSET, 0x90000u);
+    draw_triangle();
+    const u8* p = vm_base + GUEST_LOCAL_EA + 0x40000u;
+    CHECK(p[1] == 0x55, "the target was stored to guest memory again (%02X)", p[1]);
+    CHECK(stub.n_texture_create == first + 1 && stub.alive[first_tex] == 0 &&
+          stub.bound_tex[0] == stub.last_created_texture,
+          "the texture over it is re-decoded from the new bytes (%d creates)",
+          stub.n_texture_create - first);
+
+    /* No more stores: at most one more decode, then none. */
+    const int settled = stub.n_texture_create;
+    for (int f = 0; f < 3; f++) { rsx_draw_engine_present(); draw_triangle(); }
+    const int after = stub.n_texture_create;
+    rsx_draw_engine_present();
+    for (int f = 0; f < 12; f++) { rsx_draw_engine_present(); draw_triangle(); }
+    CHECK(after - settled <= 1 && stub.n_texture_create == after,
+          "unchanged bytes settle (%d then %d more decodes)",
+          after - settled, stub.n_texture_create - after);
+    memcpy(g_stub_pixel, saved, sizeof saved);
     engine_down();
 }
 
@@ -1340,6 +2462,52 @@ static void test_immediate_compositor(void)
     CHECK(stub.n_draw == 5 && stub.captured_vertices[1][3] == 0 &&
           stub.captured_vertices[1][35] == 0,
           "explicit all-zero DATA4F preserves position W and attribute alpha");
+    /* Resistance's movie player: a QUADS group whose positions are DATA2S on
+     * ATTR0 (0x1900, x in the low half), each vertex's ATTR1 written first and
+     * the colour/UV set once as constants. The single ATTR0 word completes the
+     * position, as on hardware; only DATA3F/DATA4F positions used to emit, and
+     * every movie frame drew nothing. */
+    m(M_BEGIN_END, 8u);
+    m(0x1C20, f32_bits(1)); m(0x1C24, f32_bits(1)); m(0x1C28, f32_bits(1)); m(0x1C2C, f32_bits(1));
+    m(0x1898, f32_bits(1)); m(0x189C, f32_bits(0.9f));
+    const u32 quad[4] = { 0x00000000u, 0x02D00000u, 0x02D00500u, 0x00000500u };
+    for (u32 i = 0; i < 4; i++) { m(0x1904, quad[i]); m(0x1900, quad[i]); }
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 6 && stub.draw_vertices == 4 && stub.draw_indices == 6,
+          "DATA2S positions emit a vertex each (draws %d, %u verts)",
+          stub.n_draw, stub.draw_vertices);
+    CHECK(stub.captured_vertices[2][0] == 1280 && stub.captured_vertices[2][1] == 720 &&
+          stub.captured_vertices[2][3] == 1 && stub.captured_vertices[2][4] == 1280,
+          "DATA2S position is (x low half, y high half, 0, 1) with ATTR1 current");
+    /* The other single-word encodings of ATTR0 complete a position too, and a
+     * two-word one completes on its last word only. */
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) m(0x1940, 0x01020304u);           /* DATA4UB */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 7 && stub.draw_vertices == 3, "DATA4UB ATTR0 emits per write");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) { m(0x1880, f32_bits(1)); m(0x1884, f32_bits(2)); } /* DATA2F */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 8 && stub.draw_vertices == 3, "DATA2F ATTR0 emits on its Y word");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) m(0x1E40, f32_bits((float)i));    /* DATA1F */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 9 && stub.draw_vertices == 3, "DATA1F ATTR0 emits per write");
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) { m(0x1980, 0x00020001u); m(0x1984, 0x00010000u); } /* DATA4S */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 10 && stub.draw_vertices == 3 &&
+          stub.captured_vertices[2][0] == 1 && stub.captured_vertices[2][1] == 2 &&
+          stub.captured_vertices[2][3] == 1,
+          "DATA4S ATTR0 emits on its second word only (%u verts)", stub.draw_vertices);
+    m(M_BEGIN_END, 5u);
+    for (u32 i = 0; i < 3; i++) { m(0x0A80, 0x7FFF7FFFu); m(0x0A84, 0x7FFF0000u); } /* SCALED4S */
+    m(M_BEGIN_END, 0);
+    CHECK(stub.n_draw == 11 && stub.draw_vertices == 3,
+          "SCALED4S ATTR0 emits on its second word only (%u verts)", stub.draw_vertices);
+    /* Outside BEGIN/END the same writes are only current values. */
+    m(0x1900, 0x00100010u); m(0x1940, 0x01020304u);
+    CHECK(stub.n_draw == 11, "ATTR0 writes outside BEGIN/END do not draw");
     engine_down();
 }
 
@@ -1392,6 +2560,157 @@ static void test_immediate_packed_zero_and_inline(void)
     engine_down();
 }
 
+/* ---- clears limited to the clip and the scissor ---------------------------- */
+
+/* What the rectangle hooks were asked for. */
+static struct {
+    int n_color, n_depth;
+    u32 color_surface, depth;
+    u32 color_rect[4], depth_rect[4];
+    u32 depth_flags;
+} g_rect;
+
+static void stub_clear_color_rect(void* u, u32 s, const float rgba[4],
+                                  u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)rgba;
+    g_rect.n_color++;
+    g_rect.color_surface = s;
+    g_rect.color_rect[0] = x; g_rect.color_rect[1] = y;
+    g_rect.color_rect[2] = w; g_rect.color_rect[3] = h;
+}
+
+static void stub_clear_ds_rect(void* u, u32 d, u32 f, float z, u8 st,
+                               u32 x, u32 y, u32 w, u32 h)
+{
+    (void)u; (void)z; (void)st;
+    g_rect.n_depth++;
+    g_rect.depth = d;
+    g_rect.depth_flags = f;
+    g_rect.depth_rect[0] = x; g_rect.depth_rect[1] = y;
+    g_rect.depth_rect[2] = w; g_rect.depth_rect[3] = h;
+}
+
+#define RECT_IS(r, x, y, w, h) ((r)[0] == (x) && (r)[1] == (y) && (r)[2] == (w) && (r)[3] == (h))
+
+/* RSX clears what the surface clip and the scissor let through, nothing
+ * else. Resistance's co-op split screen renders both players' views into one
+ * 2x1 antialiased 1280x720 scene target (2560x720 samples): scissor 0,0
+ * 640x720, clear, player 1's view; scissor 640,0 640x720, clear, player 2's.
+ * Cleared whole, the second clear wiped player 1's view and the left half of
+ * the screen was black under the HUD. */
+static void test_clear_rect(void)
+{
+    printf("-- clears limited to the clip and the scissor\n");
+    static rsx_draw_backend be;
+    be = g_stub_backend;
+    be.clear_color_rect = stub_clear_color_rect;
+    be.clear_depth_stencil_rect = stub_clear_ds_rect;
+
+    /* The scissor on the right half of a 256x256 surface: a split-screen
+     * view's clear leaves the other view alone. */
+    engine_up_with(&be);
+    memset(&g_rect, 0, sizeof g_rect);
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 0 &&
+          RECT_IS(g_rect.color_rect, 128u, 0u, 128u, 256u) &&
+          g_rect.color_surface == stub.last_created_color,
+          "a colour clear under a right-half scissor clears 128,0 128x256 only"
+          " (%d rect, %d whole; %u,%u %ux%u)", g_rect.n_color, stub.n_clear_color,
+          g_rect.color_rect[0], g_rect.color_rect[1], g_rect.color_rect[2],
+          g_rect.color_rect[3]);
+
+    /* A scissor covering the surface, or none, is a whole clear the backend
+     * can fold into the next pass. */
+    m(M_SCISSOR_H, 4096u << 16);
+    m(M_SCISSOR_V, 4096u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a scissor covering the surface clears it whole (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+
+    /* A scissor entirely outside the surface clears nothing. */
+    m(M_SCISSOR_H, (64u << 16) | 300u);
+    m(M_SCISSOR_V, 64u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(g_rect.n_color == 1 && stub.n_clear_color == 1,
+          "a scissor outside the surface clears nothing (%d rect, %d whole)",
+          g_rect.n_color, stub.n_clear_color);
+    engine_down();
+
+    /* The co-op frame: player 1's view under a left-half scissor, then
+     * player 2's clear under a right-half one, in the 2x1 antialiased scene. */
+    engine_up_with(&be);
+    memset(&g_rect, 0, sizeof g_rect);
+    m(M_CONTEXT_DMA_ZETA, DMA_LOCAL);
+    m(M_ZETA_OFFSET, ZETA_OFFSET);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5) | (3u << 12));   /* A8R8G8B8, Z24S8, 2x1 */
+    m(M_SURFACE_CLIP_H, 1280u << 16);
+    m(M_SURFACE_CLIP_V, 720u << 16);
+    m(M_COLOR_A_OFFSET, 0x200000u);
+    m(M_SCISSOR_H, 640u << 16);
+    m(M_SCISSOR_V, 720u << 16);
+    m(M_CLEAR_BUFFERS, 0xF3u);
+    draw_triangle();
+    const u32 scene_color = stub.bound_surface, scene_depth = stub.bound_depth;
+    m(M_SCISSOR_H, (640u << 16) | 640u);
+    const int color_whole = stub.n_clear_color, depth_whole = stub.n_clear_ds;
+    m(M_CLEAR_BUFFERS, 0xF3u);
+    CHECK(stub.n_clear_color == color_whole && stub.n_clear_ds == depth_whole &&
+          g_rect.color_surface == scene_color && g_rect.depth == scene_depth &&
+          RECT_IS(g_rect.color_rect, 1280u, 0u, 1280u, 720u) &&
+          RECT_IS(g_rect.depth_rect, 1280u, 0u, 1280u, 720u),
+          "player 2's clear under scissor 640,0 640x720 leaves player 1's half:"
+          " colour %u,%u %ux%u, depth %u,%u %ux%u samples (%d/%d whole)",
+          g_rect.color_rect[0], g_rect.color_rect[1], g_rect.color_rect[2],
+          g_rect.color_rect[3], g_rect.depth_rect[0], g_rect.depth_rect[1],
+          g_rect.depth_rect[2], g_rect.depth_rect[3],
+          stub.n_clear_color - color_whole, stub.n_clear_ds - depth_whole);
+
+    /* The composite then binds the same zeta from a 1280x720 target that is
+     * not antialiased and clears it at that clip. Only the clip limits it,
+     * not the scissor, so it stays a whole clear: made partial, it cost every
+     * frame a pass of its own (the campaign fell from ~30 fps to ~1). */
+    m(M_SCISSOR_H, 1280u << 16);
+    m(M_SURFACE_FORMAT, 8u | (2u << 5));                /* the composite: 1x */
+    m(M_COLOR_A_OFFSET, 0x600000u);
+    const int whole_before = stub.n_clear_ds, zrects_before = g_rect.n_depth;
+    m(M_CLEAR_BUFFERS, 0x03u);                          /* depth and stencil */
+    CHECK(scene_depth != 0 && g_rect.n_depth == zrects_before &&
+          stub.n_clear_ds == whole_before + 1,
+          "the 1x 1280x720 composite's depth clear of the 2560x720 scene zeta"
+          " stays whole (%d rect, %d whole)", g_rect.n_depth - zrects_before,
+          stub.n_clear_ds - whole_before);
+
+    /* A zeta only ever bound at a small clip -- a shadow map in a target
+     * the canvas' size -- is still cleared whole: nothing past its clip was
+     * ever drawn, and a whole clear stays a load action. */
+    m(M_ZETA_OFFSET, ZETA_OFFSET + 0x400000u);
+    m(M_SURFACE_CLIP_H, 256u << 16);
+    m(M_SURFACE_CLIP_V, 256u << 16);
+    m(M_COLOR_A_OFFSET, 0x700000u);
+    m(M_SCISSOR_H, 256u << 16);
+    m(M_SCISSOR_V, 256u << 16);
+    const int rects_before = g_rect.n_depth, wholes_before = stub.n_clear_ds;
+    m(M_CLEAR_BUFFERS, 0x03u);
+    CHECK(g_rect.n_depth == rects_before && stub.n_clear_ds == wholes_before + 1,
+          "a zeta only bound at its 256x256 clip is cleared whole (%d rect, %d whole)",
+          g_rect.n_depth - rects_before, stub.n_clear_ds - wholes_before);
+    engine_down();
+
+    /* A backend without the rectangle hooks keeps the whole-target clear. */
+    engine_up();
+    m(M_SCISSOR_H, (128u << 16) | 128u);
+    m(M_SCISSOR_V, 256u << 16);
+    m(M_CLEAR_BUFFERS, 0xF0u);
+    CHECK(stub.n_clear_color == 1,
+          "without clear_color_rect a scissored clear falls back to a whole one (%d)",
+          stub.n_clear_color);
+    engine_down();
+}
+
 int main(void)
 {
     vm_base = (u8*)calloc(1, GUEST_BYTES);
@@ -1408,21 +2727,38 @@ int main(void)
     test_surface_aliasing();
     test_mrt_set();
     test_texture_cache();
+    test_texture_lookup_memo();
+    test_texture_sparse_rehash();
+    test_compressed_volume();
     test_pipeline_key();
     test_restart_expansion();
+    test_indexed_runs();
     test_indexed_draws();
     test_scissor();
     test_readback();
     test_custom_guest_mapping();
+    test_polygon_offset();
     test_queued_flip_buffer();
     test_transfer_coherence();
+    test_tiled_main_memory();
+    test_tiled_fetches();
+    test_transfer_rows();
+    test_transfer_reads_fp16();
     test_inline_array();
     test_depth_clear_value();
     test_antialiased_surface();
+    test_surface_reuse_antialias();
+    test_antialiased_wpos();
     test_depth_read_as_color();
+    test_depth_snapshot_release();
+    test_depth_read_as_argb_on_gpu();
+    test_z16_read_as_depth16_on_gpu();
+    test_full_tables_evict_the_oldest();
     test_color_read_as_float();
+    test_engine_rewrite_reuploads();
     test_immediate_compositor();
     test_immediate_packed_zero_and_inline();
+    test_clear_rect();
 
     free(vm_base);
     printf(g_failures ? "\n%d check(s) FAILED\n" : "\nall checks passed\n",

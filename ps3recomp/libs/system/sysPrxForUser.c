@@ -7,6 +7,7 @@
  */
 
 #include "sysPrxForUser.h"
+#include "../../runtime/memory/vm.h"
 #include <ps3emu/guest_call.h>
 #include "../../runtime/ppu/ppu_memory.h"   /* vm_base, vm_write32: translate + byte-swap */
 #include <stdio.h>
@@ -14,6 +15,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <ctype.h>
+#include "ps3emu/log_first.h"
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -488,7 +490,7 @@ s32 sys_ppu_thread_once(u32 once_ctrl_ea, u32 init_opd)
 
     if (first && init_opd && g_ps3_guest_caller) {
         static int n = 0;
-        if (n++ < 8)
+        if (PS3_LOG_FIRST(n, 8))
             printf("[sysPrxForUser] sys_ppu_thread_once: running init 0x%08X"
                    " (ctrl 0x%08X)\n", init_opd, once_ctrl_ea);
         g_ps3_guest_caller(init_opd, 0, 0, 0, 0, 0, 0, 0, 0);
@@ -861,8 +863,8 @@ s32 sys_heap_destroy_heap(sys_heap_t heap)
  *   user-12  magic (so free() can tell our blocks from a foreign pointer)
  * The free-list link lives at the raw block start, which is dead space while
  * the block is free. */
-#define YZ_HEAP_BASE 0x50000000u
-#define YZ_HEAP_END  0x58000000u
+#define YZ_HEAP_BASE VM_HLE_HEAP_BASE
+#define YZ_HEAP_END  (VM_HLE_HEAP_BASE + VM_HLE_HEAP_SIZE)
 #define YZ_HEAP_MAGIC 0x595A4850u        /* 'YZHP' */
 #define YZ_BINS 32
 static u32 s_heap_bump = 0;
@@ -878,6 +880,10 @@ static u32 yz_bin_for(u32 need)
 static u32 yz_heap_alloc(u32 size, u32 align)
 {
     if (align < 16) align = 16;
+    /* Anything larger than the window can never fit, and letting it through
+     * wrapped `need` (size + align + 16 in 32 bits) to a tiny bin: a block far
+     * smaller than the caller asked for. */
+    if (size > YZ_HEAP_END - YZ_HEAP_BASE || align > YZ_HEAP_END - YZ_HEAP_BASE) return 0;
     u32 need = size + align + 16;         /* header + worst-case alignment pad */
     u32 b = yz_bin_for(need);
     u32 raw;
@@ -888,16 +894,19 @@ static u32 yz_heap_alloc(u32 size, u32 align)
         s_heap_bin[b] = vm_read32(raw);
     } else {
         if (s_heap_bump == 0) s_heap_bump = YZ_HEAP_BASE;
+        /* Check BEFORE advancing: bump-then-test left s_heap_bump past the end
+         * after one failure, and a later request could wrap it back below
+         * YZ_HEAP_END and hand out an address outside the window. */
+        if ((1u << b) > YZ_HEAP_END - s_heap_bump) { slot_unlock(); return 0; }
         raw = s_heap_bump;
         s_heap_bump += (1u << b);
-        if (s_heap_bump > YZ_HEAP_END) { slot_unlock(); return 0; }
     }
     slot_unlock();
 
     u32 user = (raw + 16 + align - 1) & ~(align - 1);
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
-      if (dbg) { static int n = 0; if (n++ < 400)
+      if (dbg) { static int n = 0; if (PS3_LOG_FIRST(n, 400))
           fprintf(stderr, "[heap] alloc size=%u align=%u -> 0x%08X (raw 0x%08X, bin %u)%c",
                   size, align, user, raw, b, 10); } }
     vm_write32(user - 4,  user - raw);
@@ -916,7 +925,7 @@ static void yz_heap_free(u32 user)
     u32 raw = user - off;
     { static int dbg = -1;
       if (dbg < 0) dbg = getenv("SYS_HEAP_DBG") ? 1 : 0;
-      if (dbg) { static int n = 0; if (n++ < 400)
+      if (dbg) { static int n = 0; if (PS3_LOG_FIRST(n, 400))
           fprintf(stderr, "[heap] free  0x%08X (bin %u)%c", user, b, 10); } }
     vm_write32(user - 12, 0);                            /* poison: catch double free */
     slot_lock();
@@ -971,7 +980,13 @@ u32 _sys_heap_create_heap(u32 name, u32 type, u32 blocksize, u32 flags)
 
 s32 _sys_heap_delete_heap(sys_heap_t heap)
 {
-    return sys_heap_destroy_heap(heap);
+    /* The ids _sys_heap_create_heap hands out (sys_heap_create_heap_ret) are
+     * never entered in the s_heaps table that sys_heap_destroy_heap searches, so
+     * forwarding there answered CELL_ESRCH for every heap this API ever created.
+     * Deleting one is CELL_OK; blocks are not reclaimed (the bump window has no
+     * per-heap ownership). */
+    (void)heap;
+    return CELL_OK;
 }
 
 /* The plain libc allocator sysPrxForUser exports, as opposed to the sys_heap_*

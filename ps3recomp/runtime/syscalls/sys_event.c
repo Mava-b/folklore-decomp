@@ -3,12 +3,14 @@
  */
 
 #include "sys_event.h"
+#include "sys_ppu_thread.h"         /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"             /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include "../spu/spu_workload.h"   /* spu_elf_image_size, spu_workload_dispatch_async */
 #include <string.h>
 #include <stdlib.h>               /* getenv */
+#include "ps3emu/log_first.h"
 
 /* Recorded by sys_spu_thread_initialize (lv2_register.c): the SPURS kernel
  * context EA the title's SPU task runtime is dispatched against. */
@@ -63,6 +65,10 @@ static void write_be32(uint32_t addr, uint32_t val)
     *p = val;
 }
 
+/* Last event pushed to each queue, for EVT_RECV_KICK. */
+static sys_event_t s_last_evt[SYS_EVENT_QUEUE_MAX];
+static int s_have_last_evt[SYS_EVENT_QUEUE_MAX];
+
 static uint64_t bswap64(uint64_t v)
 {
 #if __BYTE_ORDER__ == __ORDER_LITTLE_ENDIAN__ || defined(_WIN32)
@@ -78,6 +84,21 @@ static uint64_t bswap64(uint64_t v)
     return v;
 #endif
 }
+
+#ifdef _WIN32
+/* Milliseconds left to a lv2_usec_deadline() deadline, rounded UP (a timed
+ * receive must not return before the guest's timeout); 0 once it has passed. */
+static DWORD evt_ms_until(int64_t deadline)
+{
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= deadline) return 0;
+    const uint64_t left = (uint64_t)(deadline - now.QuadPart), q = (uint64_t)f.QuadPart;
+    const uint64_t ms = (left / q) * 1000ull + ((left % q) * 1000ull + q - 1) / q;
+    return ms >= (uint64_t)INFINITE ? (DWORD)(INFINITE - 1) : (DWORD)ms;
+}
+#endif
 
 /* =========================================================================
  * EVENT QUEUES
@@ -211,9 +232,13 @@ int64_t sys_event_queue_create(ppu_context* ctx)
 int64_t sys_event_queue_destroy(ppu_context* ctx)
 {
     uint32_t queue_id = LV2_ARG_U32(ctx, 0);
+    /* r4 = mode: 0, or SYS_EVENT_QUEUE_DESTROY_FORCE. It was ignored. */
+    int32_t  mode     = LV2_ARG_S32(ctx, 1);
 
     if (queue_id == 0 || queue_id > SYS_EVENT_QUEUE_MAX)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
+    if (mode != 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE)
+        return (int64_t)(int32_t)CELL_EINVAL;
 
     evt_table_lock();
 
@@ -223,14 +248,52 @@ int64_t sys_event_queue_destroy(ppu_context* ctx)
         return getenv("YDKJ_EVT_LENIENT") ? CELL_OK : (int64_t)(int32_t)CELL_ESRCH;  /* idempotent teardown */
     }
 
+    /* Receivers blocked in the queue. This used to delete the lock and
+     * condition variable under them: a receiver parked with no timeout never
+     * woke again. lv2: a plain destroy with waiters is EBUSY; FORCE wakes every
+     * waiter with CELL_ECANCELED. The lock and condition variable are
+     * deliberately NOT destroyed: a receiver that passed its unlocked `active`
+     * test just before this can still enter them safely and will see !active,
+     * and create re-initialises them when the slot is reused. */
 #ifdef _WIN32
-    DeleteCriticalSection(&q->lock);
+    EnterCriticalSection(&q->lock);
+    if (q->waiters > 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
+        LeaveCriticalSection(&q->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    q->active = 0;
+    WakeAllConditionVariable(&q->not_empty);
+    while (q->waiters > 0) {            /* let them return ECANCELED first */
+        LeaveCriticalSection(&q->lock);
+        SwitchToThread();
+        EnterCriticalSection(&q->lock);
+    }
+    LeaveCriticalSection(&q->lock);
 #else
-    pthread_cond_destroy(&q->not_empty);
-    pthread_mutex_destroy(&q->lock);
+    pthread_mutex_lock(&q->lock);
+    if (q->waiters > 0 && mode != SYS_EVENT_QUEUE_DESTROY_FORCE) {
+        pthread_mutex_unlock(&q->lock);
+        evt_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
+    q->active = 0;
+    pthread_cond_broadcast(&q->not_empty);
+    while (q->waiters > 0) {
+        pthread_mutex_unlock(&q->lock);
+        sched_yield();
+        pthread_mutex_lock(&q->lock);
+    }
+    pthread_mutex_unlock(&q->lock);
 #endif
 
-    q->active = 0;
+    /* Ports still wired to this queue are now unconnected: a send answers
+     * ENOTCONN, and the stale index can no longer deliver into whatever queue
+     * next reuses this slot. */
+    for (int i = 0; i < SYS_EVENT_PORT_MAX; i++)
+        if (g_sys_event_ports[i].active && g_sys_event_ports[i].connected_queue == (int32_t)queue_id)
+            g_sys_event_ports[i].connected_queue = 0;
+
     evt_table_unlock();
     return CELL_OK;
 }
@@ -294,6 +357,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     /* PPU_THREADGATE: the creating thread is now blocking -> workers may run
      * (PS3 priority semantics). Their job objects are fully initialized by now. */
     { extern void ydkj_release_pending_threads(void); ydkj_release_pending_threads(); }
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     if (ps3_log_verbose())
         fprintf(stderr, "[WAIT] event_queue_receive(q=%u timeout=%llu) tid=%llu cia=0x%08X lr=0x%08X\n",
                 queue_id, (unsigned long long)timeout_us,
@@ -437,7 +501,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
      * function + the value it waits on. Fires a few times. YDKJ_Q23STACK. */
     if ((queue_id == 2 || queue_id == 3) && getenv("YDKJ_Q23STACK")) {
 #ifdef _WIN32
-        static int _gs23 = 0; if (_gs23++ < 4) {
+        static int _gs23 = 0; if (PS3_LOG_FIRST(_gs23, 4)) {
             void* fr[48]; unsigned short n=RtlCaptureStackBackTrace(0,48,fr,0);
             char* base=(char*)GetModuleHandleA(0);
             char ln[1000]; int p=snprintf(ln,sizeof ln,"[Q23STACK q=%u] host RVAs:",queue_id);
@@ -470,12 +534,48 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
 
 #ifdef _WIN32
     EnterCriticalSection(&q->lock);
+    if (!q->active) {                   /* destroyed since the unlocked test */
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    /* Counted while inside (every return below gives it back): destroy needs it
+     * for its EBUSY / FORCE decision and to know when we are out. */
+    q->waiters++;
 
+    /* EVT_RECV_KICK=<qid>:<ms>: an infinite wait on that queue that sees
+     * nothing for <ms> gets the last event pushed to the queue re-delivered.
+     * For a completion queue whose producer intermittently loses a wakeup:
+     * the waiter re-checks its own state and waits again if it was not done.
+     * ponytail: papers over a lost SPU completion; find the loss to remove it. */
+    static int s_kq = -1; static DWORD s_kms = 0;
+    if (s_kq < 0) { const char* e = getenv("EVT_RECV_KICK"); s_kq = 0;
+        if (e) { s_kq = atoi(e); const char* c = strchr(e, ':'); s_kms = c ? (DWORD)atoi(c + 1) : 500; } }
+    if (timeout_us == 0 && s_kq == (int)queue_id && s_have_last_evt[queue_id - 1]) {
+        while (q->count == 0 && q->active && !q->cancelled) {
+            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, s_kms) && q->count == 0) {
+                sys_event_t evt = s_last_evt[queue_id - 1];
+                q->waiters--;
+                LeaveCriticalSection(&q->lock);
+                { static int n = 0; if (n++ < 16)
+                    fprintf(stderr, "[evt] EVT_RECV_KICK: q=%u idle %lu ms -> re-delivered last event\n",
+                            queue_id, (unsigned long)s_kms); }
+                ctx->gpr[4] = evt.source; ctx->gpr[5] = evt.data1;
+                ctx->gpr[6] = evt.data2;  ctx->gpr[7] = evt.data3;
+                if (event_addr) {
+                    uint64_t* out = (uint64_t*)vm_to_host(event_addr);
+                    out[0] = bswap64(evt.source); out[1] = bswap64(evt.data1);
+                    out[2] = bswap64(evt.data2);  out[3] = bswap64(evt.data3);
+                }
+                return CELL_OK;
+            }
+        }
+    }
     if (timeout_us == 0) {
         while (q->count == 0 && q->active && !q->cancelled) {
             SleepConditionVariableCS(&q->not_empty, &q->lock, INFINITE);
         }
         if (q->count == 0 && q->cancelled) {
+            q->waiters--;
             LeaveCriticalSection(&q->lock);
             return (int64_t)(int32_t)CELL_ECANCELED;
         }
@@ -488,26 +588,45 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
          * return ETIMEDOUT immediately if empty -- same result the game already
          * handles, just without the bogus 15ms stall. */
         if (q->count == 0 || !q->active) {
+            q->waiters--;
             LeaveCriticalSection(&q->lock);
             return (int64_t)(int32_t)CELL_ETIMEDOUT;
         }
     } else {
-        DWORD ms = (DWORD)(timeout_us / 1000);
+        /* Wait to an absolute deadline. A fixed `timeout_us / 1000` per wait
+         * truncated (1500 us became 1 ms) and restarted the FULL timeout after
+         * every wake that found the queue empty (another receiver took the
+         * event), so a contended timed receive could overrun without bound.
+         * The slice is rounded up, so it never returns before the guest's
+         * timeout, and an event that lands right at the deadline is still
+         * taken (the loop re-tests the count before giving up). Past 2^40 us
+         * (12.7 days) the QPC arithmetic would wrap; that is forever anyway. */
+        const int64_t deadline = lv2_usec_deadline(timeout_us < (1ull << 40) ? timeout_us : (1ull << 40));
         while (q->count == 0 && q->active && !q->cancelled) {
-            if (!SleepConditionVariableCS(&q->not_empty, &q->lock, ms)) {
-                if (GetLastError() == ERROR_TIMEOUT) {
-                    LeaveCriticalSection(&q->lock);
-                    return (int64_t)(int32_t)CELL_ETIMEDOUT;
-                }
+            const DWORD ms = evt_ms_until(deadline);
+            if (ms == 0) {
+                q->waiters--;
+                LeaveCriticalSection(&q->lock);
+                return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
+            SleepConditionVariableCS(&q->not_empty, &q->lock, ms);
         }
     }
 
-    if (q->count == 0 && q->cancelled) {
+    if (!q->active) {
+        /* Destroyed with SYS_EVENT_QUEUE_DESTROY_FORCE while we waited: lv2
+         * hands every waiter CELL_ECANCELED. */
+        q->waiters--;
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
-    if (!q->active || q->count == 0) {
+    if (q->count == 0 && q->cancelled) {
+        q->waiters--;
+        LeaveCriticalSection(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
+    if (q->count == 0) {
+        q->waiters--;
         LeaveCriticalSection(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
@@ -516,9 +635,15 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->head = (q->head + 1) % q->capacity;
     q->count--;
 
+    q->waiters--;
     LeaveCriticalSection(&q->lock);
 #else
     pthread_mutex_lock(&q->lock);
+    if (!q->active) {                   /* destroyed since the unlocked test */
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ESRCH;
+    }
+    q->waiters++;                       /* see the _WIN32 branch */
 
     if (timeout_us == 0) {
         while (q->count == 0 && q->active && !q->cancelled) {
@@ -535,18 +660,26 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
         }
         while (q->count == 0 && q->active && !q->cancelled) {
             int rc = pthread_cond_timedwait(&q->not_empty, &q->lock, &ts);
-            if (rc == ETIMEDOUT) {
+            if (rc == ETIMEDOUT && q->count == 0) {
+                q->waiters--;
                 pthread_mutex_unlock(&q->lock);
                 return (int64_t)(int32_t)CELL_ETIMEDOUT;
             }
         }
     }
 
-    if (q->count == 0 && q->cancelled) {
+    if (!q->active) {                   /* FORCE-destroyed while waiting */
+        q->waiters--;
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ECANCELED;
     }
-    if (!q->active || q->count == 0) {
+    if (q->count == 0 && q->cancelled) {
+        q->waiters--;
+        pthread_mutex_unlock(&q->lock);
+        return (int64_t)(int32_t)CELL_ECANCELED;
+    }
+    if (q->count == 0) {
+        q->waiters--;
         pthread_mutex_unlock(&q->lock);
         return (int64_t)(int32_t)CELL_ESRCH;
     }
@@ -555,6 +688,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     q->head = (q->head + 1) % q->capacity;
     q->count--;
 
+    q->waiters--;
     pthread_mutex_unlock(&q->lock);
 #endif
 
@@ -569,7 +703,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
     ctx->gpr[5] = evt.data1;
     ctx->gpr[6] = evt.data2;
     ctx->gpr[7] = evt.data3;
-    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && _r++<60) fprintf(stderr,
+    { static int _r=0; if (getenv("PS3_EVT_RECV_TRACE") && PS3_LOG_FIRST(_r, 60)) fprintf(stderr,
         "[RECV] q=%u source=0x%llX data1=0x%llX data2=0x%llX\n", queue_id,
         (unsigned long long)evt.source, (unsigned long long)evt.data1,
         (unsigned long long)evt.data2); }
@@ -596,7 +730,7 @@ int64_t sys_event_queue_receive(ppu_context* ctx)
                           _sel = !e ? 1 : (strcmp(e, "all") == 0 ? -1 : atoi(e)); }
     if (_sel == -1 || (int)queue_id == _sel) {
         static int _r = 0;
-        if (_r++ < 64)
+        if (PS3_LOG_FIRST(_r, 64))
             fprintf(stderr, "[evt] q=%u receive RETURNED to tid=%llu: src=0x%llX d1=0x%llX d2=0x%llX d3=0x%llX (qcount now %u)\n",
                     queue_id,
                     (unsigned long long)ctx->thread_id, (unsigned long long)evt.source,
@@ -694,6 +828,15 @@ int64_t sys_event_queue_drain(ppu_context* ctx)
 /* Helper to enqueue an event into a queue */
 static int event_queue_push(sys_event_queue_info* q, const sys_event_t* evt)
 {
+    { const int qi = (int)(q - g_sys_event_queues);
+      if (qi >= 0 && qi < SYS_EVENT_QUEUE_MAX) { s_last_evt[qi] = *evt; s_have_last_evt[qi] = 1; } }
+    /* EVT_PUSHLOG=<qid>: log every push to that queue with the host caller, to
+     * find which producer feeds a queue when nothing logs a port_send. */
+    { static int s_q = -1; if (s_q < 0) { const char* e = getenv("EVT_PUSHLOG"); s_q = e ? atoi(e) : 0; }
+      if (s_q && q == &g_sys_event_queues[s_q - 1]) { static int s_n = 0;
+        if (s_n++ < 200) fprintf(stderr, "[evt-push] q=%d src=0x%llX d=0x%llX/0x%llX/0x%llX ra=%p\n",
+                s_q, (unsigned long long)evt->source, (unsigned long long)evt->data1,
+                (unsigned long long)evt->data2, (unsigned long long)evt->data3, __builtin_return_address(0)); } }
     /* PS3_EVQSTAT=<n>: every n pushes, report each live queue's push count and
      * how many events are sitting in it unread.
      *
@@ -1011,6 +1154,20 @@ int64_t sys_event_port_send(ppu_context* ctx)
  * EVENT FLAGS
  * ========================================================================= */
 
+int64_t sys_event_flag_create(ppu_context* ctx);
+
+/* An event flag the runtime makes for a guest object (no attribute block),
+ * its id stored big-endian at the guest address id_out. */
+int64_t sys_event_flag_create_host(uint32_t id_out, uint64_t init_pattern)
+{
+    ppu_context c;
+    memset(&c, 0, sizeof c);
+    c.gpr[3] = id_out;
+    c.gpr[4] = 0;
+    c.gpr[5] = init_pattern;
+    return sys_event_flag_create(&c);
+}
+
 int64_t sys_event_flag_create(ppu_context* ctx)
 {
     uint32_t id_out_addr = LV2_ARG_PTR(ctx, 0);
@@ -1119,13 +1276,14 @@ static int flag_check(uint64_t pattern, uint64_t bitpat, uint32_t mode)
  * -----------------------------------------------------------------------*/
 int64_t sys_event_flag_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint32_t flag_id    = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat     = LV2_ARG_U64(ctx, 1);
     uint32_t mode       = LV2_ARG_U32(ctx, 2);
     uint32_t result_addr = LV2_ARG_PTR(ctx, 3);
-    { static int n=0; if(n++<30) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
+    { static int n=0; if(PS3_LOG_FIRST(n, 30)) fprintf(stderr,"[WAIT] event_flag_wait(flag=%u pat=0x%llX mode=%u)\n", flag_id,(unsigned long long)bitpat,mode); }
     uint64_t timeout_us = LV2_ARG_U64(ctx, 4);
-    { static int _w=0; if (_w++ < 40) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
+    { static int _w=0; if (PS3_LOG_FIRST(_w, 40)) fprintf(stderr, "[WAIT] event_flag_wait(flag=%u bits=0x%llX timeout=%llu)\n", flag_id, (unsigned long long)bitpat, (unsigned long long)timeout_us); }
     /* SPU-completion shim (targeted): the main thread spins in func_003319D0 until
      * *(r29+0x24) (a completion counter the SPU would increment) reaches the target
      * *(r29). Since we don't yet run the SPU workload, satisfy that counter so the
@@ -1138,7 +1296,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
         uint32_t obj = (uint32_t)ctx->gpr[29];
         uint8_t* tgt = (uint8_t*)vm_to_host(obj);
         uint8_t* cur = (uint8_t*)vm_to_host(obj + 0x24);
-        static int _n=0; if (_n++ < 12)
+        static int _n=0; if (PS3_LOG_FIRST(_n, 12))
             fprintf(stderr, "[evt] SPU-completion shim: flag=%u r29=0x%08X target=%02X%02X%02X%02X cur=%02X%02X%02X%02X -> satisfied\n",
                     flag_id, obj, tgt[0],tgt[1],tgt[2],tgt[3], cur[0],cur[1],cur[2],cur[3]);
         cur[0]=tgt[0]; cur[1]=tgt[1]; cur[2]=tgt[2]; cur[3]=tgt[3];
@@ -1146,7 +1304,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
     }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX) {
-        { static int _e=0; if(_e++<8) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
+        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) fprintf(stderr,"[evt] flag_wait flag=%u OUT-OF-RANGE (max=%d) -> ESRCH\n", flag_id, SYS_EVENT_FLAG_MAX); }
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
@@ -1157,13 +1315,13 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * real render code. Diagnostic only; identifies whether the spin is the gate. */
     { static int s_f = -1; if (s_f < 0) s_f = getenv("PS3_EVF_OK_IF_MISSING") ? 1 : 0;
       if (s_f && !g_sys_event_flags[flag_id-1].active) {
-        static int _n=0; if(_n++<4) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
+        static int _n=0; if(PS3_LOG_FIRST(_n, 4)) fprintf(stderr,"[evt] PS3_EVF_OK_IF_MISSING: flag=%u -> return CELL_OK (break spin)\n", flag_id);
         if (result_addr != 0) { write_be32(result_addr, (uint32_t)(bitpat>>32)); write_be32(result_addr+4, (uint32_t)bitpat); }
         return CELL_OK;
       } }
     sys_event_flag_info* f = &g_sys_event_flags[flag_id - 1];
     if (!f->active) {
-        { static int _e=0; if(_e++<8) {
+        { static int _e=0; if(PS3_LOG_FIRST(_e, 8)) {
             uint32_t r29=(uint32_t)ctx->gpr[29], r30=(uint32_t)ctx->gpr[30], r31=(uint32_t)ctx->gpr[31], r3g=(uint32_t)ctx->gpr[3];
             fprintf(stderr,"[evt] flag_wait flag=%u NOT ACTIVE -> ESRCH; r3=0x%08X r29=0x%08X r30=0x%08X r31=0x%08X\n", flag_id, r3g, r29, r30, r31);
             /* dump the loop's likely counter object (r29-relative, like the flag=1000 shim's *(r29)/*(r29+0x24)) */
@@ -1184,7 +1342,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
 #endif
         return (int64_t)(int32_t)CELL_ESRCH;
     }
-    { static int _a=0; if(_a++<8) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
+    { static int _a=0; if(PS3_LOG_FIRST(_a, 8)) fprintf(stderr,"[evt] flag_wait flag=%u ACTIVE, pattern=0x%llX awaiting bits=0x%llX -> BLOCK\n", flag_id,(unsigned long long)f->pattern,(unsigned long long)bitpat); }
 
     if (bitpat == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
@@ -1196,7 +1354,7 @@ int64_t sys_event_flag_wait(ppu_context* ctx)
      * identifies the gate. */
     { static int s_fe = -1; if (s_fe < 0) s_fe = getenv("PS3_EVF_FORCE") ? 1 : 0;
       if (s_fe && f->active && !flag_check(f->pattern, bitpat, mode)) {
-        static int _n = 0; if (_n++ < 20)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
             fprintf(stderr, "[evt] PS3_EVF_FORCE: force-satisfy flag=%u bits=0x%llX mode=%u\n",
                     flag_id, (unsigned long long)bitpat, mode);
 #ifdef _WIN32
@@ -1374,7 +1532,7 @@ int64_t sys_event_flag_set(ppu_context* ctx)
     uint32_t flag_id = LV2_ARG_U32(ctx, 0);
     uint64_t bitpat  = LV2_ARG_U64(ctx, 1);
 
-    { static int _n=0; if(_n++<200) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
+    { static int _n=0; if(PS3_LOG_FIRST(_n, 200)) fprintf(stderr,"[evt] flag_set(flag=%u bits=0x%llX)\n",
         flag_id,(unsigned long long)bitpat); }
 
     if (flag_id == 0 || flag_id > SYS_EVENT_FLAG_MAX)

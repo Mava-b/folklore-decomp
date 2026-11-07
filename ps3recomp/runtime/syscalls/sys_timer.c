@@ -6,12 +6,18 @@
 #define _DEFAULT_SOURCE /* tm_gmtoff on glibc */
 #endif
 #include "sys_timer.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include <time.h>
 #include "sys_event.h"
 #include "../memory/vm.h"
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include <stdlib.h>
+#include "ps3emu/log_first.h"
+#ifdef __APPLE__
+#include <mach/mach_time.h>
+#endif
+#include "ps3emu/thread_name.h"
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -70,12 +76,32 @@ uint64_t ppu_timebase_now(void)
     uint64_t q = (uint64_t)s_qpc_freq.QuadPart;
     return (d / q) * PS3_TIMEBASE_FREQ + (d % q) * PS3_TIMEBASE_FREQ / q;
 #else
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (uint64_t)ts.tv_sec * PS3_TIMEBASE_FREQ +
-           (uint64_t)ts.tv_nsec * PS3_TIMEBASE_FREQ / 1000000000ull;
+    const uint64_t ns = host_monotonic_ns();
+    return (ns / 1000000000ull) * PS3_TIMEBASE_FREQ +
+           (ns % 1000000000ull) * PS3_TIMEBASE_FREQ / 1000000000ull;
 #endif
 }
+
+#ifndef _WIN32
+uint64_t host_monotonic_ns(void)
+{
+#ifdef __APPLE__
+    static uint32_t numer, denom;
+    if (!denom) {                       /* benign race: same values either way */
+        mach_timebase_info_data_t tb;
+        mach_timebase_info(&tb);
+        numer = tb.numer; denom = tb.denom;
+    }
+    const uint64_t t = mach_absolute_time();
+    /* Split so t * numer cannot overflow (numer is 125 on Apple silicon). */
+    return (t / denom) * numer + (t % denom) * numer / denom;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+#endif
+}
+#endif
 
 static void write_be32(uint32_t addr, uint32_t val)
 {
@@ -164,8 +190,9 @@ static uint64_t usleep_clamp(uint32_t lr, uint64_t usec)
 int64_t sys_timer_usleep(ppu_context* ctx)
 {
     uint64_t usec = usleep_clamp((uint32_t)ctx->lr, LV2_ARG_U64(ctx, 0));
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     { extern unsigned long long ps3_qpc_us(void);
-      static int n=0; if (n++ < 60)
+      static int n=0; if (PS3_LOG_FIRST(n, 60))
         fprintf(stderr, "[WAIT] t=%lluus timer_usleep(%llu us) lr=0x%08llX cia=0x%08llX\n", ps3_qpc_us(),
         (unsigned long long)usec, (unsigned long long)ctx->lr, (unsigned long long)ctx->cia); }
     /* PS3_POLLTOP=<seconds>: name the usleep poll sites.
@@ -232,7 +259,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
                       s_wo = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_wo && (uint32_t)ctx->lr == (uint32_t)s_wo) {
         static int _n = 0;
-        if (_n++ < 8) {
+        if (PS3_LOG_FIRST(_n, 8)) {
           /* Dump the words at EVERY plausible object register, not just r29.
            * Which register holds the object is per-title -- r29 was right for
            * the title this was written for and is a spin COUNTER in Guitar
@@ -321,6 +348,7 @@ int64_t sys_timer_usleep(ppu_context* ctx)
 int64_t sys_timer_sleep(ppu_context* ctx)
 {
     uint32_t sec = LV2_ARG_U32(ctx, 0);
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
 
 #ifdef _WIN32
     Sleep(sec * 1000);
@@ -347,17 +375,19 @@ int64_t sys_time_get_timezone(ppu_context* ctx)
     if (!zone_addr || !dst_addr || zone_addr > UINT32_MAX - 3 || dst_addr > UINT32_MAX - 3)
         return (int32_t)CELL_EFAULT;
 
-    time_t now = time(NULL);
-    struct tm local;
     int32_t standard_minutes, daylight_minutes;
 #ifdef _WIN32
-    _tzset();
-    long west_seconds, daylight_bias;
-    if (localtime_s(&local, &now) || _get_timezone(&west_seconds) || _get_dstbias(&daylight_bias))
+    /* Ask the system, not the C runtime: _get_timezone and _get_dstbias do not exist in the msvcrt.dll that a
+     * MinGW-w64 toolchain with the msvcrt runtime links against. Bias is minutes west of UTC. */
+    TIME_ZONE_INFORMATION tz;
+    DWORD zone_id = GetTimeZoneInformation(&tz);
+    if (zone_id == TIME_ZONE_ID_INVALID)
         return (int32_t)CELL_EAGAIN;
-    standard_minutes = (int32_t)(-west_seconds / 60);
-    daylight_minutes = local.tm_isdst > 0 ? (int32_t)(-daylight_bias / 60) : 0;
+    standard_minutes = -(int32_t)(tz.Bias + tz.StandardBias);
+    daylight_minutes = zone_id == TIME_ZONE_ID_DAYLIGHT ? -(int32_t)(tz.DaylightBias - tz.StandardBias) : 0;
 #else
+    time_t now = time(NULL);
+    struct tm local;
     if (!localtime_r(&now, &local)) return (int32_t)CELL_EAGAIN;
     daylight_minutes = 0;
     if (local.tm_isdst > 0) {
@@ -425,10 +455,25 @@ int64_t sys_time_get_timebase_frequency(ppu_context* ctx)
 /* Forward declaration */
 static void timer_send_event(sys_timer_info* t);
 
+/* Microseconds on a monotonic host clock: the timer's expiration times. */
+static uint64_t timer_now_us(void)
+{
+#ifdef _WIN32
+    static LARGE_INTEGER f;
+    if (!f.QuadPart) QueryPerformanceFrequency(&f);
+    LARGE_INTEGER n; QueryPerformanceCounter(&n);
+    return (uint64_t)(n.QuadPart / f.QuadPart) * 1000000ull +
+           (uint64_t)(n.QuadPart % f.QuadPart) * 1000000ull / (uint64_t)f.QuadPart;
+#else
+    return host_monotonic_ns() / 1000ull;
+#endif
+}
+
 #ifdef _WIN32
 static DWORD WINAPI timer_thread_proc(LPVOID param)
 {
     sys_timer_info* t = (sys_timer_info*)param;
+    ps3_thread_name("lv2 timer");
 
     while (t->running) {
         DWORD ms = (DWORD)(t->period_usec / 1000);
@@ -488,9 +533,16 @@ static void timer_send_event(sys_timer_info* t)
 
     sys_event_t evt;
     evt.source = t->source;
+    /* lv2 (and RPCS3) deliver the connect's data1/data2 and, in data3, the
+     * EXPIRATION TIME -- which advances every period. It was 0 here, so a
+     * consumer that paces itself by the delta between ticks saw no time pass:
+     * Twisted Metal's BoomRangBuss audio driver wakes on this timer, derives
+     * how many blocks to service from data3, and serviced none, ever -- so
+     * brb_StartSession timed out and every later BRB request hung. */
     evt.data1  = t->data1;
-    evt.data2  = 0;
-    evt.data3  = 0;
+    evt.data2  = t->data2;
+    evt.data3  = t->next_expire;
+    t->next_expire += t->period_usec;
 
     /* Push event (ignore if queue full) */
 #ifdef _WIN32
@@ -612,6 +664,7 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     uint32_t queue_id = LV2_ARG_U32(ctx, 1);
     uint64_t source   = LV2_ARG_U64(ctx, 2);
     uint64_t data1    = LV2_ARG_U64(ctx, 3);
+    uint64_t data2    = LV2_ARG_U64(ctx, 4);
 
     if (timer_id == 0 || timer_id > SYS_TIMER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
@@ -626,6 +679,7 @@ int64_t sys_timer_connect_event_queue(ppu_context* ctx)
     t->event_queue_id = (int32_t)queue_id;
     t->source         = source;
     t->data1          = data1;
+    t->data2          = data2;
 
     return CELL_OK;
 }
@@ -678,6 +732,7 @@ int64_t sys_timer_start(ppu_context* ctx)
 
     t->period_usec = period;
     t->running     = 1;
+    t->next_expire = timer_now_us() + period;
 
 #ifdef _WIN32
     t->stop_event    = CreateEventA(NULL, TRUE, FALSE, NULL);

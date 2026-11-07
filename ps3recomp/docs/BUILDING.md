@@ -28,30 +28,34 @@ Complete guide to building the ps3recomp runtime library and game projects.
 | **CMake** | 3.20 | Build system generator |
 | **C Compiler** | C17 support | Compile runtime and HLE modules |
 | **C++ Compiler** | C++20 support | Compile templates, module registration |
-| **Python** | 3.9+ | Recompiler tools |
+| **Python** | 3.10+ (CI uses 3.12) | Recompiler tools |
 
 ### Recommended
 
 | Tool | Purpose |
 |------|---------|
-| **Ninja** | Faster builds than Make/MSBuild (`pip install ninja`) |
+| **Ninja** | Faster builds than Make/MSBuild; CI and the commands in these docs use it |
 | **ccache** | Compiler cache for faster rebuilds |
 
 ### Platform-Specific Requirements
 
+CI builds with the compilers on GitHub's `windows-latest`, `ubuntu-latest` and `macos-14` runner images; no older compiler version is tested.
+
 **Windows:**
-- Visual Studio 2022 (MSVC 17.x) or Clang/LLVM 14+
+- clang-cl (LLVM) with Visual Studio 2022 (MSVC 17.x) for the headers and libraries (what CI uses); plain MSVC `cl` builds the runtime library (see the Windows notes below), but lifted game code needs clang-cl
 - Windows SDK 10.0.19041+
 - System libraries (auto-linked): `ws2_32.lib`, `xinput.lib`, `ole32.lib`, `bcrypt.lib`
 
 **Linux:**
-- GCC 12+ or Clang 14+
+- GCC or Clang
 - Development headers: `libpthread`, `libm`
-- Optional: SDL2 development package (`libsdl2-dev`) for input/audio
+- SDL2 development package (`libsdl2-dev` on Debian/Ubuntu) for input/audio
 
 **macOS:**
-- Xcode 14+ (Apple Clang 14+)
-- Optional: SDL2 via Homebrew (`brew install sdl2`)
+- Xcode or the Xcode Command Line Tools (Apple Clang)
+- CMake, Ninja, Python 3.12 and SDL2:
+  `brew install cmake ninja python@3.12 sdl2`
+- Optional guest-shader translation: `brew install glslang spirv-cross`
 
 ---
 
@@ -97,8 +101,8 @@ cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
 ```bash
 cmake --build build
 
-# Parallel build (if not using Ninja which is parallel by default)
-cmake --build build -j$(nproc)
+# Parallel build (if not using Ninja, which is parallel by default)
+cmake --build build --parallel
 
 # Build specific target
 cmake --build build --target ps3recomp_runtime
@@ -156,6 +160,13 @@ FFmpeg stays a separate library supplied by the user; nothing from it is
 compiled into the runtime. If you redistribute FFmpeg DLLs with a port, use an
 LGPL-only build: distro and MSYS2 packages are usually built with GPL parts
 enabled (`--enable-gpl`), which changes what you may ship.
+
+cellAtrac decodes ATRAC3plus with a vendored FFmpeg decoder
+(`third_party/at3_standalone`, LGPL-2.1-or-later, kept as a separable
+component), which is compiled into the runtime. For a binary that has to stay
+free of LGPL code, configure with `-DPS3RECOMP_ATRAC_LGPL=OFF`: a stub
+(`third_party/at3_stub`) replaces it, every ATRAC track fails to open, and the
+title sees an ATRAC error. The default is ON.
 
 ### Running the Tests
 
@@ -437,18 +448,18 @@ that an NV4097 triangle covers the centre pixel. A green tick means the
 graphics bridge works, not merely that it compiled.
 
 ```bash
-brew install ninja sdl2
+brew install cmake ninja python@3.12 sdl2
 cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
 ```
 
-**No title has run from this tree on macOS yet.** The PPU boot scaffold
-(`runtime/ppu/ppu_loader.cpp`, `runtime/ppu/tests/boot_main.cpp` and the HLE
-dispatch) compiles on POSIX with zero errors under a CI ratchet, but it is
-compiled per game rather than into the library, and booting a title with it on
-macOS is the remaining work. Downstream, inFamous runs on macOS/arm64 with
-patches that are on their way upstream (#213).
+The same workflow boots a synthetic PPU ELF twice: once through
+`ps3recomp_boot_smoke`, and once through the unmodified project template. Those
+runs cover the loader, HLE dispatch, guest threads, frame clock and Metal
+backend from guest code. No retail title has been validated from this tree on
+macOS yet; downstream, inFamous runs on macOS/arm64 with patches that are on
+their way upstream (#213).
 
 Thanks to [@slushiimusic](https://github.com/slushiimusic), who reported the
 original docs-vs-reality gap in
@@ -467,7 +478,7 @@ and the Metal backend ([#96](https://github.com/sp00nznet/ps3recomp/pull/96)).
 | MSVC | 19.35+ (VS 2022) | Windows | Full support |
 | GCC | 12+ | Linux | Full support |
 | Clang | 14+ | Linux | Full support |
-| Clang / Apple Clang | 14+ (Xcode 14) | macOS | **Not building** — see #94, fix in review (#95) |
+| Apple Clang | macOS 14 runner toolchain | macOS arm64 | Full support |
 | MinGW-w64 | GCC 12+ | Windows | Supported |
 
 ### Required C17 Features
@@ -620,7 +631,7 @@ target_link_libraries(my_game PRIVATE
 cp -r ps3recomp/templates/project/ my_game/
 
 # Edit configuration
-# - config.toml: set elf_path, module settings, graphics/audio backends
+# - config.toml: reference only, not read by the tools yet
 # - CMakeLists.txt: set project name, add ps3recomp path
 # - stubs.cpp: add game-specific function overrides
 
@@ -642,12 +653,12 @@ cmake --build build
 |------|---------|
 | `main.cpp` | Entry point — initializes runtime subsystems, loads function table, creates main PPU thread |
 | `stubs.cpp` | Game-specific NID overrides and custom function implementations |
-| `config.toml` | Recompiler and runtime configuration |
+| `config.toml` | Reference only: not read by the tools yet |
 | `CMakeLists.txt` | Build configuration — links against ps3recomp_runtime |
 
 ### Configuration Reference (config.toml)
 
-See `templates/project/config.toml` for the full reference with comments. Key sections:
+Reference only: no tool or CMake file reads `config.toml` yet, so these settings have no effect. See `templates/project/config.toml` for the full reference with comments. Key sections:
 
 ```toml
 [input]

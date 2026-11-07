@@ -5,6 +5,7 @@
 #include "sys_memory.h"
 #include <stdio.h>
 #include <string.h>
+#include "../../include/ps3emu/log_first.h"   /* relative: tools/test_*memory*.py compile this file alone */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -19,15 +20,29 @@ uint32_t g_sys_mem_bump_ptr = 0;
 
 /* Total user memory size (default 213 MB, after kernel reservation) */
 #define SYS_MEM_USER_TOTAL  (213 * 1024 * 1024)
+#define SYS_MEMORY_CONTAINER_DEFAULT 0xFFFFFFFFu   /* SYS_MEMORY_CONTAINER_ID_INVALID: the default container */
 
-/* Guest window handed out by sys_memory_allocate / sys_mmapper.
- * 0x40000000+ matches where the real lv2 places these allocations (verified
- * against an RPCS3 boot log of Yakuza: Dead Souls); the window is outside
- * the pre-committed main region, so pages are committed on demand. */
-#define SYS_MEM_ALLOC_BASE  0x40000000u
-#define SYS_MEM_ALLOC_END   0x50000000u
+/* LV2 user memory and mapper reservations occupy separate address domains.
+ * User allocations start above the executable region. Mapper addresses may
+ * carry high address bits; ordinary user allocations must not inherit them. */
+#define SYS_MEM_ALLOC_BASE  0x10000000u
+#define SYS_MEM_ALLOC_END   0x20000000u
+#define SYS_MAPPER_BASE     0x40000000u
+#define SYS_MAPPER_END      0xC0000000u
+static uint32_t s_mapper_bump_ptr = SYS_MAPPER_BASE;
+typedef struct mapper_reservation {
+    uint32_t start, end, next;
+} mapper_reservation;
+static mapper_reservation s_mapper_reservations[SYS_MEMORY_ALLOC_MAX];
+
 
 static uint32_t s_total_allocated = 0;
+static uint64_t (*s_image_query)(uint64_t addr, uint64_t end);
+
+void sys_memory_set_image_query(uint64_t (*query)(uint64_t addr, uint64_t end))
+{
+    s_image_query = query;
+}
 
 /* Guest threads are real host threads; serialize the bump allocator. */
 #ifdef _WIN32
@@ -58,80 +73,79 @@ static void write_be32(uint32_t addr, uint32_t val)
  * r4 = flags (page size)
  * r5 = pointer to receive allocated address (u32*)
  * -----------------------------------------------------------------------*/
+/* Find an aligned gap among live user allocations. Freed blocks are reusable.
+ * The small runtime-injected window is reserved even when a port relocates it
+ * into this domain, and loaded ELF data/BSS remain owned by the image.
+ * Use 64-bit arithmetic for every exclusive range end. */
+static uint32_t user_address(uint32_t size, uint32_t alignment)
+{
+    uint64_t candidate = SYS_MEM_ALLOC_BASE;
+    for (;;) {
+        candidate = (candidate + alignment - 1u) & ~(uint64_t)(alignment - 1u);
+        if (candidate + size > SYS_MEM_ALLOC_END) return 0;
+        uint64_t next = s_image_query ? s_image_query(candidate, candidate + size) : candidate;
+        uint64_t injected = VM_HLE_INJECT_BASE;
+        if (candidate < injected + VM_HLE_INJECT_SIZE && injected < candidate + size &&
+            injected + VM_HLE_INJECT_SIZE > next)
+            next = injected + VM_HLE_INJECT_SIZE;
+        if (candidate < (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE &&
+            VM_PPU_TLS_BASE < candidate + size && (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE > next)
+            next = (uint64_t)VM_PPU_TLS_BASE + VM_PPU_TLS_SIZE;
+        for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
+            const sys_mem_alloc_info* a = &g_sys_mem_allocs[i];
+            uint64_t end = (uint64_t)a->addr + a->size;
+            if (a->active && candidate < end && a->addr < candidate + size && end > next)
+                next = end;
+        }
+        if (next == candidate) return (uint32_t)candidate;
+        candidate = next;
+    }
+}
+
+/* sys_memory_allocate and sys_memory_allocate_from_container share this. cid 0
+ * is the process's main pool; a container's allocations are also charged to
+ * that container (its used_size), checked against its total. */
+static int64_t memory_allocate(uint64_t requested, uint32_t flags, uint32_t cid, uint32_t addr_out)
+{
+    uint32_t alignment = (flags & SYS_MEMORY_PAGE_SIZE_1M) ? 0x100000u : 0x10000u;
+    uint64_t rounded = (requested + alignment - 1u) & ~(uint64_t)(alignment - 1u);
+    if (!requested || requested > UINT32_MAX || !rounded || rounded > UINT32_MAX)
+        return (int64_t)(int32_t)CELL_EINVAL;
+    uint32_t size = (uint32_t)rounded;
+    bump_lock();
+    if (size > SYS_MEM_USER_TOTAL - s_total_allocated) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    sys_mem_container_info* ct = NULL;
+    if (cid) {
+        ct = &g_sys_mem_containers[cid - 1];
+        if (size > ct->total_size - ct->used_size) {
+            bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+        }
+    }
+    int slot = -1;
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
+        if (!g_sys_mem_allocs[i].active) { slot = i; break; }
+    uint32_t addr = slot < 0 ? 0 : user_address(size, alignment);
+    if (!addr || vm_commit(addr, size) != CELL_OK) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    memset(vm_to_host(addr), 0, size);
+    sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
+    a->active = 1; a->addr = addr; a->size = size;
+    a->container_id = (int32_t)cid; a->page_size = alignment;
+    s_total_allocated += size;
+    if (ct) ct->used_size += size;
+    if (addr + size > g_sys_mem_bump_ptr) g_sys_mem_bump_ptr = addr + size;
+    bump_unlock();
+    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X, cid=%u) -> 0x%08X\n", size, flags, cid, addr);
+    if (addr_out) write_be32(addr_out, addr);
+    return CELL_OK;
+}
+
 int64_t sys_memory_allocate(ppu_context* ctx)
 {
-    uint32_t size      = LV2_ARG_U32(ctx, 0);
-    uint32_t flags     = LV2_ARG_U32(ctx, 1);
-    uint32_t addr_out  = LV2_ARG_PTR(ctx, 2);
-
-    fprintf(stderr, "[sys_memory] allocate(size=0x%X, flags=0x%X)\n",
-            size, flags);
-
-    /* Determine alignment based on page size flags */
-    uint32_t alignment;
-    if (flags & SYS_MEMORY_PAGE_SIZE_1M) {
-        alignment = 0x100000; /* 1 MB */
-    } else {
-        alignment = 0x10000;  /* 64 KB */
-    }
-
-    size = VM_ALIGN_UP(size, alignment);
-
-    if (size == 0)
-        return (int64_t)(int32_t)CELL_EINVAL;
-
-    bump_lock();
-
-    /* Initialize bump pointer on first call */
-    if (g_sys_mem_bump_ptr == 0)
-        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
-
-    /* Align bump pointer */
-    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
-
-    /* Check if we have room */
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-
-    /* Find a free allocation slot */
-    int slot = -1;
-    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
-        if (!g_sys_mem_allocs[i].active) { slot = i; break; }
-    }
-    if (slot < 0) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-
-    uint32_t alloc_addr = g_sys_mem_bump_ptr;
-    g_sys_mem_bump_ptr += size;
-    s_total_allocated += size;
-
-    sys_mem_alloc_info* a = &g_sys_mem_allocs[slot];
-    a->active       = 1;       /* claim the slot before unlocking */
-    a->addr         = alloc_addr;
-    a->size         = size;
-    a->container_id = 0;
-    a->page_size    = alignment;  /* 0x100000 (1M) or 0x10000 (64K) */
-
-    bump_unlock();
-
-    /* Commit the pages (window is outside the pre-committed main region);
-     * fresh commits are already zeroed by the OS */
-    if (vm_commit(alloc_addr, size) != CELL_OK) {
-        a->active = 0;
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-
-    fprintf(stderr, "[sys_memory] allocate -> 0x%08X\n", alloc_addr);
-
-    if (addr_out != 0) {
-        write_be32(addr_out, alloc_addr);
-    }
-
-    return CELL_OK;
+    return memory_allocate(LV2_ARG_U64(ctx, 0), LV2_ARG_U32(ctx, 1), 0, LV2_ARG_PTR(ctx, 2));
 }
 
 /* ---------------------------------------------------------------------------
@@ -142,15 +156,22 @@ int64_t sys_memory_allocate(ppu_context* ctx)
 int64_t sys_memory_free(ppu_context* ctx)
 {
     uint32_t addr = LV2_ARG_U32(ctx, 0);
-
+    bump_lock();
     for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; i++) {
         if (g_sys_mem_allocs[i].active && g_sys_mem_allocs[i].addr == addr) {
-            s_total_allocated -= g_sys_mem_allocs[i].size;
+            const int32_t cid = g_sys_mem_allocs[i].container_id;
+            /* An allocation carved from a 341 region (container_id = that
+             * region's base, outside 0..SYS_MEMORY_CONTAINER_MAX) lives in the
+             * mapper window and was never charged to the user total. */
+            if (cid >= 0 && cid <= SYS_MEMORY_CONTAINER_MAX)
+                s_total_allocated -= g_sys_mem_allocs[i].size;
+            if (cid > 0 && cid <= SYS_MEMORY_CONTAINER_MAX && g_sys_mem_containers[cid - 1].active)
+                g_sys_mem_containers[cid - 1].used_size -= g_sys_mem_allocs[i].size;
             g_sys_mem_allocs[i].active = 0;
-            return CELL_OK;
+            bump_unlock(); return CELL_OK;
         }
     }
-
+    bump_unlock();
     return (int64_t)(int32_t)CELL_EINVAL;
 }
 
@@ -271,14 +292,30 @@ int64_t sys_memory_container_destroy(ppu_context* ctx)
 /* ---------------------------------------------------------------------------
  * sys_memory_container_get_size
  *
- * r3 = container_id
- * r4 = pointer to output struct: { u32 total, u32 used }
+ * r3 = pointer to output struct: sys_memory_info_t { u32 total, u32 available }
+ * r4 = container_id; SYS_MEMORY_CONTAINER_ID_INVALID (0xFFFFFFFF) means the
+ *      process's default container, i.e. the title's own user memory.
+ *
+ * The argument order and the second field were both wrong: the game passes the
+ * struct first, and the second word is what is still free, not what is used. A
+ * title carving a container out of the default one ("get the size, destroy,
+ * recreate smaller, create mine") got ESRCH, then a container id of 0.
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_container_get_size(ppu_context* ctx)
 {
-    uint32_t container_id = LV2_ARG_U32(ctx, 0);
-    uint32_t out_addr     = LV2_ARG_PTR(ctx, 1);
+    uint32_t out_addr     = LV2_ARG_PTR(ctx, 0);
+    uint32_t container_id = LV2_ARG_U32(ctx, 1);
 
+    if (container_id == SYS_MEMORY_CONTAINER_DEFAULT) {
+        if (out_addr != 0) {
+            bump_lock();
+            const uint32_t avail = SYS_MEM_USER_TOTAL - s_total_allocated;
+            bump_unlock();
+            write_be32(out_addr + 0, SYS_MEM_USER_TOTAL);
+            write_be32(out_addr + 4, avail);
+        }
+        return CELL_OK;
+    }
     if (container_id == 0 || container_id > SYS_MEMORY_CONTAINER_MAX)
         return (int64_t)(int32_t)CELL_ESRCH;
 
@@ -288,7 +325,7 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
 
     if (out_addr != 0) {
         write_be32(out_addr + 0, c->total_size);
-        write_be32(out_addr + 4, c->used_size);
+        write_be32(out_addr + 4, c->total_size - c->used_size);
     }
 
     return CELL_OK;
@@ -302,41 +339,86 @@ int64_t sys_memory_container_get_size(ppu_context* ctx)
  * r5 = alignment
  * r6 = pointer to receive address (u32*)
  * -----------------------------------------------------------------------*/
+/* Mapper reservation and legacy direct mapping share their own cursor.
+ * Called with the allocator lock held. */
+static uint32_t mapper_address(uint64_t requested, uint64_t alignment)
+{
+    if (!requested || requested > UINT32_MAX || !alignment ||
+        alignment > UINT32_MAX || (alignment & (alignment - 1u))) return 0;
+    uint64_t addr = ((uint64_t)s_mapper_bump_ptr + alignment - 1u) & ~(alignment - 1u);
+    uint64_t size = (requested + alignment - 1u) & ~(alignment - 1u);
+    /* A reservation owns its entire aligned span. Recheck after every skip:
+     * an alignment adjustment can move it into another runtime-owned window. */
+    const uint64_t reserved[][2] = {
+        { VM_HLE_HEAP_BASE, (uint64_t)VM_HLE_HEAP_BASE + VM_HLE_HEAP_SIZE },
+        { VM_AUDIO_BASE, (uint64_t)VM_AUDIO_BASE + VM_AUDIO_SIZE },
+        { VM_SYS_VM_BASE, (uint64_t)VM_SYS_VM_BASE + VM_SYS_VM_SIZE },
+        { VM_HLE_INJECT_BASE, (uint64_t)VM_HLE_INJECT_BASE + VM_HLE_INJECT_SIZE }
+    };
+    for (;;) {
+        uint64_t next = s_image_query ? s_image_query(addr, addr + size) : addr;
+        for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); ++i)
+            if (addr < reserved[i][1] && reserved[i][0] < addr + size &&
+                reserved[i][1] > next) next = reserved[i][1];
+        if (next == addr) break;
+        addr = (next + alignment - 1u) & ~(alignment - 1u);
+    }
+    if (!size || addr + size > SYS_MAPPER_END || vm_commit((uint32_t)addr, (uint32_t)size) != CELL_OK)
+        return 0;
+    s_mapper_bump_ptr = (uint32_t)(addr + size);
+    return (uint32_t)addr;
+}
+
 int64_t sys_mmapper_allocate_address(ppu_context* ctx)
 {
-    uint32_t size      = LV2_ARG_U32(ctx, 0);
-    /* uint32_t flags  = LV2_ARG_U32(ctx, 1); */
-    uint32_t alignment = LV2_ARG_U32(ctx, 2);
-    uint32_t addr_out  = LV2_ARG_PTR(ctx, 3);
-
-    if (alignment == 0) alignment = 0x10000;
-    size = VM_ALIGN_UP(size, alignment);
-
+    uint64_t size = LV2_ARG_U64(ctx, 0);
+    uint64_t alignment = LV2_ARG_U64(ctx, 2);
+    uint32_t out = LV2_ARG_PTR(ctx, 3);
+    if (!alignment) alignment = 0x10000u;
+    if (alignment > UINT32_MAX || (alignment & (alignment - 1u)) || !size || size > UINT32_MAX)
+        return (int64_t)(int32_t)CELL_EINVAL;
     bump_lock();
-
-    if (g_sys_mem_bump_ptr == 0)
-        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
-
-    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
-
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
+    int slot = -1;
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i)
+        if (!s_mapper_reservations[i].start) { slot = i; break; }
+    uint32_t addr = slot < 0 ? 0 : mapper_address(size, alignment);
+    if (addr) {
+        mapper_reservation* r = &s_mapper_reservations[slot];
+        r->start = r->next = addr; r->end = s_mapper_bump_ptr;
     }
-
-    uint32_t alloc_addr = g_sys_mem_bump_ptr;
-    g_sys_mem_bump_ptr += size;
-
     bump_unlock();
-
-    /* Commit the reserved region */
-    vm_commit(alloc_addr, size);
-
-    if (addr_out != 0) {
-        write_be32(addr_out, alloc_addr);
-    }
-
+    if (!addr) return (int64_t)(int32_t)CELL_ENOMEM;
+    if (out) write_be32(out, addr);
     return CELL_OK;
+}
+
+/* Claim a mapped block inside the caller's existing reservation. The loader's
+ * search-and-map bridge and the allocator share this ownership bookkeeping,
+ * so an unsuccessful request leaves all reservation cursors unchanged. */
+int64_t sys_mmapper_search_map_address(uint32_t start, uint32_t size, uint32_t* out)
+{
+    if (!out || !size) return (int64_t)(int32_t)CELL_EINVAL;
+    bump_lock();
+    mapper_reservation* found = NULL;
+    for (int i = 0; i < SYS_MEMORY_ALLOC_MAX; ++i) {
+        mapper_reservation* r = &s_mapper_reservations[i];
+        if (r->start && ((!start && !found) || (start >= r->start && start < r->end))) {
+            found = r; if (start) break;
+        }
+    }
+    if (!found) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_EINVAL;
+    }
+    uint64_t addr = found->next;
+    if (start > addr) addr = start;
+    addr = (addr + 0xFFFFFu) & ~0xFFFFFull;
+    uint64_t end = (addr + size + 0xFFFFFu) & ~0xFFFFFull;
+    if (end > found->end || vm_commit((uint32_t)addr, size) != CELL_OK) {
+        bump_unlock(); return (int64_t)(int32_t)CELL_ENOMEM;
+    }
+    found->next = (uint32_t)end;
+    *out = (uint32_t)addr;
+    bump_unlock(); return CELL_OK;
 }
 
 /* ---------------------------------------------------------------------------
@@ -437,6 +519,16 @@ static int alloc_slot_claim(uint32_t addr, uint32_t size, int32_t container_id, 
  * r4 = container id
  * r5 = flags (page size)
  * r6 = pointer to receive allocated address (u32*)
+ *
+ * Was unregistered. MLB The Show 16 builds its animation and movie buffer pools
+ * ("SharedMemContAnim", "SharedMemContMovie") in containers carved from the
+ * default one; with no allocation the pool stayed empty and loading a match
+ * called a method on a NULL buffer.
+ *
+ * Two kinds of container id: the base of a region lv2 341 handed out (see
+ * s_carved above -- Folklore), carved here first fit; and a real container
+ * from lv2 324 or the default container, which memory_allocate serves from the
+ * user window and charges to the container (upstream).
  * -----------------------------------------------------------------------*/
 int64_t sys_memory_allocate_from_container(ppu_context* ctx)
 {
@@ -495,42 +587,12 @@ int64_t sys_memory_allocate_from_container(ppu_context* ctx)
     }
     bump_unlock();
 
-    if (alloc_addr == 0) {
-        /* A container from lv2 324 (ids 1..SYS_MEMORY_CONTAINER_MAX): charge
-         * it and take fresh memory from the main window. */
-        if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
-            return (int64_t)(int32_t)CELL_ESRCH;
-        sys_mem_container_info* c = &g_sys_mem_containers[cid - 1];
-        if (c->used_size + size > c->total_size)
-            return (int64_t)(int32_t)CELL_ENOMEM;
-
-        bump_lock();
-        if (g_sys_mem_bump_ptr == 0)
-            g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
-        g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, alignment);
-        if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-            bump_unlock();
-            return (int64_t)(int32_t)CELL_ENOMEM;
-        }
-        alloc_addr = g_sys_mem_bump_ptr;
-        g_sys_mem_bump_ptr += size;
-        c->used_size += size;
-        bump_unlock();
-
-        if (vm_commit(alloc_addr, size) != CELL_OK)
-            return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-
-    if (alloc_slot_claim(alloc_addr, size, (int32_t)cid, alignment) < 0)
-        return (int64_t)(int32_t)CELL_ENOMEM;
-
-    { static int n = 0; if (n++ < 16)
-        fprintf(stderr, "[sys_memory] allocate_from_container(cid=0x%08X, size=0x%X) -> 0x%08X\n",
-                cid, size, alloc_addr); }
-
-    if (addr_out != 0)
-        write_be32(addr_out, alloc_addr);
-    return CELL_OK;
+    /* Not a 341 region: the default container, or one from lv2 324. */
+    if (cid == SYS_MEMORY_CONTAINER_DEFAULT)
+        return memory_allocate(LV2_ARG_U64(ctx, 0), flags, 0, addr_out);
+    if (cid == 0 || cid > SYS_MEMORY_CONTAINER_MAX || !g_sys_mem_containers[cid - 1].active)
+        return (int64_t)(int32_t)CELL_ESRCH;
+    return memory_allocate(LV2_ARG_U64(ctx, 0), flags, cid, addr_out);
 }
 
 /* ---------------------------------------------------------------------------
@@ -563,27 +625,18 @@ int64_t sys_mmapper_allocate_memory(ppu_context* ctx)
     if (size == 0)
         return (int64_t)(int32_t)CELL_EINVAL;
 
-    size = VM_ALIGN_UP(size, VM_PAGE_SIZE);
-
     bump_lock();
-    if (g_sys_mem_bump_ptr == 0)
-        g_sys_mem_bump_ptr = SYS_MEM_ALLOC_BASE;
-    g_sys_mem_bump_ptr = VM_ALIGN_UP(g_sys_mem_bump_ptr, VM_PAGE_SIZE);
-    if (g_sys_mem_bump_ptr + size > SYS_MEM_ALLOC_END) {
-        bump_unlock();
-        return (int64_t)(int32_t)CELL_ENOMEM;
-    }
-    uint32_t addr = g_sys_mem_bump_ptr;
-    g_sys_mem_bump_ptr += size;
+    uint32_t addr = mapper_address(size, VM_PAGE_SIZE);
     bump_unlock();
+    if (!addr) return (int64_t)(int32_t)CELL_ENOMEM;
 
-    vm_commit(addr, size);
+    /* mapper_address commits the span itself; record it for 350's carving. */
     carved_record(addr, size);
 
     if (addr_out != 0)
         write_be32(addr_out, addr);
 
-    { static int n = 0; if (n++ < 4)
+    { static int n = 0; if (PS3_LOG_FIRST(n, 4))
         fprintf(stderr, "[sys_memory] mmapper_allocate_memory size=0x%X -> 0x%08X\n",
                 size, addr); }
 
@@ -639,11 +692,15 @@ int64_t sys_mmapper_map_shared_memory(ppu_context* ctx)
  * -----------------------------------------------------------------------*/
 void sys_memory_init(lv2_syscall_table* tbl)
 {
+    bump_lock();
     memset(g_sys_mem_allocs,     0, sizeof(g_sys_mem_allocs));
     memset(g_sys_mem_containers, 0, sizeof(g_sys_mem_containers));
     memset(g_sys_mmapper_shared, 0, sizeof(g_sys_mmapper_shared));
     g_sys_mem_bump_ptr = 0;
     s_total_allocated  = 0;
+    s_mapper_bump_ptr = SYS_MAPPER_BASE;
+    memset(s_mapper_reservations, 0, sizeof(s_mapper_reservations));
+    bump_unlock();
 
     lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE,             sys_memory_allocate);
     lv2_syscall_register(tbl, SYS_MEMORY_FREE,                 sys_memory_free);
@@ -652,11 +709,11 @@ void sys_memory_init(lv2_syscall_table* tbl)
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_CREATE,     sys_memory_container_create);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_DESTROY,    sys_memory_container_destroy);
     lv2_syscall_register(tbl, SYS_MEMORY_CONTAINER_GET_SIZE,   sys_memory_container_get_size);
+    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_ADDRESS,    sys_mmapper_allocate_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_FREE_ADDRESS,        sys_mmapper_free_address);
     lv2_syscall_register(tbl, SYS_MMAPPER_ALLOCATE_SHARED_MEMORY, sys_mmapper_allocate_shared_memory);
     lv2_syscall_register(tbl, SYS_MMAPPER_MAP_SHARED_MEMORY,  sys_mmapper_map_shared_memory);
     lv2_syscall_register(tbl, 341, sys_mmapper_allocate_memory);
     lv2_syscall_register(tbl, 342, sys_mmapper_allocate_memory_from_container);
-    lv2_syscall_register(tbl, SYS_MEMORY_ALLOCATE_FROM_CONTAINER, sys_memory_allocate_from_container);
 }

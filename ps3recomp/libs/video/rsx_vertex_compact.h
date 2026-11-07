@@ -97,6 +97,11 @@ void rsx_vertex_fetch_plan_set_inline(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
     const u8* data, u32 bytes);
 
+/* Renderer default for a disabled attribute. The legacy white ATTR3 fallback
+ * applies only before a current color has been explicitly written. Shared by
+ * the compact and legacy fetch paths. */
+void rsx_vertex_fetch_default(const rsx_dispatch* rsx, u32 attr, float out[4]);
+
 /* Decode all 16 descriptors/defaults once for a draw. */
 void rsx_vertex_fetch_plan_init(
     rsx_vertex_fetch_plan* plan, const rsx_dispatch* rsx,
@@ -116,14 +121,13 @@ void rsx_vertex_fetch_plan_prepare(
 int rsx_vertex_fetch_one(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* ref, u8* out);
 
-/* rsx_vertex_fetch_one for refs[0..count), vertex i written at
- * out + i * out_stride, with byte-identical results. Works attribute by
- * attribute with the format switch hoisted out of the vertex loop, which is
- * where the live renderer spent most of its time. Returns 0 exactly when
- * rsx_vertex_fetch_one would for some vertex (an unusable ATTR0). */
+/* rsx_vertex_fetch_one for refs[0..count) into consecutive compact vertices
+ * at out (layout.stride apart), with the same values and the same failure:
+ * 0 when some vertex's enabled ATTR0 cannot be fetched. Walks attribute by
+ * attribute so each vertex type decodes in a loop of its own. */
 int rsx_vertex_fetch_many(
     const rsx_vertex_fetch_plan* plan, const rsx_vertex_ref* refs, u32 count,
-    u8* out, u32 out_stride);
+    u8* out);
 
 /* Collapse repeated (vertex_id, base_index) references in first-use order.
  * refs is rewritten in place with the unique prefix.  The occurrence map

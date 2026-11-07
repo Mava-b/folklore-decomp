@@ -184,6 +184,27 @@ static s32 content_free_kb(void)
     return 0;
 }
 
+/* hddFreeSizeKB as the guest reads it. Games compute hddFreeSizeKB * 1024
+ * in 32 bits to get bytes, so a real free space of 4 GiB or more wraps to
+ * whatever is left over modulo 4 GiB: depending on how full the host disk
+ * happens to be, the install check sees a few MB and fails with "not enough
+ * space" (inFAMOUS 2 did, at boot, with 41.7 GB free). RPCS3 reports 40 GiB
+ * - 256 KiB for every one of these calls for that reason (cellGame.cpp,
+ * cellHddGameCheck): times 1024 that is 0xFFFC0000, still nearly 4 GiB
+ * after the wrap. Here the measured value is kept below 4 GiB, where it
+ * cannot wrap and a nearly full disk still reads as one, and RPCS3's figure
+ * is reported above it. PS3_GAME_FREE_SPACE_RAW=1 reports the measured
+ * value (capped at INT32_MAX KB) always, as before. */
+#define CELL_GAME_FREE_KB_WRAP     (4 * 1024 * 1024)        /* x1024 = 2^32 */
+#define CELL_GAME_FREE_KB_REPORTED (40 * 1024 * 1024 - 256) /* RPCS3 */
+static s32 content_free_kb_reported(void)
+{
+    const s32 kb = content_free_kb();
+    const char* raw = getenv("PS3_GAME_FREE_SPACE_RAW");
+    if (raw && *raw && *raw != '0') return kb;
+    return kb >= CELL_GAME_FREE_KB_WRAP ? CELL_GAME_FREE_KB_REPORTED : kb;
+}
+
 /* ---------------------------------------------------------------------------
  * Configuration
  * -----------------------------------------------------------------------*/
@@ -295,6 +316,15 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
         printf("[cellGame] PARAM.SFO not read ('%s'); keeping title id '%s'\n",
                sfo_path, s_title_id);
     }
+    /* CATEGORY decides the type cellGameBootCheck reports: "DG" is a disc game, "HG" an HDD game (a PSN
+     * download, booted from /dev_hdd0/game/<id>). Titles check it and give up on a type they do not expect.
+     * RPCS3 reports HDD for every category that is not a disc one; only these two are mapped here, any
+     * other keeps the default. */
+    if (sfo_read_string(sfo_path, "CATEGORY", tmp, sizeof(tmp)) == 0 && tmp[0]) {
+        if (strcmp(tmp, "HG") == 0)      s_game_type = CELL_GAME_GAMETYPE_HDD;
+        else if (strcmp(tmp, "DG") == 0) s_game_type = CELL_GAME_GAMETYPE_DISC;
+        printf("[cellGame] CATEGORY '%s' -> game type %u\n", tmp, (unsigned)s_game_type);
+    }
     if (sfo_read_string(sfo_path, "TITLE", tmp, sizeof(tmp)) == 0 && tmp[0]) {
         strncpy(s_title, tmp, sizeof(s_title) - 1); s_title[sizeof(s_title) - 1] = '\0';
     }
@@ -312,6 +342,21 @@ void cellGame_init_from_paramsfo(const char* sfo_path)
 
 /* Central title-id accessor so other modules (cellSysutil etc.) don't hardcode it. */
 const char* cellGame_get_title_id(void) { return s_title_id; }
+/* The title id when the booted title is an HDD game (CATEGORY "HG"), else NULL:
+ * its /dev_hdd0/game/<id>/ IS the booted game directory (sys_fs.c). */
+const char* cellGame_get_hdd_title_id(void)
+{
+    return s_game_type == CELL_GAME_GAMETYPE_HDD && s_title_id[0] ? s_title_id : NULL;
+}
+
+/* Whether the title was started as a game patch (CATEGORY GP over a disc
+ * game). The port boots the title itself, never a patch. */
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved)
+{
+    (void)size; (void)reserved;
+    printf("[cellGame] PatchCheck() -> not a patch\n");
+    return CELL_GAME_ERROR_NOTPATCH;
+}
 
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName)
@@ -345,7 +390,7 @@ s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
     if (attr_ea) vm_write32(attr_ea, 0);
 
     if (size_ea) {
-        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 0, (u32)content_free_kb_reported());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);                           /* sysSizeKB */
     }
@@ -432,7 +477,7 @@ s32 cellGameDataCheck(u32 type, const char* dirName, CellGameContentSize* size)
 
     uint32_t size_ea = (uint32_t)(uintptr_t)size;
     if (size_ea) {
-        vm_write32(size_ea + 0, (u32)content_free_kb());
+        vm_write32(size_ea + 0, (u32)content_free_kb_reported());
         vm_write32(size_ea + 4, (uint32_t)CELL_GAME_SIZEKB_NOTCALC);
         vm_write32(size_ea + 8, 0);
     }
@@ -497,7 +542,7 @@ static s32 gamedata_stat_callback(const char* tag, u32 version, uint32_t dir_ea,
     memset(vm_base + cb, 0, (set + 0x20) - cb);
 
     /* CellGameDataStatGet (offsets per SDK, RPCS3-verified). */
-    vm_write32(get + 0x000, (u32)content_free_kb());
+    vm_write32(get + 0x000, (u32)content_free_kb_reported());
     vm_write32(get + 0x004, is_new_data);                            /* isNewData = 0 (data exists) */
     snprintf((char*)(vm_base + get + 0x008), 96, "/dev_hdd0/game/%s", dir);          /* contentInfoPath */
     snprintf((char*)(vm_base + get + 0x427), 96, "/dev_hdd0/game/%s/USRDIR", dir);   /* gameDataPath */

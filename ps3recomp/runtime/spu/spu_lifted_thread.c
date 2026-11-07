@@ -3,6 +3,7 @@
 #include "spu_lifted_thread.h"
 #include "spu_coherency.h"
 #include "spu_context.h"
+#include "ps3emu/ps3_tprof.h"   /* PS3_TPROF: in-process thread samples */
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -101,7 +102,7 @@ void spu_lifted_thread_setup(spu_context* ctx, const spu_lifted_thread_desc* d)
      * case. Asking the registry which image owns the entry point gets the same
      * answer the title's own registration order implies, without the lv2 layer
      * having to know any image ids. */
-    { int img = spu_image_of_function(ctx->pc);
+    { int img = d->image_id > 0 ? d->image_id : spu_image_of_function(ctx->pc);
       ctx->image_id = (img >= 0) ? img : 0; }
 
     if (d->img_ea) spu_deploy_image(ctx, d->img_ea);
@@ -135,6 +136,7 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
     }
 
     ctx->status = SPU_STATUS_RUNNING;
+    ps3_tprof_thread('S', ctx->spu_id);
     /* The dispatcher resolves ctx->pc in ctx->image_id and runs it; the halt
      * landing pad catches an SPU that stops from inside a nested call, and
      * drains the tail-transfer chain when it returns normally. */
@@ -176,6 +178,7 @@ void spu_lifted_thread_run(spu_context* ctx, spu_lifted_thread_result* out)
      * private engine before restart can reset the context or destroy frees it. */
     spu_coh_unregister(ctx);
     spu_mfc_release(ctx);
+    ps3_tprof_thread_exit();
 
     if (out) *out = r;
 }

@@ -313,6 +313,7 @@ def run_port(port, build=True, shots=False):
 
     env = dict(penv)
     env["PS3_MILESTONE_OUT"] = log
+    env.setdefault("PS3_MUTE", "1")     # silent at the device; the title's audio path is unchanged
 
     # --shots: run the port the way its README documents instead of headless,
     # and keep the frames. The default gate run is deliberately headless on the
@@ -545,7 +546,9 @@ def cmd_check(ports, args):
             # race, and the first run after a build is the likeliest place to
             # catch one. YDKJ's teardown alternates between exit 0 and an access
             # violation entirely on its own.
-            if not args.no_confirm and not shots:
+            # Never for a build failure: the re-run skips the build and runs
+            # whatever stale exe is left, which "passes" (2026-10-19, #353).
+            if not args.no_confirm and not shots and not note.startswith("build failed"):
                 print("[%s] %s -- confirming" % (name, note.split(";")[0]))
                 status, log, note = run_port(port, build=False, shots=False)
             if status != "ok":

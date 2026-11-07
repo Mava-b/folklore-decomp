@@ -5,6 +5,8 @@
  * spu_<mnemonic> helpers the lifter emits, so interpreted and lifted code are
  * bit-identical. Uncommon opcodes trap loudly (never silently wrong).
  */
+#include <time.h>
+#include "../platform/mingw_timespec_get.h"   /* timespec_get on msvcrt MinGW */
 #include "spu_interp.h"
 #include "spu_helpers.h"
 #include <stdio.h>
@@ -16,7 +18,7 @@ u128 spu_rdch(spu_context* ctx, uint32_t channel);
 void spu_wrch(spu_context* ctx, uint32_t channel, u128 value);
 uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 
-#include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_dec_* */
+#include "spu_interp_tables.inc"   /* spu_op enum, spu_op_name[], spu_decode_tab[] */
 
 /* Work descriptor for the next SYS_SPU_THREAD_STOP_RECEIVE_EVENT service, set
  * by the event-port send that wakes a sim SPU. Single-slot: dispatch is
@@ -24,7 +26,7 @@ uint32_t spu_rchcnt(spu_context* ctx, uint32_t channel);
 uint32_t g_spu_pending_evt[3];
 int      g_spu_pending_evt_valid;
 
-/* ---- decode: 32-bit insn -> fields (mirrors spu_disasm.spu_decode order) ---- */
+/* ---- decode: 32-bit insn -> fields (one lookup in spu_decode_tab) ---- */
 typedef struct {
     spu_op   op;
     uint8_t  rt, ra, rb, rc, ch;
@@ -37,61 +39,38 @@ static int32_t sx(uint32_t v, int bits) {
     return (int32_t)((v ^ m) - m);
 }
 
+/* Every opcode field is a prefix of bits 31..21, so the op and the immediate
+ * form come from one table load; the cascade precedence is baked into the
+ * table by tools/gen_spu_interp.py. Only the fields the form needs are
+ * computed. */
 static void spu_decode1(uint32_t insn, uint32_t pc, spu_ins* d) {
-    uint32_t op4 = (insn >> 28) & 0xF,  op7 = (insn >> 25) & 0x7F;
-    uint32_t op8 = (insn >> 24) & 0xFF, op9 = (insn >> 23) & 0x1FF;
-    uint32_t op10 = (insn >> 22) & 0x3FF, op11 = (insn >> 21) & 0x7FF;
+    const spu_decode_ent e = spu_decode_tab[insn >> 21];
+    d->op = (spu_op)e.op;
     d->rt = insn & 0x7F; d->ra = (insn >> 7) & 0x7F;
     d->rb = (insn >> 14) & 0x7F; d->rc = (insn >> 21) & 0x7F;
     d->ch = (insn >> 7) & 0x7F; d->imm = 0; d->tgt = 0;
-    int32_t i10 = sx((insn >> 14) & 0x3FF, 10);
-    int32_t i16 = sx((insn >> 7) & 0xFFFF, 16);
-    uint32_t i18 = (insn >> 7) & 0x3FFFF;
 
-    /* RRR (4) */
-    if ((d->op = spu_dec_rrr(op4)) != SPU_word) return;
-    /* RI18 (7) */
-    if ((d->op = spu_dec_ri18(op7)) != SPU_word) {
-        d->imm = (d->op == SPU_ila) ? (int32_t)i18 : (int32_t)(i18 & 0xFFFF);
-        return;
+    switch ((spu_decode_form)e.form) {
+    case SPU_F_NONE: break;
+    case SPU_F_I18:   d->imm = (int32_t)((insn >> 7) & 0x3FFFF); break;
+    case SPU_F_I18LO: d->imm = (int32_t)((insn >> 7) & 0xFFFF); break;
+    case SPU_F_LQA:
+        d->tgt = ((((insn >> 7) & 0xFFFF) << 2)) & 0x3FFF0; break;
+    case SPU_F_LQR:
+        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4) + pc) & 0x3FFF0; break;
+    case SPU_F_BREL:
+        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4) + pc) & 0x3FFFF; break;
+    case SPU_F_BABS:
+        d->tgt = ((uint32_t)(sx((insn >> 7) & 0xFFFF, 16) * 4)) & 0x3FFFF; break;
+    case SPU_F_I16S:  d->imm = sx((insn >> 7) & 0xFFFF, 16); break;
+    case SPU_F_I16U:  d->imm = (int32_t)((insn >> 7) & 0xFFFF); break;
+    case SPU_F_I10:   d->imm = sx((insn >> 14) & 0x3FF, 10); break;
+    case SPU_F_I10Q:  d->imm = (int32_t)((uint32_t)sx((insn >> 14) & 0x3FF, 10) << 4); break;
+    case SPU_F_I8:    d->imm = (insn >> 14) & 0xFF; break;
+    case SPU_F_STOP:  d->imm = insn & 0x3FFF; break;
+    case SPU_F_I7S:   d->imm = sx(d->rb, 7); break;
+    case SPU_F_I7U:   d->imm = d->rb; break;
     }
-    /* RI16 (9) — before RI10 (shared top-8-bit opcodes) */
-    if ((d->op = spu_dec_ri16(op9)) != SPU_word) {
-        switch (d->op) {
-        case SPU_lqa: case SPU_stqa: d->tgt = ((uint32_t)(i16 & 0xFFFF) << 2) & 0x3FFF0; break;
-        case SPU_lqr: case SPU_stqr: d->tgt = ((uint32_t)(i16 * 4) + pc) & 0x3FFF0; break;
-        case SPU_br: case SPU_brsl: case SPU_brz: case SPU_brnz:
-        case SPU_brhz: case SPU_brhnz: d->tgt = ((uint32_t)(i16 * 4) + pc) & 0x3FFFF; break;
-        case SPU_bra: case SPU_brasl: d->tgt = ((uint32_t)(i16 * 4)) & 0x3FFFF; break;
-        case SPU_il: d->imm = i16; break;
-        default: d->imm = (int32_t)(i16 & 0xFFFF); break; /* ilh/ilhu/iohl */
-        }
-        return;
-    }
-    /* channel ops (op11) — before RI10 (wrch/shli op8 clash) */
-    if (op11 == 0x00D) { d->op = SPU_rdch;   return; }
-    if (op11 == 0x10D) { d->op = SPU_wrch;   return; }
-    if (op11 == 0x00F) { d->op = SPU_rchcnt; return; }
-    /* RI10 (8) */
-    if ((d->op = spu_dec_ri10(op8)) != SPU_word) {
-        d->imm = (d->op == SPU_lqd || d->op == SPU_stqd) ? (i10 << 4) : i10;
-        return;
-    }
-    /* RI8 (10) float<->int conversions */
-    if ((d->op = spu_dec_ri8(op10)) != SPU_word) { d->imm = (insn >> 14) & 0xFF; return; }
-    /* RR (11) */
-    if ((d->op = spu_dec_rr(op11)) != SPU_word) {
-        if (d->op == SPU_stop) d->imm = insn & 0x3FFF;
-        return;
-    }
-    /* RI7 (11) rotate/shift/gen-control immediates */
-    if ((d->op = spu_dec_ri7(op11)) != SPU_word) {
-        d->imm = spu_ri7_unsigned(d->op) ? d->rb : sx(d->rb, 7);
-        return;
-    }
-    /* LSX (redundant with RR's lqx/stqx, kept for order-parity) */
-    if ((d->op = spu_dec_lsx(op11)) != SPU_word) return;
-    d->op = SPU_word;
 }
 
 /* spu_lifted_lookup() is defined by spu_fn_registry.c (the single owner of the
@@ -308,16 +287,16 @@ static int spu_step(spu_context* ctx) {
     case SPU_brnz: if (PREF(DST) != 0) next = d.tgt; break;
     case SPU_brhz: if ((PREF(DST) & 0xFFFF) == 0) next = d.tgt; break;
     case SPU_brhnz:if ((PREF(DST) & 0xFFFF) != 0) next = d.tgt; break;
-    /* bi/iret carry the interrupt enable/disable bits (E = 0x40000 sets
-     * int_enable, D = 0x80000 clears it), effective when the branch is taken,
-     * exactly as the lifter decodes them. */
+    /* Every taken indirect branch (bi, bisl, bisled, iret and the conditional
+     * bi* forms) carries the interrupt enable/disable bits (E = 0x40000 sets
+     * int_enable, D = 0x80000 clears it), exactly as the lifter decodes them. */
     #define SPU_IED_BITS() do { \
         if (insn & 0x40000u) ctx->int_enable = 1; \
         else if (insn & 0x80000u) ctx->int_enable = 0; \
     } while (0)
     case SPU_bi:   next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); break;
     case SPU_bisl: { uint32_t tg = PREF(A) & 0x3FFFC;   /* read ra BEFORE the link write: rt may alias ra */
-        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; break; }
+        DST = spu_link((pc + 4) & 0x3FFFC); next = tg; SPU_IED_BITS(); break; }
     case SPU_bisled: { uint32_t tg = PREF(A) & 0x3FFFC;   /* branch when an enabled event is pending */
         DST = spu_link((pc + 4) & 0x3FFFC);
         if ((__atomic_load_n(&ctx->event_status, __ATOMIC_ACQUIRE) & ctx->event_mask) != 0) {
@@ -336,10 +315,10 @@ static int spu_step(spu_context* ctx) {
             ctx->irq_saved = 0;
         }
         break;
-    case SPU_biz:  if (PREF(DST) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_binz: if (PREF(DST) != 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) next = PREF(A) & 0x3FFFC; break;
-    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) next = PREF(A) & 0x3FFFC; break;
+    case SPU_biz:  if (PREF(DST) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_binz: if (PREF(DST) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_bihz: if ((PREF(DST) & 0xFFFF) == 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
+    case SPU_bihnz:if ((PREF(DST) & 0xFFFF) != 0) { next = PREF(A) & 0x3FFFC; SPU_IED_BITS(); } break;
     case SPU_stop: case SPU_stopd:
         ctx->pc = next; ctx->stop_code = (d.op == SPU_stopd) ? 0x3FFFu : (uint32_t)I;   /* stopd carries no code field: RPCS3 reports 0x3FFF */
         ctx->status = SPU_STATUS_STOPPED_BY_STOP; return 1;
@@ -389,7 +368,82 @@ uint32_t spu_interp_run(spu_context* ctx, uint32_t start_lsa) {
     return spu_interp_run_until(ctx, start_lsa, 0);
 }
 
+/* SPU_INTERP_STATS=<seconds>: how much SPU code runs interpreted, by image
+ * and 1 KB page of local store, and where the interpreter was entered. A job
+ * module streamed in at an address nothing was lifted for runs here at a
+ * fraction of the compiled speed, and from the outside that only looks like a
+ * workload that is slow for no reason (late audio, slow decode). The entry
+ * list tells the two causes apart: entries spread over a code body mean its
+ * lift isn't dispatched at all; a few hot entries inside an otherwise lifted
+ * body are function starts the lifter didn't find. Counts are unlocked. */
+enum { IS_N = 64 };
+static long s_is = -1;
+static volatile long long s_is_tot;
+static int s_is_img[IS_N]; static uint32_t s_is_page[IS_N]; static volatile long long s_is_cnt[IS_N];
+static int s_ie_img[IS_N]; static uint32_t s_ie_pc[IS_N]; static volatile long long s_ie_cnt[IS_N];
+static unsigned long long s_is_t0;
+
+static int interp_stats_on(void)
+{
+    if (s_is < 0) { const char* e = getenv("SPU_INTERP_STATS"); s_is = e ? atol(e) : 0; }
+    return s_is > 0;
+}
+
+static void interp_stats_bump(int* img, uint32_t* key, volatile long long* cnt, int image, uint32_t k)
+{
+    int i;
+    for (i = 0; i < IS_N && cnt[i]; i++)
+        if (img[i] == image && key[i] == k) break;
+    if (i < IS_N) {
+        if (!cnt[i]) { img[i] = image; key[i] = k; }
+        cnt[i]++;
+    }
+}
+
+static void interp_stats_top(const char* what, int* img, uint32_t* key, volatile long long* cnt, int n)
+{
+    fprintf(stderr, "  top %s:\n", what);
+    for (int r = 0; r < n; r++) {
+        int best = -1;
+        for (int j = 0; j < IS_N; j++)
+            if (cnt[j] > 0 && (best < 0 || cnt[j] > cnt[best])) best = j;
+        if (best < 0) break;
+        fprintf(stderr, "    img=0x%08X ls=0x%05X  %lld\n", (uint32_t)img[best], key[best], cnt[best]);
+        cnt[best] = -cnt[best];
+    }
+    for (int j = 0; j < IS_N; j++) cnt[j] = 0;
+}
+
+static void interp_stats_step(const spu_context* ctx)
+{
+    interp_stats_bump(s_is_img, s_is_page, s_is_cnt, ctx->image_id, ctx->pc & ~0x3FFu);
+    if ((++s_is_tot & 0xFFFF) != 0) return;
+    struct timespec ts; timespec_get(&ts, TIME_UTC);   /* stdlib: fixtures link this file alone */
+    unsigned long long now = (unsigned long long)ts.tv_sec * 1000ull + (unsigned long long)ts.tv_nsec / 1000000ull;
+    if (!s_is_t0) { s_is_t0 = now; return; }
+    if (now - s_is_t0 < (unsigned long long)s_is * 1000ull) return;
+    fprintf(stderr, "[spu-interp] %.1fM steps/s over %lds\n", s_is_tot / 1e6 / (double)s_is, s_is);
+    interp_stats_top("pages (steps)", s_is_img, s_is_page, s_is_cnt, 6);
+    interp_stats_top("entries (calls)", s_ie_img, s_ie_pc, s_ie_cnt, 8);
+    s_is_tot = 0; s_is_t0 = now;
+}
+
 uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t stop_lsa) {
+    if (interp_stats_on()) {
+        /* Credit an entry inside a resident code region to the image that
+         * owns it, so the list names the lift that's missing the entry. */
+        uint32_t pc = start_lsa & 0x3FFFC, key = pc; int owner = ctx->image_id;
+        for (unsigned s = 0; s < 4; ++s)
+            if (ctx->resident_code[s].image_id && pc >= ctx->resident_code[s].lsa &&
+                pc - ctx->resident_code[s].lsa < ctx->resident_code[s].size) {
+                owner = ctx->resident_code[s].image_id;
+                /* Relocatable code: the CANONICAL pc (placement-independent), which
+                 * is the entry its --reloc lift needs. */
+                key = ctx->resident_code[s].canon
+                    ? pc - ctx->resident_code[s].lsa + ctx->resident_code[s].canon : pc;
+            }
+        interp_stats_bump(s_ie_img, s_ie_pc, s_ie_cnt, owner, key);
+    }
     ctx->pc = start_lsa & 0x3FFFC;
     ctx->status = SPU_STATUS_RUNNING;
     uint64_t steps = 0;
@@ -444,6 +498,7 @@ uint32_t spu_interp_run_until(spu_context* ctx, uint32_t start_lsa, uint32_t sto
         }
         if (_tr>0) { ring[rc&63]=ctx->pc; rc++; if(rn<64)rn++; }
         steps++;
+        if (interp_stats_on()) interp_stats_step(ctx);
         /* SPU_STEPCAP=N: a task that never halts (infinite work/wait loop) never
          * dumps its ring. Force a one-shot dump after N steps to see where it loops. */
         if (_tr>0 && _cap && steps == _cap) {

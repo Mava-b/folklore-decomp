@@ -99,15 +99,63 @@ static inline double ppu_fmadd_core(double a, double c, double b, int neg_b, int
     if (r != r) return ppu_fp_default_qnan();
     return neg_res ? -r : r;
 }
-/* Round-to-single of a NaN keeps the full double payload (quieted). */
+/* Round to single: the result must be representable in single format, NaNs
+ * included -- their payload is truncated to the single fraction (as RPCS3). */
 static inline double ppu_fp_single(double r)
 {
-    return (r != r) ? r : (double)(float)r;
+    return (double)(float)r;
 }
+/* frsp of a NaN (Book I 4.6.6): FRB[0:34] quieted, then 29 zero bits -- the
+ * payload truncated to the single fraction. Explicit, not host conversion. */
 static inline double ppu_frsp(double b)
 {
-    if (b != b) return ppu_fp_quiet(b);
+    if (b != b) {
+        double q = ppu_fp_quiet(b);
+        uint64_t u; memcpy(&u, &q, 8);
+        u &= ~((1ull << 29) - 1);
+        memcpy(&q, &u, 8);
+        return q;
+    }
     return (double)(float)b;
+}
+/* FPSCR (Book I 4.2.2), big-endian bit n = 1u << (31 - n). FEX (1) and VX (2)
+ * are summaries and never written directly: VX = OR of the VX* bits (7-12,
+ * 21-23), FEX = OR of each exception bit ANDed with its enable (VX/VE, OX/OE,
+ * UX/UE, ZX/ZE, XX/XE). FP arithmetic does not update FPSCR status yet; the
+ * move instructions below are exact. */
+static inline uint32_t ppu_fpscr_sum(uint32_t f)
+{
+    f &= ~0x60000000u;
+    if (f & 0x01F80700u) f |= 0x20000000u;
+    if ((f >> 22) & f & 0xF8u) f |= 0x40000000u;
+    return f;
+}
+static inline void ppu_mtfsb(ppu_context* ctx, int bt, int set)
+{
+    uint32_t m = 0x80000000u >> bt;
+    if (bt == 1 || bt == 2) return;
+    if (set) {
+        /* An exception bit going 0 -> 1 also sets FX (mtfsb1 is not among
+         * the instructions exempt from that rule: mtfsf, mtfsfi). */
+        if (!(ctx->fpscr & m) && (m & 0x1FF80700u)) ctx->fpscr |= 0x80000000u;
+        ctx->fpscr |= m;
+    } else {
+        ctx->fpscr &= ~m;
+    }
+    ctx->fpscr = ppu_fpscr_sum(ctx->fpscr);
+}
+static inline void ppu_mtfsf(ppu_context* ctx, uint32_t flm, uint32_t v)
+{
+    uint32_t m = 0;
+    for (int i = 0; i < 8; i++) if (flm & (0x80u >> i)) m |= 0xF0000000u >> (4 * i);
+    ctx->fpscr = ppu_fpscr_sum((ctx->fpscr & ~m) | (v & m));
+}
+static inline uint32_t ppu_mcrfs(ppu_context* ctx, int bfa)
+{
+    uint32_t sh = 28 - 4 * bfa, field = (ctx->fpscr >> sh) & 0xF;
+    /* The exception bits copied are cleared (FX OX UX ZX XX VX*). */
+    ctx->fpscr = ppu_fpscr_sum(ctx->fpscr & ~(0x9FF80700u & (0xFu << sh)));
+    return field;
 }
 
 /* AltiVec register byte order: ctx->vr holds RAW big-endian guest bytes (lvx is
@@ -186,13 +234,17 @@ static inline uint64_t ppc_mulhdu(uint64_t a, uint64_t b) {
 }
 #endif
 
+#include "ppu_vmx.h"   /* exact VMX semantics (runtime/ppu/ppu_vmx.h) */
+
 /* VM base pointer (defined by game project) */
 extern "C" uint8_t* vm_base;
 
-/* Indirect call dispatch (bctrl/bctr) — implemented by the game project.
+/* Indirect call dispatch (bctrl/bctr) â€” implemented by the game project.
  * Looks up the guest address in CTR via a hash table and calls the
  * corresponding host function. Handles OPD resolution. */
 extern "C" void ps3_indirect_call(ppu_context* ctx);
+/* Indirect call to an explicit target, CTR untouched (b<cond>lrl). */
+extern "C" void ps3_indirect_call_to(ppu_context* ctx, uint32_t target);
 
 /* Firmware-import HLE dispatch: a lifted import stub (a .lib.stub trampoline)
  * is replaced with a direct call to the registered HLE handler for its NID
@@ -216,6 +268,15 @@ extern "C" PPU_THREAD_LOCAL void (*g_trampoline_fn)(void*);
 
 
 /* Rotate helpers */
+static inline uint64_t ppc_rlw64(uint64_t rs, int sh, int mb, int me, uint64_t ra, int insert) {
+    uint32_t w = (uint32_t)rs; sh &= 31;
+    uint32_t rw = sh ? ((w << sh) | (w >> (32 - sh))) : w;
+    uint64_t r = ((uint64_t)rw << 32) | rw;
+    int x = mb + 32, y = me + 32;
+    uint64_t m = (x <= y) ? ((~0ull >> x) & (~0ull << (63 - y)))
+                          : ((~0ull >> x) | (~0ull << (63 - y)));
+    return insert ? ((r & m) | (ra & ~m)) : (r & m);
+}
 static inline uint32_t ppc_rlwinm(uint32_t rs, int sh, int mb, int me) {
     sh &= 31;
     uint32_t rotated = sh ? ((rs << sh) | (rs >> (32 - sh))) : rs;
@@ -346,6 +407,15 @@ static void check_fpr(const char* name, int reg, uint64_t got, uint64_t want) {
 static uint8_t g_vm_stub[65536];
 extern "C" { uint8_t* vm_base = g_vm_stub; }
 #define VMOFF(a) ((uint32_t)(a) & 0xFFFFu)
+/* The lifter's raw (guest byte order) accessors live in its HEADER preamble,
+ * which this driver does not include (it has its own memory): the same
+ * accessors over the stub, through the same 64 KiB window as vm_read*. */
+/* A template, not a statement expression: cl builds this driver on Windows. */
+template <class T> static inline T vm_raw_ld_(uint64_t ea) { T v; memcpy(&v, g_vm_stub + VMOFF(ea), sizeof(T)); return v; }
+#define VM_RAW_LD(T, ea) vm_raw_ld_<T>(ea)
+#define VM_RAW_ST(T, ea, val) do { T _v = (val); memcpy(g_vm_stub + VMOFF(ea), &_v, sizeof(T)); } while (0)
+static inline void vm_raw_ld16(void* dst, uint64_t ea) { memcpy(dst, g_vm_stub + VMOFF(ea), 16); }
+static inline void vm_raw_st16(uint64_t ea, const void* src) { memcpy(g_vm_stub + VMOFF(ea), src, 16); }
 /* Trap guard. A "may_trap" case exists to prove lifted code does NOT fault --
  * e.g. divw by zero must be lowered to a defined result, not a hardware trap.
  * MSVC catches that with SEH. POSIX has no SEH, so arm a signal handler and
@@ -1241,84 +1311,84 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0x0 b=0x2 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 109: mulld a=0xffffffffffffffff b=0x80000000 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0xffffffffffffffff b=0x80000000 ca=None", 3, ctx->gpr[3], 0xFFFFFFFF80000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 110: mulld a=0xffffffff b=0xcddc962ddf2367d6 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0xffffffff b=0xcddc962ddf2367d6 ca=None", 3, ctx->gpr[3], 0x1146D1A820DC982AULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 111: mulld a=0x100000000 b=0x1 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0x100000000 b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000100000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 112: mulld a=0xcddc962ddf2367d6 b=0xffffffff ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0xcddc962ddf2367d6 b=0xffffffff ca=None", 3, ctx->gpr[3], 0x1146D1A820DC982AULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 113: mulld a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=None", 3, ctx->gpr[3], 0x885A8C66207BE260ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 114: mulld a=0x0 b=0x0 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0x0 b=0x0 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 115: mulld a=0xffffffffffffffff b=0x1 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0xffffffffffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 116: mulld a=0x7fffffffffffffff b=0x1 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0x7fffffffffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x7FFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 117: mulld a=0x8000000000000000 b=0xffffffffffffffff ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0x8000000000000000 b=0xffffffffffffffff ca=None", 3, ctx->gpr[3], 0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 118: mulld a=0xffffffff b=0x1 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0xffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x00000000FFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 119: mulld a=0x80000000 b=0x80000000 ca=None | mulld r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        ctx->gpr[3] = (int64_t)ctx->gpr[4] * (int64_t)ctx->gpr[5];
+        ctx->gpr[3] = ctx->gpr[4] * ctx->gpr[5];
         check_reg("mulld a=0x80000000 b=0x80000000 ca=None", 3, ctx->gpr[3], 0x4000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 120: mulhw a=0x0 b=0x2 ca=None | mulhw r3, r4, r5 */
@@ -1409,84 +1479,84 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0x0 b=0x2 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 133: mulhwu a=0xffffffffffffffff b=0x80000000 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0xffffffffffffffff b=0x80000000 ca=None", 3, ctx->gpr[3], 0x000000007FFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 134: mulhwu a=0xffffffff b=0xcddc962ddf2367d6 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0xffffffff b=0xcddc962ddf2367d6 ca=None", 3, ctx->gpr[3], 0x00000000DF2367D5ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 135: mulhwu a=0x100000000 b=0x1 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0x100000000 b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 136: mulhwu a=0xcddc962ddf2367d6 b=0xffffffff ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0xcddc962ddf2367d6 b=0xffffffff ca=None", 3, ctx->gpr[3], 0x00000000DF2367D5ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 137: mulhwu a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=None", 3, ctx->gpr[3], 0x0000000012DC6E16ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 138: mulhwu a=0x0 b=0x0 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0x0 b=0x0 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 139: mulhwu a=0xffffffffffffffff b=0x1 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0xffffffffffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 140: mulhwu a=0x7fffffffffffffff b=0x1 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0x7fffffffffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 141: mulhwu a=0x8000000000000000 b=0xffffffffffffffff ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0x8000000000000000 b=0xffffffffffffffff ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 142: mulhwu a=0xffffffff b=0x1 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0xffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 143: mulhwu a=0x80000000 b=0x80000000 ca=None | mulhwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwu a=0x80000000 b=0x80000000 ca=None", 3, ctx->gpr[3], 0x0000000040000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 144: mulhd a=0x0 b=0x2 ca=None | mulhd r3, r4, r5 */
@@ -1661,7 +1731,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x0 b=0x2 ca=0", 3, ctx->gpr[3], 0x0000000000000002ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x0 b=0x2 ca=0", ctx->xer, 0);
     }
@@ -1670,7 +1740,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x0 b=0x2 ca=1", 3, ctx->gpr[3], 0x0000000000000003ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x0 b=0x2 ca=1", ctx->xer, 0);
     }
@@ -1678,7 +1748,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffffffffffff b=0x80000000 ca=0", 3, ctx->gpr[3], 0x000000007FFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffffffffffff b=0x80000000 ca=0", ctx->xer, 1);
     }
@@ -1687,7 +1757,7 @@ int main(void) {
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffffffffffff b=0x80000000 ca=1", 3, ctx->gpr[3], 0x0000000080000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffffffffffff b=0x80000000 ca=1", ctx->xer, 1);
     }
@@ -1695,7 +1765,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffff b=0xcddc962ddf2367d6 ca=0", 3, ctx->gpr[3], 0xCDDC962EDF2367D5ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffff b=0xcddc962ddf2367d6 ca=0", ctx->xer, 0);
     }
@@ -1704,7 +1774,7 @@ int main(void) {
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffff b=0xcddc962ddf2367d6 ca=1", 3, ctx->gpr[3], 0xCDDC962EDF2367D6ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffff b=0xcddc962ddf2367d6 ca=1", ctx->xer, 0);
     }
@@ -1712,7 +1782,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x100000000 b=0x1 ca=0", 3, ctx->gpr[3], 0x0000000100000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x100000000 b=0x1 ca=0", ctx->xer, 0);
     }
@@ -1721,7 +1791,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x100000000 b=0x1 ca=1", 3, ctx->gpr[3], 0x0000000100000002ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x100000000 b=0x1 ca=1", ctx->xer, 0);
     }
@@ -1729,7 +1799,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xcddc962ddf2367d6 b=0xffffffff ca=0", 3, ctx->gpr[3], 0xCDDC962EDF2367D5ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xcddc962ddf2367d6 b=0xffffffff ca=0", ctx->xer, 0);
     }
@@ -1738,7 +1808,7 @@ int main(void) {
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xcddc962ddf2367d6 b=0xffffffff ca=1", 3, ctx->gpr[3], 0xCDDC962EDF2367D6ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xcddc962ddf2367d6 b=0xffffffff ca=1", ctx->xer, 0);
     }
@@ -1746,7 +1816,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=0", 3, ctx->gpr[3], 0xFC5610F49F225176ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=0", ctx->xer, 1);
     }
@@ -1755,7 +1825,7 @@ int main(void) {
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=1", 3, ctx->gpr[3], 0xFC5610F49F225177ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=1", ctx->xer, 1);
     }
@@ -1763,7 +1833,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x0 b=0x0 ca=0", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x0 b=0x0 ca=0", ctx->xer, 0);
     }
@@ -1772,7 +1842,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x0 b=0x0 ca=1", 3, ctx->gpr[3], 0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x0 b=0x0 ca=1", ctx->xer, 0);
     }
@@ -1780,7 +1850,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffffffffffff b=0x1 ca=0", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffffffffffff b=0x1 ca=0", ctx->xer, 1);
     }
@@ -1789,7 +1859,7 @@ int main(void) {
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffffffffffff b=0x1 ca=1", 3, ctx->gpr[3], 0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffffffffffff b=0x1 ca=1", ctx->xer, 1);
     }
@@ -1797,7 +1867,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x7fffffffffffffff b=0x1 ca=0", 3, ctx->gpr[3], 0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x7fffffffffffffff b=0x1 ca=0", ctx->xer, 0);
     }
@@ -1806,7 +1876,7 @@ int main(void) {
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x7fffffffffffffff b=0x1 ca=1", 3, ctx->gpr[3], 0x8000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x7fffffffffffffff b=0x1 ca=1", ctx->xer, 0);
     }
@@ -1814,7 +1884,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x8000000000000000 b=0xffffffffffffffff ca=0", 3, ctx->gpr[3], 0x7FFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x8000000000000000 b=0xffffffffffffffff ca=0", ctx->xer, 1);
     }
@@ -1823,7 +1893,7 @@ int main(void) {
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x8000000000000000 b=0xffffffffffffffff ca=1", 3, ctx->gpr[3], 0x8000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x8000000000000000 b=0xffffffffffffffff ca=1", ctx->xer, 1);
     }
@@ -1831,7 +1901,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffff b=0x1 ca=0", 3, ctx->gpr[3], 0x0000000100000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffff b=0x1 ca=0", ctx->xer, 0);
     }
@@ -1840,7 +1910,7 @@ int main(void) {
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0xffffffff b=0x1 ca=1", 3, ctx->gpr[3], 0x0000000100000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0xffffffff b=0x1 ca=1", ctx->xer, 0);
     }
@@ -1848,7 +1918,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x80000000 b=0x80000000 ca=0", 3, ctx->gpr[3], 0x0000000100000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x80000000 b=0x80000000 ca=0", ctx->xer, 0);
     }
@@ -1857,7 +1927,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t result = ctx->gpr[4] + ctx->gpr[5] + ca; ctx->xer = (ctx->xer & ~(1u << 29)) | ((result < ctx->gpr[4] || (ca && result == ctx->gpr[4])) ? (1u << 29) : 0); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("addeo a=0x80000000 b=0x80000000 ca=1", 3, ctx->gpr[3], 0x0000000100000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("addeo a=0x80000000 b=0x80000000 ca=1", ctx->xer, 0);
     }
@@ -1865,7 +1935,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x0 b=0x2 ca=0", 3, ctx->gpr[3], 0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x0 b=0x2 ca=0", ctx->xer, 1);
     }
@@ -1874,7 +1944,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x0 b=0x2 ca=1", 3, ctx->gpr[3], 0x0000000000000002ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x0 b=0x2 ca=1", ctx->xer, 1);
     }
@@ -1882,7 +1952,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffffffffffff b=0x80000000 ca=0", 3, ctx->gpr[3], 0x0000000080000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffffffffffff b=0x80000000 ca=0", ctx->xer, 0);
     }
@@ -1891,7 +1961,7 @@ int main(void) {
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffffffffffff b=0x80000000 ca=1", 3, ctx->gpr[3], 0x0000000080000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffffffffffff b=0x80000000 ca=1", ctx->xer, 0);
     }
@@ -1899,7 +1969,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffff b=0xcddc962ddf2367d6 ca=0", 3, ctx->gpr[3], 0xCDDC962CDF2367D6ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffff b=0xcddc962ddf2367d6 ca=0", ctx->xer, 1);
     }
@@ -1908,7 +1978,7 @@ int main(void) {
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffff b=0xcddc962ddf2367d6 ca=1", 3, ctx->gpr[3], 0xCDDC962CDF2367D7ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffff b=0xcddc962ddf2367d6 ca=1", ctx->xer, 1);
     }
@@ -1916,7 +1986,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x100000000 b=0x1 ca=0", 3, ctx->gpr[3], 0xFFFFFFFF00000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x100000000 b=0x1 ca=0", ctx->xer, 0);
     }
@@ -1925,7 +1995,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x100000000 b=0x1 ca=1", 3, ctx->gpr[3], 0xFFFFFFFF00000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x100000000 b=0x1 ca=1", ctx->xer, 0);
     }
@@ -1933,7 +2003,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xcddc962ddf2367d6 b=0xffffffff ca=0", 3, ctx->gpr[3], 0x322369D320DC9828ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xcddc962ddf2367d6 b=0xffffffff ca=0", ctx->xer, 0);
     }
@@ -1942,7 +2012,7 @@ int main(void) {
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xcddc962ddf2367d6 b=0xffffffff ca=1", 3, ctx->gpr[3], 0x322369D320DC9829ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xcddc962ddf2367d6 b=0xffffffff ca=1", ctx->xer, 0);
     }
@@ -1950,7 +2020,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=0", 3, ctx->gpr[3], 0x0163643C4D8612A9ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=0", ctx->xer, 1);
     }
@@ -1959,7 +2029,7 @@ int main(void) {
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=1", 3, ctx->gpr[3], 0x0163643C4D8612AAULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=1", ctx->xer, 1);
     }
@@ -1967,7 +2037,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x0 b=0x0 ca=0", 3, ctx->gpr[3], 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x0 b=0x0 ca=0", ctx->xer, 0);
     }
@@ -1976,7 +2046,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x0 b=0x0 ca=1", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x0 b=0x0 ca=1", ctx->xer, 1);
     }
@@ -1984,7 +2054,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffffffffffff b=0x1 ca=0", 3, ctx->gpr[3], 0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffffffffffff b=0x1 ca=0", ctx->xer, 0);
     }
@@ -1993,7 +2063,7 @@ int main(void) {
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffffffffffff b=0x1 ca=1", 3, ctx->gpr[3], 0x0000000000000002ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffffffffffff b=0x1 ca=1", ctx->xer, 0);
     }
@@ -2001,7 +2071,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x7fffffffffffffff b=0x1 ca=0", 3, ctx->gpr[3], 0x8000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x7fffffffffffffff b=0x1 ca=0", ctx->xer, 0);
     }
@@ -2010,7 +2080,7 @@ int main(void) {
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x7fffffffffffffff b=0x1 ca=1", 3, ctx->gpr[3], 0x8000000000000002ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x7fffffffffffffff b=0x1 ca=1", ctx->xer, 0);
     }
@@ -2018,7 +2088,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x8000000000000000 b=0xffffffffffffffff ca=0", 3, ctx->gpr[3], 0x7FFFFFFFFFFFFFFEULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x8000000000000000 b=0xffffffffffffffff ca=0", ctx->xer, 1);
     }
@@ -2027,7 +2097,7 @@ int main(void) {
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x8000000000000000 b=0xffffffffffffffff ca=1", 3, ctx->gpr[3], 0x7FFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x8000000000000000 b=0xffffffffffffffff ca=1", ctx->xer, 1);
     }
@@ -2035,7 +2105,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffff b=0x1 ca=0", 3, ctx->gpr[3], 0xFFFFFFFF00000001ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffff b=0x1 ca=0", ctx->xer, 0);
     }
@@ -2044,7 +2114,7 @@ int main(void) {
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0xffffffff b=0x1 ca=1", 3, ctx->gpr[3], 0xFFFFFFFF00000002ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0xffffffff b=0x1 ca=1", ctx->xer, 0);
     }
@@ -2052,7 +2122,7 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x80000000 b=0x80000000 ca=0", 3, ctx->gpr[3], 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x80000000 b=0x80000000 ca=0", ctx->xer, 0);
     }
@@ -2061,7 +2131,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
       ctx->xer |= (1u << 29);
-        { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; }
+        { const uint64_t _a = ctx->gpr[4], _b = ctx->gpr[5]; (void)_b; { uint64_t ca = (ctx->xer >> 29) & 1; uint64_t a = ~ctx->gpr[4], b = ctx->gpr[5]; uint64_t s1 = a + b; uint64_t co = (s1 < a); uint64_t result = s1 + ca; co |= (result < s1); ctx->xer = (ctx->xer & ~(1u << 29)) | ((uint32_t)co << 29); ctx->gpr[3] = result; } { const uint64_t _r = ctx->gpr[3]; (void)_r; const uint32_t _ov = (uint32_t)((((~_a ^ _r) & (_b ^ _r)) >> 63)); ctx->xer = (ctx->xer & ~0x40000000u) | (_ov << 30) | (_ov << 31); } }
         check_reg("subfeo a=0x80000000 b=0x80000000 ca=1", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
         check_ca("subfeo a=0x80000000 b=0x80000000 ca=1", ctx->xer, 1);
     }
@@ -2153,84 +2223,84 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0x0 b=0x2 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 229: mulhwuo a=0xffffffffffffffff b=0x80000000 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0xffffffffffffffff b=0x80000000 ca=None", 3, ctx->gpr[3], 0x000000007FFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 230: mulhwuo a=0xffffffff b=0xcddc962ddf2367d6 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0xCDDC962DDF2367D6ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0xffffffff b=0xcddc962ddf2367d6 ca=None", 3, ctx->gpr[3], 0x00000000DF2367D5ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 231: mulhwuo a=0x100000000 b=0x1 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000100000000ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0x100000000 b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 232: mulhwuo a=0xcddc962ddf2367d6 b=0xffffffff ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xCDDC962DDF2367D6ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0xcddc962ddf2367d6 b=0xffffffff ca=None", 3, ctx->gpr[3], 0x00000000DF2367D5ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 233: mulhwuo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFD79565C28CE1F66ULL;
       ctx->gpr[5] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0xfd79565c28ce1f66 b=0xfedcba9876543210 ca=None", 3, ctx->gpr[3], 0x0000000012DC6E16ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 234: mulhwuo a=0x0 b=0x0 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0x0 b=0x0 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 235: mulhwuo a=0xffffffffffffffff b=0x1 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0xffffffffffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 236: mulhwuo a=0x7fffffffffffffff b=0x1 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0x7fffffffffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 237: mulhwuo a=0x8000000000000000 b=0xffffffffffffffff ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0x8000000000000000 b=0xffffffffffffffff ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 238: mulhwuo a=0xffffffff b=0x1 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x00000000FFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0xffffffff b=0x1 ca=None", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 239: mulhwuo a=0x80000000 b=0x80000000 ca=None | mulhwuo r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x0000000080000000ULL;
-        ctx->gpr[3] = (int64_t)(int32_t)((int32_t)((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5] >> 32));
+        ctx->gpr[3] = (uint32_t)(((uint64_t)(uint32_t)ctx->gpr[4] * (uint64_t)(uint32_t)ctx->gpr[5]) >> 32);
         check_reg("mulhwuo a=0x80000000 b=0x80000000 ca=None", 3, ctx->gpr[3], 0x0000000040000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 240: addme a=0x0 ca=0 | addme r3, r4 */
@@ -2741,28 +2811,28 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000064ULL;
       ctx->gpr[5] = 0x0000000000000007ULL;
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         check_reg("divw a=0x64 b=0x7", 3, ctx->gpr[3], 0x000000000000000EULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 309: divw a=0xffffffffffffffff b=0x3 | divw r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000003ULL;
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         check_reg("divw a=0xffffffffffffffff b=0x3", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 310: divw a=0x7fffffff b=0x2 | divw r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x000000007FFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         check_reg("divw a=0x7fffffff b=0x2", 3, ctx->gpr[3], 0x000000003FFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 311: divw a=0x5 b=0xffffffffffffffff | divw r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         check_reg("divw a=0x5 b=0xffffffffffffffff", 3, ctx->gpr[3], 0x00000000FFFFFFFBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 312: divw UNDEF a=0x1 b=0x0 | divw r3, r4, r5 */
@@ -2770,7 +2840,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
       CONF_TRY
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         g_pass++;
       CONF_EXCEPT
         printf("FAIL divw UNDEF a=0x1 b=0x0: HOST TRAP (div?) -- lifted code must not fault\n");
@@ -2782,7 +2852,7 @@ int main(void) {
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
       CONF_TRY
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         g_pass++;
       CONF_EXCEPT
         printf("FAIL divw UNDEF a=0x8000000000000000 b=0xffffffffffffffff: HOST TRAP (div?) -- lifted code must not fault\n");
@@ -2794,7 +2864,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
       CONF_TRY
-        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
+        { int32_t _a=(int32_t)ctx->gpr[4], _b=(int32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)((_b==0||(_a==(int32_t)0x80000000&&_b==-1))?0:_a/_b); }
         g_pass++;
       CONF_EXCEPT
         printf("FAIL divw UNDEF a=0x80000000 b=0xffffffffffffffff: HOST TRAP (div?) -- lifted code must not fault\n");
@@ -2805,35 +2875,35 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000064ULL;
       ctx->gpr[5] = 0x0000000000000007ULL;
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         check_reg("divwu a=0x64 b=0x7", 3, ctx->gpr[3], 0x000000000000000EULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 316: divwu a=0xffffffffffffffff b=0x3 | divwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000003ULL;
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         check_reg("divwu a=0xffffffffffffffff b=0x3", 3, ctx->gpr[3], 0x0000000055555555ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 317: divwu a=0x80000000 b=0xffffffff | divwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x00000000FFFFFFFFULL;
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         check_reg("divwu a=0x80000000 b=0xffffffff", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 318: divwu a=0x7fffffff b=0x2 | divwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x000000007FFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         check_reg("divwu a=0x7fffffff b=0x2", 3, ctx->gpr[3], 0x000000003FFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 319: divwu a=0x5 b=0xffffffffffffffff | divwu r3, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         check_reg("divwu a=0x5 b=0xffffffffffffffff", 3, ctx->gpr[3], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 320: divwu UNDEF a=0x1 b=0x0 | divwu r3, r4, r5 */
@@ -2841,7 +2911,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
       CONF_TRY
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         g_pass++;
       CONF_EXCEPT
         printf("FAIL divwu UNDEF a=0x1 b=0x0: HOST TRAP (div?) -- lifted code must not fault\n");
@@ -2853,7 +2923,7 @@ int main(void) {
       ctx->gpr[4] = 0x8000000000000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
       CONF_TRY
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         g_pass++;
       CONF_EXCEPT
         printf("FAIL divwu UNDEF a=0x8000000000000000 b=0xffffffffffffffff: HOST TRAP (div?) -- lifted code must not fault\n");
@@ -2865,7 +2935,7 @@ int main(void) {
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0xFFFFFFFFFFFFFFFFULL;
       CONF_TRY
-        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (int64_t)(int32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
+        { uint32_t _b=(uint32_t)ctx->gpr[5]; ctx->gpr[3] = (uint32_t)(_b==0?0:(uint32_t)ctx->gpr[4]/_b); }
         g_pass++;
       CONF_EXCEPT
         printf("FAIL divwu UNDEF a=0x80000000 b=0xffffffffffffffff: HOST TRAP (div?) -- lifted code must not fault\n");
@@ -5411,365 +5481,365 @@ int main(void) {
     { /* case 686: rlwinm a=0x12345678 sh=0 mb=0 me=31 | rlwinm r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x0000000012345678ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 687: rlwimi a=0x12345678 sh=0 mb=0 me=31 | rlwimi r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x0000000012345678ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 688: rlwinm a=0x12345678 sh=1 mb=0 me=31 | rlwinm r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x000000002468ACF0ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 689: rlwimi a=0x12345678 sh=1 mb=0 me=31 | rlwimi r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x000000002468ACF0ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 690: rlwinm a=0x12345678 sh=13 mb=5 me=20 | rlwinm r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x0000000002CF0000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 691: rlwimi a=0x12345678 sh=13 mb=5 me=20 | rlwimi r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x00000000BACF03BBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 692: rlwinm a=0x12345678 sh=16 mb=16 me=31 | rlwinm r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x0000000000001234ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 693: rlwimi a=0x12345678 sh=16 mb=16 me=31 | rlwimi r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x00000000BBBB1234ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 694: rlwinm a=0x12345678 sh=4 mb=28 me=3 | rlwinm r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x0000000020000001ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 695: rlwimi a=0x12345678 sh=4 mb=28 me=3 | rlwimi r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x000000002BBBBBB1ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 696: rlwinm a=0x12345678 sh=31 mb=31 me=0 | rlwinm r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 697: rlwimi a=0x12345678 sh=31 mb=31 me=0 | rlwimi r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x000000003BBBBBBAULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 698: rlwinm a=0x12345678 sh=0 mb=31 me=31 | rlwinm r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, 0, 0);
         check_reg("rlwinm a=0x12345678 sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 699: rlwimi a=0x12345678 sh=0 mb=31 me=31 | rlwimi r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000012345678ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x12345678 sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x00000000BBBBBBBAULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 700: rlwinm a=0x80000001 sh=0 mb=0 me=31 | rlwinm r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x0000000080000001ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 701: rlwimi a=0x80000001 sh=0 mb=0 me=31 | rlwimi r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x0000000080000001ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 702: rlwinm a=0x80000001 sh=1 mb=0 me=31 | rlwinm r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x0000000000000003ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 703: rlwimi a=0x80000001 sh=1 mb=0 me=31 | rlwimi r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x0000000000000003ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 704: rlwinm a=0x80000001 sh=13 mb=5 me=20 | rlwinm r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x0000000000003000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 705: rlwimi a=0x80000001 sh=13 mb=5 me=20 | rlwimi r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x00000000B80033BBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 706: rlwinm a=0x80000001 sh=16 mb=16 me=31 | rlwinm r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x0000000000008000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 707: rlwimi a=0x80000001 sh=16 mb=16 me=31 | rlwimi r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x00000000BBBB8000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 708: rlwinm a=0x80000001 sh=4 mb=28 me=3 | rlwinm r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x0000000000000008ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 709: rlwimi a=0x80000001 sh=4 mb=28 me=3 | rlwimi r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x000000000BBBBBB8ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 710: rlwinm a=0x80000001 sh=31 mb=31 me=0 | rlwinm r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x0000000080000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 711: rlwimi a=0x80000001 sh=31 mb=31 me=0 | rlwimi r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x00000000BBBBBBBAULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 712: rlwinm a=0x80000001 sh=0 mb=31 me=31 | rlwinm r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, 0, 0);
         check_reg("rlwinm a=0x80000001 sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x0000000000000001ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 713: rlwimi a=0x80000001 sh=0 mb=31 me=31 | rlwimi r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x0000000080000001ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0x80000001 sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x00000000BBBBBBBBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 714: rlwinm a=0xffffffff sh=0 mb=0 me=31 | rlwinm r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x00000000FFFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 715: rlwimi a=0xffffffff sh=0 mb=0 me=31 | rlwimi r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x00000000FFFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 716: rlwinm a=0xffffffff sh=1 mb=0 me=31 | rlwinm r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x00000000FFFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 717: rlwimi a=0xffffffff sh=1 mb=0 me=31 | rlwimi r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x00000000FFFFFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 718: rlwinm a=0xffffffff sh=13 mb=5 me=20 | rlwinm r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x0000000007FFF800ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 719: rlwimi a=0xffffffff sh=13 mb=5 me=20 | rlwimi r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x00000000BFFFFBBBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 720: rlwinm a=0xffffffff sh=16 mb=16 me=31 | rlwinm r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x000000000000FFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 721: rlwimi a=0xffffffff sh=16 mb=16 me=31 | rlwimi r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x00000000BBBBFFFFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 722: rlwinm a=0xffffffff sh=4 mb=28 me=3 | rlwinm r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x00000000F000000FULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 723: rlwimi a=0xffffffff sh=4 mb=28 me=3 | rlwimi r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x00000000FBBBBBBFULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 724: rlwinm a=0xffffffff sh=31 mb=31 me=0 | rlwinm r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x0000000080000001ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 725: rlwimi a=0xffffffff sh=31 mb=31 me=0 | rlwimi r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x00000000BBBBBBBBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 726: rlwinm a=0xffffffff sh=0 mb=31 me=31 | rlwinm r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, 0, 0);
         check_reg("rlwinm a=0xffffffff sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x0000000000000001ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 727: rlwimi a=0xffffffff sh=0 mb=31 me=31 | rlwimi r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0x00000000FFFFFFFFULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xffffffff sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x00000000BBBBBBBBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 728: rlwinm a=0xfedcba9876543210 sh=0 mb=0 me=31 | rlwinm r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x0000000076543210ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 729: rlwimi a=0xfedcba9876543210 sh=0 mb=0 me=31 | rlwimi r4, r3, 0, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=0 mb=0 me=31", 4, ctx->gpr[4], 0x0000000076543210ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 730: rlwinm a=0xfedcba9876543210 sh=1 mb=0 me=31 | rlwinm r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x00000000ECA86420ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 731: rlwimi a=0xfedcba9876543210 sh=1 mb=0 me=31 | rlwimi r4, r3, 1, 0, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 1, 0, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 1, 0, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=1 mb=0 me=31", 4, ctx->gpr[4], 0x00000000ECA86420ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 732: rlwinm a=0xfedcba9876543210 sh=13 mb=5 me=20 | rlwinm r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x0000000006420800ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 733: rlwimi a=0xfedcba9876543210 sh=13 mb=5 me=20 | rlwimi r4, r3, 13, 5, 20 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 13, 5, 20);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 13, 5, 20, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=13 mb=5 me=20", 4, ctx->gpr[4], 0x00000000BE420BBBULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 734: rlwinm a=0xfedcba9876543210 sh=16 mb=16 me=31 | rlwinm r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x0000000000007654ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 735: rlwimi a=0xfedcba9876543210 sh=16 mb=16 me=31 | rlwimi r4, r3, 16, 16, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 16, 16, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 16, 16, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=16 mb=16 me=31", 4, ctx->gpr[4], 0x00000000BBBB7654ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 736: rlwinm a=0xfedcba9876543210 sh=4 mb=28 me=3 | rlwinm r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x0000000060000007ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 737: rlwimi a=0xfedcba9876543210 sh=4 mb=28 me=3 | rlwimi r4, r3, 4, 28, 3 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 4, 28, 3);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 4, 28, 3, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=4 mb=28 me=3", 4, ctx->gpr[4], 0x000000006BBBBBB7ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 738: rlwinm a=0xfedcba9876543210 sh=31 mb=31 me=0 | rlwinm r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 739: rlwimi a=0xfedcba9876543210 sh=31 mb=31 me=0 | rlwimi r4, r3, 31, 31, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 31, 31, 0);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 31, 31, 0, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=31 mb=31 me=0", 4, ctx->gpr[4], 0x000000003BBBBBBAULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 740: rlwinm a=0xfedcba9876543210 sh=0 mb=31 me=31 | rlwinm r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
-        ctx->gpr[4] = (uint64_t)ppc_rlwinm((uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, 0, 0);
         check_reg("rlwinm a=0xfedcba9876543210 sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x0000000000000000ULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 741: rlwimi a=0xfedcba9876543210 sh=0 mb=31 me=31 | rlwimi r4, r3, 0, 31, 31 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[3] = 0xFEDCBA9876543210ULL;
       ctx->gpr[4] = 0xAAAAAAAABBBBBBBBULL;
-        ctx->gpr[4] = (ctx->gpr[4] & 0xFFFFFFFF00000000ull) | (uint64_t)ppc_rlwimi((uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[3], 0, 31, 31);
+        ctx->gpr[4] = ppc_rlw64(ctx->gpr[3], 0, 31, 31, ctx->gpr[4], 1);
         check_reg("rlwimi a=0xfedcba9876543210 sh=0 mb=31 me=31", 4, ctx->gpr[4], 0x00000000BBBBBBBAULL, 0x00000000FFFFFFFFULL);
     }
     { /* case 742: rldicl a=0x123456789abcdef0 sh=0 mb=0 | rldicl r4, r3, 0, 0 */
@@ -6116,7 +6186,7 @@ int main(void) {
     { /* case 797: mulli a=0x0 imm=0 | mulli r3, r4, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0);
         check_reg("mulli a=0x0 imm=0", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 798: addi a=0x0 imm=1 | addi r3, r4, 1 */
@@ -6148,7 +6218,7 @@ int main(void) {
     { /* case 802: mulli a=0x0 imm=1 | mulli r3, r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(1);
         check_reg("mulli a=0x0 imm=1", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 803: addi a=0x0 imm=-1 | addi r3, r4, -1 */
@@ -6180,7 +6250,7 @@ int main(void) {
     { /* case 807: mulli a=0x0 imm=-1 | mulli r3, r4, -1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-1);
         check_reg("mulli a=0x0 imm=-1", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 808: addi a=0x0 imm=-4 | addi r3, r4, -4 */
@@ -6212,7 +6282,7 @@ int main(void) {
     { /* case 812: mulli a=0x0 imm=-4 | mulli r3, r4, -4 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-4));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-4);
         check_reg("mulli a=0x0 imm=-4", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 813: addi a=0x0 imm=32767 | addi r3, r4, 32767 */
@@ -6244,7 +6314,7 @@ int main(void) {
     { /* case 817: mulli a=0x0 imm=32767 | mulli r3, r4, 32767 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0x7FFF));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0x7FFF);
         check_reg("mulli a=0x0 imm=32767", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 818: addi a=0x0 imm=-32768 | addi r3, r4, -32768 */
@@ -6276,7 +6346,7 @@ int main(void) {
     { /* case 822: mulli a=0x0 imm=-32768 | mulli r3, r4, -32768 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-32768));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-32768);
         check_reg("mulli a=0x0 imm=-32768", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 823: addi a=0x5 imm=0 | addi r3, r4, 0 */
@@ -6308,7 +6378,7 @@ int main(void) {
     { /* case 827: mulli a=0x5 imm=0 | mulli r3, r4, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0);
         check_reg("mulli a=0x5 imm=0", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 828: addi a=0x5 imm=1 | addi r3, r4, 1 */
@@ -6340,7 +6410,7 @@ int main(void) {
     { /* case 832: mulli a=0x5 imm=1 | mulli r3, r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(1);
         check_reg("mulli a=0x5 imm=1", 3, ctx->gpr[3], 0x0000000000000005ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 833: addi a=0x5 imm=-1 | addi r3, r4, -1 */
@@ -6372,7 +6442,7 @@ int main(void) {
     { /* case 837: mulli a=0x5 imm=-1 | mulli r3, r4, -1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-1);
         check_reg("mulli a=0x5 imm=-1", 3, ctx->gpr[3], 0xFFFFFFFFFFFFFFFBULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 838: addi a=0x5 imm=-4 | addi r3, r4, -4 */
@@ -6404,7 +6474,7 @@ int main(void) {
     { /* case 842: mulli a=0x5 imm=-4 | mulli r3, r4, -4 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-4));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-4);
         check_reg("mulli a=0x5 imm=-4", 3, ctx->gpr[3], 0xFFFFFFFFFFFFFFECULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 843: addi a=0x5 imm=32767 | addi r3, r4, 32767 */
@@ -6436,7 +6506,7 @@ int main(void) {
     { /* case 847: mulli a=0x5 imm=32767 | mulli r3, r4, 32767 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0x7FFF));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0x7FFF);
         check_reg("mulli a=0x5 imm=32767", 3, ctx->gpr[3], 0x0000000000027FFBULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 848: addi a=0x5 imm=-32768 | addi r3, r4, -32768 */
@@ -6468,7 +6538,7 @@ int main(void) {
     { /* case 852: mulli a=0x5 imm=-32768 | mulli r3, r4, -32768 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000005ULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-32768));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-32768);
         check_reg("mulli a=0x5 imm=-32768", 3, ctx->gpr[3], 0xFFFFFFFFFFFD8000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 853: addi a=0xffffffffffffffff imm=0 | addi r3, r4, 0 */
@@ -6500,7 +6570,7 @@ int main(void) {
     { /* case 857: mulli a=0xffffffffffffffff imm=0 | mulli r3, r4, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0);
         check_reg("mulli a=0xffffffffffffffff imm=0", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 858: addi a=0xffffffffffffffff imm=1 | addi r3, r4, 1 */
@@ -6532,7 +6602,7 @@ int main(void) {
     { /* case 862: mulli a=0xffffffffffffffff imm=1 | mulli r3, r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(1);
         check_reg("mulli a=0xffffffffffffffff imm=1", 3, ctx->gpr[3], 0xFFFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 863: addi a=0xffffffffffffffff imm=-1 | addi r3, r4, -1 */
@@ -6564,7 +6634,7 @@ int main(void) {
     { /* case 867: mulli a=0xffffffffffffffff imm=-1 | mulli r3, r4, -1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-1);
         check_reg("mulli a=0xffffffffffffffff imm=-1", 3, ctx->gpr[3], 0x0000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 868: addi a=0xffffffffffffffff imm=-4 | addi r3, r4, -4 */
@@ -6596,7 +6666,7 @@ int main(void) {
     { /* case 872: mulli a=0xffffffffffffffff imm=-4 | mulli r3, r4, -4 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-4));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-4);
         check_reg("mulli a=0xffffffffffffffff imm=-4", 3, ctx->gpr[3], 0x0000000000000004ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 873: addi a=0xffffffffffffffff imm=32767 | addi r3, r4, 32767 */
@@ -6628,7 +6698,7 @@ int main(void) {
     { /* case 877: mulli a=0xffffffffffffffff imm=32767 | mulli r3, r4, 32767 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0x7FFF));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0x7FFF);
         check_reg("mulli a=0xffffffffffffffff imm=32767", 3, ctx->gpr[3], 0xFFFFFFFFFFFF8001ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 878: addi a=0xffffffffffffffff imm=-32768 | addi r3, r4, -32768 */
@@ -6660,7 +6730,7 @@ int main(void) {
     { /* case 882: mulli a=0xffffffffffffffff imm=-32768 | mulli r3, r4, -32768 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-32768));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-32768);
         check_reg("mulli a=0xffffffffffffffff imm=-32768", 3, ctx->gpr[3], 0x0000000000008000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 883: addi a=0x7fffffffffffffff imm=0 | addi r3, r4, 0 */
@@ -6692,7 +6762,7 @@ int main(void) {
     { /* case 887: mulli a=0x7fffffffffffffff imm=0 | mulli r3, r4, 0 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0);
         check_reg("mulli a=0x7fffffffffffffff imm=0", 3, ctx->gpr[3], 0x0000000000000000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 888: addi a=0x7fffffffffffffff imm=1 | addi r3, r4, 1 */
@@ -6724,7 +6794,7 @@ int main(void) {
     { /* case 892: mulli a=0x7fffffffffffffff imm=1 | mulli r3, r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(1);
         check_reg("mulli a=0x7fffffffffffffff imm=1", 3, ctx->gpr[3], 0x7FFFFFFFFFFFFFFFULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 893: addi a=0x7fffffffffffffff imm=-1 | addi r3, r4, -1 */
@@ -6756,7 +6826,7 @@ int main(void) {
     { /* case 897: mulli a=0x7fffffffffffffff imm=-1 | mulli r3, r4, -1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-1));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-1);
         check_reg("mulli a=0x7fffffffffffffff imm=-1", 3, ctx->gpr[3], 0x8000000000000001ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 898: addi a=0x7fffffffffffffff imm=-4 | addi r3, r4, -4 */
@@ -6788,7 +6858,7 @@ int main(void) {
     { /* case 902: mulli a=0x7fffffffffffffff imm=-4 | mulli r3, r4, -4 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-4));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-4);
         check_reg("mulli a=0x7fffffffffffffff imm=-4", 3, ctx->gpr[3], 0x0000000000000004ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 903: addi a=0x7fffffffffffffff imm=32767 | addi r3, r4, 32767 */
@@ -6820,7 +6890,7 @@ int main(void) {
     { /* case 907: mulli a=0x7fffffffffffffff imm=32767 | mulli r3, r4, 32767 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(0x7FFF));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(0x7FFF);
         check_reg("mulli a=0x7fffffffffffffff imm=32767", 3, ctx->gpr[3], 0x7FFFFFFFFFFF8001ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 908: addi a=0x7fffffffffffffff imm=-32768 | addi r3, r4, -32768 */
@@ -6852,415 +6922,415 @@ int main(void) {
     { /* case 912: mulli a=0x7fffffffffffffff imm=-32768 | mulli r3, r4, -32768 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x7FFFFFFFFFFFFFFFULL;
-        ctx->gpr[3] = (uint64_t)((int64_t)ctx->gpr[4] * (int64_t)(-32768));
+        ctx->gpr[3] = ctx->gpr[4] * (uint64_t)(int64_t)(-32768);
         check_reg("mulli a=0x7fffffffffffffff imm=-32768", 3, ctx->gpr[3], 0x0000000000008000ULL, 0xFFFFFFFFFFFFFFFFULL);
     }
     { /* case 913: cmpd bf=0 a=0x0 b=0x0 | cmpd r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpd bf=0 a=0x0 b=0x0", ctx->cr, 2, 28);
     }
     { /* case 914: cmpw bf=0 a=0x0 b=0x0 | cmpw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpw bf=0 a=0x0 b=0x0", ctx->cr, 2, 28);
     }
     { /* case 915: cmpld bf=0 a=0x0 b=0x0 | cmpld r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpld bf=0 a=0x0 b=0x0", ctx->cr, 2, 28);
     }
     { /* case 916: cmplw bf=0 a=0x0 b=0x0 | cmplw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmplw bf=0 a=0x0 b=0x0", ctx->cr, 2, 28);
     }
     { /* case 917: cmpd bf=7 a=0x0 b=0x0 | cmpd cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpd bf=7 a=0x0 b=0x0", ctx->cr, 2, 0);
     }
     { /* case 918: cmpw bf=7 a=0x0 b=0x0 | cmpw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpw bf=7 a=0x0 b=0x0", ctx->cr, 2, 0);
     }
     { /* case 919: cmpld bf=7 a=0x0 b=0x0 | cmpld cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpld bf=7 a=0x0 b=0x0", ctx->cr, 2, 0);
     }
     { /* case 920: cmplw bf=7 a=0x0 b=0x0 | cmplw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
       ctx->gpr[5] = 0x0000000000000000ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmplw bf=7 a=0x0 b=0x0", ctx->cr, 2, 0);
     }
     { /* case 921: cmpdi a=0x0 | cmpdi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpdi a=0x0", ctx->cr, 8, 28);
     }
     { /* case 922: cmpwi a=0x0 | cmpwi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000000ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpwi a=0x0", ctx->cr, 8, 28);
     }
     { /* case 923: cmpd bf=0 a=0x1 b=0x2 | cmpd r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpd bf=0 a=0x1 b=0x2", ctx->cr, 8, 28);
     }
     { /* case 924: cmpw bf=0 a=0x1 b=0x2 | cmpw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpw bf=0 a=0x1 b=0x2", ctx->cr, 8, 28);
     }
     { /* case 925: cmpld bf=0 a=0x1 b=0x2 | cmpld r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpld bf=0 a=0x1 b=0x2", ctx->cr, 8, 28);
     }
     { /* case 926: cmplw bf=0 a=0x1 b=0x2 | cmplw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmplw bf=0 a=0x1 b=0x2", ctx->cr, 8, 28);
     }
     { /* case 927: cmpd bf=7 a=0x1 b=0x2 | cmpd cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpd bf=7 a=0x1 b=0x2", ctx->cr, 8, 0);
     }
     { /* case 928: cmpw bf=7 a=0x1 b=0x2 | cmpw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpw bf=7 a=0x1 b=0x2", ctx->cr, 8, 0);
     }
     { /* case 929: cmpld bf=7 a=0x1 b=0x2 | cmpld cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpld bf=7 a=0x1 b=0x2", ctx->cr, 8, 0);
     }
     { /* case 930: cmplw bf=7 a=0x1 b=0x2 | cmplw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
       ctx->gpr[5] = 0x0000000000000002ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmplw bf=7 a=0x1 b=0x2", ctx->cr, 8, 0);
     }
     { /* case 931: cmpdi a=0x1 | cmpdi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpdi a=0x1", ctx->cr, 2, 28);
     }
     { /* case 932: cmpwi a=0x1 | cmpwi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000001ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpwi a=0x1", ctx->cr, 2, 28);
     }
     { /* case 933: cmpd bf=0 a=0x2 b=0x1 | cmpd r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpd bf=0 a=0x2 b=0x1", ctx->cr, 4, 28);
     }
     { /* case 934: cmpw bf=0 a=0x2 b=0x1 | cmpw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpw bf=0 a=0x2 b=0x1", ctx->cr, 4, 28);
     }
     { /* case 935: cmpld bf=0 a=0x2 b=0x1 | cmpld r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpld bf=0 a=0x2 b=0x1", ctx->cr, 4, 28);
     }
     { /* case 936: cmplw bf=0 a=0x2 b=0x1 | cmplw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmplw bf=0 a=0x2 b=0x1", ctx->cr, 4, 28);
     }
     { /* case 937: cmpd bf=7 a=0x2 b=0x1 | cmpd cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpd bf=7 a=0x2 b=0x1", ctx->cr, 4, 0);
     }
     { /* case 938: cmpw bf=7 a=0x2 b=0x1 | cmpw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpw bf=7 a=0x2 b=0x1", ctx->cr, 4, 0);
     }
     { /* case 939: cmpld bf=7 a=0x2 b=0x1 | cmpld cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpld bf=7 a=0x2 b=0x1", ctx->cr, 4, 0);
     }
     { /* case 940: cmplw bf=7 a=0x2 b=0x1 | cmplw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmplw bf=7 a=0x2 b=0x1", ctx->cr, 4, 0);
     }
     { /* case 941: cmpdi a=0x2 | cmpdi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpdi a=0x2", ctx->cr, 4, 28);
     }
     { /* case 942: cmpwi a=0x2 | cmpwi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000000000002ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpwi a=0x2", ctx->cr, 4, 28);
     }
     { /* case 943: cmpd bf=0 a=0xffffffffffffffff b=0x1 | cmpd r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpd bf=0 a=0xffffffffffffffff b=0x1", ctx->cr, 8, 28);
     }
     { /* case 944: cmpw bf=0 a=0xffffffffffffffff b=0x1 | cmpw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpw bf=0 a=0xffffffffffffffff b=0x1", ctx->cr, 8, 28);
     }
     { /* case 945: cmpld bf=0 a=0xffffffffffffffff b=0x1 | cmpld r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpld bf=0 a=0xffffffffffffffff b=0x1", ctx->cr, 4, 28);
     }
     { /* case 946: cmplw bf=0 a=0xffffffffffffffff b=0x1 | cmplw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmplw bf=0 a=0xffffffffffffffff b=0x1", ctx->cr, 4, 28);
     }
     { /* case 947: cmpd bf=7 a=0xffffffffffffffff b=0x1 | cmpd cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpd bf=7 a=0xffffffffffffffff b=0x1", ctx->cr, 8, 0);
     }
     { /* case 948: cmpw bf=7 a=0xffffffffffffffff b=0x1 | cmpw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpw bf=7 a=0xffffffffffffffff b=0x1", ctx->cr, 8, 0);
     }
     { /* case 949: cmpld bf=7 a=0xffffffffffffffff b=0x1 | cmpld cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpld bf=7 a=0xffffffffffffffff b=0x1", ctx->cr, 4, 0);
     }
     { /* case 950: cmplw bf=7 a=0xffffffffffffffff b=0x1 | cmplw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
       ctx->gpr[5] = 0x0000000000000001ULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmplw bf=7 a=0xffffffffffffffff b=0x1", ctx->cr, 4, 0);
     }
     { /* case 951: cmpdi a=0xffffffffffffffff | cmpdi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpdi a=0xffffffffffffffff", ctx->cr, 8, 28);
     }
     { /* case 952: cmpwi a=0xffffffffffffffff | cmpwi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFFFFFFFFFFULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpwi a=0xffffffffffffffff", ctx->cr, 8, 28);
     }
     { /* case 953: cmpd bf=0 a=0x80000000 b=0x7fffffff | cmpd r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpd bf=0 a=0x80000000 b=0x7fffffff", ctx->cr, 4, 28);
     }
     { /* case 954: cmpw bf=0 a=0x80000000 b=0x7fffffff | cmpw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpw bf=0 a=0x80000000 b=0x7fffffff", ctx->cr, 8, 28);
     }
     { /* case 955: cmpld bf=0 a=0x80000000 b=0x7fffffff | cmpld r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpld bf=0 a=0x80000000 b=0x7fffffff", ctx->cr, 4, 28);
     }
     { /* case 956: cmplw bf=0 a=0x80000000 b=0x7fffffff | cmplw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmplw bf=0 a=0x80000000 b=0x7fffffff", ctx->cr, 4, 28);
     }
     { /* case 957: cmpd bf=7 a=0x80000000 b=0x7fffffff | cmpd cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpd bf=7 a=0x80000000 b=0x7fffffff", ctx->cr, 4, 0);
     }
     { /* case 958: cmpw bf=7 a=0x80000000 b=0x7fffffff | cmpw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpw bf=7 a=0x80000000 b=0x7fffffff", ctx->cr, 8, 0);
     }
     { /* case 959: cmpld bf=7 a=0x80000000 b=0x7fffffff | cmpld cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpld bf=7 a=0x80000000 b=0x7fffffff", ctx->cr, 4, 0);
     }
     { /* case 960: cmplw bf=7 a=0x80000000 b=0x7fffffff | cmplw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmplw bf=7 a=0x80000000 b=0x7fffffff", ctx->cr, 4, 0);
     }
     { /* case 961: cmpdi a=0x80000000 | cmpdi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpdi a=0x80000000", ctx->cr, 4, 28);
     }
     { /* case 962: cmpwi a=0x80000000 | cmpwi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0x0000000080000000ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpwi a=0x80000000", ctx->cr, 8, 28);
     }
     { /* case 963: cmpd bf=0 a=0xffffffff80000000 b=0x7fffffff | cmpd r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpd bf=0 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 8, 28);
     }
     { /* case 964: cmpw bf=0 a=0xffffffff80000000 b=0x7fffffff | cmpw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpw bf=0 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 8, 28);
     }
     { /* case 965: cmpld bf=0 a=0xffffffff80000000 b=0x7fffffff | cmpld r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpld bf=0 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 4, 28);
     }
     { /* case 966: cmplw bf=0 a=0xffffffff80000000 b=0x7fffffff | cmplw r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmplw bf=0 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 4, 28);
     }
     { /* case 967: cmpd bf=7 a=0xffffffff80000000 b=0x7fffffff | cmpd cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpd bf=7 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 8, 0);
     }
     { /* case 968: cmpw bf=7 a=0xffffffff80000000 b=0x7fffffff | cmpw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpw bf=7 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 8, 0);
     }
     { /* case 969: cmpld bf=7 a=0xffffffff80000000 b=0x7fffffff | cmpld cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint64_t)ctx->gpr[4]; uint64_t b = (uint64_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmpld bf=7 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 4, 0);
     }
     { /* case 970: cmplw bf=7 a=0xffffffff80000000 b=0x7fffffff | cmplw cr7, r4, r5 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
       ctx->gpr[5] = 0x000000007FFFFFFFULL;
-        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
+        { uint64_t a = (uint32_t)ctx->gpr[4]; uint64_t b = (uint32_t)ctx->gpr[5]; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 0)) | (cr_val << 0); }
         check_cr("cmplw bf=7 a=0xffffffff80000000 b=0x7fffffff", ctx->cr, 4, 0);
     }
     { /* case 971: cmpdi a=0xffffffff80000000 | cmpdi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
-        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int64_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpdi a=0xffffffff80000000", ctx->cr, 8, 28);
     }
     { /* case 972: cmpwi a=0xffffffff80000000 | cmpwi r4, 1 */
       memset(ctx, 0, sizeof(*ctx));
       ctx->gpr[4] = 0xFFFFFFFF80000000ULL;
-        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = (a < b) ? 8 : (a > b) ? 4 : 2; ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
+        { int64_t a = (int32_t)ctx->gpr[4]; int64_t b = (int64_t)1; uint32_t cr_val = ((a < b) ? 8 : (a > b) ? 4 : 2) | ((ctx->xer >> 31) & 1u); ctx->cr = (ctx->cr & ~(0xFu << 28)) | (cr_val << 28); }
         check_cr("cmpwi a=0xffffffff80000000", ctx->cr, 8, 28);
     }
     { /* case 973: add. a=0x1 b=0x1 | add. r3, r4, r5 */
@@ -7408,87 +7478,87 @@ int main(void) {
     { /* vcase 0: vupkhsh pos | vupkhsh v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<4;i++){ int16_t h=(int16_t)((b[2*i]<<8)|b[2*i+1]); int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksh(&ctx->vr[2], &ctx->vr[5], 0);
       { uint8_t _want[16] = { 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x03, 0x04, 0x00, 0x00, 0x05, 0x06, 0x00, 0x00, 0x07, 0x08 }; check_vr("vupkhsh pos", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 1: vupklsh pos | vupklsh v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<4;i++){ int16_t h=(int16_t)((b[2*(4+i)]<<8)|b[2*(4+i)+1]); int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksh(&ctx->vr[2], &ctx->vr[5], 1);
       { uint8_t _want[16] = { 0x00, 0x00, 0x09, 0x0A, 0x00, 0x00, 0x0B, 0x0C, 0x00, 0x00, 0x0D, 0x0E, 0x00, 0x00, 0x0F, 0x10 }; check_vr("vupklsh pos", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 2: vupkhsh neg | vupkhsh v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<4;i++){ int16_t h=(int16_t)((b[2*i]<<8)|b[2*i+1]); int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksh(&ctx->vr[2], &ctx->vr[5], 0);
       { uint8_t _want[16] = { 0xFF, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xFF, 0x80 }; check_vr("vupkhsh neg", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 3: vupklsh neg | vupklsh v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<4;i++){ int16_t h=(int16_t)((b[2*(4+i)]<<8)|b[2*(4+i)+1]); int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksh(&ctx->vr[2], &ctx->vr[5], 1);
       { uint8_t _want[16] = { 0xFF, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xFF, 0x80, 0xFF, 0xFF, 0xFF, 0x80 }; check_vr("vupklsh neg", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 4: vupkhsh mix | vupkhsh v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x00, 0x01, 0xFF, 0xFF, 0x7F, 0xFF, 0x80, 0x00, 0x00, 0x00, 0xFF, 0xFE, 0x00, 0x64, 0xFF, 0x9C }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<4;i++){ int16_t h=(int16_t)((b[2*i]<<8)|b[2*i+1]); int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksh(&ctx->vr[2], &ctx->vr[5], 0);
       { uint8_t _want[16] = { 0x00, 0x00, 0x00, 0x01, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x7F, 0xFF, 0xFF, 0xFF, 0x80, 0x00 }; check_vr("vupkhsh mix", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 5: vupklsh mix | vupklsh v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x00, 0x01, 0xFF, 0xFF, 0x7F, 0xFF, 0x80, 0x00, 0x00, 0x00, 0xFF, 0xFE, 0x00, 0x64, 0xFF, 0x9C }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<4;i++){ int16_t h=(int16_t)((b[2*(4+i)]<<8)|b[2*(4+i)+1]); int32_t v=(int32_t)h; r[4*i]=(uint8_t)(v>>24); r[4*i+1]=(uint8_t)(v>>16); r[4*i+2]=(uint8_t)(v>>8); r[4*i+3]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksh(&ctx->vr[2], &ctx->vr[5], 1);
       { uint8_t _want[16] = { 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFE, 0x00, 0x00, 0x00, 0x64, 0xFF, 0xFF, 0xFF, 0x9C }; check_vr("vupklsh mix", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 6: vupkhsb pos | vupkhsb v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<8;i++){ int16_t v=(int16_t)(int8_t)b[i]; r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksb(&ctx->vr[2], &ctx->vr[5], 0);
       { uint8_t _want[16] = { 0x00, 0x01, 0x00, 0x02, 0x00, 0x03, 0x00, 0x04, 0x00, 0x05, 0x00, 0x06, 0x00, 0x07, 0x00, 0x08 }; check_vr("vupkhsb pos", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 7: vupklsb pos | vupklsb v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F, 0x10 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<8;i++){ int16_t v=(int16_t)(int8_t)b[8+i]; r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksb(&ctx->vr[2], &ctx->vr[5], 1);
       { uint8_t _want[16] = { 0x00, 0x09, 0x00, 0x0A, 0x00, 0x0B, 0x00, 0x0C, 0x00, 0x0D, 0x00, 0x0E, 0x00, 0x0F, 0x00, 0x10 }; check_vr("vupklsb pos", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 8: vupkhsb neg | vupkhsb v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<8;i++){ int16_t v=(int16_t)(int8_t)b[i]; r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksb(&ctx->vr[2], &ctx->vr[5], 0);
       { uint8_t _want[16] = { 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80 }; check_vr("vupkhsb neg", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 9: vupklsb neg | vupklsb v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<8;i++){ int16_t v=(int16_t)(int8_t)b[8+i]; r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksb(&ctx->vr[2], &ctx->vr[5], 1);
       { uint8_t _want[16] = { 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80, 0xFF, 0x80 }; check_vr("vupklsb neg", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 10: vupkhsb mix | vupkhsb v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x01, 0xFF, 0x7F, 0x80, 0x00, 0x02, 0xFE, 0x03, 0x81, 0x01, 0x7E, 0x00, 0xFF, 0x02, 0x80, 0x10 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<8;i++){ int16_t v=(int16_t)(int8_t)b[i]; r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksb(&ctx->vr[2], &ctx->vr[5], 0);
       { uint8_t _want[16] = { 0x00, 0x01, 0xFF, 0xFF, 0x00, 0x7F, 0xFF, 0x80, 0x00, 0x00, 0x00, 0x02, 0xFF, 0xFE, 0x00, 0x03 }; check_vr("vupkhsb mix", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 11: vupklsb mix | vupklsb v2, v0, v5 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x01, 0xFF, 0x7F, 0x80, 0x00, 0x02, 0xFE, 0x03, 0x81, 0x01, 0x7E, 0x00, 0xFF, 0x02, 0x80, 0x10 }; memcpy(&ctx->vr[5], _vb, 16); }
-      { const uint8_t* b=(const uint8_t*)&ctx->vr[5]; uint8_t r[16]; for(int i=0;i<8;i++){ int16_t v=(int16_t)(int8_t)b[8+i]; r[2*i]=(uint8_t)(v>>8); r[2*i+1]=(uint8_t)v; } memcpy(&ctx->vr[2], r, 16); }
+      vmx_vupksb(&ctx->vr[2], &ctx->vr[5], 1);
       { uint8_t _want[16] = { 0xFF, 0x81, 0x00, 0x01, 0x00, 0x7E, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x02, 0xFF, 0x80, 0x00, 0x10 }; check_vr("vupklsb mix", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 12: vcmpgtsw mixed | vcmpgtsw v2, v0, v1 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x07 }; memcpy(&ctx->vr[1], _vb, 16); }
       { uint8_t _va[16] = { 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07 }; memcpy(&ctx->vr[0], _va, 16); }
-      { const uint8_t* a=(const uint8_t*)&ctx->vr[0]; const uint8_t* b=(const uint8_t*)&ctx->vr[1]; uint8_t d[16]; int t=0; for(int i=0;i<4;i++){ uint32_t x=0,y=0; for(int k=0;k<4;k++){ x=(uint32_t)((x<<8)|a[i*4+k]); y=(uint32_t)((y<<8)|b[i*4+k]); } int gt=((int32_t)x>(int32_t)y); for(int k=0;k<4;k++) d[i*4+k]=gt?0xFFu:0x00u; t+=gt; } memcpy(&ctx->vr[2], d, 16); }
+      (void)vmx_vcmpgtsw(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1]);
       { uint8_t _want[16] = { 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; check_vr("vcmpgtsw mixed", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 13: vcmpgtsh mixed | vcmpgtsh v2, v0, v1 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x00, 0x02, 0x00, 0x0A, 0x00, 0x01, 0x00, 0x07, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05 }; memcpy(&ctx->vr[1], _vb, 16); }
       { uint8_t _va[16] = { 0x01, 0x00, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x07, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05, 0x00, 0x05 }; memcpy(&ctx->vr[0], _va, 16); }
-      { const uint8_t* a=(const uint8_t*)&ctx->vr[0]; const uint8_t* b=(const uint8_t*)&ctx->vr[1]; uint8_t d[16]; int t=0; for(int i=0;i<8;i++){ uint16_t x=0,y=0; for(int k=0;k<2;k++){ x=(uint16_t)((x<<8)|a[i*2+k]); y=(uint16_t)((y<<8)|b[i*2+k]); } int gt=((int16_t)x>(int16_t)y); for(int k=0;k<2;k++) d[i*2+k]=gt?0xFFu:0x00u; t+=gt; } memcpy(&ctx->vr[2], d, 16); }
+      (void)vmx_vcmpgtsh(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1]);
       { uint8_t _want[16] = { 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; check_vr("vcmpgtsh mixed", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 14: vadduwm canary | vadduwm v2, v0, v1 */
@@ -7503,7 +7573,7 @@ int main(void) {
       { uint8_t _vb[16] = { 0x3F, 0x80, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00, 0x3F, 0x80, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
       { uint8_t _va[16] = { 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
       { uint8_t _vc[16] = { 0x40, 0x40, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00 }; memcpy(&ctx->vr[3], _vc, 16); }
-      { float a[4],b[4],c[4],d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); ppu_vldf4(&ctx->vr[3],c); for(int i=0;i<4;i++) d[i]=a[i]*c[i]+b[i]; ppu_vstf4(&ctx->vr[2],d); }
+      vmx_vmaddfp(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1], &ctx->vr[3], ctx->vscr);
       { uint8_t _want[16] = { 0x40, 0xE0, 0x00, 0x00, 0x40, 0xE0, 0x00, 0x00, 0x40, 0xE0, 0x00, 0x00, 0x40, 0xE0, 0x00, 0x00 }; check_vr("vmaddfp canary", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 16: vspltw w=1 canary | vspltw v2, v5, 1 */
@@ -7522,1377 +7592,1377 @@ int main(void) {
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x40, 0xA0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
       { uint8_t _va[16] = { 0x3F, 0x80, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
-      { float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ((a[i]>b[i]) ? a[i] : (b[i]>a[i]) ? b[i] : (signbit(a[i]) ? b[i] : a[i])); ppu_vstf4(&ctx->vr[2],d); }
+      vmx_vmaxfp(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1], ctx->vscr);
       { uint8_t _want[16] = { 0x40, 0x00, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; check_vr("vmaxfp canary", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 19: vminfp canary | vminfp v2, v0, v1 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
       { uint8_t _va[16] = { 0x3F, 0x80, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0x40, 0xA0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
-      { float a[4],b[4],d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i] = (a[i]!=a[i]) ? a[i]+a[i] : (b[i]!=b[i]) ? b[i]+b[i] : ((a[i]<b[i]) ? a[i] : (b[i]<a[i]) ? b[i] : (signbit(a[i]) ? a[i] : b[i])); ppu_vstf4(&ctx->vr[2],d); }
+      vmx_vminfp(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1], ctx->vscr);
       { uint8_t _want[16] = { 0x3F, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00 }; check_vr("vminfp canary", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 20: vrfin | vrfin v2, v0, v1 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x3F, 0xC0, 0x00, 0x00, 0x40, 0x20, 0x00, 0x00, 0xBF, 0xC0, 0x00, 0x00, 0x40, 0x19, 0x99, 0x9A }; memcpy(&ctx->vr[1], _vb, 16); }
-      { float b[4],d[4]; ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i]=nearbyintf(b[i]); ppu_vstf4(&ctx->vr[2],d); }
+      vmx_vrfin(&ctx->vr[2], &ctx->vr[1], ctx->vscr);
       { uint8_t _want[16] = { 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 }; check_vr("vrfin", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 21: vrfiz | vrfiz v2, v0, v1 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x3F, 0xC0, 0x00, 0x00, 0x40, 0x20, 0x00, 0x00, 0xBF, 0xC0, 0x00, 0x00, 0xC0, 0x2C, 0xCC, 0xCD }; memcpy(&ctx->vr[1], _vb, 16); }
-      { float b[4],d[4]; ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) d[i]=truncf(b[i]); ppu_vstf4(&ctx->vr[2],d); }
+      vmx_vrfiz(&ctx->vr[2], &ctx->vr[1], ctx->vscr);
       { uint8_t _want[16] = { 0x3F, 0x80, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xBF, 0x80, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00 }; check_vr("vrfiz", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { /* vcase 22: vcmpbfp | vcmpbfp v2, v0, v1 */
       memset(ctx, 0, sizeof(*ctx));
       { uint8_t _vb[16] = { 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00 }; memcpy(&ctx->vr[1], _vb, 16); }
       { uint8_t _va[16] = { 0x3F, 0x80, 0x00, 0x00, 0x40, 0x40, 0x00, 0x00, 0xC0, 0x40, 0x00, 0x00, 0x7F, 0xC0, 0x00, 0x00 }; memcpy(&ctx->vr[0], _va, 16); }
-      { float a[4],b[4]; uint32_t d[4]; ppu_vldf4(&ctx->vr[0],a); ppu_vldf4(&ctx->vr[1],b); for(int i=0;i<4;i++) { uint32_t r=0; if(!(a[i]<=b[i])) r|=0x80000000u; if(!(a[i]>=-b[i])) r|=0x40000000u; d[i]=r; } ppu_vstu4(&ctx->vr[2],d); }
+      (void)vmx_vcmpbfp(&ctx->vr[2], &ctx->vr[0], &ctx->vr[1]);
       { uint8_t _want[16] = { 0x00, 0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0xC0, 0x00, 0x00, 0x00 }; check_vr("vcmpbfp", (const uint8_t*)&ctx->vr[2], _want); }
     }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {160};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {16,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {161};
       if (memcmp((uint8_t*)&ctx->vr[2]+1, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {162};
       if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,18,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {163};
       if (memcmp((uint8_t*)&ctx->vr[2]+3, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {164};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {165};
       if (memcmp((uint8_t*)&ctx->vr[2]+5, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,21,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {166};
       if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,22,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {167};
       if (memcmp((uint8_t*)&ctx->vr[2]+7, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {168};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {169};
       if (memcmp((uint8_t*)&ctx->vr[2]+9, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,25,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {170};
       if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {171};
       if (memcmp((uint8_t*)&ctx->vr[2]+11, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {172};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {173};
       if (memcmp((uint8_t*)&ctx->vr[2]+13, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,29,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {174};
       if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {175};
       if (memcmp((uint8_t*)&ctx->vr[2]+15, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {160};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {16,161,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {161};
       if (memcmp((uint8_t*)&ctx->vr[2]+1, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {162};
       if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,18,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {163};
       if (memcmp((uint8_t*)&ctx->vr[2]+3, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {164};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {165};
       if (memcmp((uint8_t*)&ctx->vr[2]+5, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,21,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {166};
       if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,22,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {167};
       if (memcmp((uint8_t*)&ctx->vr[2]+7, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {168};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {169};
       if (memcmp((uint8_t*)&ctx->vr[2]+9, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,25,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {170};
       if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {171};
       if (memcmp((uint8_t*)&ctx->vr[2]+11, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {172};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {173};
       if (memcmp((uint8_t*)&ctx->vr[2]+13, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,29,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {174};
       if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memset(&ctx->vr[2], 0, 16); { uint8_t _e = VM_RAW_LD(uint8_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 1); } }
       const uint8_t want[] = {175};
       if (memcmp((uint8_t*)&ctx->vr[2]+15, want, 1) == 0) ++g_pass; else { printf("FAIL lvebx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~0ULL; { uint8_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 1); VM_RAW_ST(uint8_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,174,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvebx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {160,161};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {160,161};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {164,165};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {164,165};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {168,169};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {168,169};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {172,173};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {172,173};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {160,161};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {160,161};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {16,17,162,163,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+2, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {164,165};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {164,165};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+6, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {168,169};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {168,169};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+10, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {172,173};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {172,173};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memset(&ctx->vr[2], 0, 16); { uint16_t _e = VM_RAW_LD(uint16_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 2); } }
       const uint8_t want[] = {174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+14, want, 2) == 0) ++g_pass; else { printf("FAIL lvehx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~1ULL; { uint16_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 2); VM_RAW_ST(uint16_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,172,173,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvehx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=544;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=545;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=546;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=547;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=548;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=549;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=550;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=551;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=552;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=553;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=554;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=555;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=556;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=557;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=558;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=559;
-      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = ctx->gpr[4]; ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=0 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=32;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=0: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=33;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=1: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=34;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=2: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {160,161,162,163};
       if (memcmp((uint8_t*)&ctx->vr[2]+0, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=35;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {16,17,18,19,164,165,166,167,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=3: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=36;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=4: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=37;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=5: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=38;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=6: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {164,165,166,167};
       if (memcmp((uint8_t*)&ctx->vr[2]+4, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=39;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,20,21,22,23,168,169,170,171,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=7: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=40;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=8: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=41;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=9: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=42;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=10: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {168,169,170,171};
       if (memcmp((uint8_t*)&ctx->vr[2]+8, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=43;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,24,25,26,27,172,173,174,175};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=11: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=44;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=12: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=45;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=13: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=46;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=14: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), vm_base + (uint32_t)ea, 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memset(&ctx->vr[2], 0, 16); { uint32_t _e = VM_RAW_LD(uint32_t, ea); memcpy((uint8_t*)&ctx->vr[2] + (ea & 15), &_e, 4); } }
       const uint8_t want[] = {172,173,174,175};
       if (memcmp((uint8_t*)&ctx->vr[2]+12, want, 4) == 0) ++g_pass; else { printf("FAIL lvewx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
     { memset(ctx, 0, sizeof(*ctx));
       memset(g_vm_stub, 0xCC, sizeof(g_vm_stub));
       for (int k=0; k<16; ++k) { ((uint8_t*)&ctx->vr[2])[k] = (uint8_t)(0x10+k); g_vm_stub[0x220+k] = (uint8_t)(0xA0+k); }
       ctx->gpr[0]=0x1000; ctx->gpr[3]=0x200; ctx->gpr[4]=47;
-      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; memcpy(vm_base + (uint32_t)ea, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); }
+      { uint64_t ea = (ctx->gpr[3] + ctx->gpr[4]); ea &= ~3ULL; { uint32_t _e; memcpy(&_e, (const uint8_t*)&ctx->vr[2] + (ea & 15), 4); VM_RAW_ST(uint32_t, ea, _e); } }
       const uint8_t want[] = {160,161,162,163,164,165,166,167,168,169,170,171,28,29,30,31};
       if (memcmp(g_vm_stub+0x220, want, 16) == 0 && g_vm_stub[0x21F] == 0xCC && g_vm_stub[0x230] == 0xCC) ++g_pass; else { printf("FAIL stvewx RA=3 offset=15: wrong element or address\n"); ++g_fail; } }
 
