@@ -558,6 +558,40 @@ std::string engineSaveSlotImport(const std::string& pickedFolder, int* firstSlot
            report;
 }
 
+std::string engineSaveSlotDuplicate(int number, int* newSlot)
+{
+    if (newSlot)
+    {
+        *newSlot = -1;
+    }
+    const SaveSlot slot = engineSaveSlotRead(number);
+    if (!slot.exists)
+    {
+        return "Slot " + std::to_string(number) + " has no save to duplicate.";
+    }
+    const int copyNumber = engineSaveSlotNextFree();
+    const std::string copyName = engineSaveSlotDirectoryName(copyNumber);
+    const std::string destination = engineSaveSlotFolder() + "\\" + copyName;
+    if (copyNumber == number || isDirectory(destination))
+    {
+        return "There is no free slot to duplicate slot " + std::to_string(number) + " into.";
+    }
+    std::string problem;
+    if (!copyFolder(slot.folder, destination, problem))
+    {
+        return "Slot " + std::to_string(number) + " was not duplicated: " + problem + ".";
+    }
+    renameSfoDirectory(destination, copyName);
+    if (newSlot)
+    {
+        *newSlot = copyNumber;
+    }
+    std::fprintf(stderr, "[saves] slot %d duplicated into slot %d\n", number, copyNumber);
+    return "Slot " + std::to_string(number) + " duplicated into slot " + std::to_string(copyNumber) +
+           ". The game still uses slot " + std::to_string(number) + "; press Use on slot " +
+           std::to_string(copyNumber) + " to play the copy.";
+}
+
 std::string engineSaveSlotExport(int number, const std::string& destinationFolder)
 {
     const SaveSlot slot = engineSaveSlotRead(number);

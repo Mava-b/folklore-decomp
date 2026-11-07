@@ -62,6 +62,11 @@ int engineSaveSlotNextFree();
  * `firstSlot` receives the first slot filled, or -1. */
 std::string engineSaveSlotImport(const std::string& pickedFolder, int* firstSlot);
 
+/* Copy slot `number` into the next free slot (to try something, or keep a
+ * point to go back to). Returns a report for the player; `newSlot` receives
+ * the copy's number, or -1. */
+std::string engineSaveSlotDuplicate(int number, int* newSlot);
+
 /* Copy slot `number` to <destinationFolder>\<its directory name>, the
  * shape RPCS3 and a PS3 use. Returns a report for the player. */
 std::string engineSaveSlotExport(int number, const std::string& destinationFolder);

@@ -935,6 +935,20 @@ namespace
         return chosen;
     }
 
+    /* SameLine, unless a button `label` would run past the page's edge;
+     * then it starts the next line. */
+    void sameLineIfFits(const char* label)
+    {
+        const ImGuiStyle& style = ImGui::GetStyle();
+        const float buttonWidth = ImGui::CalcTextSize(label).x + style.FramePadding.x * 2.0f;
+        const float lastRight = ImGui::GetItemRectMax().x - ImGui::GetWindowPos().x;
+        const float pageRight = ImGui::GetWindowContentRegionMax().x;
+        if (lastRight + style.ItemSpacing.x + buttonWidth <= pageRight)
+        {
+            ImGui::SameLine();
+        }
+    }
+
     bool drawSavesPage()
     {
         EngineSettings& settings = engineSettings();
@@ -982,18 +996,29 @@ namespace
         }
         ImGui::SameLine();
         ImGui::BeginDisabled(!selectedHasSave);
+        const std::string duplicateLabel = "Duplicate slot " + std::to_string(settings.saveSlot);
+        if (ImGui::Button(duplicateLabel.c_str()))
+        {
+            deleteConfirmSlot = -1;
+            int copyNumber = -1;
+            const std::string result = engineSaveSlotDuplicate(settings.saveSlot, &copyNumber);
+            std::lock_guard<std::mutex> guard(saveWork.lock);
+            saveWork.report = result;
+            saveWork.refresh = true;
+        }
+        ImGui::SameLine();
         const std::string exportLabel = "Export slot " + std::to_string(settings.saveSlot) + "...";
         if (ImGui::Button(exportLabel.c_str()))
         {
             deleteConfirmSlot = -1;
             startSaveExport(settings.saveSlot);
         }
-        ImGui::SameLine();
         if (deleteConfirmSlot == settings.saveSlot)
         {
+            const std::string confirmLabel = "Confirm: delete slot " + std::to_string(settings.saveSlot);
+            sameLineIfFits(confirmLabel.c_str());
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.60f, 0.22f, 0.20f, 1.0f));
             ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kBad);
-            const std::string confirmLabel = "Confirm: delete slot " + std::to_string(settings.saveSlot);
             if (ImGui::Button(confirmLabel.c_str()))
             {
                 const std::string result = engineSaveSlotDelete(settings.saveSlot);
@@ -1003,7 +1028,7 @@ namespace
                 deleteConfirmSlot = -1;
             }
             ImGui::PopStyleColor(2);
-            ImGui::SameLine();
+            sameLineIfFits("Cancel");
             if (ImGui::Button("Cancel"))
             {
                 deleteConfirmSlot = -1;
@@ -1014,6 +1039,7 @@ namespace
         else
         {
             const std::string deleteLabel = "Delete slot " + std::to_string(settings.saveSlot) + "...";
+            sameLineIfFits(deleteLabel.c_str());
             if (ImGui::Button(deleteLabel.c_str()))
             {
                 deleteConfirmSlot = settings.saveSlot;

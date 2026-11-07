@@ -1561,7 +1561,8 @@ What 0006 fixes in ps3recomp to make that run:
     for the launcher's Saves page; import/export/delete are folder copies
     (CopyFileA keeps the file times the "saved" date comes from), and an
     imported save of this release gets its SFO SAVEDATA_DIRECTORY renamed
-    to its slot.
+    to its slot. Duplicate copies a slot into the next free one the same
+    way.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
