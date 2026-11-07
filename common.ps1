@@ -14,7 +14,7 @@ $LogDir        = Join-Path $Root 'logs'
 
 # The ps3recomp revision the lifted code in folklore\src was generated and
 # test-built against. Change it only together with a relift (tools\relift.sh).
-$Ps3RecompCommit = '39a36296511c445707adabcd312f0b740cfbd694'
+$Ps3RecompCommit = 'de4f090328ea08bef6b2f15caec0b85e343a7ece'
 
 $GitExe    = Join-Path $Tools 'git\cmd\git.exe'
 $CMakeExe  = Join-Path $Tools 'cmake\bin\cmake.exe'
