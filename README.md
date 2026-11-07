@@ -260,6 +260,11 @@ beside the launcher): put your own copy of the cover art there and it fills
 the left-hand panel. It is not in the repository; without it the launcher
 shows the plain panel in the screenshots above.
 
+**Icon**: `folklore_icon.ico` in the project folder becomes the icon of both
+folklore.exe and FolkloreLauncher.exe (and of the game's window) the next
+time build.ps1 runs. Like the art it comes from the game, so it is not in the
+repository; without it both get Windows' default icon.
+
 **From a package**: unzip, double-click `run_launcher.bat`, choose your disc
 dump (and the 1.10 update for a 1.10 build) on the Game page, press Play.
 

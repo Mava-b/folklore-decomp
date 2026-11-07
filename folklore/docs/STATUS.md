@@ -1563,6 +1563,12 @@ What 0006 fixes in ps3recomp to make that run:
     imported save of this release gets its SFO SAVEDATA_DIRECTORY renamed
     to its slot. Duplicate copies a slot into the next free one the same
     way.
+110. Icons: folklore/CMakeLists.txt writes build\folklore_icon.rc
+    ("1 ICON <project>\folklore_icon.ico") and adds it to folklore and
+    FolkloreLauncher when that file exists (it is made from a game texture,
+    so it is gitignored like launcher_art.jpg). The launcher's window class
+    already loaded icon 1; patches/0087 makes the game window's class load
+    it too.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

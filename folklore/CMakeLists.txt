@@ -217,3 +217,21 @@ if(WIN32)
         "${PS3RECOMP_DIR}/include")
     target_link_libraries(FolkloreLauncher PRIVATE d3d11 dxgi dwmapi ole32 shell32 uuid bcrypt)
 endif()
+
+# The icon of folklore.exe and FolkloreLauncher.exe: folklore_icon.ico in the
+# project folder (beside run.ps1), when there is one. Like launcher_art.jpg
+# it is made from the game's own art, so it is not in the repository; without
+# it both exes get Windows' default icon. Both windows use resource 1.
+set(FOLKLORE_ICON_FILE "${CMAKE_CURRENT_SOURCE_DIR}/../folklore_icon.ico")
+if(WIN32 AND EXISTS "${FOLKLORE_ICON_FILE}")
+    enable_language(RC)
+    get_filename_component(FOLKLORE_ICON_FULL "${FOLKLORE_ICON_FILE}" ABSOLUTE)
+    file(TO_NATIVE_PATH "${FOLKLORE_ICON_FULL}" FOLKLORE_ICON_NATIVE)
+    string(REPLACE "\\" "\\\\" FOLKLORE_ICON_ESCAPED "${FOLKLORE_ICON_NATIVE}")
+    set(FOLKLORE_ICON_RC "${CMAKE_CURRENT_BINARY_DIR}/folklore_icon.rc")
+    file(CONFIGURE OUTPUT "${FOLKLORE_ICON_RC}" CONTENT "1 ICON \"${FOLKLORE_ICON_ESCAPED}\"\n")
+    target_sources(folklore PRIVATE "${FOLKLORE_ICON_RC}")
+    target_sources(FolkloreLauncher PRIVATE "${FOLKLORE_ICON_RC}")
+    set_property(SOURCE "${FOLKLORE_ICON_RC}" APPEND PROPERTY OBJECT_DEPENDS "${FOLKLORE_ICON_FULL}")
+    message(STATUS "Icon: ${FOLKLORE_ICON_FULL}")
+endif()

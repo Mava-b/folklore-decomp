@@ -42,3 +42,4 @@ __pycache__/
 # The launcher's picture (your own copy of the cover art; not distributed here).
 /launcher_art.jpg
 /launcher_art.png
+/folklore_icon.ico
