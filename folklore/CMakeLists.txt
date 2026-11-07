@@ -10,7 +10,11 @@
 #   cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
 #   cmake --build build
 #
-# Linux (compile/link check only; ps3recomp does not boot titles on POSIX yet):
+# macOS (Apple silicon, Metal renderer):
+#   ../setup_mac.sh does all of this for you; the runtime is built as part of
+#   this project (add_subdirectory) so its Metal/SDL2/shader libraries link.
+#
+# Linux (compile/link check only):
 #   cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
 cmake_minimum_required(VERSION 3.20)
 
@@ -36,7 +40,13 @@ endif()
 # ppu_vmx.h use its SIMD paths. -ffp-contract=off above still keeps the
 # compiler from fusing anything the PPU code did not fuse. Set it to empty
 # (-DFOLKLORE_CPU_LEVEL=) for a build that runs on any x86-64 CPU.
-set(FOLKLORE_CPU_LEVEL "x86-64-v3" CACHE STRING "-march level for the build (empty = baseline x86-64)")
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "^(arm64|aarch64|ARM64)$")
+    # Apple silicon / arm64: no x86 -march level (ppu_vmx.h uses its portable path).
+    set(_folklore_default_cpu_level "")
+else()
+    set(_folklore_default_cpu_level "x86-64-v3")
+endif()
+set(FOLKLORE_CPU_LEVEL "${_folklore_default_cpu_level}" CACHE STRING "-march level for the build (empty = baseline x86-64)")
 if(FOLKLORE_CPU_LEVEL)
     if(CMAKE_CXX_COMPILER_FRONTEND_VARIANT STREQUAL "MSVC")
         add_compile_options(/clang:-march=${FOLKLORE_CPU_LEVEL})
@@ -50,6 +60,17 @@ set(CMAKE_C_STANDARD 17)
 get_filename_component(DEFAULT_PS3RECOMP_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../ps3recomp" ABSOLUTE)
 set(PS3RECOMP_DIR "${DEFAULT_PS3RECOMP_DIR}" CACHE PATH "ps3recomp repo root")
 
+if(APPLE)
+    # macOS: build the runtime as part of this project, so its Metal, SDL2,
+    # glslang and spirv-cross link requirements come with the target.
+    # FFmpeg (Homebrew) is loaded at run time for the cutscenes.
+    if(NOT DEFINED PS3RECOMP_FFMPEG_RUNTIME AND EXISTS "/opt/homebrew/include/libavcodec/avcodec.h")
+        set(PS3RECOMP_FFMPEG_RUNTIME ON CACHE BOOL "" FORCE)
+        set(PS3RECOMP_FFMPEG_INCLUDE_DIR "/opt/homebrew/include" CACHE PATH "" FORCE)
+    endif()
+    add_subdirectory("${PS3RECOMP_DIR}" "${CMAKE_BINARY_DIR}/ps3recomp" EXCLUDE_FROM_ALL)
+    set(PS3RECOMP_RUNTIME_LIB ps3recomp_runtime)
+else()
 if(WIN32)
     set(DEFAULT_RUNTIME_LIB "${PS3RECOMP_DIR}/build/ps3recomp_runtime.lib")
 else()
@@ -59,6 +80,7 @@ set(PS3RECOMP_RUNTIME_LIB "${DEFAULT_RUNTIME_LIB}" CACHE FILEPATH "prebuilt ps3r
 
 if(NOT EXISTS "${PS3RECOMP_RUNTIME_LIB}")
     message(FATAL_ERROR "ps3recomp runtime not found at ${PS3RECOMP_RUNTIME_LIB} -- build it first (setup.ps1 does)")
+endif()
 endif()
 
 # CONFIGURE_DEPENDS: a build re-checks these folders, so files added by a
@@ -175,6 +197,12 @@ if(WIN32)
     target_link_libraries(folklore PRIVATE ws2_32 bcrypt xinput ole32 d3d12 dxgi dxguid d3dcompiler)
     # Every guest call is a host call, so recompiled call chains nest deeply.
     target_link_options(folklore PRIVATE /STACK:268435456 /MAP:folklore.map)
+elseif(APPLE)
+    # SDL2, pthreads and the Metal frameworks come with ps3recomp_runtime.
+    target_link_libraries(folklore PRIVATE "-framework CoreGraphics")
+    # The guest's main thread runs on the process's main thread, and every
+    # guest call is a host call: give it the same 256 MB Windows gets (/STACK).
+    target_link_options(folklore PRIVATE "LINKER:-stack_size,0x10000000")
 else()
     find_package(SDL2 REQUIRED)
     find_package(Threads REQUIRED)
