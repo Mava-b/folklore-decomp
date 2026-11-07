@@ -203,6 +203,40 @@ elseif(APPLE)
     # The guest's main thread runs on the process's main thread, and every
     # guest call is a host call: give it the same 256 MB Windows gets (/STACK).
     target_link_options(folklore PRIVATE "LINKER:-stack_size,0x10000000")
+    # An app bundle, so macOS treats the game as a game (Game Mode in
+    # fullscreen: CPU/GPU priority, half the Bluetooth latency for controllers;
+    # macos/Info.plist.in). build-mac/folklore links to the bundle's
+    # executable, so run_mac.sh and the launcher start it directly and keep the
+    # environment and the log. The icon is your disc's ICON0.PNG, which
+    # setup_mac.sh copies to build-mac/icon0.png (never distributed).
+    set(FOLKLORE_ICON_PNG "${CMAKE_BINARY_DIR}/icon0.png")
+    set(FOLKLORE_ICNS_NAME "")
+    if(EXISTS "${FOLKLORE_ICON_PNG}")
+        set(FOLKLORE_ICNS "${CMAKE_BINARY_DIR}/Folklore.icns")
+        # ICON0.PNG is 320x176 and an .icns wants a square: pad, scale, convert.
+        set(FOLKLORE_ICON_SQUARE "${CMAKE_BINARY_DIR}/icon0_square.png")
+        add_custom_command(OUTPUT "${FOLKLORE_ICNS}"
+            COMMAND sh "${CMAKE_CURRENT_SOURCE_DIR}/macos/make_icns.sh" "${FOLKLORE_ICON_PNG}" "${FOLKLORE_ICON_SQUARE}" "${FOLKLORE_ICNS}"
+            DEPENDS "${FOLKLORE_ICON_PNG}" "${CMAKE_CURRENT_SOURCE_DIR}/macos/make_icns.sh"
+            COMMENT "Making the bundle icon")
+        target_sources(folklore PRIVATE "${FOLKLORE_ICNS}")
+        set_source_files_properties("${FOLKLORE_ICNS}" PROPERTIES MACOSX_PACKAGE_LOCATION Resources)
+        set(FOLKLORE_ICNS_NAME "Folklore.icns")
+    endif()
+    set_target_properties(folklore PROPERTIES
+        MACOSX_BUNDLE TRUE
+        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/macos/Info.plist.in"
+        MACOSX_BUNDLE_GUI_IDENTIFIER "io.github.erikomis.folklorerecomp.game"
+        MACOSX_BUNDLE_BUNDLE_NAME "Folklore"
+        MACOSX_BUNDLE_EXECUTABLE_NAME "folklore"
+        MACOSX_BUNDLE_ICON_FILE "${FOLKLORE_ICNS_NAME}"
+        MACOSX_BUNDLE_SHORT_VERSION_STRING "0.5"
+        MACOSX_BUNDLE_BUNDLE_VERSION "0.5")
+    add_custom_command(TARGET folklore POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E rm -f "${CMAKE_BINARY_DIR}/folklore"
+        COMMAND ${CMAKE_COMMAND} -E create_symlink "folklore.app/Contents/MacOS/folklore"
+                "${CMAKE_BINARY_DIR}/folklore"
+        COMMENT "build-mac/folklore -> folklore.app/Contents/MacOS/folklore")
 else()
     find_package(SDL2 REQUIRED)
     find_package(Threads REQUIRED)

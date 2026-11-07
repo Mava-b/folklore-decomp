@@ -103,6 +103,12 @@ if [ -z "$NO_PROMOTE" ]; then
     "$VENV/bin/python" -I "$ROOT/folklore/tools/promote_regs.py" --dir "$ROOT/folklore/src/recomp" "$recomp_dir" \
         > "$ROOT/logs/promote-mac.log" 2>&1 || die "register promotion failed -- see logs/promote-mac.log"
 fi
+# The bundle's icon: your disc's own ICON0.PNG (never distributed).
+mkdir -p "$BUILD"
+# (cat, not cp: the disc is read only and cp would keep its mode)
+if [ -f "$game_dir/PS3_GAME/ICON0.PNG" ]; then
+    rm -f "$BUILD/icon0.png"; cat "$game_dir/PS3_GAME/ICON0.PNG" > "$BUILD/icon0.png"
+fi
 step "Building (folklore/build-mac)"
 cmake -S "$ROOT/folklore" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
     -DPS3RECOMP_DIR="$ROOT/ps3recomp" -DFOLKLORE_RECOMP_DIR="$recomp_dir" > "$ROOT/logs/configure-mac.log" 2>&1 \

@@ -12,7 +12,7 @@ ROOT=${0:A:h}
 source "$ROOT/mac_common.sh"
 [ -f "$SETTINGS" ] || die "run ./setup_mac.sh <your Folklore .iso or folder> first"
 source "$SETTINGS"
-EXE=$BUILD/folklore
+EXE=${FOLKLORE_EXE:-$BUILD/folklore}     # FOLKLORE_EXE: run another build
 [ -x "$EXE" ] || die "not built yet: ./setup_mac.sh"
 
 game_dir=$(mount_game)
@@ -20,13 +20,17 @@ elf=$(elf_for "$game_dir/PS3_GAME/USRDIR/EBOOT.BIN")
 [ -f "$elf" ] || die "EBOOT not decrypted yet: ./setup_mac.sh"
 
 mkdir -p "$ROOT/hdd0/game" "$ROOT/hdd0/home/00000001/savedata" "$ROOT/hdd1/cache" \
-         "$ROOT/logs" "$BUILD/msl_cache"
+         "$ROOT/logs" "$BUILD/msl_cache" "$BUILD/shader_cache"
 export PS3_VFS_ROOT=$game_dir
 export PS3_HDD0_ROOT=$ROOT/hdd0
 export PS3_HDD1_ROOT=$ROOT/hdd1
 export PS3_TITLE=Folklore
 export FOLKLORE_SETTINGS=$ROOT/folklore_settings.ini
 export RSX_MSL_CACHE=$BUILD/msl_cache
+# Compiled shaders kept between runs (fewer first-use hitches), and what the
+# in-game menu (F1, Cmd+, or L3+R3) changes, saved when it closes.
+export PS3_SHADER_CACHE=${PS3_SHADER_CACHE-$BUILD/shader_cache}
+export PS3_OVERLAY_INI=${PS3_OVERLAY_INI-$ROOT/overlay.ini}
 # The switches run.ps1 sets for every run.
 export PS3_SPURS_JOBCTX_SBUF70=1
 export SPU_INTERP_UNLIFTED=1

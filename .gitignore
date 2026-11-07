@@ -48,3 +48,4 @@ __pycache__/
 /gamedisc/
 /folklore/build-mac/
 /folklore/src/recomp/.lifted_from
+/overlay.ini
