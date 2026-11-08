@@ -1622,6 +1622,16 @@ What 0006 fixes in ps3recomp to make that run:
     the previous one does not continue it. Checked on that frame: the
     arrows now stay in the middle, and all 381 letter-to-letter
     continuations of its text are kept.
+117. Experience bonus after a capture (capture-20261108-123135): the bonus
+    runs a strip of sparkles along the top-right bars (x 744-988, y 68-128
+    of 1280x720); it is one CPU-evaluated draw (e062172c, 180 vertices)
+    whose quads span most of the width, so by its centre it stayed in the
+    middle while the bars went right: the sparkles showed left of the
+    bars. And as a box (111) it pulled the bars it crossed to the middle --
+    the HUD shifting left and back. patches/0094: a CPU-evaluated draw
+    whose middle is in the bars' band (y 56-140) and whose right end is on
+    them (x 744-1210) goes right; and boxes are only panels (the plain 2D
+    program or a big mesh), never effects.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
