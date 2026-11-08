@@ -1657,6 +1657,26 @@ What 0006 fixes in ps3recomp to make that run:
     a moved-out panel now pulls text that lies wholly on it, as a centred
     one does (safe since 0094 keeps effects out of boxes). Simulated over
     all 16 captures: only the pick-up rows change.
+120. Auto-capture fills a boss's left / right bar but never finishes it
+    (run-20261108-131244: "[capture-assist] capture state 2: filling the
+    bar"). State 2 (func_00103270 in 1.10, func_00102B70 in 1.00) keeps a
+    phase at +48 of the capture controller: 0 waiting for a swing, 1 a
+    swing landed -- wait for one back the other way, 2 won -- after a
+    short wait it moves to the state at +220 (func_00100CE8). The count
+    is compared with the target only as a swing lands (0x103884), and
+    constant full-scale motion never swings back, so the full bar was
+    never noticed. engine_capture_assist.cpp: in state 2, once the count
+    is full the phase is set to 2, as the game does after the last swing,
+    and the log says "bar full, swing phase N -> won".
+    Boss capture bar in ultrawide (capture-20261108-131244, third F2): when
+    a move lands, a glow (pso a23efbba..., 360 vertices) spills past the
+    bar's frame (f082820f..., 360 vertices) by about 4:3 -- the glow is
+    left stretched while the frame is placed. Both are CPU-evaluated 3D
+    vertex programs (world and projection matrices c256-263); the capture
+    has no constants, so which check refuses the glow is not known.
+    patches/0097: a "[hud]" log line the first time each CPU-evaluated
+    scanout draw is placed or refused, with the reason (not evaluated, w
+    varies, w not positive, full width) and its extent.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
