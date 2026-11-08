@@ -213,31 +213,23 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
 
 ### macOS (Apple silicon) — early
 
-The game also builds natively for Apple-silicon Macs, drawing with Metal
-through ps3recomp's own renderer. A new game starts and plays: cutscenes,
-Doolin, the story pages. The PS3's yes/no prompts appear as a sheet on the
-window: answer with Cross/A or Circle/B, Return/Escape, or the mouse. The Mac
-build is much newer than the Windows build. Most of the
-**What's better than on the PS3** list, and the engine menu, are written for
-the Direct3D 12 renderer and are not on the Mac yet. Controllers' motion
-sensors are not read on the Mac yet, so captures complete by themselves
-(auto-capture, boss captures included). The Windows settings file is read
-from `folklore_settings.ini` beside `run_mac.sh`.
-
-You need [Homebrew](https://brew.sh) and the Xcode command-line tools
-(`xcode-select --install`). Then:
+The game also builds natively for Apple-silicon Macs, drawing with Metal. A
+new game starts and plays: cutscenes, Doolin, the story pages. Motion
+sensors are not read on the Mac yet (captures complete by themselves), and
+the engine menu and most of the **What's better than on the PS3** list are
+Direct3D 12 only. With [Homebrew](https://brew.sh) and the Xcode command-line
+tools:
 
 ```sh
 ./setup_mac.sh ~/path/to/Folklore.iso      # or the folder that contains PS3_GAME
 ./run_mac.sh
 ```
 
-`setup_mac.sh` installs `cmake ninja sdl2 glslang spirv-cross ffmpeg` with
-Homebrew. It then decrypts the EBOOT with the port's own decrypter, lifts the
-game code, and builds `folklore/build-mac/folklore`. A disc image is mounted
-read only at `gamedisc/`. Saves go to `hdd0/` and `hdd1/`, as on Windows.
-The log is `logs/run-mac.log`. Extra arguments to `run_mac.sh` are
-environment overrides, for example `./run_mac.sh PS3_AA=smaa PS3_ANISO=16`.
+Everything about the Mac build (status, the in-game menu, the variables, the
+fixes) is in [README.macOS.md](README.macOS.md)
+([Português](README.macOS.pt-BR.md)); what is missing is in
+[ROADMAP.macOS.md](ROADMAP.macOS.md). [`launcher/`](launcher/README.md) is a
+Mac app that installs, sets up and starts it without a terminal.
 
 ---
 
@@ -617,8 +609,8 @@ Point people at this repository instead.
 | `folklore/` | The port: CMake project, Folklore-specific HLE, the engine menu and settings (`src/engine`), the lifting scripts (`tools/`) and the engineering log (`docs/STATUS.md`) |
 | `folklore/src/recomp/` | Empty here; setup fills it with the game's code translated from **your** EBOOT |
 | `folklore/firmware_lle/` | Not in the repository; only made by `setup.ps1 -LibsrePrx`, from **your** libsre.prx, for comparison runs |
-| `ps3recomp/` | The recompiler and runtime: [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp) at commit `39a3629`, with everything in `patches/` already applied |
-| `patches/` | The changes this port made to ps3recomp, one patch per fix, kept as a record (and so they can go upstream) |
+| `ps3recomp/` | The recompiler and runtime: [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp) at commit `de4f090` (v0.19.0+3), with everything in `patches/` already applied |
+| `patches/` | The changes this port made to ps3recomp: one patch on `de4f090`, and the earlier one-patch-per-fix series in `v0.15-39a36296/`, kept as a record (and so they can go upstream) |
 
 Created by the scripts and ignored by git: `tools/`, `logs/`, `hdd0/`,
 `hdd1/`, `gamedata/`, `dist/`, `folklore/build/`, `ps3recomp/build/`, the
