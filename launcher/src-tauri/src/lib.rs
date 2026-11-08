@@ -574,10 +574,12 @@ fn repo_root(st: &Settings) -> Option<PathBuf> {
         let p = PathBuf::from(p);
         return is_repo(&p).then_some(p);
     }
+    // Only the places tied to this launcher are adopted by themselves. A
+    // folder the scan finds elsewhere runs its own scripts, so it is offered
+    // in the list (find_repos) and used once the player picks it (repo_dir).
     near_candidates()
         .into_iter()
         .find(|p| is_repo(p))
-        .or_else(|| scanned_candidates().into_iter().find(|p| is_repo(p)))
         .map(|p| p.canonicalize().unwrap_or(p))
 }
 
@@ -636,13 +638,10 @@ fn saved_game(repo: &Path) -> Option<String> {
     let text = fs::read_to_string(&f).ok()?;
     let line = text.lines().rev().find(|l| l.trim_start().starts_with("FOLKLORE_GAME="))?;
     let raw = line.trim_start().trim_start_matches("FOLKLORE_GAME=").trim_end();
-    if let Some(v) = zsh_unquote(raw) {
-        return Some(v);
-    }
-    // a form only zsh reads: let zsh read the file
-    let out = Command::new("/bin/zsh").args(["-fc", "source \"$1\"; print -r -- \"$FOLKLORE_GAME\"", "zsh"]).arg(&f).stdin(Stdio::null()).stderr(Stdio::null()).output().ok()?;
-    let v = String::from_utf8_lossy(&out.stdout).trim_end_matches('\n').to_string();
-    (!v.is_empty()).then_some(v)
+    // Read as text only, never run: a form this parser does not know
+    // (zsh's $'...') is treated as no game saved, and the player picks the
+    // disc again.
+    zsh_unquote(raw)
 }
 
 /// The folder holding PS3_GAME: a dumped folder as it is, or the image
