@@ -1645,6 +1645,18 @@ What 0006 fixes in ps3recomp to make that run:
     run where the engine menu had not been opened -- the timer's rate was
     only read when the menu was first drawn. engine_menu.cpp reads it on
     the first frame now.
+119. Item pick-up box torn apart (capture-20261108-131244, "Warcadia
+    picture book, pg. 1"): the box is drawn right to left -- icon
+    1128-1192, end 1096-1128, middle 759-1096, left end 727-759 (x of
+    1280, y 600-664) -- each piece touching the one before, and 0093's
+    "a line runs left to right" stopped the middle and left end following
+    the icon: they and the text over them stayed in the middle while the
+    icon and the box's right end went right. patches/0096: a piece that
+    ends exactly where the previous one starts still continues it (the
+    player-select arrows end 8 pixels short of Keats, so 116 holds); and
+    a moved-out panel now pulls text that lies wholly on it, as a centred
+    one does (safe since 0094 keeps effects out of boxes). Simulated over
+    all 16 captures: only the pick-up rows change.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
