@@ -19,7 +19,21 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-### New in v0.6: save slots
+### New in v0.62: smoother play and a tidier ultrawide HUD
+
+- **No more quarter-second freezes in fights**: a hold-up between the game
+  and the renderer, every few seconds in heavy combat, is gone.
+- **Clean fade-in after Load Game**: no more half-drawn frames (a black
+  screen with only the HUD, flickering pieces) while the new area's shaders
+  are built; the loading screen stays up until the area is ready.
+- **Ultrawide HUD**: speech bubbles keep the game's proportions beside the
+  character speaking; place names, the item pick-up box and the boss capture
+  bar stay in one piece; the Search prompt, the player-select arrows and the
+  capture bonus sparkles stay where they belong.
+- **Auto-capture** now finishes the boss captures where you swing the
+  controller left and right.
+
+### v0.6: save slots
 
 The launcher's new **Saves** page lets you keep as many saves as you like and
 choose which one the game plays before you press Play. Each slot shows the
