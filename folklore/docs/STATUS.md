@@ -1677,6 +1677,15 @@ What 0006 fixes in ps3recomp to make that run:
     patches/0097: a "[hud]" log line the first time each CPU-evaluated
     scanout draw is placed or refused, with the reason (not evaluated, w
     varies, w not positive, full width) and its extent.
+121. The boss capture bar, found (run-20261108-134234, with 0097's log;
+    auto-capture finished that boss, so 120 works): the bar's two meshes
+    (360 vertices each) are placed most of the time, but in the intro
+    animation and on each hit they grow to x 23-1277 of 1280 (soft
+    transparent edges far wider than what shows) and were then taken for a
+    full-screen pass and left stretched, so the bar jumped between the
+    two widths. patches/0098: a CPU-evaluated draw less than a quarter of
+    the screen high is never "full width". Every other full-width
+    CPU-evaluated draw in that run is at least half the screen high.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

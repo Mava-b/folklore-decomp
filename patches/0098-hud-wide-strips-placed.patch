@@ -1,0 +1,22 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8795,8 +8795,16 @@
+             highestY = screenY;
+         }
+     }
+-    /* Clip space runs -1..1: a draw 95% of the width or more is full-screen. */
+-    if (!(highestX - lowestX < 1.9f))
++    /* Clip space runs -1..1: a draw 95% of the width or more is full-screen.
++     * Not a CPU-evaluated strip less than a quarter of the height, though:
++     * the boss capture bar's glow and frame (360-vertex meshes, soft edges
++     * far wider than what shows) grow to x 23-1277 of 1280 in their intro
++     * and on each hit (run-20261108-134234), so in those frames they were
++     * left stretched and in the others placed -- the bar jumped in width.
++     * Every genuinely full-screen CPU-evaluated draw in that run is at
++     * least half the screen high. */
++    const int cpuStrip = !useRows && highestY - lowestY < 0.5f;
++    if (!(highestX - lowestX < 1.9f) && !cpuStrip)
+     {
+         if (!useRows)
+         {
