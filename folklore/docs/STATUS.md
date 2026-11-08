@@ -1734,6 +1734,11 @@ What 0006 fixes in ps3recomp to make that run:
     slowed every frame to 300-800 ms, so there they finished in 6 held
     frames. patches/0102: held for up to a second instead, and a log line
     when the limit shows an incomplete frame.
+    Confirmed (run-20261108-151126, about 27,000 frames with fights and
+    loads): no ring back-pressure stalls, no incomplete frame let through,
+    and the player saw no glitch after Load Game. The hitches left are the
+    area loads (one frame uploading 56-89 MB of textures, 110-220 ms,
+    right after the game's own 100 ms load pause) and the boot.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
