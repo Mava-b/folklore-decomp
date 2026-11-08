@@ -1715,6 +1715,25 @@ What 0006 fixes in ps3recomp to make that run:
       does not publish put. patches/0100: the report now also gives both
       lap counts, put, the word the drain stands on, the room asked and
       the soft end offered (32 reports), to fix it from the next run.
+124. Fight hitches, found (run-20261108-145159, with 0100's report):
+    "guest lap 6725, drain lap 6724; put 0x00002BE8 (ea 0x44902BE8); word
+    at the drain 0x20000000" -- the drain had caught up with put, which
+    stood on the wrap's JUMP back to the ring's start; the guest was at the
+    start asking for room. The drain takes that JUMP only once put moves
+    past it, and the guest waited for the drain: 150 ms each. The fix for
+    run-20261102-182600 publishes put before waiting, but not at the
+    ring's start (a drain also at the start would read put == get as
+    nothing to do). patches/0101: at the start too, unless the drain is
+    there -- put at the start takes the drain through its JUMP.
+125. Glitchy screen after "Load Game" (capture-20261108-145159): the first
+    frames of the loaded area draw with ~190 pipelines still building in
+    the background (drop_pso: all 46 scanout draws in frame 714, the
+    scene's composite in 717 -- black with only the HUD). Such frames are
+    held back (the last whole frame stays up), but for at most 20 frames,
+    a third of a second at 60 fps, less than the builds take; the capture
+    slowed every frame to 300-800 ms, so there they finished in 6 held
+    frames. patches/0102: held for up to a second instead, and a log line
+    when the limit shows an incomplete frame.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

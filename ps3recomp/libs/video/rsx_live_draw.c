@@ -15546,28 +15546,52 @@ void rsx_live_draw_present(u32 buffer_id)
      * shaders in its first frames, and showing those frames put pieces of
      * the scene, the HUD without its picture and stale images on screen
      * for a moment (capture-20261102-183530: 11-32 draws a frame left out
-     * as the save faded in). At most 20 frames in a row are held back, so
-     * a long compile cannot freeze the picture. LD_HOLD_INCOMPLETE=0 shows
-     * every frame as before. */
+     * as the save faded in). Frames are held back for at most a second in
+     * a row, so a long compile cannot freeze the picture. That limit was 20
+     * frames, a third of a second at 60 fps, and loading a save builds
+     * about 190 pipelines (run-20261108-145159, "Load Game"): the cap ran
+     * out first and the half-built frames showed -- the glitchy screen
+     * after Load Game. (A capture slows each frame to 300-800 ms, so the
+     * builds finished within 6 held frames there.) A line in the log says
+     * when the limit lets an incomplete frame through.
+     * LD_HOLD_INCOMPLETE=0 shows every frame as before. */
     int holdFrame = 0;
     {
         static int holdEnabled = -1;
         static LONG skippedAtLastPresent = 0;
         static u32 framesHeld = 0;
         static u32 framesShown = 0;
+        static ULONGLONG holdStartMs = 0;
+        static u32 holdGiveUpLogs = 0;
+        const ULONGLONG holdLimitMs = 1000u;
         if (holdEnabled < 0)
         {
             const char* text = getenv("LD_HOLD_INCOMPLETE");
             holdEnabled = (text && *text == '0') ? 0 : 1;
         }
         const LONG skippedNow = InterlockedCompareExchange(&g_ld_pso_draws_skipped, 0, 0);
-        if (holdEnabled && skippedNow != skippedAtLastPresent && framesShown > 0 && framesHeld < 20u)
+        const int incomplete = skippedNow != skippedAtLastPresent;
+        const ULONGLONG nowMs = GetTickCount64();
+        if (holdEnabled && incomplete && framesShown > 0 && (framesHeld == 0 || nowMs - holdStartMs < holdLimitMs))
         {
+            if (framesHeld == 0)
+            {
+                holdStartMs = nowMs;
+            }
             holdFrame = 1;
             framesHeld++;
         }
         else
         {
+            if (holdEnabled && incomplete && framesHeld > 0 && holdGiveUpLogs < 16u)
+            {
+                holdGiveUpLogs++;
+                fprintf(stderr,
+                        "[live-draw] frame %u shown with %ld draws still waiting for shaders, after holding %u "
+                        "frames (%llu ms)\n",
+                        g_ld_frames, (long)(skippedNow - skippedAtLastPresent), framesHeld,
+                        (unsigned long long)(nowMs - holdStartMs));
+            }
             framesHeld = 0;
             framesShown++;
         }
