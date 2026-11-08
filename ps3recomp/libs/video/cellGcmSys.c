@@ -3077,11 +3077,23 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
         if (waitedMs >= GCM_RING_WAIT_CAP_MS || drainStuck)
         {
             static int reports = 0;
-            if (reports < 8)
+            if (reports < 32)
             {
                 reports++;
                 fprintf(stderr, "[gcm] ring back-pressure: drain still at 0x%08X, %u bytes past the guest at 0x%08X, after %d ms; letting the guest go\n",
                         drainedEa, drainedEa - current, current, waitedMs);
+                /* What held it (the combat hitches of run-20261108-140721:
+                 * the guest always at the ring's start, the drain a few KB
+                 * in, 260 ms a time): the laps each side counts, the put
+                 * the drain sees, the word the drain stands on, the room the
+                 * guest asked for and the soft end it was offered. */
+                const u32 putOffset = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+                const u32 drainWord = drainedEa >= s_ring_begin && drainedEa < s_ring_end ? vm_read32(drainedEa) : 0u;
+                fprintf(stderr, "[gcm]   guest lap %u, drain lap %u; put 0x%08X (ea 0x%08X); word at the drain 0x%08X; "
+                        "asked %u bytes, soft end 0x%08X; ring 0x%08X-0x%08X; drain passes while still %u\n",
+                        (unsigned)s_ring_guest_lap, (unsigned)s_ring_drain_lap, putOffset, gcm_io2ea(putOffset),
+                        drainWord, requiredBytes, gcm_ring_soft_end(current), s_ring_begin, s_ring_end,
+                        (unsigned)(s_drain_passes - passesWhileStill));
             }
             vm_write32(ctx + 0x4, s_ring_end);
             if (waitBegin)

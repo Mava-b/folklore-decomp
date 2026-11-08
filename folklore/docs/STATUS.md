@@ -1697,6 +1697,24 @@ What 0006 fixes in ps3recomp to make that run:
     scissor the same way. patches/0099: a draw's extent is cut to its
     scissor when that is a real clip (under 95% of the surface wide), so
     placement goes by what shows; the fills land in the zones they did.
+123. Hitches in run-20261108-140721 (70 [hitch] lines):
+    - Frames 21779-21815: the F2 capture itself.
+    - Area loads (frames 475, 1861, 5331, 7498, 10228, 11564; each after a
+      100 ms usleep frame): 93-184 ms, the renderer uploading 56-90 MB of
+      textures in one frame (the texture pack's large ones among them).
+    - Frame 794: 241 ms building pipelines (231 ms; 32 draws waiting) on
+      a first visit; the shader cache keeps them for later runs.
+    - Frames 2123-2356, in a fight: 13 hitches of ~260 ms with "ring held
+      ~238 ms" and "[gcm] ring back-pressure: drain still at 0x449xxxxx,
+      N KB past the guest at 0x44900000 (the ring's start), after 151 ms;
+      letting the guest go". The ring is 2044 KB and a fight frame reaches
+      1835 KB, so the guest wraps about once a frame; just after a wrap it
+      waits for room while the drain stands a few KB into the ring, until
+      the 150 ms stall check lets it go. Same shape as the deadlock fixed
+      for run-20261102-182600, but at the ring's start, where that fix
+      does not publish put. patches/0100: the report now also gives both
+      lap counts, put, the word the drain stands on, the room asked and
+      the soft end offered (32 reports), to fix it from the next run.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
