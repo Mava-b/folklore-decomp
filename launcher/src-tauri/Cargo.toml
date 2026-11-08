@@ -1,0 +1,45 @@
+[package]
+name = "folklore-launcher"
+version = "0.1.0"
+description = "Launcher for the Folklore static-recompilation port on macOS: install from your own disc, settings, play"
+license = "MIT"
+edition = "2021"
+publish = false
+
+[lib]
+name = "folklore_launcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# the saves manager's and the log archive's .zip files (both already in the
+# tree through tauri)
+flate2 = "1"
+crc32fast = "1"
+# the Dock icon and the Steam art drawn from the player's disc (app_icon.rs,
+# steam_art.rs): PNG in and out, already in the tree through tauri (muda)
+png = "0.18"
+# the build-feature scan (lib.rs build_features): substring search in the
+# game's executable, already in the tree through tauri
+memchr = "2"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NSApplication/NSWorkspace for the Dock and Finder icons (the versions and
+# most features tauri itself uses)
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString"] }
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder", "NSWorkspace"] }
+
+# Build scripts and proc macros keep their debug info in release builds.
+# Without it, on the development Mac (macOS 27, ld-27037, Rust 1.94) the
+# proc-macro dylibs of a `tauri build` (which sets MACOSX_DEPLOYMENT_TARGET
+# from bundle.macOS.minimumSystemVersion) were refused by dyld ("mis-aligned
+# LINKEDIT string pool") and the build failed. The app itself is unchanged.
+[profile.release.build-override]
+debug = true

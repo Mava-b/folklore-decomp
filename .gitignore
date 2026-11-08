@@ -49,3 +49,9 @@ __pycache__/
 /folklore/build-mac/
 /folklore/src/recomp/.lifted_from
 /overlay.ini
+
+# The launcher (launcher/): npm, Vite and Cargo output.
+/launcher/node_modules/
+/launcher/dist/
+/launcher/src-tauri/target/
+/launcher/src-tauri/gen/
