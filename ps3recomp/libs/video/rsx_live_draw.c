@@ -8898,12 +8898,17 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
     const int continuesLine = !bigMesh && previous->frame == g_ld_frames && previous->target == target &&
                               previous->key == g_ld_current_pso.key && top < previous->bottom &&
                               bottom > previous->top && left <= previous->right + 0.04f &&
-                              right >= previous->left - 0.04f && left >= previous->left - 0.002f;
+                              right >= previous->left - 0.04f &&
+                              (left >= previous->left - 0.002f || fabsf(right - previous->left) <= 0.002f);
     /* A line runs left to right, so a piece starting left of the previous
      * one does not continue it: on player select (capture-20261107-173348)
      * the arrows between the names (600-632 and 648-680 of 1280) come right
      * after "Keats" (688-816) in the same program and were carried right
-     * with it. */
+     * with it. Unless it ends exactly where the previous one starts: the
+     * pick-up box's pieces, drawn right to left and each touching the one
+     * before (capture-20261108-131244: icon 1128-1192, end 1096-1128,
+     * middle 759-1096, left end 727-759), stay together -- the arrows end
+     * 8 pixels short of Keats. */
     if (g_ld_hud_boxes.frame != g_ld_frames || g_ld_hud_boxes.target != target)
     {
         g_ld_hud_boxes.frame = g_ld_frames;
@@ -8920,8 +8925,15 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
          * and a moved-out effect drawn near world-placed text (the "Search"
          * prompt over Ellen, capture-20261107-122656) dragged that text to
          * the edge whenever the camera turned it past the middle. */
-        if (g_ld_hud_boxes.places[boxIndex] == LD_HUD_CENTRE && middleY >= box[2] && middleY <= box[3] &&
-            left <= box[1] + LD_HUD_BOX_MARGIN && right >= box[0] - LD_HUD_BOX_MARGIN &&
+        /* Since 0094 boxes are only panels, never effects, so a moved-out
+         * panel pulls text too -- but only text wholly on it (no margin):
+         * the pick-up box went right while its text ("Warcadia picture book,
+         * pg. 1", x 759-1097, starting on the box's middle piece, centred at
+         * x 927) stayed in the middle (capture-20261108-131244). */
+        const int boxCentred = g_ld_hud_boxes.places[boxIndex] == LD_HUD_CENTRE;
+        const float margin = boxCentred ? LD_HUD_BOX_MARGIN : 0.002f;
+        if (middleY >= box[2] && middleY <= box[3] && left <= box[1] + margin && right >= box[0] - margin &&
+            (boxCentred || (left >= box[0] - margin && right <= box[1] + margin)) &&
             (right - left) * 2.0f <= boxWidth)
         {
             overBox = (int)boxIndex;
