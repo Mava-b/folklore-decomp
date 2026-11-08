@@ -1686,6 +1686,17 @@ What 0006 fixes in ps3recomp to make that run:
     two widths. patches/0098: a CPU-evaluated draw less than a quarter of
     the screen high is never "full width". Every other full-width
     CPU-evaluated draw in that run is at least half the screen high.
+122. Boss capture bar, the hard-edged block past its ends on a successful
+    input (capture-20261108-140721): not the bar's meshes (0098 placed
+    them) but its flash, an effect quad (draw 246, 6 vertices) that zooms
+    out past the screen's edges and is clipped to the bar by its scissor
+    (x 512-766, y 570-594 of 1280x720). Judged by the quad it was a
+    full-screen pass, so it was left stretched and its scissor not
+    shrunk: the block was exactly x 512-766, 4:3 wider than the placed
+    bar. The bar's fills and the gauges' fills are quads cut down by a
+    scissor the same way. patches/0099: a draw's extent is cut to its
+    scissor when that is a real clip (under 95% of the surface wide), so
+    placement goes by what shows; the fills land in the zones they did.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
