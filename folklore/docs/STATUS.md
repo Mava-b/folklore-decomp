@@ -1632,6 +1632,19 @@ What 0006 fixes in ps3recomp to make that run:
     whose middle is in the bars' band (y 56-140) and whose right end is on
     them (x 744-1210) goes right; and boxes are only panels (the plain 2D
     program or a big mesh), never effects.
+118. Capture bonus, second capture (capture-20261108-125702): in one frame
+    the gauges' Id icons, spirit bar and "Exp x1.0" went to the middle.
+    The bonus's sparkle cloud is one draw of particle quads (e062172c,
+    1920 vertices; 1272 a frame later): 0088 let draws up to 4096
+    vertices into placement and 0091 made those a "big mesh" -- centred,
+    and a box (111) that pulled what was drawn over it to the middle.
+    The place-name bubble that 0088 was for is triangles (1050, prim 5);
+    patches/0095: over 1024 vertices only triangles are placed, a cloud of
+    quads (prim 8) is left stretched as before 0088.
+    Also: F2 capture never ended (and the game crawled until killed) in a
+    run where the engine menu had not been opened -- the timer's rate was
+    only read when the menu was first drawn. engine_menu.cpp reads it on
+    the first frame now.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

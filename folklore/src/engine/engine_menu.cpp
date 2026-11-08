@@ -1479,6 +1479,15 @@ namespace
                      unsigned format, uint32_t width, uint32_t height)
     {
         (void)rtv;
+        /* The timer's rate, before anything uses it: it used to be set only
+         * when the menu was first drawn, so an F2 capture in a run where the
+         * menu had not been opened never reached its four seconds -- the
+         * capture ran on and the game crawled until it was killed. */
+        if (!menu.frequency.QuadPart)
+        {
+            QueryPerformanceFrequency(&menu.frequency);
+            QueryPerformanceCounter(&menu.lastFrame);
+        }
         if (menu.failed)
         {
             return;
