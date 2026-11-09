@@ -8,6 +8,7 @@
 #include "engine_settings.h"
 #include "engine_region.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #define WIN32_LEAN_AND_MEAN
@@ -323,6 +324,23 @@ void engineSettingsLoad()
             const int percent = std::atoi(value);
             settingsInstance.sharpening = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
         }
+        else if (std::strcmp(key, "hdr") == 0)
+        {
+            settingsInstance.hdr = parseBool(value);
+        }
+        else if (std::strcmp(key, "hdr_peak_nits") == 0)
+        {
+            settingsInstance.hdrPeakNits = std::clamp(std::atoi(value), kHdrPeakMinimum, kHdrPeakMaximum);
+        }
+        else if (std::strcmp(key, "hdr_paper_white_nits") == 0)
+        {
+            settingsInstance.hdrPaperWhiteNits =
+                std::clamp(std::atoi(value), kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
+        }
+        else if (std::strcmp(key, "hdr_highlights") == 0)
+        {
+            settingsInstance.hdrHighlights = std::clamp(std::atoi(value), 0, 100);
+        }
         else if (std::strcmp(key, "aspect_ratio") == 0)
         {
             if (std::strcmp(value, "display") == 0)
@@ -446,6 +464,12 @@ void engineSettingsSave()
                  : current.textureDetail == EngineSettings::TextureDetail::Sharpest ? "sharpest"
                                                                                     : "sharper");
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
+    std::fprintf(file, "# HDR output (an HDR display with Windows' HDR on): peak and paper white in nits,\n");
+    std::fprintf(file, "# highlights 0-100 %% of the way to the peak\n");
+    std::fprintf(file, "hdr = %d\n", current.hdr ? 1 : 0);
+    std::fprintf(file, "hdr_peak_nits = %d\n", current.hdrPeakNits);
+    std::fprintf(file, "hdr_paper_white_nits = %d\n", current.hdrPaperWhiteNits);
+    std::fprintf(file, "hdr_highlights = %d\n", current.hdrHighlights);
     std::fprintf(file, "# Replacement textures (next start); folder empty = textures\\replace next to this file\n");
     std::fprintf(file, "texture_pack = %d\n", current.texturePack ? 1 : 0);
     std::fprintf(file, "texture_pack_dir = %s\n", current.texturePackDir.c_str());
@@ -510,6 +534,7 @@ extern "C"
     void rsx_live_draw_set_shadow_softness(int level);
     void rsx_live_draw_set_repeat_draws(int enabled);
     void rsx_live_draw_set_sharpening(uint32_t percent);
+    void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent);
     void rsx_live_draw_set_texture_pack(const char* folder);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
@@ -564,6 +589,8 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_hud_edge(current.hudEdge);
     rsx_live_draw_set_shadow_softness((int)current.shadows);
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
+    rsx_live_draw_set_hdr(current.hdr ? 1 : 0, (uint32_t)current.hdrPeakNits, (uint32_t)current.hdrPaperWhiteNits,
+                          (uint32_t)current.hdrHighlights);
     engineDepthOfFieldApply();
     engineBloomApply();
     engineIdSoulsApply();

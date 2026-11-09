@@ -148,6 +148,15 @@ void rsx_live_draw_set_async_shaders(int enabled);
  * sharpening of the presented game image (live; movies are not sharpened). */
 void rsx_live_draw_set_anisotropy(u32 level);
 void rsx_live_draw_set_sharpening(u32 percent);
+/* HDR output: when enabled, frames go to the window as HDR (scRGB): the
+ * game's picture at paper white, its highlights stretched towards the peak
+ * (highlightPercent of the way, 0-100), the HUD and the engine overlay left
+ * at paper white. Live; the window must be on a display with Windows' HDR
+ * on to look right. _get_hdr_status: -1 not known yet, else bit 0 = the
+ * window's display has HDR on, bit 1 = frames are going out as HDR;
+ * displayPeakNits gets the peak the display reports (0 if unknown). */
+void rsx_live_draw_set_hdr(int enabled, u32 peakNits, u32 paperWhiteNits, u32 highlightPercent);
+int rsx_live_draw_get_hdr_status(u32* displayPeakNits);
 /* Texture detail: a mip bias in hundredths of a level, 0 (the game's
  * choice) down to -200, for the same textures as anisotropic filtering
  * (live, like it). Negative picks finer mip levels: sharper surfaces in the

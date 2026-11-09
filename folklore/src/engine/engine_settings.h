@@ -46,6 +46,13 @@ enum class GameLanguage : int
     Italian = 5,
 };
 
+/* HDR output's ranges (EngineSettings::hdr*), shared by the engine menu and
+ * the launcher. */
+constexpr int kHdrPeakMinimum = 400;
+constexpr int kHdrPeakMaximum = 4000;
+constexpr int kHdrPaperWhiteMinimum = 80;
+constexpr int kHdrPaperWhiteMaximum = 400;
+
 struct EngineSettings
 {
     FrameRateCap frameRateCap = FrameRateCap::Original;
@@ -72,6 +79,15 @@ struct EngineSettings
      * contrast-adaptive sharpening of the final image. Both apply at once. */
     int anisotropy = 16;
     int sharpening = 0;
+    /* HDR output, for an HDR display with Windows' HDR on: the picture at
+     * paper white (nits), the 3D scene's highlights stretched towards the
+     * peak (nits) by hdrHighlights % of the way; the HUD and menus stay at
+     * paper white. The game draws in 8-bit, so this expands its finished
+     * picture rather than unlocking a hidden one. Applies at once. */
+    bool hdr = false;
+    int hdrPeakNits = 1000;
+    int hdrPaperWhiteNits = 200;
+    int hdrHighlights = 50;
     /* Texture detail: the game's mip levels, or a finer level chosen
      * (mip bias -0.5 / -1.0) so surfaces keep their detail further away.
      * Applies at once. */

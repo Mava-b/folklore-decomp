@@ -58,6 +58,7 @@ extern "C"
     int rsx_null_backend_is_fullscreen(void);
     void rsx_null_backend_set_fullscreen(int enabled);
     void rsx_live_draw_get_shader_stats(uint32_t* pending, uint32_t* built, uint32_t* skippedDraws);
+    int rsx_live_draw_get_hdr_status(uint32_t* displayPeakNits);
     extern volatile int g_cellpad_block_guest_input;
     /* A controller read over HID (cellPad.c): a DualShock 3 or 4, DualSense
      * or Switch Pro. Buttons in CELL_PAD packing. */
@@ -1071,6 +1072,54 @@ namespace
         return false;
     }
 
+    /* HDR output: on or off, and its three levels. Under them, whether the
+     * game's display has Windows' HDR on (the renderer checks every second
+     * or so), since without it the picture looks washed out. */
+    bool drawHdr()
+    {
+        EngineSettings& settings = engineSettings();
+        bool changed = false;
+        ImGui::TextUnformatted("HDR");
+        changed |= ImGui::Checkbox("HDR output (brighter highlights on an HDR display)", &settings.hdr);
+        uint32_t displayPeak = 0;
+        const int status = rsx_live_draw_get_hdr_status(&displayPeak);
+        const bool displayHdr = status >= 0 && (status & 1) != 0;
+        if (settings.hdr)
+        {
+            const float sliderWidth = ImGui::GetFontSize() * 18.0f;
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Peak brightness##hdr", &settings.hdrPeakNits, kHdrPeakMinimum,
+                                        kHdrPeakMaximum, "%d nits");
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Paper white (HUD, menus, mid-tones)##hdr", &settings.hdrPaperWhiteNits,
+                                        kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum, "%d nits");
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Highlights##hdr", &settings.hdrHighlights, 0, 100, "%d%%");
+            if (status >= 0 && !displayHdr)
+            {
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                   "Windows' HDR is off for this display: turn on Use HDR in Windows'");
+                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                                   "Settings > System > Display, or the picture looks washed out.");
+            }
+            else if (displayHdr && displayPeak > 0)
+            {
+                ImGui::TextDisabled("This display reports a peak of %u nits; set Peak brightness near it.",
+                                    displayPeak);
+            }
+            else
+            {
+                ImGui::TextDisabled("Peak brightness: your display's. Highlights: how far towards it the bright");
+                ImGui::TextDisabled("parts of the scene go (0%% = plain SDR at paper white).");
+            }
+        }
+        else if (displayHdr)
+        {
+            ImGui::TextDisabled("This display has Windows' HDR on.");
+        }
+        return changed;
+    }
+
     /* Render resolution, anti-aliasing and shader building. The resolution
      * is fixed when the renderer starts, so a new one shows on the next
      * launch; the others change at once. */
@@ -1203,6 +1252,7 @@ namespace
         changed |= radioSharpening("Medium", 60);
         ImGui::SameLine();
         changed |= radioSharpening("High", 100);
+        changed |= drawHdr();
         ImGui::TextUnformatted("Depth of field");
         {
             int depthOfFieldIndex = (int)settings.depthOfField;

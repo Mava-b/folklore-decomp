@@ -124,7 +124,7 @@ static volatile long g_ld_ps1_vram_ready = 0;
 #include <initguid.h>
 #include <d3d12.h>
 #include <d3d12sdklayers.h>
-#include <dxgi1_4.h>
+#include <dxgi1_6.h>
 #include <d3dcompiler.h>
 #include "rsx_smaa_data.h"
 /* stb_image's inflate (libs/codec/cellPngDec.c owns the implementation). */
@@ -205,7 +205,12 @@ extern volatile unsigned long long g_yz_auto_start_tick;
 /* Soft shadows: the stencil shadow mask and its blur (ld_soft_shadow_draw). */
 #define SRV_SHADOW_MASK0  (SRV_CPU_HEAP_SLOTS + 6)
 #define SRV_SHADOW_MASK1  (SRV_CPU_HEAP_SLOTS + 7)
-#define SRV_CPU_HEAP_TOTAL (SRV_CPU_HEAP_SLOTS + 8)
+/* HDR output: the composite, its copy before the overlay, and the game
+ * image before its first HUD draw (ld_hdr_compose). */
+#define SRV_HDR_COMPOSITE (SRV_CPU_HEAP_SLOTS + 8)
+#define SRV_HDR_BEFORE_OVERLAY (SRV_CPU_HEAP_SLOTS + 9)
+#define SRV_HDR_SNAPSHOT  (SRV_CPU_HEAP_SLOTS + 10)
+#define SRV_CPU_HEAP_TOTAL (SRV_CPU_HEAP_SLOTS + 11)
 #define SRV_TABLE_SIZE   16
 /* Both banks together; each frame gets SRV_BANK_TABLES. */
 #define SRV_RING_TABLES  8192
@@ -481,6 +486,23 @@ typedef struct {
     ID3D12PipelineState*       present_pso[3];   /* scale, FXAA, box downsample */
     ID3D12Resource*            present_movie;    /* host movie frame, SRV_PRESENT_MOVIE */
     u32                        present_movie_w, present_movie_h;
+    /* HDR output (ld_hdr_*): the back buffer's format, the final pass, the
+     * 8-bit composite the present pass and the overlay draw into (and its
+     * copy before the overlay), and the game image before its first HUD
+     * draw. */
+    DXGI_FORMAT                bb_fmt;
+    int                        hdr_state;        /* 0 not tried, 1 ready, -1 unavailable */
+    ID3D12RootSignature*       hdr_rootsig;
+    ID3D12PipelineState*       hdr_pso;
+    ID3D12Resource*            hdr_images[2];    /* composite, before the overlay (COMMON at rest) */
+    u32                        hdr_w, hdr_h;
+    ID3D12Resource*            hdr_snapshot;
+    D3D12_RESOURCE_STATES      hdr_snapshot_state;
+    u32                        hdr_snapshot_w, hdr_snapshot_h;
+    DXGI_FORMAT                hdr_snapshot_fmt;
+    u32                        hdr_snapshot_target;
+    int                        hdr_snapshot_valid;
+    u32                        hdr_status_countdown;
     /* SMAA 1x before the present pass (ld_smaa_run). */
     int                        smaa_state;       /* 0 not tried, 1 ready, -1 unavailable */
     ID3D12RootSignature*       smaa_rootsig;
@@ -530,6 +552,16 @@ static u32 s_ld_sampler_anisotropy = 1;         /* what the cached samplers were
 static volatile LONG g_ld_texture_lod_bias = 0;  /* requested mip bias in hundredths (0 = the game's choice) */
 static LONG s_ld_sampler_lod_bias = 0;           /* what the cached samplers were built with (render thread) */
 static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
+/* HDR output (rsx_live_draw_set_hdr): off by default. Peak and paper white
+ * in nits; highlights 0-100 % of the way to the peak. */
+static volatile LONG g_ld_hdr_enabled = 0;
+static volatile LONG g_ld_hdr_peak_nits = 1000;
+static volatile LONG g_ld_hdr_paper_white_nits = 200;
+static volatile LONG g_ld_hdr_highlight_percent = 50;
+static volatile LONG g_ld_hdr_display = -1;      /* the window's display: -1 unknown, 0 SDR, 1 HDR on */
+static volatile LONG g_ld_hdr_display_peak = 0;  /* the peak it reports, in nits (0 unknown) */
+static volatile LONG g_ld_hdr_output = 0;        /* 1 while frames go out as HDR */
+static int g_ld_hdr_frame_active = 0;            /* render thread: this frame is HDR */
 static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 1 centred 16:9, 2 edges */
 static volatile LONG g_ld_hud_edge = 100;        /* edges: how far out, 0 (centred) - 100 (screen edge) % */
 static volatile LONG g_ld_shadow_softness = 0;   /* stencil shadow edges: 0 the game's, 1 soft, 2 softer */
@@ -2579,6 +2611,50 @@ void rsx_live_draw_set_hud_edge(int percent)
 void rsx_live_draw_set_sharpening(u32 percent)
 {
     InterlockedExchange(&g_ld_sharpen_percent, (LONG)(percent > 100u ? 100u : percent));
+}
+
+void rsx_live_draw_set_hdr(int enabled, u32 peakNits, u32 paperWhiteNits, u32 highlightPercent)
+{
+    if (peakNits < 400u)
+    {
+        peakNits = 400u;
+    }
+    if (peakNits > 10000u)
+    {
+        peakNits = 10000u;
+    }
+    if (paperWhiteNits < 80u)
+    {
+        paperWhiteNits = 80u;
+    }
+    if (paperWhiteNits > 500u)
+    {
+        paperWhiteNits = 500u;
+    }
+    if (highlightPercent > 100u)
+    {
+        highlightPercent = 100u;
+    }
+    InterlockedExchange(&g_ld_hdr_peak_nits, (LONG)peakNits);
+    InterlockedExchange(&g_ld_hdr_paper_white_nits, (LONG)paperWhiteNits);
+    InterlockedExchange(&g_ld_hdr_highlight_percent, (LONG)highlightPercent);
+    InterlockedExchange(&g_ld_hdr_enabled, enabled ? 1 : 0);
+}
+
+int rsx_live_draw_get_hdr_status(u32* displayPeakNits)
+{
+    if (displayPeakNits)
+    {
+        const LONG peak = InterlockedCompareExchange(&g_ld_hdr_display_peak, 0, 0);
+        *displayPeakNits = peak > 0 ? (u32)peak : 0u;
+    }
+    const LONG display = InterlockedCompareExchange(&g_ld_hdr_display, 0, 0);
+    const LONG output = InterlockedCompareExchange(&g_ld_hdr_output, 0, 0);
+    if (display < 0)
+    {
+        return -1;
+    }
+    return (display ? 1 : 0) | (output ? 2 : 0);
 }
 
 void rsx_live_draw_get_shader_stats(u32* pending, u32* built, u32* skippedDraws)
@@ -8630,15 +8706,25 @@ static void ld_hud_note(const char* outcome, u32 vertexCount, float left, float 
     fflush(stderr);
 }
 
-static int ld_hud_draw_place(const surface_t* surface, u32 target, const float viewportTransform[8])
+/* Whether the HUD is being moved at all: an ultrawide picture with a
+ * layout other than stretched. */
+static int ld_hud_placing(const surface_t* surface)
 {
     const LONG layout = InterlockedCompareExchange(&g_ld_hud_layout, 0, 0);
-    if (layout == 0)
-    {
-        return 0;
-    }
     const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
-    if (!(surface->scale_x > verticalScale * 1.01f))
+    return layout != 0 && surface->scale_x > verticalScale * 1.01f;
+}
+
+static void ld_hdr_scene_snapshot(u32 target);
+
+/* Decides where a 2D overlay draw goes (ld_hud_draw_place). With HDR output
+ * on it also runs when nothing is moved (16:9, or the stretched layout), to
+ * find the first overlay draw of the frame: the HDR pass leaves what the
+ * overlay draws at paper white. */
+static int ld_hud_draw_place_decide(const surface_t* surface, u32 target, const float viewportTransform[8])
+{
+    const LONG layout = InterlockedCompareExchange(&g_ld_hud_layout, 0, 0);
+    if (!ld_hud_placing(surface) && !g_ld_hdr_frame_active)
     {
         return 0;
     }
@@ -9132,6 +9218,16 @@ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float v
         return LD_HUD_ANCHORED;
     }
     return place;
+}
+
+static int ld_hud_draw_place(const surface_t* surface, u32 target, const float viewportTransform[8])
+{
+    const int place = ld_hud_draw_place_decide(surface, target, viewportTransform);
+    if (place != 0 && g_ld_hdr_frame_active)
+    {
+        ld_hdr_scene_snapshot(target);
+    }
+    return ld_hud_placing(surface) ? place : 0;
 }
 
 /* primitive ids = raw NV4097 VERTEX_BEGIN_END arg (rsx_dispatch stores it raw;
@@ -12940,7 +13036,7 @@ static void ld_sync_swapchain_size(void)
         }
     }
     const HRESULT resizeResult = g.swap->lpVtbl->ResizeBuffers(
-        g.swap, LD_SWAP_BUFFERS, clientWidth, clientHeight, DXGI_FORMAT_R8G8B8A8_UNORM, 0);
+        g.swap, LD_SWAP_BUFFERS, clientWidth, clientHeight, g.bb_fmt, 0);
     if (SUCCEEDED(resizeResult))
     {
         g.bb_w = clientWidth;
@@ -13872,6 +13968,29 @@ static int ld_soft_shadow_draw(const surface_t* surface, D3D12_CPU_DESCRIPTOR_HA
  * pixels, already in PIXEL_SHADER_RESOURCE) into back buffer `bufferIndex`,
  * which is in PRESENT and is left in RENDER_TARGET. */
 /* gameImage: 1 for the game's frame (sharpening applies), 0 for a movie. */
+/* Where the game image goes in the back buffer: its own shape, centred,
+ * black bars filling the rest. rect: left, top, width, height in pixels. */
+static void ld_present_image_rect(u32 sourceWidth, u32 sourceHeight, float rect[4])
+{
+    float imageWidth = (float)g.bb_w;
+    float imageHeight = (float)g.bb_h;
+    const float sourceAspect = (float)sourceWidth / (float)sourceHeight;
+    if (imageWidth / imageHeight > sourceAspect + 0.01f)
+    {
+        imageWidth = imageHeight * sourceAspect;
+    }
+    else if (imageWidth / imageHeight < sourceAspect - 0.01f)
+    {
+        imageHeight = imageWidth / sourceAspect;
+    }
+    imageWidth = (float)(u32)(imageWidth + 0.5f);
+    imageHeight = (float)(u32)(imageHeight + 0.5f);
+    rect[0] = (float)(u32)(((float)g.bb_w - imageWidth) * 0.5f);
+    rect[1] = (float)(u32)(((float)g.bb_h - imageHeight) * 0.5f);
+    rect[2] = imageWidth;
+    rect[3] = imageHeight;
+}
+
 static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
                            ID3D12Resource* backBuffer, u32 bufferIndex, int gameImage)
 {
@@ -13926,21 +14045,12 @@ static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
     g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &target, FALSE, NULL);
     /* Keep the image's shape: a window of another aspect ratio gets black
      * bars rather than a stretched picture. */
-    float imageWidth = (float)g.bb_w;
-    float imageHeight = (float)g.bb_h;
-    const float sourceAspect = (float)sourceWidth / (float)sourceHeight;
-    if (imageWidth / imageHeight > sourceAspect + 0.01f)
-    {
-        imageWidth = imageHeight * sourceAspect;
-    }
-    else if (imageWidth / imageHeight < sourceAspect - 0.01f)
-    {
-        imageHeight = imageWidth / sourceAspect;
-    }
-    imageWidth = (float)(u32)(imageWidth + 0.5f);
-    imageHeight = (float)(u32)(imageHeight + 0.5f);
-    const float imageLeft = (float)(u32)(((float)g.bb_w - imageWidth) * 0.5f);
-    const float imageTop = (float)(u32)(((float)g.bb_h - imageHeight) * 0.5f);
+    float imageRect[4];
+    ld_present_image_rect(sourceWidth, sourceHeight, imageRect);
+    const float imageLeft = imageRect[0];
+    const float imageTop = imageRect[1];
+    const float imageWidth = imageRect[2];
+    const float imageHeight = imageRect[3];
     if (imageWidth < (float)g.bb_w || imageHeight < (float)g.bb_h)
     {
         const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
@@ -13966,6 +14076,568 @@ static int ld_present_pass(u32 sourceSlot, u32 sourceWidth, u32 sourceHeight,
     g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
     return 1;
+}
+
+/* ---------------------------------------------------------------------------
+ * HDR output (rsx_live_draw_set_hdr). Folklore draws every surface in 8-bit
+ * colour, clamped to white, so there is no HDR image to show: this expands
+ * the finished SDR picture instead, as Windows' Auto HDR does, but only the
+ * game's 3D scene. The back buffer becomes R16G16B16A16_FLOAT (scRGB: linear,
+ * 1.0 = 80 nits). The present pass and the engine overlay keep drawing in
+ * 8-bit, into a composite the size of the back buffer, so nothing about
+ * them changes; then one pass writes the back buffer: the composite at
+ * paper white, with the scene's highlights stretched towards the peak.
+ *
+ * What is HUD: the game draws its 3D picture into the display buffer first
+ * (the resolve, the bloom composite) and its 2D overlay after. The first
+ * draw ld_hud_draw_place takes for an overlay (also at 16:9, where it
+ * places nothing) copies the display buffer as it is (ld_hdr_scene_snapshot):
+ * where the final image differs from that copy, the HUD drew. The engine
+ * overlay is found the same way, from a copy of the composite made before
+ * it draws. Those pixels stay at paper white, so gauges, text and menus do
+ * not glare. Movies are expanded as pictures, with no snapshot.
+ * -----------------------------------------------------------------------*/
+#define RTV_HDR_BASE (RTV_SHADOW_BASE + 2)
+
+static const char k_ld_hdr_hlsl[] =
+    "Texture2D<float4> compositeImage : register(t0);  /* the 8-bit picture, back-buffer size */\n"
+    "Texture2D<float4> beforeOverlay : register(t1);   /* the same before the engine overlay */\n"
+    "Texture2D<float4> gameFinal : register(t2);       /* the game's image, its own size */\n"
+    "Texture2D<float4> gameScene : register(t3);       /* the same before its first HUD draw */\n"
+    "SamplerState linearClamp : register(s0);\n"
+    "cbuffer HdrConstants : register(b0)\n"
+    "{\n"
+    "    float4 targetSize;  /* w, h, 1/w, 1/h of the back buffer */\n"
+    "    float4 imageRect;   /* left, top, width, height of the game image in it */\n"
+    "    float4 hdrOptions;  /* paper white / 80 nits, peak / paper white, highlights 0-1, scene copy valid */\n"
+    "};\n"
+    "struct HdrVertex\n"
+    "{\n"
+    "    float4 position : SV_Position;\n"
+    "};\n"
+    "HdrVertex hdrVs(uint vertexId : SV_VertexID)\n"
+    "{\n"
+    "    HdrVertex result;\n"
+    "    float2 corner = float2((vertexId << 1) & 2, vertexId & 2);\n"
+    "    result.position = float4(corner * float2(2.0, -2.0) + float2(-1.0, 1.0), 0.0, 1.0);\n"
+    "    return result;\n"
+    "}\n"
+    "float largestComponent(float3 value)\n"
+    "{\n"
+    "    return max(value.r, max(value.g, value.b));\n"
+    "}\n"
+    "/* Highlights: above a knee, brightness is stretched smoothly so the\n"
+    " * game's white reaches paper white x (1 + highlights x (peak/paper - 1)).\n"
+    " * The colour is scaled as a whole, so hues stay put; brightness is a mix\n"
+    " * of luminance and the largest channel, so saturated glows (the Ids,\n"
+    " * magic) lift too, not only white. */\n"
+    "float3 expandHighlights(float3 linearColor)\n"
+    "{\n"
+    "    float luminance = dot(linearColor, float3(0.2126, 0.7152, 0.0722));\n"
+    "    float brightness = lerp(luminance, largestComponent(linearColor), 0.5);\n"
+    "    const float knee = 0.45;\n"
+    "    float above = saturate((brightness - knee) / (1.0 - knee));\n"
+    "    float gain = 1.0 + hdrOptions.z * (hdrOptions.y - 1.0) * above * above;\n"
+    "    return linearColor * gain;\n"
+    "}\n"
+    "float4 hdrPs(HdrVertex input) : SV_Target\n"
+    "{\n"
+    "    int3 pixel = int3(input.position.xy, 0);\n"
+    "    float3 composite = saturate(compositeImage.Load(pixel).rgb);\n"
+    "    float3 before = saturate(beforeOverlay.Load(pixel).rgb);\n"
+    "    float overlayWeight = smoothstep(0.004, 0.02, largestComponent(abs(composite - before)));\n"
+    "    float hudWeight = 0.0;\n"
+    "    float2 imageUv = (input.position.xy - imageRect.xy) / imageRect.zw;\n"
+    "    [branch] if (hdrOptions.w > 0.5 && all(imageUv >= 0.0) && all(imageUv <= 1.0))\n"
+    "    {\n"
+    "        float3 finalColor = saturate(gameFinal.SampleLevel(linearClamp, imageUv, 0.0).rgb);\n"
+    "        float3 sceneColor = saturate(gameScene.SampleLevel(linearClamp, imageUv, 0.0).rgb);\n"
+    "        hudWeight = smoothstep(0.01, 0.06, largestComponent(abs(finalColor - sceneColor)));\n"
+    "    }\n"
+    "    float interfaceWeight = max(overlayWeight, hudWeight);\n"
+    "    float3 linearColor = pow(composite, 2.2);\n"
+    "    float3 result = lerp(expandHighlights(linearColor), linearColor, interfaceWeight);\n"
+    "    return float4(result * hdrOptions.x, 1.0);\n"
+    "}\n";
+
+static ID3DBlob* ld_hdr_compile(const char* entryPoint, const char* profile)
+{
+    ID3DBlob* shader = NULL;
+    ID3DBlob* errors = NULL;
+    const HRESULT result = D3DCompile(k_ld_hdr_hlsl, sizeof(k_ld_hdr_hlsl) - 1u, "hdr_pass", NULL, NULL, entryPoint,
+                                      profile, D3DCOMPILE_OPTIMIZATION_LEVEL3, 0, &shader, &errors);
+    if (FAILED(result))
+    {
+        fprintf(stderr, "[hdr] %s compile failed hr=0x%08lX: %s\n", entryPoint, (unsigned long)result,
+                errors ? (const char*)errors->lpVtbl->GetBufferPointer(errors) : "<no diagnostics>");
+        if (errors)
+        {
+            errors->lpVtbl->Release(errors);
+        }
+        return NULL;
+    }
+    if (errors)
+    {
+        errors->lpVtbl->Release(errors);
+    }
+    return shader;
+}
+
+/* The final pass, built on first use; 1 when it is ready. */
+static int ld_hdr_build(void)
+{
+    if (g.hdr_state != 0)
+    {
+        return g.hdr_state > 0;
+    }
+    g.hdr_state = -1;
+    D3D12_DESCRIPTOR_RANGE sourceRange = {0};
+    sourceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+    sourceRange.NumDescriptors = 4;
+    D3D12_ROOT_PARAMETER parameters[2] = {0};
+    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+    parameters[0].Constants.ShaderRegister = 0;
+    parameters[0].Constants.Num32BitValues = 12;
+    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+    parameters[1].DescriptorTable.NumDescriptorRanges = 1;
+    parameters[1].DescriptorTable.pDescriptorRanges = &sourceRange;
+    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_STATIC_SAMPLER_DESC linearSampler = {0};
+    linearSampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+    linearSampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linearSampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linearSampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+    linearSampler.MaxLOD = D3D12_FLOAT32_MAX;
+    linearSampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+    D3D12_ROOT_SIGNATURE_DESC description = {0};
+    description.NumParameters = 2;
+    description.pParameters = parameters;
+    description.NumStaticSamplers = 1;
+    description.pStaticSamplers = &linearSampler;
+    ID3DBlob* serialized = NULL;
+    ID3DBlob* errors = NULL;
+    if (FAILED(D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, &serialized, &errors)))
+    {
+        if (errors)
+        {
+            errors->lpVtbl->Release(errors);
+        }
+        fprintf(stderr, "[hdr] root signature failed; HDR output unavailable\n");
+        return 0;
+    }
+    if (errors)
+    {
+        errors->lpVtbl->Release(errors);
+    }
+    const HRESULT rootResult = g.dev->lpVtbl->CreateRootSignature(
+        g.dev, 0, serialized->lpVtbl->GetBufferPointer(serialized), serialized->lpVtbl->GetBufferSize(serialized),
+        &IID_ID3D12RootSignature, (void**)&g.hdr_rootsig);
+    serialized->lpVtbl->Release(serialized);
+    if (FAILED(rootResult))
+    {
+        g.hdr_rootsig = NULL;
+        fprintf(stderr, "[hdr] root signature failed; HDR output unavailable\n");
+        return 0;
+    }
+    ID3DBlob* vertexShader = ld_hdr_compile("hdrVs", "vs_5_0");
+    ID3DBlob* pixelShader = ld_hdr_compile("hdrPs", "ps_5_0");
+    if (vertexShader && pixelShader)
+    {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pipeline = {0};
+        pipeline.pRootSignature = g.hdr_rootsig;
+        pipeline.VS.pShaderBytecode = vertexShader->lpVtbl->GetBufferPointer(vertexShader);
+        pipeline.VS.BytecodeLength = vertexShader->lpVtbl->GetBufferSize(vertexShader);
+        pipeline.PS.pShaderBytecode = pixelShader->lpVtbl->GetBufferPointer(pixelShader);
+        pipeline.PS.BytecodeLength = pixelShader->lpVtbl->GetBufferSize(pixelShader);
+        pipeline.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        pipeline.SampleMask = 0xFFFFFFFFu;
+        pipeline.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pipeline.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pipeline.RasterizerState.DepthClipEnable = TRUE;
+        pipeline.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pipeline.NumRenderTargets = 1;
+        pipeline.RTVFormats[0] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        pipeline.SampleDesc.Count = 1;
+        const HRESULT pipelineResult = g.dev->lpVtbl->CreateGraphicsPipelineState(
+            g.dev, &pipeline, &IID_ID3D12PipelineState, (void**)&g.hdr_pso);
+        if (FAILED(pipelineResult))
+        {
+            g.hdr_pso = NULL;
+            fprintf(stderr, "[hdr] pipeline failed hr=0x%08lX\n", (unsigned long)pipelineResult);
+        }
+    }
+    if (vertexShader)
+    {
+        vertexShader->lpVtbl->Release(vertexShader);
+    }
+    if (pixelShader)
+    {
+        pixelShader->lpVtbl->Release(pixelShader);
+    }
+    if (!g.hdr_pso)
+    {
+        return 0;
+    }
+    g.hdr_state = 1;
+    fprintf(stderr, "[hdr] HDR output pass ready\n");
+    return 1;
+}
+
+/* The composite and its copy, at the back buffer's size; 1 when they exist. */
+static int ld_hdr_images_ensure(void)
+{
+    if (g.hdr_images[0] && g.hdr_images[1] && g.hdr_w == g.bb_w && g.hdr_h == g.bb_h)
+    {
+        return 1;
+    }
+    for (u32 imageIndex = 0; imageIndex < 2; imageIndex++)
+    {
+        if (g.hdr_images[imageIndex])
+        {
+            retire_texture(g.hdr_images[imageIndex]);
+            g.hdr_images[imageIndex] = NULL;
+        }
+    }
+    D3D12_HEAP_PROPERTIES heap = {0};
+    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+    D3D12_RESOURCE_DESC description = {0};
+    description.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+    description.Width = g.bb_w;
+    description.Height = g.bb_h;
+    description.DepthOrArraySize = 1;
+    description.MipLevels = 1;
+    description.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    description.SampleDesc.Count = 1;
+    description.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+    for (u32 imageIndex = 0; imageIndex < 2; imageIndex++)
+    {
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &heap, D3D12_HEAP_FLAG_NONE, &description,
+                                                          D3D12_RESOURCE_STATE_COMMON, NULL, &IID_ID3D12Resource,
+                                                          (void**)&g.hdr_images[imageIndex])))
+        {
+            g.hdr_images[imageIndex] = NULL;
+            fprintf(stderr, "[hdr] could not create the %ux%u composite\n", g.bb_w, g.bb_h);
+            return 0;
+        }
+        g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.hdr_images[imageIndex], NULL,
+                                              rtv_handle(RTV_HDR_BASE + imageIndex));
+        srv_write(imageIndex == 0 ? SRV_HDR_COMPOSITE : SRV_HDR_BEFORE_OVERLAY, g.hdr_images[imageIndex]);
+    }
+    g.hdr_w = g.bb_w;
+    g.hdr_h = g.bb_h;
+    return 1;
+}
+
+/* Once a present, before anything is drawn for it: switch the swap chain
+ * between 8-bit SDR and scRGB as the setting asks, and every second or so
+ * note whether the window's display has Windows' HDR on. */
+static void ld_hdr_sync_swapchain(void)
+{
+    if (!g.swap || !g.ready)
+    {
+        return;
+    }
+    int wanted = InterlockedCompareExchange(&g_ld_hdr_enabled, 0, 0) != 0 && g.present_pso[LD_PRESENT_SCALE] != NULL;
+    if (wanted && !ld_hdr_build())
+    {
+        wanted = 0;
+    }
+    const DXGI_FORMAT wantedFormat = wanted ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    if (wantedFormat != g.bb_fmt)
+    {
+        ld_flush(LD_FLUSH_PRESENT);
+        if (!g.ready)
+        {
+            return;
+        }
+        for (u32 bufferIndex = 0; bufferIndex < LD_SWAP_BUFFERS; bufferIndex++)
+        {
+            if (g.backbuf[bufferIndex])
+            {
+                g.backbuf[bufferIndex]->lpVtbl->Release(g.backbuf[bufferIndex]);
+                g.backbuf[bufferIndex] = NULL;
+            }
+        }
+        const HRESULT resizeResult =
+            g.swap->lpVtbl->ResizeBuffers(g.swap, LD_SWAP_BUFFERS, g.bb_w, g.bb_h, wantedFormat, 0);
+        if (SUCCEEDED(resizeResult))
+        {
+            g.bb_fmt = wantedFormat;
+        }
+        else
+        {
+            fprintf(stderr, "[hdr] switching the back buffer to %s failed hr=0x%08lX\n",
+                    wanted ? "HDR" : "SDR", (unsigned long)resizeResult);
+            if (wanted)
+            {
+                g.hdr_state = -1;        /* do not try again this run */
+            }
+        }
+        for (u32 bufferIndex = 0; bufferIndex < LD_SWAP_BUFFERS; bufferIndex++)
+        {
+            g.swap->lpVtbl->GetBuffer(g.swap, bufferIndex, &IID_ID3D12Resource, (void**)&g.backbuf[bufferIndex]);
+            g.dev->lpVtbl->CreateRenderTargetView(g.dev, g.backbuf[bufferIndex], NULL, rtv_handle(bufferIndex));
+        }
+        const DXGI_COLOR_SPACE_TYPE colourSpace = g.bb_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                      ? DXGI_COLOR_SPACE_RGB_FULL_G10_NONE_P709
+                                                      : DXGI_COLOR_SPACE_RGB_FULL_G22_NONE_P709;
+        const HRESULT colourResult = g.swap->lpVtbl->SetColorSpace1(g.swap, colourSpace);
+        fprintf(stderr, "[hdr] output now %s (colour space %s)\n",
+                g.bb_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT ? "HDR, scRGB" : "SDR",
+                SUCCEEDED(colourResult) ? "set" : "not set");
+        g.hdr_status_countdown = 0;
+    }
+    g_ld_hdr_frame_active = g.bb_fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    InterlockedExchange(&g_ld_hdr_output, g_ld_hdr_frame_active ? 1 : 0);
+    if (g.hdr_status_countdown)
+    {
+        g.hdr_status_countdown--;
+        return;
+    }
+    g.hdr_status_countdown = 60u;
+    IDXGIOutput* output = NULL;
+    if (FAILED(g.swap->lpVtbl->GetContainingOutput(g.swap, &output)) || !output)
+    {
+        return;
+    }
+    IDXGIOutput6* output6 = NULL;
+    if (SUCCEEDED(output->lpVtbl->QueryInterface(output, &IID_IDXGIOutput6, (void**)&output6)) && output6)
+    {
+        DXGI_OUTPUT_DESC1 outputDescription;
+        memset(&outputDescription, 0, sizeof(outputDescription));
+        if (SUCCEEDED(output6->lpVtbl->GetDesc1(output6, &outputDescription)))
+        {
+            const LONG hdrOn = outputDescription.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? 1 : 0;
+            const LONG previous = InterlockedExchange(&g_ld_hdr_display, hdrOn);
+            InterlockedExchange(&g_ld_hdr_display_peak, (LONG)outputDescription.MaxLuminance);
+            if (previous != hdrOn)
+            {
+                fprintf(stderr, "[hdr] display: Windows HDR %s, peak %.0f nits\n", hdrOn ? "on" : "off",
+                        (double)outputDescription.MaxLuminance);
+            }
+        }
+        output6->lpVtbl->Release(output6);
+    }
+    output->lpVtbl->Release(output);
+}
+
+/* The first overlay draw of a frame into display buffer `target` (render
+ * thread, inside the frame's command list): copy the buffer as it is. */
+static void ld_hdr_scene_snapshot(u32 target)
+{
+    if (!g_ld_hdr_frame_active || target >= MAX_SURFACES)
+    {
+        return;
+    }
+    if (g.hdr_snapshot_valid && g.hdr_snapshot_target == target)
+    {
+        return;
+    }
+    surface_t* surface = &g.surfaces[target];
+    if (!surface->tex)
+    {
+        return;
+    }
+    D3D12_RESOURCE_DESC description;
+    surface->tex->lpVtbl->GetDesc(surface->tex, &description);
+    if (description.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || description.SampleDesc.Count != 1)
+    {
+        return;
+    }
+    if (!g.hdr_snapshot || g.hdr_snapshot_w != (u32)description.Width || g.hdr_snapshot_h != description.Height ||
+        g.hdr_snapshot_fmt != description.Format)
+    {
+        if (g.hdr_snapshot)
+        {
+            retire_texture(g.hdr_snapshot);
+            g.hdr_snapshot = NULL;
+        }
+        D3D12_HEAP_PROPERTIES heap = {0};
+        heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+        D3D12_RESOURCE_DESC copyDescription = description;
+        copyDescription.MipLevels = 1;
+        copyDescription.Flags = D3D12_RESOURCE_FLAG_NONE;
+        copyDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+        if (FAILED(g.dev->lpVtbl->CreateCommittedResource(g.dev, &heap, D3D12_HEAP_FLAG_NONE, &copyDescription,
+                                                          D3D12_RESOURCE_STATE_COPY_DEST, NULL,
+                                                          &IID_ID3D12Resource, (void**)&g.hdr_snapshot)))
+        {
+            g.hdr_snapshot = NULL;
+            return;
+        }
+        g.hdr_snapshot_state = D3D12_RESOURCE_STATE_COPY_DEST;
+        g.hdr_snapshot_w = (u32)description.Width;
+        g.hdr_snapshot_h = description.Height;
+        g.hdr_snapshot_fmt = description.Format;
+        srv_write(SRV_HDR_SNAPSHOT, g.hdr_snapshot);
+    }
+    if (description.MipLevels != 1)
+    {
+        return;                          /* CopyResource needs matching mips; display buffers have one */
+    }
+    D3D12_RESOURCE_BARRIER barriers[2];
+    memset(barriers, 0, sizeof(barriers));
+    u32 barrierCount = 0;
+    barriers[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[barrierCount].Transition.pResource = surface->tex;
+    barriers[barrierCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[barrierCount].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[barrierCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barrierCount++;
+    if (g.hdr_snapshot_state != D3D12_RESOURCE_STATE_COPY_DEST)
+    {
+        barriers[barrierCount].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[barrierCount].Transition.pResource = g.hdr_snapshot;
+        barriers[barrierCount].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+        barriers[barrierCount].Transition.StateBefore = g.hdr_snapshot_state;
+        barriers[barrierCount].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+        barrierCount++;
+    }
+    g.list->lpVtbl->ResourceBarrier(g.list, barrierCount, barriers);
+    g.list->lpVtbl->CopyResource(g.list, g.hdr_snapshot, surface->tex);
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barriers[1].Transition.pResource = g.hdr_snapshot;
+    barriers[1].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    g.hdr_snapshot_state = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.hdr_snapshot_valid = 1;
+    g.hdr_snapshot_target = target;
+}
+
+/* Present black into the HDR back buffer (nothing was drawn this time). */
+static void ld_hdr_present_black(ID3D12Resource* backBuffer, u32 bufferIndex)
+{
+    D3D12_RESOURCE_BARRIER barrier = {0};
+    barrier.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+    barrier.Transition.pResource = backBuffer;
+    barrier.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
+    const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(bufferIndex), black, 0, NULL);
+    barrier.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barrier.Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    g.list->lpVtbl->ResourceBarrier(g.list, 1, &barrier);
+}
+
+/* The present pass has drawn the game image into the composite (left in
+ * RENDER_TARGET when `drawn`): copy it, run the engine overlay over it, and
+ * write the HDR back buffer. `gameSlot` is the image's own SRV, in
+ * PIXEL_SHADER_RESOURCE; `hasScene` whether the snapshot is of it. Leaves the
+ * back buffer in PRESENT. */
+static void ld_hdr_compose(ID3D12Resource* backBuffer, u32 bufferIndex, int drawn, u32 gameSlot, u32 gameWidth,
+                           u32 gameHeight, int hasScene)
+{
+    if (!drawn || !g.hdr_images[0] || !g.hdr_images[1] || !g.hdr_pso)
+    {
+        ld_hdr_present_black(backBuffer, bufferIndex);
+        return;
+    }
+    ID3D12Resource* composite = g.hdr_images[0];
+    ID3D12Resource* beforeOverlay = g.hdr_images[1];
+    D3D12_RESOURCE_BARRIER barriers[3];
+    memset(barriers, 0, sizeof(barriers));
+    for (u32 barrierIndex = 0; barrierIndex < 3; barrierIndex++)
+    {
+        barriers[barrierIndex].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+        barriers[barrierIndex].Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+    }
+    barriers[0].Transition.pResource = composite;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[1].Transition.pResource = beforeOverlay;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    g.list->lpVtbl->CopyResource(g.list, beforeOverlay, composite);
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    /* The overlay draws in 8-bit, as always, and leaves the composite in
+     * COMMON (PRESENT). */
+    ld_overlay_then_present_state(composite, RTV_HDR_BASE, D3D12_RESOURCE_STATE_RENDER_TARGET);
+
+    u32 slots[SRV_TABLE_SIZE];
+    for (u32 slotIndex = 0; slotIndex < SRV_TABLE_SIZE; slotIndex++)
+    {
+        slots[slotIndex] = SRV_WHITE;
+    }
+    slots[0] = SRV_HDR_COMPOSITE;
+    slots[1] = SRV_HDR_BEFORE_OVERLAY;
+    slots[2] = gameSlot;
+    slots[3] = hasScene ? SRV_HDR_SNAPSHOT : gameSlot;
+    if (g.srv_ring_used >= ld_srv_end())
+    {
+        ld_flush(LD_FLUSH_DESCRIPTOR_RING);
+        if (!g.ready)
+        {
+            return;
+        }
+        g.srv_ring_used = ld_srv_base();
+        g_ld_ring_epoch++;
+    }
+    const D3D12_GPU_DESCRIPTOR_HANDLE table = srv_table(slots);
+    barriers[0].Transition.pResource = composite;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barriers[1].Transition.pResource = backBuffer;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PRESENT;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    g.list->lpVtbl->ResourceBarrier(g.list, 2, barriers);
+    if (table.ptr)
+    {
+        const D3D12_CPU_DESCRIPTOR_HANDLE target = rtv_handle(bufferIndex);
+        g.list->lpVtbl->OMSetRenderTargets(g.list, 1, &target, FALSE, NULL);
+        const D3D12_VIEWPORT viewport = {0.0f, 0.0f, (float)g.bb_w, (float)g.bb_h, 0.0f, 1.0f};
+        const D3D12_RECT scissor = {0, 0, (LONG)g.bb_w, (LONG)g.bb_h};
+        g.list->lpVtbl->RSSetViewports(g.list, 1, &viewport);
+        g.list->lpVtbl->RSSetScissorRects(g.list, 1, &scissor);
+        ID3D12DescriptorHeap* heaps[] = {g.srv_heap, g.smp_heap};
+        g.list->lpVtbl->SetDescriptorHeaps(g.list, 2, heaps);
+        g.list->lpVtbl->SetGraphicsRootSignature(g.list, g.hdr_rootsig);
+        g.list->lpVtbl->SetPipelineState(g.list, g.hdr_pso);
+        float imageRect[4];
+        ld_present_image_rect(gameWidth, gameHeight, imageRect);
+        const float paperWhite = (float)InterlockedCompareExchange(&g_ld_hdr_paper_white_nits, 0, 0);
+        const float peak = (float)InterlockedCompareExchange(&g_ld_hdr_peak_nits, 0, 0);
+        const float highlights = (float)InterlockedCompareExchange(&g_ld_hdr_highlight_percent, 0, 0) / 100.0f;
+        const float constants[12] = {
+            (float)g.bb_w, (float)g.bb_h, 1.0f / (float)g.bb_w, 1.0f / (float)g.bb_h,
+            imageRect[0], imageRect[1], imageRect[2], imageRect[3],
+            paperWhite / 80.0f, peak > paperWhite ? peak / paperWhite : 1.0f, highlights, hasScene ? 1.0f : 0.0f
+        };
+        g.list->lpVtbl->SetGraphicsRoot32BitConstants(g.list, 0, 12, constants, 0);
+        g.list->lpVtbl->SetGraphicsRootDescriptorTable(g.list, 1, table);
+        g.list->lpVtbl->IASetPrimitiveTopology(g.list, D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+        g.list->lpVtbl->DrawInstanced(g.list, 3, 1, 0, 0);
+    }
+    else
+    {
+        const float black[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(bufferIndex), black, 0, NULL);
+    }
+    barriers[0].Transition.pResource = backBuffer;
+    barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+    barriers[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PRESENT;
+    barriers[1].Transition.pResource = composite;
+    barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barriers[1].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    barriers[2].Transition.pResource = beforeOverlay;
+    barriers[2].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+    barriers[2].Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+    g.list->lpVtbl->ResourceBarrier(g.list, 3, barriers);
+    if (hasScene)
+    {
+        g.hdr_snapshot_valid = 0;
+    }
 }
 
 static int make_root_signature(void)
@@ -14314,6 +14986,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     /* swap chain bound to the runtime's HWND */
     DXGI_SWAP_CHAIN_DESC1 scd = {0};
     scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+    g.bb_fmt = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
     scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     IDXGISwapChain1* sc1 = NULL;
@@ -14328,7 +15001,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
     /* RTV heap: [0..1] backbuffers, [2..] surface cache */
     D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
     hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
-    hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES + 3 + 2; /* + SMAA's three, the shadow masks' two */
+    hd.NumDescriptors = LD_SWAP_BUFFERS + MAX_SURFACES + 3 + 2 + 2; /* + SMAA's three, the shadow masks' two, HDR's two */
     g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.rtv_heap);
     g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
     for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
@@ -14813,6 +15486,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
      * window may also have changed size since the last present. */
     ld_wait_idle();
     ld_sync_swapchain_size();
+    ld_hdr_sync_swapchain();
     if (w > g.width)  w = g.width;
     if (h > g.height) h = g.height;
     const u32 pitch = (w * 4 + 255) & ~255u;          /* D3D12 copy pitch align */
@@ -14873,7 +15547,8 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
     /* A frame the size of the back buffer is copied straight in, as before;
      * any other size goes through a texture and the present pass. */
     int scaledMovie = 0;
-    if ((w != g.bb_w || h != g.bb_h) && g.present_pso[LD_PRESENT_SCALE])
+    const int hdrOutput = g_ld_hdr_frame_active;
+    if ((hdrOutput || w != g.bb_w || h != g.bb_h) && g.present_pso[LD_PRESENT_SCALE])
     {
         if (g.present_movie && (g.present_movie_w != w || g.present_movie_h != h))
         {
@@ -14921,12 +15596,34 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
         b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
         b.Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
-        const int drawn = ld_present_pass(SRV_PRESENT_MOVIE, w, h, bb, bbi, 0);
-        b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
-        b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
-        g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
-        ld_overlay_then_present_state(bb, bbi, drawn ? D3D12_RESOURCE_STATE_RENDER_TARGET
-                                                     : D3D12_RESOURCE_STATE_PRESENT);
+        if (hdrOutput)
+        {
+            int drawn = 0;
+            if (ld_hdr_images_ensure())
+            {
+                drawn = ld_present_pass(SRV_PRESENT_MOVIE, w, h, g.hdr_images[0], RTV_HDR_BASE, 0);
+            }
+            if (g.ready)
+            {
+                ld_hdr_compose(bb, bbi, drawn, SRV_PRESENT_MOVIE, w, h, 0);
+            }
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+        }
+        else
+        {
+            const int drawn = ld_present_pass(SRV_PRESENT_MOVIE, w, h, bb, bbi, 0);
+            b.Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+            b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_DEST;
+            g.list->lpVtbl->ResourceBarrier(g.list, 1, &b);
+            ld_overlay_then_present_state(bb, bbi, drawn ? D3D12_RESOURCE_STATE_RENDER_TARGET
+                                                         : D3D12_RESOURCE_STATE_PRESENT);
+        }
+    }
+    else if (hdrOutput)
+    {
+        ld_hdr_present_black(bb, bbi);   /* no texture for the movie frame: nothing to show it with */
     }
     else
     {
@@ -15489,6 +16186,7 @@ void rsx_live_draw_present(u32 buffer_id)
       } }
     ID3D12Resource* srcimg = presented_surface->tex;
     ld_sync_swapchain_size();
+    ld_hdr_sync_swapchain();
     if (!g.ready) return;
     const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
     ID3D12Resource* bb = g.backbuf[bbi];
@@ -15508,12 +16206,34 @@ void rsx_live_draw_present(u32 buffer_id)
 
     /* The present pass when the image and back buffer differ in size or
      * format, or FXAA is on; otherwise the plain copy it always was. */
+    /* HDR output always goes through the present pass, into the 8-bit
+     * composite, and then ld_hdr_compose. */
+    const int hdrOutput = g_ld_hdr_frame_active;
     const int presentPass = g.present_pso[LD_PRESENT_SCALE] &&
-        (sourceWidth != g.bb_w || sourceHeight != g.bb_h ||
+        (hdrOutput || sourceWidth != g.bb_w || sourceHeight != g.bb_h ||
          presented_surface->fmt != DXGI_FORMAT_R8G8B8A8_UNORM ||
          InterlockedCompareExchange(&g_ld_post_aa, 0, 0) != 0 ||
          InterlockedCompareExchange(&g_ld_sharpen_percent, 0, 0) != 0);
-    if (presentPass)
+    if (presentPass && hdrOutput)
+    {
+        bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, bar);
+        int drawn = 0;
+        if (ld_hdr_images_ensure())
+        {
+            drawn = ld_present_pass(SRV_SURFACE_BASE + target, sourceWidth, sourceHeight, g.hdr_images[0],
+                                    RTV_HDR_BASE, 1);
+        }
+        if (g.ready)
+        {
+            ld_hdr_compose(bb, bbi, drawn, SRV_SURFACE_BASE + target, sourceWidth, sourceHeight,
+                           g.hdr_snapshot_valid && g.hdr_snapshot_target == target);
+        }
+        bar[0].Transition.StateBefore = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
+        bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+        g.list->lpVtbl->ResourceBarrier(g.list, 1, bar);
+    }
+    else if (presentPass)
     {
         bar[0].Transition.StateAfter = D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
         g.list->lpVtbl->ResourceBarrier(g.list, 1, bar);

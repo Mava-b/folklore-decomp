@@ -40,6 +40,7 @@
 
 #include <windows.h>
 #include <d3d11.h>
+#include <dxgi1_6.h>
 #include <dwmapi.h>
 #include <shellapi.h>
 
@@ -610,6 +611,67 @@ namespace
         ImGui::PopStyleColor();
     }
 
+    /* Whether a display has Windows' HDR on, and the highest peak one
+     * reports, in nits. Looked up again every two seconds, so turning HDR
+     * on in Windows' settings shows here without restarting. */
+    struct HdrDisplays
+    {
+        bool anyHdr = false;
+        float peakNits = 0.0f;
+    };
+
+    HdrDisplays hdrDisplays()
+    {
+        static HdrDisplays cached;
+        static ULONGLONG checkedAt = 0;
+        const ULONGLONG now = GetTickCount64();
+        if (checkedAt != 0 && now - checkedAt < 2000)
+        {
+            return cached;
+        }
+        checkedAt = now;
+        HdrDisplays found;
+        IDXGIFactory1* factory = nullptr;
+        if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void**)&factory)) || !factory)
+        {
+            cached = found;
+            return cached;
+        }
+        for (UINT adapterIndex = 0;; adapterIndex++)
+        {
+            IDXGIAdapter1* adapter = nullptr;
+            if (factory->EnumAdapters1(adapterIndex, &adapter) == DXGI_ERROR_NOT_FOUND || !adapter)
+            {
+                break;
+            }
+            for (UINT outputIndex = 0;; outputIndex++)
+            {
+                IDXGIOutput* output = nullptr;
+                if (adapter->EnumOutputs(outputIndex, &output) == DXGI_ERROR_NOT_FOUND || !output)
+                {
+                    break;
+                }
+                IDXGIOutput6* output6 = nullptr;
+                if (SUCCEEDED(output->QueryInterface(__uuidof(IDXGIOutput6), (void**)&output6)) && output6)
+                {
+                    DXGI_OUTPUT_DESC1 description = {};
+                    if (SUCCEEDED(output6->GetDesc1(&description)) &&
+                        description.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020)
+                    {
+                        found.anyHdr = true;
+                        found.peakNits = std::max(found.peakNits, description.MaxLuminance);
+                    }
+                    output6->Release();
+                }
+                output->Release();
+            }
+            adapter->Release();
+        }
+        factory->Release();
+        cached = found;
+        return cached;
+    }
+
     /* A combo over a list of labels; true when the choice changed. */
     bool choice(const char* label, int* index, const std::vector<const char*>& options, float width = 320.0f)
     {
@@ -1082,6 +1144,49 @@ namespace
         return changed;
     }
 
+    /* HDR output (Graphics page): on or off, its three levels, and whether
+     * Windows' HDR is on for a display. The engine menu has the same. */
+    bool drawHdrSettings(EngineSettings& settings)
+    {
+        bool changed = false;
+        changed |= ImGui::Checkbox("HDR output (brighter highlights on an HDR display)", &settings.hdr);
+        const HdrDisplays displays = hdrDisplays();
+        if (settings.hdr)
+        {
+            const float sliderWidth = 320.0f * ImGui::GetIO().FontGlobalScale;
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Peak brightness", &settings.hdrPeakNits, kHdrPeakMinimum, kHdrPeakMaximum,
+                                        "%d nits");
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Paper white", &settings.hdrPaperWhiteNits, kHdrPaperWhiteMinimum,
+                                        kHdrPaperWhiteMaximum, "%d nits");
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Highlights", &settings.hdrHighlights, 0, 100, "%d%%");
+            if (!displays.anyHdr)
+            {
+                ImGui::PushStyleColor(ImGuiCol_Text, kWarning);
+                ImGui::TextWrapped("Windows' HDR is off for every display: turn on Use HDR in Settings > System > "
+                                   "Display, or the picture looks washed out.");
+                ImGui::PopStyleColor();
+            }
+            else if (displays.peakNits > 0.0f)
+            {
+                char text[160];
+                std::snprintf(text, sizeof(text), "Your HDR display reports a peak of %.0f nits; set Peak brightness "
+                                                  "near it.", displays.peakNits);
+                note(text);
+            }
+            note("The game draws in 8-bit colour, so HDR here stretches its highlights (sun, sky, glowing Ids "
+                 "and magic) towards your display's peak. The HUD and menus stay at paper white, the brightness "
+                 "of everything else. Highlights at 0% is plain SDR. Also in the engine menu, live.");
+        }
+        else if (displays.anyHdr)
+        {
+            note("A display has Windows' HDR on: HDR output can use it.");
+        }
+        return changed;
+    }
+
     bool drawGraphicsPage()
     {
         EngineSettings& settings = engineSettings();
@@ -1115,6 +1220,7 @@ namespace
         changed |= enumChoice("Texture detail", &settings.textureDetail, {"Original (the PS3's)", "Sharper", "Sharpest"});
         ImGui::SetNextItemWidth(320.0f * ImGui::GetIO().FontGlobalScale);
         changed |= ImGui::SliderInt("Sharpening", &settings.sharpening, 0, 100, "%d%%");
+        changed |= drawHdrSettings(settings);
         changed |= ImGui::Checkbox("High-resolution textures (texture pack in textures\\replace)", &settings.texturePack);
 
         sectionHeading("Texture dump");

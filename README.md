@@ -69,6 +69,9 @@ be turned back to the original.
   screen's edges (with a *How far out* slider), and menus, speech bubbles
   and fades stay where they belong.
 - **Anti-aliasing**: SMAA (sharp, clean edges) or FXAA.
+- **HDR**: on an HDR display, the sun, skies, glowing Ids and magic go
+  brighter than white towards your display's peak, while the HUD and menus
+  stay at a comfortable paper white.
 - **Sharper textures**: finer texture levels in the distance, plus up to 16x
   anisotropic filtering and optional sharpening.
 - **Ambient occlusion**: soft shading where surfaces meet — corners, under
@@ -356,6 +359,16 @@ saved to `folklore_settings.ini`.
     that stay sharp, text and texture detail kept), *FXAA* (softer) or
     *Off*. Applies at once. *Anisotropic filtering* (up to 16x),
     *Sharpening*.
+  - *HDR output* (off by default; also on the launcher's Graphics page):
+    for a display with Windows' HDR on (Settings → System → Display → *Use
+    HDR*). The game draws in 8-bit colour, so there is no hidden HDR picture
+    to unlock: this stretches the bright parts of the 3D scene towards the
+    display's peak, as Windows' Auto HDR does, but leaves the HUD, text and
+    menus at paper white so they do not glare. *Peak brightness* (set it near
+    what your display reports; the menu shows it), *Paper white* (the
+    brightness of the HUD and everything not a highlight) and *Highlights*
+    (how far towards the peak; 0% is plain SDR). Applies at once. If Windows'
+    HDR is off the picture looks washed out, and the menu says so.
   - *Texture detail*: *Sharper* (the default), *Sharpest* or *Original* —
     finer texture levels, so walls, ground and clothing keep their detail
     further away. Applies at once.

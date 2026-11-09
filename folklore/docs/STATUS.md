@@ -1739,6 +1739,30 @@ What 0006 fixes in ps3recomp to make that run:
     and the player saw no glitch after Load Game. The hitches left are the
     area loads (one frame uploading 56-89 MB of textures, 110-220 ms,
     right after the game's own 100 ms load pause) and the boot.
+126. HDR output (patches/0103, engine menu and launcher: hdr,
+    hdr_peak_nits, hdr_paper_white_nits, hdr_highlights). Every surface the
+    game draws is 8-bit (fmt 8 throughout capture-20261108-145159), clamped
+    to white, so this is inverse tone mapping of the finished picture:
+    - The swap chain switches live between R8G8B8A8 and R16G16B16A16_FLOAT
+      with scRGB (G10, P709) colour space (ld_hdr_sync_swapchain, once a
+      present; also notes every ~60 presents whether the window's display
+      has Windows' HDR on, and its reported peak).
+    - The present pass (scaling, FXAA/SMAA, sharpening) and the engine
+      overlay still draw in 8-bit, into a composite the back buffer's size;
+      a copy of it is made before the overlay. ld_hdr_compose then writes
+      the back buffer: pow 2.2 to linear, x paper white / 80 nits, and above
+      a knee (0.45, on a mix of luminance and the largest channel, so
+      coloured glows lift too) a gain rising smoothly to peak / paper white
+      at white, scaled by the Highlights setting. Colours are scaled whole,
+      never past the peak.
+    - The HUD stays at paper white: the first draw ld_hud_draw_place takes
+      for an overlay in a frame (at 16:9 too, where HDR runs its decision
+      without moving anything) copies the display buffer first
+      (ld_hdr_scene_snapshot); where the presented image differs from that
+      copy the HUD drew, and those pixels are not expanded. The engine
+      overlay is found the same way from the copy before it. Movies are
+      expanded whole.
+    Built and checked in syntax here; not yet seen on an HDR display.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
