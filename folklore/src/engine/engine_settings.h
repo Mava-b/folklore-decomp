@@ -51,7 +51,7 @@ enum class GameLanguage : int
 constexpr int kHdrPeakMinimum = 400;
 constexpr int kHdrPeakMaximum = 4000;
 constexpr int kHdrPaperWhiteMinimum = 80;
-constexpr int kHdrPaperWhiteMaximum = 400;
+constexpr int kHdrPaperWhiteMaximum = 500;
 
 struct EngineSettings
 {
@@ -83,10 +83,12 @@ struct EngineSettings
      * paper white (nits), the 3D scene's highlights stretched towards the
      * peak (nits) by hdrHighlights % of the way; the HUD and menus stay at
      * paper white. The game draws in 8-bit, so this expands its finished
-     * picture rather than unlocking a hidden one. Applies at once. */
+     * picture rather than unlocking a hidden one. 0 = automatic: the peak
+     * the display reports, and Windows' SDR content brightness (what SDR
+     * games are shown at, so the picture matches HDR off). Applies at once. */
     bool hdr = false;
-    int hdrPeakNits = 1000;
-    int hdrPaperWhiteNits = 200;
+    int hdrPeakNits = 0;
+    int hdrPaperWhiteNits = 0;
     int hdrHighlights = 50;
     /* Texture detail: the game's mip levels, or a finer level chosen
      * (mip bias -0.5 / -1.0) so surfaces keep their detail further away.

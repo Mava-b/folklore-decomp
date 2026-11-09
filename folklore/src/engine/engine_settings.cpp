@@ -328,14 +328,16 @@ void engineSettingsLoad()
         {
             settingsInstance.hdr = parseBool(value);
         }
-        else if (std::strcmp(key, "hdr_peak_nits") == 0)
+        else if (std::strcmp(key, "hdr_peak") == 0)
         {
-            settingsInstance.hdrPeakNits = std::clamp(std::atoi(value), kHdrPeakMinimum, kHdrPeakMaximum);
+            const int nits = std::atoi(value);
+            settingsInstance.hdrPeakNits = nits <= 0 ? 0 : std::clamp(nits, kHdrPeakMinimum, kHdrPeakMaximum);
         }
-        else if (std::strcmp(key, "hdr_paper_white_nits") == 0)
+        else if (std::strcmp(key, "hdr_paper_white") == 0)
         {
+            const int nits = std::atoi(value);
             settingsInstance.hdrPaperWhiteNits =
-                std::clamp(std::atoi(value), kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
+                nits <= 0 ? 0 : std::clamp(nits, kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
         }
         else if (std::strcmp(key, "hdr_highlights") == 0)
         {
@@ -464,11 +466,11 @@ void engineSettingsSave()
                  : current.textureDetail == EngineSettings::TextureDetail::Sharpest ? "sharpest"
                                                                                     : "sharper");
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
-    std::fprintf(file, "# HDR output (an HDR display with Windows' HDR on): peak and paper white in nits,\n");
-    std::fprintf(file, "# highlights 0-100 %% of the way to the peak\n");
+    std::fprintf(file, "# HDR output (an HDR display with Windows' HDR on): peak and paper white in nits\n");
+    std::fprintf(file, "# (0 = the display's peak / Windows' SDR content brightness), highlights 0-100 %%\n");
     std::fprintf(file, "hdr = %d\n", current.hdr ? 1 : 0);
-    std::fprintf(file, "hdr_peak_nits = %d\n", current.hdrPeakNits);
-    std::fprintf(file, "hdr_paper_white_nits = %d\n", current.hdrPaperWhiteNits);
+    std::fprintf(file, "hdr_peak = %d\n", current.hdrPeakNits);
+    std::fprintf(file, "hdr_paper_white = %d\n", current.hdrPaperWhiteNits);
     std::fprintf(file, "hdr_highlights = %d\n", current.hdrHighlights);
     std::fprintf(file, "# Replacement textures (next start); folder empty = textures\\replace next to this file\n");
     std::fprintf(file, "texture_pack = %d\n", current.texturePack ? 1 : 0);

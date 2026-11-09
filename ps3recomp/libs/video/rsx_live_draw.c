@@ -553,10 +553,12 @@ static volatile LONG g_ld_texture_lod_bias = 0;  /* requested mip bias in hundre
 static LONG s_ld_sampler_lod_bias = 0;           /* what the cached samplers were built with (render thread) */
 static volatile LONG g_ld_sharpen_percent = 0;  /* present-pass sharpening, 0-100 */
 /* HDR output (rsx_live_draw_set_hdr): off by default. Peak and paper white
- * in nits; highlights 0-100 % of the way to the peak. */
+ * in nits, 0 = automatic (the display's peak; Windows' SDR content
+ * brightness); highlights 0-100 % of the way to the peak. */
 static volatile LONG g_ld_hdr_enabled = 0;
-static volatile LONG g_ld_hdr_peak_nits = 1000;
-static volatile LONG g_ld_hdr_paper_white_nits = 200;
+static volatile LONG g_ld_hdr_peak_nits = 0;
+static volatile LONG g_ld_hdr_paper_white_nits = 0;
+static volatile LONG g_ld_hdr_sdr_white = 0;     /* Windows' SDR content brightness there, in nits (0 unknown) */
 static volatile LONG g_ld_hdr_highlight_percent = 50;
 static volatile LONG g_ld_hdr_display = -1;      /* the window's display: -1 unknown, 0 SDR, 1 HDR on */
 static volatile LONG g_ld_hdr_display_peak = 0;  /* the peak it reports, in nits (0 unknown) */
@@ -2615,21 +2617,22 @@ void rsx_live_draw_set_sharpening(u32 percent)
 
 void rsx_live_draw_set_hdr(int enabled, u32 peakNits, u32 paperWhiteNits, u32 highlightPercent)
 {
-    if (peakNits < 400u)
+    /* 0 stays 0: automatic. */
+    if (peakNits && peakNits < 100u)
     {
-        peakNits = 400u;
+        peakNits = 100u;
     }
     if (peakNits > 10000u)
     {
         peakNits = 10000u;
     }
-    if (paperWhiteNits < 80u)
+    if (paperWhiteNits && paperWhiteNits < 80u)
     {
         paperWhiteNits = 80u;
     }
-    if (paperWhiteNits > 500u)
+    if (paperWhiteNits > 1000u)
     {
-        paperWhiteNits = 500u;
+        paperWhiteNits = 1000u;
     }
     if (highlightPercent > 100u)
     {
@@ -2639,6 +2642,39 @@ void rsx_live_draw_set_hdr(int enabled, u32 peakNits, u32 paperWhiteNits, u32 hi
     InterlockedExchange(&g_ld_hdr_paper_white_nits, (LONG)paperWhiteNits);
     InterlockedExchange(&g_ld_hdr_highlight_percent, (LONG)highlightPercent);
     InterlockedExchange(&g_ld_hdr_enabled, enabled ? 1 : 0);
+}
+
+/* The levels HDR output uses: a setting, or for 0 what the display and
+ * Windows report, or 1000 / 200 nits when they do not. */
+static u32 ld_hdr_peak_in_use(void)
+{
+    const LONG setting = InterlockedCompareExchange(&g_ld_hdr_peak_nits, 0, 0);
+    const LONG display = InterlockedCompareExchange(&g_ld_hdr_display_peak, 0, 0);
+    return setting > 0 ? (u32)setting : (display >= 100 ? (u32)display : 1000u);
+}
+
+static u32 ld_hdr_paper_white_in_use(void)
+{
+    const LONG setting = InterlockedCompareExchange(&g_ld_hdr_paper_white_nits, 0, 0);
+    const LONG windows = InterlockedCompareExchange(&g_ld_hdr_sdr_white, 0, 0);
+    return setting > 0 ? (u32)setting : (windows >= 80 ? (u32)windows : 200u);
+}
+
+void rsx_live_draw_get_hdr_levels(u32* peakInUse, u32* paperWhiteInUse, u32* windowsSdrWhite)
+{
+    if (peakInUse)
+    {
+        *peakInUse = ld_hdr_peak_in_use();
+    }
+    if (paperWhiteInUse)
+    {
+        *paperWhiteInUse = ld_hdr_paper_white_in_use();
+    }
+    if (windowsSdrWhite)
+    {
+        const LONG windows = InterlockedCompareExchange(&g_ld_hdr_sdr_white, 0, 0);
+        *windowsSdrWhite = windows > 0 ? (u32)windows : 0u;
+    }
 }
 
 int rsx_live_draw_get_hdr_status(u32* displayPeakNits)
@@ -14329,6 +14365,55 @@ static int ld_hdr_images_ensure(void)
     return 1;
 }
 
+/* Windows' SDR content brightness (Settings > System > Display > HDR) for
+ * the display named `deviceName` (\\.\DISPLAYn), in nits, or 0. Windows
+ * shows SDR games at this level, so it is HDR output's paper white unless
+ * one is set. */
+static u32 ld_hdr_windows_sdr_white(const WCHAR* deviceName)
+{
+    UINT32 pathCount = 0;
+    UINT32 modeCount = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS || !pathCount)
+    {
+        return 0;
+    }
+    DISPLAYCONFIG_PATH_INFO* paths = (DISPLAYCONFIG_PATH_INFO*)calloc(pathCount, sizeof(*paths));
+    DISPLAYCONFIG_MODE_INFO* modes = (DISPLAYCONFIG_MODE_INFO*)calloc(modeCount ? modeCount : 1u, sizeof(*modes));
+    u32 nits = 0;
+    if (paths && modes &&
+        QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths, &modeCount, modes, NULL) == ERROR_SUCCESS)
+    {
+        for (UINT32 pathIndex = 0; pathIndex < pathCount && !nits; pathIndex++)
+        {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME source;
+            memset(&source, 0, sizeof(source));
+            source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = sizeof(source);
+            source.header.adapterId = paths[pathIndex].sourceInfo.adapterId;
+            source.header.id = paths[pathIndex].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+                wcscmp(source.viewGdiDeviceName, deviceName) != 0)
+            {
+                continue;
+            }
+            DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel;
+            memset(&whiteLevel, 0, sizeof(whiteLevel));
+            whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            whiteLevel.header.size = sizeof(whiteLevel);
+            whiteLevel.header.adapterId = paths[pathIndex].targetInfo.adapterId;
+            whiteLevel.header.id = paths[pathIndex].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&whiteLevel.header) == ERROR_SUCCESS && whiteLevel.SDRWhiteLevel)
+            {
+                /* In thousandths of 80 nits. */
+                nits = (u32)(((unsigned long long)whiteLevel.SDRWhiteLevel * 80ull + 500ull) / 1000ull);
+            }
+        }
+    }
+    free(paths);
+    free(modes);
+    return nits;
+}
+
 /* Once a present, before anything is drawn for it: switch the swap chain
  * between 8-bit SDR and scRGB as the setting asks, and every second or so
  * note whether the window's display has Windows' HDR on. */
@@ -14411,11 +14496,21 @@ static void ld_hdr_sync_swapchain(void)
             const LONG hdrOn = outputDescription.ColorSpace == DXGI_COLOR_SPACE_RGB_FULL_G2084_NONE_P2020 ? 1 : 0;
             const LONG previous = InterlockedExchange(&g_ld_hdr_display, hdrOn);
             InterlockedExchange(&g_ld_hdr_display_peak, (LONG)outputDescription.MaxLuminance);
-            if (previous != hdrOn)
+            /* Windows' SDR brightness: every fifth look (about five
+             * seconds), and whenever HDR was just turned on or off. */
+            static u32 looks = 0;
+            const LONG previousWhite = InterlockedCompareExchange(&g_ld_hdr_sdr_white, 0, 0);
+            if (previous != hdrOn || looks % 5u == 0u)
             {
-                fprintf(stderr, "[hdr] display: Windows HDR %s, peak %.0f nits\n", hdrOn ? "on" : "off",
-                        (double)outputDescription.MaxLuminance);
+                const u32 sdrWhite = hdrOn ? ld_hdr_windows_sdr_white(outputDescription.DeviceName) : 0u;
+                InterlockedExchange(&g_ld_hdr_sdr_white, (LONG)sdrWhite);
+                if (previous != hdrOn || (LONG)sdrWhite != previousWhite)
+                {
+                    fprintf(stderr, "[hdr] display: Windows HDR %s, peak %.0f nits, SDR content brightness %u nits\n",
+                            hdrOn ? "on" : "off", (double)outputDescription.MaxLuminance, sdrWhite);
+                }
             }
+            looks++;
         }
         output6->lpVtbl->Release(output6);
     }
@@ -14606,8 +14701,8 @@ static void ld_hdr_compose(ID3D12Resource* backBuffer, u32 bufferIndex, int draw
         g.list->lpVtbl->SetPipelineState(g.list, g.hdr_pso);
         float imageRect[4];
         ld_present_image_rect(gameWidth, gameHeight, imageRect);
-        const float paperWhite = (float)InterlockedCompareExchange(&g_ld_hdr_paper_white_nits, 0, 0);
-        const float peak = (float)InterlockedCompareExchange(&g_ld_hdr_peak_nits, 0, 0);
+        const float paperWhite = (float)ld_hdr_paper_white_in_use();
+        const float peak = (float)ld_hdr_peak_in_use();
         const float highlights = (float)InterlockedCompareExchange(&g_ld_hdr_highlight_percent, 0, 0) / 100.0f;
         const float constants[12] = {
             (float)g.bb_w, (float)g.bb_h, 1.0f / (float)g.bb_w, 1.0f / (float)g.bb_h,

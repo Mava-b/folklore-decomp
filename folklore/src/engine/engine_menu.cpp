@@ -59,6 +59,7 @@ extern "C"
     void rsx_null_backend_set_fullscreen(int enabled);
     void rsx_live_draw_get_shader_stats(uint32_t* pending, uint32_t* built, uint32_t* skippedDraws);
     int rsx_live_draw_get_hdr_status(uint32_t* displayPeakNits);
+    void rsx_live_draw_get_hdr_levels(uint32_t* peakInUse, uint32_t* paperWhiteInUse, uint32_t* windowsSdrWhite);
     extern volatile int g_cellpad_block_guest_input;
     /* A controller read over HID (cellPad.c): a DualShock 3 or 4, DualSense
      * or Switch Pro. Buttons in CELL_PAD packing. */
@@ -1072,9 +1073,11 @@ namespace
         return false;
     }
 
-    /* HDR output: on or off, and its three levels. Under them, whether the
-     * game's display has Windows' HDR on (the renderer checks every second
-     * or so), since without it the picture looks washed out. */
+    /* HDR output: on or off, and its three levels. Paper white and peak
+     * follow Windows' SDR content brightness and the display's peak unless
+     * set by hand. Under them, whether the game's display has Windows' HDR
+     * on (the renderer checks every second or so), since without it the
+     * picture looks washed out. */
     bool drawHdr()
     {
         EngineSettings& settings = engineSettings();
@@ -1084,38 +1087,80 @@ namespace
         uint32_t displayPeak = 0;
         const int status = rsx_live_draw_get_hdr_status(&displayPeak);
         const bool displayHdr = status >= 0 && (status & 1) != 0;
-        if (settings.hdr)
+        if (!settings.hdr)
         {
-            const float sliderWidth = ImGui::GetFontSize() * 18.0f;
-            ImGui::SetNextItemWidth(sliderWidth);
-            changed |= ImGui::SliderInt("Peak brightness##hdr", &settings.hdrPeakNits, kHdrPeakMinimum,
-                                        kHdrPeakMaximum, "%d nits");
+            if (displayHdr)
+            {
+                ImGui::TextDisabled("This display has Windows' HDR on.");
+            }
+            return changed;
+        }
+        uint32_t peakInUse = 0;
+        uint32_t paperWhiteInUse = 0;
+        uint32_t windowsWhite = 0;
+        rsx_live_draw_get_hdr_levels(&peakInUse, &paperWhiteInUse, &windowsWhite);
+        const float sliderWidth = ImGui::GetFontSize() * 18.0f;
+        char label[128];
+
+        bool paperWhiteAutomatic = settings.hdrPaperWhiteNits == 0;
+        if (windowsWhite > 0)
+        {
+            std::snprintf(label, sizeof(label), "Paper white: Windows' SDR content brightness (%u nits)##hdrpaper",
+                          windowsWhite);
+        }
+        else
+        {
+            std::snprintf(label, sizeof(label), "Paper white: Windows' SDR content brightness##hdrpaper");
+        }
+        if (ImGui::Checkbox(label, &paperWhiteAutomatic))
+        {
+            settings.hdrPaperWhiteNits =
+                paperWhiteAutomatic ? 0
+                                    : std::clamp((int)paperWhiteInUse, kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
+            changed = true;
+        }
+        if (!paperWhiteAutomatic)
+        {
             ImGui::SetNextItemWidth(sliderWidth);
             changed |= ImGui::SliderInt("Paper white (HUD, menus, mid-tones)##hdr", &settings.hdrPaperWhiteNits,
                                         kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum, "%d nits");
-            ImGui::SetNextItemWidth(sliderWidth);
-            changed |= ImGui::SliderInt("Highlights##hdr", &settings.hdrHighlights, 0, 100, "%d%%");
-            if (status >= 0 && !displayHdr)
-            {
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
-                                   "Windows' HDR is off for this display: turn on Use HDR in Windows'");
-                ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
-                                   "Settings > System > Display, or the picture looks washed out.");
-            }
-            else if (displayHdr && displayPeak > 0)
-            {
-                ImGui::TextDisabled("This display reports a peak of %u nits; set Peak brightness near it.",
-                                    displayPeak);
-            }
-            else
-            {
-                ImGui::TextDisabled("Peak brightness: your display's. Highlights: how far towards it the bright");
-                ImGui::TextDisabled("parts of the scene go (0%% = plain SDR at paper white).");
-            }
         }
-        else if (displayHdr)
+
+        bool peakAutomatic = settings.hdrPeakNits == 0;
+        if (displayPeak > 0)
         {
-            ImGui::TextDisabled("This display has Windows' HDR on.");
+            std::snprintf(label, sizeof(label), "Peak brightness: the display's (%u nits)##hdrpeak", displayPeak);
+        }
+        else
+        {
+            std::snprintf(label, sizeof(label), "Peak brightness: the display's##hdrpeak");
+        }
+        if (ImGui::Checkbox(label, &peakAutomatic))
+        {
+            settings.hdrPeakNits =
+                peakAutomatic ? 0 : std::clamp((int)peakInUse, kHdrPeakMinimum, kHdrPeakMaximum);
+            changed = true;
+        }
+        if (!peakAutomatic)
+        {
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Peak brightness##hdr", &settings.hdrPeakNits, kHdrPeakMinimum,
+                                        kHdrPeakMaximum, "%d nits");
+        }
+
+        ImGui::SetNextItemWidth(sliderWidth);
+        changed |= ImGui::SliderInt("Highlights##hdr", &settings.hdrHighlights, 0, 100, "%d%%");
+        if (status >= 0 && !displayHdr)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "Windows' HDR is off for this display: turn on Use HDR in Windows'");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "Settings > System > Display, or the picture looks washed out.");
+        }
+        else
+        {
+            ImGui::TextDisabled("Highlights: how far towards the peak the bright parts of the scene go");
+            ImGui::TextDisabled("(0%% = the same picture as HDR off).");
         }
         return changed;
     }

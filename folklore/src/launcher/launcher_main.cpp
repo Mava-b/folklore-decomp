@@ -618,7 +618,51 @@ namespace
     {
         bool anyHdr = false;
         float peakNits = 0.0f;
+        unsigned sdrWhiteNits = 0;      /* Windows' SDR content brightness there */
     };
+
+    /* Windows' SDR content brightness (Settings > System > Display > HDR)
+     * for the display named `deviceName`, in nits, or 0. The game uses it as
+     * HDR output's paper white unless one is set. */
+    unsigned windowsSdrWhite(const wchar_t* deviceName)
+    {
+        UINT32 pathCount = 0;
+        UINT32 modeCount = 0;
+        if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &pathCount, &modeCount) != ERROR_SUCCESS || !pathCount)
+        {
+            return 0;
+        }
+        std::vector<DISPLAYCONFIG_PATH_INFO> paths(pathCount);
+        std::vector<DISPLAYCONFIG_MODE_INFO> modes(modeCount ? modeCount : 1u);
+        if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &pathCount, paths.data(), &modeCount, modes.data(), nullptr) !=
+            ERROR_SUCCESS)
+        {
+            return 0;
+        }
+        for (UINT32 pathIndex = 0; pathIndex < pathCount; pathIndex++)
+        {
+            DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
+            source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+            source.header.size = sizeof(source);
+            source.header.adapterId = paths[pathIndex].sourceInfo.adapterId;
+            source.header.id = paths[pathIndex].sourceInfo.id;
+            if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+                wcscmp(source.viewGdiDeviceName, deviceName) != 0)
+            {
+                continue;
+            }
+            DISPLAYCONFIG_SDR_WHITE_LEVEL whiteLevel = {};
+            whiteLevel.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+            whiteLevel.header.size = sizeof(whiteLevel);
+            whiteLevel.header.adapterId = paths[pathIndex].targetInfo.adapterId;
+            whiteLevel.header.id = paths[pathIndex].targetInfo.id;
+            if (DisplayConfigGetDeviceInfo(&whiteLevel.header) == ERROR_SUCCESS && whiteLevel.SDRWhiteLevel)
+            {
+                return (unsigned)(((unsigned long long)whiteLevel.SDRWhiteLevel * 80ull + 500ull) / 1000ull);
+            }
+        }
+        return 0;
+    }
 
     HdrDisplays hdrDisplays()
     {
@@ -660,6 +704,7 @@ namespace
                     {
                         found.anyHdr = true;
                         found.peakNits = std::max(found.peakNits, description.MaxLuminance);
+                        found.sdrWhiteNits = std::max(found.sdrWhiteNits, windowsSdrWhite(description.DeviceName));
                     }
                     output6->Release();
                 }
@@ -1151,39 +1196,76 @@ namespace
         bool changed = false;
         changed |= ImGui::Checkbox("HDR output (brighter highlights on an HDR display)", &settings.hdr);
         const HdrDisplays displays = hdrDisplays();
-        if (settings.hdr)
+        if (!settings.hdr)
         {
-            const float sliderWidth = 320.0f * ImGui::GetIO().FontGlobalScale;
-            ImGui::SetNextItemWidth(sliderWidth);
-            changed |= ImGui::SliderInt("Peak brightness", &settings.hdrPeakNits, kHdrPeakMinimum, kHdrPeakMaximum,
-                                        "%d nits");
+            if (displays.anyHdr)
+            {
+                note("A display has Windows' HDR on: HDR output can use it.");
+            }
+            return changed;
+        }
+        const float sliderWidth = 320.0f * ImGui::GetIO().FontGlobalScale;
+        char label[128];
+
+        bool paperWhiteAutomatic = settings.hdrPaperWhiteNits == 0;
+        if (displays.sdrWhiteNits > 0)
+        {
+            std::snprintf(label, sizeof(label), "Paper white: Windows' SDR content brightness (%u nits)",
+                          displays.sdrWhiteNits);
+        }
+        else
+        {
+            std::snprintf(label, sizeof(label), "Paper white: Windows' SDR content brightness");
+        }
+        if (ImGui::Checkbox(label, &paperWhiteAutomatic))
+        {
+            const int current = displays.sdrWhiteNits > 0 ? (int)displays.sdrWhiteNits : 200;
+            settings.hdrPaperWhiteNits =
+                paperWhiteAutomatic ? 0 : std::clamp(current, kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
+            changed = true;
+        }
+        if (!paperWhiteAutomatic)
+        {
             ImGui::SetNextItemWidth(sliderWidth);
             changed |= ImGui::SliderInt("Paper white", &settings.hdrPaperWhiteNits, kHdrPaperWhiteMinimum,
                                         kHdrPaperWhiteMaximum, "%d nits");
-            ImGui::SetNextItemWidth(sliderWidth);
-            changed |= ImGui::SliderInt("Highlights", &settings.hdrHighlights, 0, 100, "%d%%");
-            if (!displays.anyHdr)
-            {
-                ImGui::PushStyleColor(ImGuiCol_Text, kWarning);
-                ImGui::TextWrapped("Windows' HDR is off for every display: turn on Use HDR in Settings > System > "
-                                   "Display, or the picture looks washed out.");
-                ImGui::PopStyleColor();
-            }
-            else if (displays.peakNits > 0.0f)
-            {
-                char text[160];
-                std::snprintf(text, sizeof(text), "Your HDR display reports a peak of %.0f nits; set Peak brightness "
-                                                  "near it.", displays.peakNits);
-                note(text);
-            }
-            note("The game draws in 8-bit colour, so HDR here stretches its highlights (sun, sky, glowing Ids "
-                 "and magic) towards your display's peak. The HUD and menus stay at paper white, the brightness "
-                 "of everything else. Highlights at 0% is plain SDR. Also in the engine menu, live.");
         }
-        else if (displays.anyHdr)
+
+        bool peakAutomatic = settings.hdrPeakNits == 0;
+        if (displays.peakNits > 0.0f)
         {
-            note("A display has Windows' HDR on: HDR output can use it.");
+            std::snprintf(label, sizeof(label), "Peak brightness: the display's (%.0f nits)", displays.peakNits);
         }
+        else
+        {
+            std::snprintf(label, sizeof(label), "Peak brightness: the display's");
+        }
+        if (ImGui::Checkbox(label, &peakAutomatic))
+        {
+            const int current = displays.peakNits > 0.0f ? (int)displays.peakNits : 1000;
+            settings.hdrPeakNits = peakAutomatic ? 0 : std::clamp(current, kHdrPeakMinimum, kHdrPeakMaximum);
+            changed = true;
+        }
+        if (!peakAutomatic)
+        {
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Peak brightness", &settings.hdrPeakNits, kHdrPeakMinimum, kHdrPeakMaximum,
+                                        "%d nits");
+        }
+
+        ImGui::SetNextItemWidth(sliderWidth);
+        changed |= ImGui::SliderInt("Highlights", &settings.hdrHighlights, 0, 100, "%d%%");
+        if (!displays.anyHdr)
+        {
+            ImGui::PushStyleColor(ImGuiCol_Text, kWarning);
+            ImGui::TextWrapped("Windows' HDR is off for every display: turn on Use HDR in Settings > System > "
+                               "Display, or the picture looks washed out.");
+            ImGui::PopStyleColor();
+        }
+        note("The game draws in 8-bit colour, so HDR here stretches its highlights (sun, sky, glowing Ids and "
+             "magic) towards your display's peak. Everything else, the HUD and menus included, stays at paper "
+             "white, which by default is the brightness Windows shows SDR games at, so the picture matches HDR "
+             "off. Highlights at 0% is that same picture. Also in the engine menu, live.");
         return changed;
     }
 

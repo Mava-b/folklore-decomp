@@ -157,6 +157,11 @@ void rsx_live_draw_set_sharpening(u32 percent);
  * displayPeakNits gets the peak the display reports (0 if unknown). */
 void rsx_live_draw_set_hdr(int enabled, u32 peakNits, u32 paperWhiteNits, u32 highlightPercent);
 int rsx_live_draw_get_hdr_status(u32* displayPeakNits);
+/* peakNits / paperWhiteNits 0 = automatic: the display's reported peak, and
+ * Windows' SDR content brightness (what SDR games are shown at, so the
+ * picture matches HDR off). _get_hdr_levels: the levels in use, and Windows'
+ * SDR content brightness (0 unknown). */
+void rsx_live_draw_get_hdr_levels(u32* peakInUse, u32* paperWhiteInUse, u32* windowsSdrWhite);
 /* Texture detail: a mip bias in hundredths of a level, 0 (the game's
  * choice) down to -200, for the same textures as anisotropic filtering
  * (live, like it). Negative picks finer mip levels: sharper surfaces in the

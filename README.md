@@ -364,11 +364,13 @@ saved to `folklore_settings.ini`.
     HDR*). The game draws in 8-bit colour, so there is no hidden HDR picture
     to unlock: this stretches the bright parts of the 3D scene towards the
     display's peak, as Windows' Auto HDR does, but leaves the HUD, text and
-    menus at paper white so they do not glare. *Peak brightness* (set it near
-    what your display reports; the menu shows it), *Paper white* (the
-    brightness of the HUD and everything not a highlight) and *Highlights*
-    (how far towards the peak; 0% is plain SDR). Applies at once. If Windows'
-    HDR is off the picture looks washed out, and the menu says so.
+    menus at paper white so they do not glare. *Paper white* (the
+    brightness of the HUD and everything not a highlight) follows Windows'
+    *SDR content brightness* by default, so the picture matches HDR off;
+    *Peak brightness* follows what the display reports; either can be set by
+    hand. *Highlights*: how far towards the peak the bright parts go (0% is
+    the same picture as HDR off). Applies at once. If Windows' HDR is off
+    the picture looks washed out, and the menu says so.
   - *Texture detail*: *Sharper* (the default), *Sharpest* or *Original* —
     finer texture levels, so walls, ground and clothing keep their detail
     further away. Applies at once.

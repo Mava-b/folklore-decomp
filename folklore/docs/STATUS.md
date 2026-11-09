@@ -1763,6 +1763,18 @@ What 0006 fixes in ps3recomp to make that run:
       overlay is found the same way from the copy before it. Movies are
       expanded whole.
     Built and checked in syntax here; not yet seen on an HDR display.
+127. HDR too dim (run-20261109-181746: "[hdr] display: Windows HDR on,
+    peak 600 nits"): paper white had to go to its 400-nit maximum to match
+    HDR off. With Windows' HDR on, SDR games are shown at its SDR content
+    brightness (Settings > System > Display > HDR), here about 400 nits,
+    not the 200 the setting started at; the 1000-nit peak was also beyond
+    the display's 600. patches/0104 and the menus: paper white and peak are
+    automatic by default (0 in the ini, new keys hdr_paper_white and
+    hdr_peak): Windows' SDR white level for the window's display
+    (DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+    matched to the DXGI output by its GDI device name; checked about every
+    five seconds) and the peak DXGI reports. Either can still be set by
+    hand (paper white up to 500 nits).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
