@@ -3826,7 +3826,16 @@ static void gcm_rsx_process_fifo_unlocked(void)
             const u32 putEa = gcm_io2ea(putNow);
             const u32 word = putEa ? vm_read32(putEa) : 0u;
             u32 wordTarget = 0;
-            const int onWrapJump = gcm_fifo_jump_target(word, &wordTarget) && gcm_io2ea(wordTarget) == s_ring_begin &&
+            /* The word at put is the guest's wrap JUMP only once the guest has
+             * written it, i.e. moved past put. With the guest still AT put the
+             * word is whatever an earlier lap left there -- often that lap's
+             * own early wrap JUMP -- and reading it as a fresh one counted the
+             * drain a lap behind: the guest then waited on an empty ring until
+             * the 150 ms stall rule let it go (four hitches in a 30-minute
+             * session on macOS). */
+            const u32 guestCurrent = s_ring_ctx ? vm_read32(s_ring_ctx + 0x8) : 0u;
+            const int onWrapJump = guestCurrent != putEa &&
+                                   gcm_fifo_jump_target(word, &wordTarget) && gcm_io2ea(wordTarget) == s_ring_begin &&
                                    putEa != s_ring_begin;
             s_ring_drain_lap = onWrapJump ? lapAfter - 1u : lapAfter;
         }
@@ -4351,6 +4360,15 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
             lastDrainedEa = drainedEa;
             stillMs = 0;
             passesWhileStill = s_drain_passes;
+        }
+        /* The drain parked exactly where the guest writes, with nothing
+         * published past it, has read everything: the ring is empty, not a
+         * lap full, whatever the lap counts say. */
+        if (drainedEa == current && gcm_io2ea(s_fifo_getoff) == current &&
+            vm_read32(GCM_CONTROL_GUEST_ADDR + 0) == s_fifo_getoff)
+        {
+            s_ring_drain_lap = s_ring_guest_lap;
+            continue;
         }
         const int drainStuck = stillMs >= GCM_RING_STALL_MS &&
                                (u32)(s_drain_passes - passesWhileStill) >= GCM_RING_STALL_PASSES;
