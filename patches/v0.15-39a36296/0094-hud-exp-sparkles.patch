@@ -1,0 +1,34 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8934,6 +8934,16 @@
+     {
+         place = LD_HUD_CENTRE;
+     }
++    else if (!useRows && middleY * 720.0f >= 56.0f && middleY * 720.0f <= 140.0f && right * 1280.0f >= 744.0f &&
++             right * 1280.0f <= 1210.0f)
++    {
++        /* An effect along the top-right gauges (capture-20261108-123135:
++         * after a capture the experience bonus runs a strip of sparkles
++         * along the bars, x 744-988, y 68-128 of 1280x720): a strip that
++         * starts far left (its centre is left of the middle) but ends on the
++         * bars belongs with them. */
++        place = LD_HUD_RIGHT;
++    }
+     else
+     {
+         /* By the centre, not the extent: the map's background is a turning
+@@ -8951,7 +8961,12 @@
+     }
+     /* A background big enough to carry text or icons (at least 10% of the
+      * width, 3% of the height) is a box for the draws after it. */
+-    if (right - left >= 0.10f && bottom - top >= 0.03f && g_ld_hud_boxes.count < LD_HUD_MAX_BOXES)
++    /* Only panels drawn as such (the plain 2D program, or a big mesh like
++     * the place-name bubble), not effects: the experience sparkle strip
++     * (above) spans most of the width and pulled the gauge bars it crossed
++     * to the middle. */
++    if ((useRows || bigMesh) && right - left >= 0.10f && bottom - top >= 0.03f &&
++        g_ld_hud_boxes.count < LD_HUD_MAX_BOXES)
+     {
+         float* box = g_ld_hud_boxes.rects[g_ld_hud_boxes.count];
+         box[0] = left;

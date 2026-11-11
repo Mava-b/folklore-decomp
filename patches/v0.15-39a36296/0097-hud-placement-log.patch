@@ -1,0 +1,98 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8594,6 +8594,42 @@
+ } ld_hud_box_list;
+ static ld_hud_box_list g_ld_hud_boxes;
+ 
++/* Diagnostic: the first time each CPU-evaluated scanout draw (pipeline,
++ * outcome) is seen, one log line says what placement made of it -- placed
++ * where, or why it was left stretched. The boss capture bar
++ * (capture-20261108-131244) is two such draws, its frame placed and its
++ * glow left stretched, and the capture cannot say which check refused the
++ * glow (it has no constants). */
++#define LD_HUD_NOTE_MAX 256
++static void ld_hud_note(const char* outcome, u32 vertexCount, float left, float right, float top, float bottom,
++                        float clipW)
++{
++    static u64 seenKeys[LD_HUD_NOTE_MAX];
++    static const char* seenOutcomes[LD_HUD_NOTE_MAX];
++    static u32 seenCount = 0;
++    const u64 key = g_ld_current_pso.key;
++    for (u32 seenIndex = 0; seenIndex < seenCount; seenIndex++)
++    {
++        if (seenKeys[seenIndex] == key && seenOutcomes[seenIndex] == outcome)
++        {
++            return;
++        }
++    }
++    if (seenCount >= LD_HUD_NOTE_MAX)
++    {
++        return;
++    }
++    seenKeys[seenCount] = key;
++    seenOutcomes[seenCount] = outcome;
++    seenCount++;
++    fprintf(stderr,
++            "[hud] pso %016llx vp %016llx prim %u verts %u: %s (x %.0f-%.0f y %.0f-%.0f of 1280x720, w %.4g)\n",
++            (unsigned long long)key, (unsigned long long)g_ld_current_pso.vp_hash,
++            (unsigned)g.rsx.current_primitive, (unsigned)vertexCount, outcome, left * 1280.0f, right * 1280.0f,
++            top * 720.0f, bottom * 720.0f, clipW);
++    fflush(stderr);
++}
++
+ static int ld_hud_draw_place(const surface_t* surface, u32 target, const float viewportTransform[8])
+ {
+     const LONG layout = InterlockedCompareExchange(&g_ld_hud_layout, 0, 0);
+@@ -8709,6 +8745,7 @@
+             if (rsx_vp_evaluate_position(programCode, programBytes, (const float (*)[4])inputs,
+                                          (const u32 (*)[4])g.rsx.constants, clip) != 0)
+             {
++                ld_hud_note("stretched: vertex program not evaluated", vertexCount, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+                 return 0;
+             }
+             clipX = clip[0];
+@@ -8721,11 +8758,17 @@
+             }
+             else if (fabsf(clipW - firstW) > 1e-4f * fabsf(firstW))
+             {
++                ld_hud_note("stretched: w varies (perspective)", vertexCount, 0.0f, 0.0f, 0.0f, 0.0f, clipW);
+                 return 0;
+             }
+         }
+         if (!(clipW > 1e-6f) || !(clipX == clipX) || !(clipY == clipY))
+         {
++            if (!useRows)
++            {
++                ld_hud_note("stretched: w not positive or position not a number", vertexCount, 0.0f, 0.0f, 0.0f,
++                            0.0f, clipW);
++            }
+             return 0;
+         }
+         const float screenX = clipX / clipW * viewportTransform[0] + viewportTransform[4];
+@@ -8755,6 +8798,11 @@
+     /* Clip space runs -1..1: a draw 95% of the width or more is full-screen. */
+     if (!(highestX - lowestX < 1.9f))
+     {
++        if (!useRows)
++        {
++            ld_hud_note("stretched: full width", vertexCount, (lowestX + 1.0f) * 0.5f, (highestX + 1.0f) * 0.5f,
++                        (1.0f - highestY) * 0.5f, (1.0f - lowestY) * 0.5f, firstW);
++        }
+         return 0;
+     }
+     /* Screen fractions from the top left (clip y points up). */
+@@ -9007,6 +9055,13 @@
+     g_ld_hud_previous.bottom = bottom;
+     g_ld_hud_previous.place = place;
+     g_ld_hud_previous.anchor = anchor;
++    if (!useRows)
++    {
++        static const char* const placeNames[] = {"placed: stretched", "placed: centre", "placed: left",
++                                                 "placed: right", "placed: in a speech bubble"};
++        ld_hud_note(placeNames[place >= 0 && place <= LD_HUD_IN_PICTURE ? place : 0], vertexCount, left, right,
++                    top, bottom, firstW);
++    }
+     if (place == LD_HUD_IN_PICTURE)
+     {
+         g_ld_hud_anchor = anchor;

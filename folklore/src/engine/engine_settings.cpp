@@ -8,6 +8,7 @@
 #include "engine_settings.h"
 #include "engine_region.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #ifdef _WIN32
@@ -293,6 +294,11 @@ void engineSettingsLoad()
         {
             settingsInstance.texturePackDir = value;
         }
+        else if (std::strcmp(key, "save_slot") == 0)
+        {
+            const int slot = std::atoi(value);
+            settingsInstance.saveSlot = slot >= 0 && slot <= 9999 ? slot : 0;
+        }
         else if (std::strcmp(key, "bloom") == 0)
         {
             settingsInstance.bloom = std::strcmp(value, "original") == 0 ? EngineSettings::Bloom::Original
@@ -353,6 +359,25 @@ void engineSettingsLoad()
         {
             const int percent = std::atoi(value);
             settingsInstance.sharpening = percent < 0 ? 0 : (percent > 100 ? 100 : percent);
+        }
+        else if (std::strcmp(key, "hdr") == 0)
+        {
+            settingsInstance.hdr = parseBool(value);
+        }
+        else if (std::strcmp(key, "hdr_peak") == 0)
+        {
+            const int nits = std::atoi(value);
+            settingsInstance.hdrPeakNits = nits <= 0 ? 0 : std::clamp(nits, kHdrPeakMinimum, kHdrPeakMaximum);
+        }
+        else if (std::strcmp(key, "hdr_paper_white") == 0)
+        {
+            const int nits = std::atoi(value);
+            settingsInstance.hdrPaperWhiteNits =
+                nits <= 0 ? 0 : std::clamp(nits, kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
+        }
+        else if (std::strcmp(key, "hdr_highlights") == 0)
+        {
+            settingsInstance.hdrHighlights = std::clamp(std::atoi(value), 0, 100);
         }
         else if (std::strcmp(key, "aspect_ratio") == 0)
         {
@@ -477,9 +502,17 @@ void engineSettingsSave()
                  : current.textureDetail == EngineSettings::TextureDetail::Sharpest ? "sharpest"
                                                                                     : "sharper");
     std::fprintf(file, "sharpening = %d\n", current.sharpening);
+    std::fprintf(file, "# HDR output (an HDR display with Windows' HDR on): peak and paper white in nits\n");
+    std::fprintf(file, "# (0 = the display's peak / Windows' SDR content brightness), highlights 0-100 %%\n");
+    std::fprintf(file, "hdr = %d\n", current.hdr ? 1 : 0);
+    std::fprintf(file, "hdr_peak = %d\n", current.hdrPeakNits);
+    std::fprintf(file, "hdr_paper_white = %d\n", current.hdrPaperWhiteNits);
+    std::fprintf(file, "hdr_highlights = %d\n", current.hdrHighlights);
     std::fprintf(file, "# Replacement textures (next start); folder empty = textures\\replace next to this file\n");
     std::fprintf(file, "texture_pack = %d\n", current.texturePack ? 1 : 0);
     std::fprintf(file, "texture_pack_dir = %s\n", current.texturePackDir.c_str());
+    std::fprintf(file, "# The save slot the game loads and saves (0-9999; choose it in the launcher)\n");
+    std::fprintf(file, "save_slot = %d\n", current.saveSlot);
     std::fprintf(file, "# original (the game's two-tap blur) or smooth (next start)\n");
     std::fprintf(file, "depth_of_field = %s\n",
                  current.depthOfField == EngineSettings::DepthOfField::Original ? "original" : "smooth");
@@ -539,6 +572,7 @@ extern "C"
     void rsx_live_draw_set_shadow_softness(int level);
     void rsx_live_draw_set_repeat_draws(int enabled);
     void rsx_live_draw_set_sharpening(uint32_t percent);
+    void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent);
     void rsx_live_draw_set_texture_pack(const char* folder);
     int cellPad_set_motion_mode(int mode);
     void rsx_live_draw_set_aspect(float aspect);
@@ -593,6 +627,8 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_hud_edge(current.hudEdge);
     rsx_live_draw_set_shadow_softness((int)current.shadows);
     rsx_live_draw_set_sharpening((uint32_t)current.sharpening);
+    rsx_live_draw_set_hdr(current.hdr ? 1 : 0, (uint32_t)current.hdrPeakNits, (uint32_t)current.hdrPaperWhiteNits,
+                          (uint32_t)current.hdrHighlights);
     engineDepthOfFieldApply();
     engineBloomApply();
     engineIdSoulsApply();

@@ -1,0 +1,20 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8665,6 +8665,16 @@
+     {
+         return 0;                        /* not a small overlay (the place-name bubble has 1050) */
+     }
++    else if (vertexCount > 1024u && g.rsx.current_primitive == 8u)
++    {
++        /* Over 1024 vertices, only a mesh of triangles (the place-name
++         * bubble) is let in; a cloud of particle quads (the capture bonus's
++         * sparkles, 1920 and 1272 vertices in capture-20261108-125702) is
++         * left stretched as before 0088 -- placed as a big mesh it went to
++         * the middle and, as a box, took the gauges' icons, spirit bar and
++         * "Exp x1.0" with it. */
++        return 0;
++    }
+     float lowestX = 1e30f;
+     float highestX = -1e30f;
+     float lowestY = 1e30f;

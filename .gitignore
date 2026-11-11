@@ -58,3 +58,6 @@ __pycache__/
 
 # macOS Finder metadata.
 .DS_Store
+
+# The icon the Windows build makes from your copy (patch 0087).
+/folklore_icon.ico

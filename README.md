@@ -19,7 +19,30 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-### New in v0.5: the launcher
+### New in v0.62: smoother play and a tidier ultrawide HUD
+
+- **No more quarter-second freezes in fights**: a hold-up between the game
+  and the renderer, every few seconds in heavy combat, is gone.
+- **Clean fade-in after Load Game**: no more half-drawn frames (a black
+  screen with only the HUD, flickering pieces) while the new area's shaders
+  are built; the loading screen stays up until the area is ready.
+- **Ultrawide HUD**: speech bubbles keep the game's proportions beside the
+  character speaking; place names, the item pick-up box and the boss capture
+  bar stay in one piece; the Search prompt, the player-select arrows and the
+  capture bonus sparkles stay where they belong.
+- **Auto-capture** now finishes the boss captures where you swing the
+  controller left and right.
+
+### v0.6: save slots
+
+The launcher's new **Saves** page lets you keep as many saves as you like and
+choose which one the game plays before you press Play. Each slot shows the
+picture of the area it was saved in, the character and place, both
+characters' chapters, the play time and when it was saved. Start a **New
+slot**, **Import** saves (RPCS3's too), **Duplicate**, **Export** (ready for
+RPCS3) or **Delete** one. See [*Save slots*](#save-slots).
+
+### v0.5: the launcher
 
 ![Folklore launcher, Game page](docs/images/launcher_game.png)
 
@@ -46,6 +69,9 @@ be turned back to the original.
   screen's edges (with a *How far out* slider), and menus, speech bubbles
   and fades stay where they belong.
 - **Anti-aliasing**: SMAA (sharp, clean edges) or FXAA.
+- **HDR**: on an HDR display, the sun, skies, glowing Ids and magic go
+  brighter than white towards your display's peak, while the HUD and menus
+  stay at a comfortable paper white.
 - **Sharper textures**: finer texture levels in the distance, plus up to 16x
   anisotropic filtering and optional sharpening.
 - **Ambient occlusion**: soft shading where surfaces meet — corners, under
@@ -249,6 +275,12 @@ ones `run.ps1` uses).
 - **Game**: your disc dump and, for a 1.10 build, the installed 1.10 update,
   each checked the way the game checks them; where saves and installed data
   go; optional firmware fonts.
+- **Saves**: your save slots, each with the picture of the area it was saved
+  in, the character and place, both characters' chapters, the play time and
+  when it was saved. Choose the slot the game plays, start a **New slot**,
+  **Import...** saves (from RPCS3 too), **Duplicate**, **Export...** or
+  **Delete...** one;
+  see [*Save slots*](#save-slots).
 - **DLC**: the packs installed, **Add DLC from RPCS3...** and **Add licences
   (.rap)...**, and any pack still missing its licence.
 - **Graphics**, **Display**, **Gameplay**: every setting of the in-game
@@ -265,8 +297,39 @@ beside the launcher): put your own copy of the cover art there and it fills
 the left-hand panel. It is not in the repository; without it the launcher
 shows the plain panel in the screenshots above.
 
+**Icon**: `folklore_icon.ico` in the project folder becomes the icon of both
+folklore.exe and FolkloreLauncher.exe (and of the game's window) the next
+time build.ps1 runs. Like the art it comes from the game, so it is not in the
+repository; without it both get Windows' default icon.
+
 **From a package**: unzip, double-click `run_launcher.bat`, choose your disc
 dump (and the 1.10 update for a 1.10 build) on the Game page, press Play.
+
+### Save slots
+
+Folklore keeps each save in its own folder (`BCUS98147-SAVEDATA-0000`,
+`-0001`, ...; `BCES00050-...` for the European release). On a PS3 the game
+shows them in a list and you pick one; the port has no such list, so it used
+to load and overwrite the first. Now the **Saves** page of the launcher picks
+the slot before the game starts, and the game loads and saves only that one
+(`save_slot` in `folklore_settings.ini`). An empty slot starts a new game,
+which then saves into it. The in-game engine menu shows the slot in use.
+
+- **New slot**: the next free number; press Play for a new game in it.
+- **Import...**: one save folder, a folder of them (an export, or RPCS3's
+  `dev_hdd0\home\00000001\savedata`), or RPCS3's own folder. Each save gets
+  the next free slot; one already in a slot is skipped. A save made with the
+  other release is marked, as it may not load.
+- **Duplicate slot N**: copies the slot into the next free one, to try
+  something without risking the original or keep a point to go back to. The
+  game keeps using the original until you press **Use** on the copy.
+- **Export slot N...**: copies the slot to a folder you choose, as a PS3
+  save folder: it can go straight into RPCS3's `savedata` folder.
+- **Delete slot N...** (press Confirm): moves the slot to `deleted_saves\`,
+  from where Import brings it back.
+
+The saves live in `gamedata\dev_hdd0\home\00000001\savedata` in the data
+folder (the project folder, or the one set on the Game page).
 
 ### Engine menu
 
@@ -316,6 +379,18 @@ saved to `folklore_settings.ini`.
     that stay sharp, text and texture detail kept), *FXAA* (softer) or
     *Off*. Applies at once. *Anisotropic filtering* (up to 16x),
     *Sharpening*.
+  - *HDR output* (off by default; also on the launcher's Graphics page):
+    for a display with Windows' HDR on (Settings → System → Display → *Use
+    HDR*). The game draws in 8-bit colour, so there is no hidden HDR picture
+    to unlock: this stretches the bright parts of the 3D scene towards the
+    display's peak, as Windows' Auto HDR does, but leaves the HUD, text and
+    menus at paper white so they do not glare. *Paper white* (the
+    brightness of the HUD and everything not a highlight) follows Windows'
+    *SDR content brightness* by default, so the picture matches HDR off;
+    *Peak brightness* follows what the display reports; either can be set by
+    hand. *Highlights*: how far towards the peak the bright parts go (0% is
+    the same picture as HDR off). Applies at once. If Windows' HDR is off
+    the picture looks washed out, and the menu says so.
   - *Texture detail*: *Sharper* (the default), *Sharpest* or *Original* —
     finer texture levels, so walls, ground and clothing keep their detail
     further away. Applies at once.
@@ -530,6 +605,10 @@ their own subfolders.
   distant surfaces shimmer. Uncompressed files without them get them made
   as they load.
 - A cube map can only replace a cube map.
+- Dumping with the pack on: textures the pack replaces are not dumped, and
+  dumps from earlier runs that now have a replacement are moved into
+  `textures\dump\replaced` when the game starts, so `textures\dump` only
+  holds the textures still to be made.
 - The menu shows how many replacements were found and how many are in use.
   A file that cannot be used is skipped (the game's own texture shows) and
   the log says why (`[tex-pack]` lines).

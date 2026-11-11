@@ -1548,6 +1548,233 @@ What 0006 fixes in ps3recomp to make that run:
     first version of the patch also rewrote four CRLF lines of
     rsx_live_draw.c and git on Windows refused it; edit those files as
     bytes.)
+109. Save slots. Folklore saves through cellSaveDataListSave2/ListLoad2
+    into <title id>-SAVEDATA-NNNN directories; a PS3 shows the list and
+    the player picks. Headless, dispatch_func_select took the first listed
+    entry (the game passes the existing saves as its fixed list, plus a
+    new-save name), so every load and save went to -0000. patches/0086:
+    PS3_SAVEDATA_SELECT names one directory; listings hide the others of
+    its family (name up to the trailing digits), and a List save writes it
+    (created when new). engine_save_slots sets it from save_slot at boot
+    and reads each slot's PARAM.SFO (SUB_TITLE: character, realm, area;
+    DETAIL: both chapters and play time) and ICON0.PNG (the area, 320x176)
+    for the launcher's Saves page; import/export/delete are folder copies
+    (CopyFileA keeps the file times the "saved" date comes from), and an
+    imported save of this release gets its SFO SAVEDATA_DIRECTORY renamed
+    to its slot. Duplicate copies a slot into the next free one the same
+    way.
+110. Icons: folklore/CMakeLists.txt writes build\folklore_icon.rc
+    ("1 ICON <project>\folklore_icon.ico") and adds it to folklore and
+    FolkloreLauncher when that file exists (it is made from a game texture,
+    so it is gitignored like launcher_art.jpg). The launcher's window class
+    already loaded icon 1; patches/0087 makes the game window's class load
+    it too.
+111. Ultrawide place-name popup (capture-20261107-111421): the dark bubble
+    is one 1050-vertex mesh, over ld_hud_draw_place's 1024 limit, so it was
+    stretched with the picture; and its text, which starts on the bubble's
+    left end (first letter centred at x 545 of 1280), went to the left
+    edge in the "edges" layout while the bubble stayed in the middle.
+    patches/0088: the limit is 4096, and HUD backgrounds (10% x 3% of the
+    screen or more) are kept per frame with where they went; a draw that
+    starts a line over one (its middle within the box's height, overlapping
+    it with 5% of the screen to spare, half its width or less) goes with it.
+112. Speech bubbles in ultrawide (patches/0089). The story scenes' bubbles
+    were left stretched with the picture (87): the game aims each tail's
+    tip at its speaker through the Hor+ camera, so the tip was right, but
+    every bubble was wider by the aspect's gain and crowded over the
+    characters, its text stretched. Now (layouts centred and edges) a
+    bubble's pieces (tail outline, body, tail fill: depth-tested 2D,
+    grouped as they come -- a triangle starts a bubble unless it repeats
+    the latest tail's corners, a quad joins the latest bubble it overlaps)
+    and its text are drawn at the game's proportions, pinned at the tail's
+    tip (the corner furthest from the middle of the other two): viewport
+    left = tip x (1 - shrink). Simulated on capture-20261031-161917: three
+    bubbles, each with all its letters (18, 19, 33).
+113. "Search" prompt jumping right (capture-20261107-122656, after 0088):
+    the prompt is world-placed text over Ellen (x 604-676, y 194-230 of
+    1280x720, the same every frame); in some frames it went to the right
+    edge while its pill stayed. Nothing but a box (111) could send it
+    there: a CPU-evaluated effect drawn before it (e062172c, its extent
+    changing with the camera) was recorded as a box moved right. patches/
+    0090: only boxes left in the middle pull text to them -- 111 needs no
+    more (the place-name bubble is in the middle), and a moved-out box's own
+    contents already go its way by the zones.
+114. Player select arrows beside "Keats" (screenshot, no capture): the
+    arrows between the two names went right with Keats after 0088. The
+    likely cause is 0088's vertex limit: a mesh over 1024 vertices used to
+    be left stretched (and so stayed in the middle); now classified, it
+    could join Keats's line or go by the zones. patches/0091: such a big
+    CPU-evaluated mesh keeps its proportions but always stays in the middle
+    and never continues a line.
+115. Dumping with a texture pack on: a texture the pack replaces was
+    already never dumped (the replacement is returned first, looked up by
+    the name's first 16 hex digits, size ignored), but the dump folder kept
+    the originals from earlier runs, mixed in with those still to make.
+    patches/0092: with both on, dumps the pack now replaces are moved once
+    per run into <dump>\replaced.
+116. Player select arrows, found (capture-20261107-173348): not a big mesh
+    (114 guessed wrong; 0091 stays, harmless). The names and arrows are
+    plain 2D quads in one program: Ellen 464-592, Keats 688-816, then the
+    right arrow 648-680 and the left arrow 600-632 (x of 1280, y 312-408).
+    The arrows came right after Keats, overlapped its line and were within
+    0.04 of it, so they "continued" Keats's line and went right with it.
+    patches/0093: a line runs left to right -- a piece starting left of
+    the previous one does not continue it. Checked on that frame: the
+    arrows now stay in the middle, and all 381 letter-to-letter
+    continuations of its text are kept.
+117. Experience bonus after a capture (capture-20261108-123135): the bonus
+    runs a strip of sparkles along the top-right bars (x 744-988, y 68-128
+    of 1280x720); it is one CPU-evaluated draw (e062172c, 180 vertices)
+    whose quads span most of the width, so by its centre it stayed in the
+    middle while the bars went right: the sparkles showed left of the
+    bars. And as a box (111) it pulled the bars it crossed to the middle --
+    the HUD shifting left and back. patches/0094: a CPU-evaluated draw
+    whose middle is in the bars' band (y 56-140) and whose right end is on
+    them (x 744-1210) goes right; and boxes are only panels (the plain 2D
+    program or a big mesh), never effects.
+118. Capture bonus, second capture (capture-20261108-125702): in one frame
+    the gauges' Id icons, spirit bar and "Exp x1.0" went to the middle.
+    The bonus's sparkle cloud is one draw of particle quads (e062172c,
+    1920 vertices; 1272 a frame later): 0088 let draws up to 4096
+    vertices into placement and 0091 made those a "big mesh" -- centred,
+    and a box (111) that pulled what was drawn over it to the middle.
+    The place-name bubble that 0088 was for is triangles (1050, prim 5);
+    patches/0095: over 1024 vertices only triangles are placed, a cloud of
+    quads (prim 8) is left stretched as before 0088.
+    Also: F2 capture never ended (and the game crawled until killed) in a
+    run where the engine menu had not been opened -- the timer's rate was
+    only read when the menu was first drawn. engine_menu.cpp reads it on
+    the first frame now.
+119. Item pick-up box torn apart (capture-20261108-131244, "Warcadia
+    picture book, pg. 1"): the box is drawn right to left -- icon
+    1128-1192, end 1096-1128, middle 759-1096, left end 727-759 (x of
+    1280, y 600-664) -- each piece touching the one before, and 0093's
+    "a line runs left to right" stopped the middle and left end following
+    the icon: they and the text over them stayed in the middle while the
+    icon and the box's right end went right. patches/0096: a piece that
+    ends exactly where the previous one starts still continues it (the
+    player-select arrows end 8 pixels short of Keats, so 116 holds); and
+    a moved-out panel now pulls text that lies wholly on it, as a centred
+    one does (safe since 0094 keeps effects out of boxes). Simulated over
+    all 16 captures: only the pick-up rows change.
+120. Auto-capture fills a boss's left / right bar but never finishes it
+    (run-20261108-131244: "[capture-assist] capture state 2: filling the
+    bar"). State 2 (func_00103270 in 1.10, func_00102B70 in 1.00) keeps a
+    phase at +48 of the capture controller: 0 waiting for a swing, 1 a
+    swing landed -- wait for one back the other way, 2 won -- after a
+    short wait it moves to the state at +220 (func_00100CE8). The count
+    is compared with the target only as a swing lands (0x103884), and
+    constant full-scale motion never swings back, so the full bar was
+    never noticed. engine_capture_assist.cpp: in state 2, once the count
+    is full the phase is set to 2, as the game does after the last swing,
+    and the log says "bar full, swing phase N -> won".
+    Boss capture bar in ultrawide (capture-20261108-131244, third F2): when
+    a move lands, a glow (pso a23efbba..., 360 vertices) spills past the
+    bar's frame (f082820f..., 360 vertices) by about 4:3 -- the glow is
+    left stretched while the frame is placed. Both are CPU-evaluated 3D
+    vertex programs (world and projection matrices c256-263); the capture
+    has no constants, so which check refuses the glow is not known.
+    patches/0097: a "[hud]" log line the first time each CPU-evaluated
+    scanout draw is placed or refused, with the reason (not evaluated, w
+    varies, w not positive, full width) and its extent.
+121. The boss capture bar, found (run-20261108-134234, with 0097's log;
+    auto-capture finished that boss, so 120 works): the bar's two meshes
+    (360 vertices each) are placed most of the time, but in the intro
+    animation and on each hit they grow to x 23-1277 of 1280 (soft
+    transparent edges far wider than what shows) and were then taken for a
+    full-screen pass and left stretched, so the bar jumped between the
+    two widths. patches/0098: a CPU-evaluated draw less than a quarter of
+    the screen high is never "full width". Every other full-width
+    CPU-evaluated draw in that run is at least half the screen high.
+122. Boss capture bar, the hard-edged block past its ends on a successful
+    input (capture-20261108-140721): not the bar's meshes (0098 placed
+    them) but its flash, an effect quad (draw 246, 6 vertices) that zooms
+    out past the screen's edges and is clipped to the bar by its scissor
+    (x 512-766, y 570-594 of 1280x720). Judged by the quad it was a
+    full-screen pass, so it was left stretched and its scissor not
+    shrunk: the block was exactly x 512-766, 4:3 wider than the placed
+    bar. The bar's fills and the gauges' fills are quads cut down by a
+    scissor the same way. patches/0099: a draw's extent is cut to its
+    scissor when that is a real clip (under 95% of the surface wide), so
+    placement goes by what shows; the fills land in the zones they did.
+123. Hitches in run-20261108-140721 (70 [hitch] lines):
+    - Frames 21779-21815: the F2 capture itself.
+    - Area loads (frames 475, 1861, 5331, 7498, 10228, 11564; each after a
+      100 ms usleep frame): 93-184 ms, the renderer uploading 56-90 MB of
+      textures in one frame (the texture pack's large ones among them).
+    - Frame 794: 241 ms building pipelines (231 ms; 32 draws waiting) on
+      a first visit; the shader cache keeps them for later runs.
+    - Frames 2123-2356, in a fight: 13 hitches of ~260 ms with "ring held
+      ~238 ms" and "[gcm] ring back-pressure: drain still at 0x449xxxxx,
+      N KB past the guest at 0x44900000 (the ring's start), after 151 ms;
+      letting the guest go". The ring is 2044 KB and a fight frame reaches
+      1835 KB, so the guest wraps about once a frame; just after a wrap it
+      waits for room while the drain stands a few KB into the ring, until
+      the 150 ms stall check lets it go. Same shape as the deadlock fixed
+      for run-20261102-182600, but at the ring's start, where that fix
+      does not publish put. patches/0100: the report now also gives both
+      lap counts, put, the word the drain stands on, the room asked and
+      the soft end offered (32 reports), to fix it from the next run.
+124. Fight hitches, found (run-20261108-145159, with 0100's report):
+    "guest lap 6725, drain lap 6724; put 0x00002BE8 (ea 0x44902BE8); word
+    at the drain 0x20000000" -- the drain had caught up with put, which
+    stood on the wrap's JUMP back to the ring's start; the guest was at the
+    start asking for room. The drain takes that JUMP only once put moves
+    past it, and the guest waited for the drain: 150 ms each. The fix for
+    run-20261102-182600 publishes put before waiting, but not at the
+    ring's start (a drain also at the start would read put == get as
+    nothing to do). patches/0101: at the start too, unless the drain is
+    there -- put at the start takes the drain through its JUMP.
+125. Glitchy screen after "Load Game" (capture-20261108-145159): the first
+    frames of the loaded area draw with ~190 pipelines still building in
+    the background (drop_pso: all 46 scanout draws in frame 714, the
+    scene's composite in 717 -- black with only the HUD). Such frames are
+    held back (the last whole frame stays up), but for at most 20 frames,
+    a third of a second at 60 fps, less than the builds take; the capture
+    slowed every frame to 300-800 ms, so there they finished in 6 held
+    frames. patches/0102: held for up to a second instead, and a log line
+    when the limit shows an incomplete frame.
+    Confirmed (run-20261108-151126, about 27,000 frames with fights and
+    loads): no ring back-pressure stalls, no incomplete frame let through,
+    and the player saw no glitch after Load Game. The hitches left are the
+    area loads (one frame uploading 56-89 MB of textures, 110-220 ms,
+    right after the game's own 100 ms load pause) and the boot.
+126. HDR output (patches/0103, engine menu and launcher: hdr,
+    hdr_peak_nits, hdr_paper_white_nits, hdr_highlights). Every surface the
+    game draws is 8-bit (fmt 8 throughout capture-20261108-145159), clamped
+    to white, so this is inverse tone mapping of the finished picture:
+    - The swap chain switches live between R8G8B8A8 and R16G16B16A16_FLOAT
+      with scRGB (G10, P709) colour space (ld_hdr_sync_swapchain, once a
+      present; also notes every ~60 presents whether the window's display
+      has Windows' HDR on, and its reported peak).
+    - The present pass (scaling, FXAA/SMAA, sharpening) and the engine
+      overlay still draw in 8-bit, into a composite the back buffer's size;
+      a copy of it is made before the overlay. ld_hdr_compose then writes
+      the back buffer: pow 2.2 to linear, x paper white / 80 nits, and above
+      a knee (0.45, on a mix of luminance and the largest channel, so
+      coloured glows lift too) a gain rising smoothly to peak / paper white
+      at white, scaled by the Highlights setting. Colours are scaled whole,
+      never past the peak.
+    - The HUD stays at paper white: the first draw ld_hud_draw_place takes
+      for an overlay in a frame (at 16:9 too, where HDR runs its decision
+      without moving anything) copies the display buffer first
+      (ld_hdr_scene_snapshot); where the presented image differs from that
+      copy the HUD drew, and those pixels are not expanded. The engine
+      overlay is found the same way from the copy before it. Movies are
+      expanded whole.
+    Built and checked in syntax here; not yet seen on an HDR display.
+127. HDR too dim (run-20261109-181746: "[hdr] display: Windows HDR on,
+    peak 600 nits"): paper white had to go to its 400-nit maximum to match
+    HDR off. With Windows' HDR on, SDR games are shown at its SDR content
+    brightness (Settings > System > Display > HDR), here about 400 nits,
+    not the 200 the setting started at; the 1000-nit peak was also beyond
+    the display's 600. patches/0104 and the menus: paper white and peak are
+    automatic by default (0 in the ini, new keys hdr_paper_white and
+    hdr_peak): Windows' SDR white level for the window's display
+    (DisplayConfigGetDeviceInfo, DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL,
+    matched to the DXGI output by its GDI device name; checked about every
+    five seconds) and the peak DXGI reports. Either can still be set by
+    hand (paper white up to 500 nits).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

@@ -46,6 +46,13 @@ enum class GameLanguage : int
     Italian = 5,
 };
 
+/* HDR output's ranges (EngineSettings::hdr*), shared by the engine menu and
+ * the launcher. */
+constexpr int kHdrPeakMinimum = 400;
+constexpr int kHdrPeakMaximum = 4000;
+constexpr int kHdrPaperWhiteMinimum = 80;
+constexpr int kHdrPaperWhiteMaximum = 500;
+
 struct EngineSettings
 {
     FrameRateCap frameRateCap = FrameRateCap::Original;
@@ -72,6 +79,17 @@ struct EngineSettings
      * contrast-adaptive sharpening of the final image. Both apply at once. */
     int anisotropy = 16;
     int sharpening = 0;
+    /* HDR output, for an HDR display with Windows' HDR on: the picture at
+     * paper white (nits), the 3D scene's highlights stretched towards the
+     * peak (nits) by hdrHighlights % of the way; the HUD and menus stay at
+     * paper white. The game draws in 8-bit, so this expands its finished
+     * picture rather than unlocking a hidden one. 0 = automatic: the peak
+     * the display reports, and Windows' SDR content brightness (what SDR
+     * games are shown at, so the picture matches HDR off). Applies at once. */
+    bool hdr = false;
+    int hdrPeakNits = 0;
+    int hdrPaperWhiteNits = 0;
+    int hdrHighlights = 50;
     /* Texture detail: the game's mip levels, or a finer level chosen
      * (mip bias -0.5 / -1.0) so surfaces keep their detail further away.
      * Applies at once. */
@@ -87,6 +105,10 @@ struct EngineSettings
      * that is empty. Read when the renderer starts: next launch. */
     bool texturePack = false;
     std::string texturePackDir;
+    /* Save slot: which of the game's save directories (<title id>-SAVEDATA-
+     * NNNN) it loads and saves, chosen in the launcher (engine_save_slots).
+     * Read when the game starts. */
+    int saveSlot = 0;
     /* Menus and HUD wider than 16:9: stretched across the screen (as the
      * game draws them), centred at their own proportions, or centred with
      * the map, gauges and hints moved out towards the edges (hudEdge: 0-100

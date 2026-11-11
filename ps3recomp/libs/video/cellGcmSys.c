@@ -4375,11 +4375,23 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
         if (waitedMs >= GCM_RING_WAIT_CAP_MS || drainStuck)
         {
             static int reports = 0;
-            if (reports < 8)
+            if (reports < 32)
             {
                 reports++;
                 fprintf(stderr, "[gcm] ring back-pressure: drain still at 0x%08X, %u bytes past the guest at 0x%08X, after %d ms; letting the guest go\n",
                         drainedEa, drainedEa - current, current, waitedMs);
+                /* What held it (the combat hitches of run-20261108-140721:
+                 * the guest always at the ring's start, the drain a few KB
+                 * in, 260 ms a time): the laps each side counts, the put
+                 * the drain sees, the word the drain stands on, the room the
+                 * guest asked for and the soft end it was offered. */
+                const u32 putOffset = vm_read32(GCM_CONTROL_GUEST_ADDR + 0);
+                const u32 drainWord = drainedEa >= s_ring_begin && drainedEa < s_ring_end ? vm_read32(drainedEa) : 0u;
+                fprintf(stderr, "[gcm]   guest lap %u, drain lap %u; put 0x%08X (ea 0x%08X); word at the drain 0x%08X; "
+                        "asked %u bytes, soft end 0x%08X; ring 0x%08X-0x%08X; drain passes while still %u\n",
+                        (unsigned)s_ring_guest_lap, (unsigned)s_ring_drain_lap, putOffset, gcm_io2ea(putOffset),
+                        drainWord, requiredBytes, gcm_ring_soft_end(current), s_ring_begin, s_ring_end,
+                        (unsigned)(s_drain_passes - passesWhileStill));
             }
             vm_write32(ctx + 0x4, s_ring_end);
             if (waitBegin)
@@ -4397,9 +4409,16 @@ static int gcm_ring_make_room(u32 ctx, u32 countWords)
              * once something is published in the new lap -- without this the
              * guest waited for the drain and the drain for the guest, 150 ms
              * at a time (run-20261102-182600, 2-3 fps once a fight began).
-             * Not at the ring's start: put there would read "nothing to do"
-             * to a drain that is itself at the start of the previous lap. */
-            if (current != s_ring_begin)
+             * Not at the ring's start while the drain is there too: put
+             * there would read "nothing to do" to a drain at the start of
+             * the previous lap. But a drain anywhere else has a lap to
+             * finish that ends in the wrap's JUMP, and needs put at the
+             * start to take it: in fights (run-20261108-145159) the drain
+             * stood on that JUMP with put on it ("word at the drain
+             * 0x20000000", put = drain), the guest waited at the start for
+             * room, and each held the other for 150 ms -- the 260 ms
+             * combat hitches. */
+            if (current != s_ring_begin || g_gcm_fifo_drained_ea != s_ring_begin)
             {
                 atomic_thread_fence(memory_order_release);
                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(current));

@@ -1,0 +1,75 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -4240,6 +4240,60 @@
+     return texture;
+ }
+ 
++/* With dumping and a texture pack both on: the dump folder is where the
++ * textures still to be made are found, so dumps that the pack now replaces
++ * (by the first 16 hex digits of the name, whatever the size after them)
++ * are moved once into <dump>\replaced, out of the way but not lost.
++ * Replaced textures are never dumped again (decode_guest_texture_dumping
++ * returns the replacement first). */
++static void ld_texture_dump_sweep_replaced(void)
++{
++    static LONG swept = 0;
++    if (InterlockedCompareExchange(&swept, 1, 0) != 0)
++    {
++        return;
++    }
++    char pattern[MAX_PATH + 8];
++    snprintf(pattern, sizeof(pattern), "%s\\*.dds", g_ld_texture_dump_folder);
++    WIN32_FIND_DATAA found;
++    const HANDLE search = FindFirstFileA(pattern, &found);
++    if (search == INVALID_HANDLE_VALUE)
++    {
++        return;
++    }
++    char replacedFolder[MAX_PATH + 16];
++    snprintf(replacedFolder, sizeof(replacedFolder), "%s\\replaced", g_ld_texture_dump_folder);
++    u32 moved = 0;
++    do
++    {
++        u64 key = 0;
++        if ((found.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) || !ld_texture_pack_parse_key(found.cFileName, &key))
++        {
++            continue;
++        }
++        if (!ld_texture_pack_find(key))
++        {
++            continue;
++        }
++        CreateDirectoryA(replacedFolder, NULL);
++        char from[MAX_PATH * 2];
++        char to[MAX_PATH * 2];
++        snprintf(from, sizeof(from), "%s\\%s", g_ld_texture_dump_folder, found.cFileName);
++        snprintf(to, sizeof(to), "%s\\%s", replacedFolder, found.cFileName);
++        if (MoveFileExA(from, to, MOVEFILE_REPLACE_EXISTING))
++        {
++            moved++;
++        }
++    } while (FindNextFileA(search, &found));
++    FindClose(search);
++    if (moved)
++    {
++        fprintf(stderr, "[tex-dump] %u dumped textures now have a replacement: moved to %s\n", moved,
++                replacedFolder);
++        fflush(stderr);
++    }
++}
++
+ /* decode_guest_texture_profiled, or the texture pack's replacement for it
+  * (*replacedFormat says which), writing the texture to the dump folder on
+  * the way when dumping is on and this texture has not been written yet. */
+@@ -4248,6 +4302,10 @@
+ {
+     *replacedFormat = DXGI_FORMAT_UNKNOWN;
+     const u32 baseFormat = texture->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
++    if (dumpAllowed && ld_texture_dump_enabled() && ld_texture_pack_active())
++    {
++        ld_texture_dump_sweep_replaced();
++    }
+     if (contentHash && baseFormat != TEX_FMT_DEPTH24_D8 && baseFormat != RSX_TEX_FMT_W16Z16Y16X16_FLOAT &&
+         ld_texture_pack_active())
+     {

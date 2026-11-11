@@ -1,0 +1,66 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8795,6 +8795,62 @@
+             highestY = screenY;
+         }
+     }
++    /* What shows of a draw is what its scissor lets through. The boss
++     * capture bar's flash (capture-20261108-140721, draw 246) is an effect
++     * quad that zooms out past the screen's edges on each successful input,
++     * clipped to the bar (scissor x 512-766, y 570-594 of 1280x720): judged
++     * by its quad it was a full-screen pass, left stretched, and its
++     * unshrunk scissor showed as a hard-edged block 4:3 wider than the bar.
++     * So a draw's extent is cut to its scissor when the scissor is a real
++     * clip (narrower than 95% of the surface); the gauges' and the bar's
++     * fills, quads cut down the same way, land in the zones they did. */
++    {
++        const int scissorWritten =
++            g.rsx.seen[M_SCISSOR_HORIZONTAL >> 2] != 0 || g.rsx.seen[M_SCISSOR_VERTICAL >> 2] != 0;
++        if (scissorWritten && surface->w && surface->h)
++        {
++            const u32 scissorHorizontal = rsx_dsp_reg(&g.rsx, M_SCISSOR_HORIZONTAL);
++            const u32 scissorVertical = rsx_dsp_reg(&g.rsx, M_SCISSOR_VERTICAL);
++            const float surfaceWidth = (float)surface->w;
++            const float surfaceHeight = (float)surface->h;
++            const float scissorLeft = (float)(scissorHorizontal & 0xFFFFu) / surfaceWidth;
++            const float scissorRight = scissorLeft + (float)(scissorHorizontal >> 16) / surfaceWidth;
++            const float scissorTop = (float)(scissorVertical & 0xFFFFu) / surfaceHeight;
++            const float scissorBottom = scissorTop + (float)(scissorVertical >> 16) / surfaceHeight;
++            if (scissorRight > scissorLeft && scissorBottom > scissorTop && scissorRight - scissorLeft < 0.95f)
++            {
++                /* To clip space (y points up). */
++                const float clipLeft = scissorLeft * 2.0f - 1.0f;
++                const float clipRight = scissorRight * 2.0f - 1.0f;
++                const float clipTop = 1.0f - scissorTop * 2.0f;
++                const float clipBottom = 1.0f - scissorBottom * 2.0f;
++                if (lowestX < clipLeft)
++                {
++                    lowestX = clipLeft;
++                }
++                if (highestX > clipRight)
++                {
++                    highestX = clipRight;
++                }
++                if (highestY > clipTop)
++                {
++                    highestY = clipTop;
++                }
++                if (lowestY < clipBottom)
++                {
++                    lowestY = clipBottom;
++                }
++                if (lowestX > highestX || lowestY > highestY)
++                {
++                    /* Nothing of it shows; place it by its scissor. */
++                    lowestX = clipLeft;
++                    highestX = clipRight;
++                    lowestY = clipBottom;
++                    highestY = clipTop;
++                }
++            }
++        }
++    }
+     /* Clip space runs -1..1: a draw 95% of the width or more is full-screen.
+      * Not a CPU-evaluated strip less than a quarter of the height, though:
+      * the boss capture bar's glow and frame (360-vertex meshes, soft edges

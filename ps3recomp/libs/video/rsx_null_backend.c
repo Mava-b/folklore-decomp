@@ -354,6 +354,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     wc.lpfnWndProc = null_wndproc;
     wc.hInstance = GetModuleHandle(NULL);
     wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    /* The exe's own icon (resource 1) for the title bar and taskbar, when
+     * the game embeds one; Windows' default otherwise. */
+    wc.hIcon = LoadIconA(GetModuleHandle(NULL), MAKEINTRESOURCEA(1));
     wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
     wc.lpszClassName = "ps3recomp_null";
     RegisterClassExA(&wc);

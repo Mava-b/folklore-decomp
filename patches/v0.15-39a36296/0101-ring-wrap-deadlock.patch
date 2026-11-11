@@ -1,0 +1,23 @@
+diff --git a/libs/video/cellGcmSys.c b/libs/video/cellGcmSys.c
+--- a/libs/video/cellGcmSys.c
++++ b/libs/video/cellGcmSys.c
+@@ -3111,9 +3111,16 @@
+              * once something is published in the new lap -- without this the
+              * guest waited for the drain and the drain for the guest, 150 ms
+              * at a time (run-20261102-182600, 2-3 fps once a fight began).
+-             * Not at the ring's start: put there would read "nothing to do"
+-             * to a drain that is itself at the start of the previous lap. */
+-            if (current != s_ring_begin)
++             * Not at the ring's start while the drain is there too: put
++             * there would read "nothing to do" to a drain at the start of
++             * the previous lap. But a drain anywhere else has a lap to
++             * finish that ends in the wrap's JUMP, and needs put at the
++             * start to take it: in fights (run-20261108-145159) the drain
++             * stood on that JUMP with put on it ("word at the drain
++             * 0x20000000", put = drain), the guest waited at the start for
++             * room, and each held the other for 150 ms -- the 260 ms
++             * combat hitches. */
++            if (current != s_ring_begin || g_gcm_fifo_drained_ea != s_ring_begin)
+             {
+                 atomic_thread_fence(memory_order_release);
+                 vm_write32(GCM_CONTROL_GUEST_ADDR + 0, gcm_ea2io(current));

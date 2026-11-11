@@ -1,0 +1,17 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -8888,7 +8888,12 @@
+     const int continuesLine = !bigMesh && previous->frame == g_ld_frames && previous->target == target &&
+                               previous->key == g_ld_current_pso.key && top < previous->bottom &&
+                               bottom > previous->top && left <= previous->right + 0.04f &&
+-                              right >= previous->left - 0.04f;
++                              right >= previous->left - 0.04f && left >= previous->left - 0.002f;
++    /* A line runs left to right, so a piece starting left of the previous
++     * one does not continue it: on player select (capture-20261107-173348)
++     * the arrows between the names (600-632 and 648-680 of 1280) come right
++     * after "Keats" (688-816) in the same program and were carried right
++     * with it. */
+     if (g_ld_hud_boxes.frame != g_ld_frames || g_ld_hud_boxes.target != target)
+     {
+         g_ld_hud_boxes.frame = g_ld_frames;

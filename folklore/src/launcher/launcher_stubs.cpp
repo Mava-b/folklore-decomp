@@ -20,6 +20,13 @@ extern "C"
     void rsx_live_draw_set_repeat_draws(int enabled) { (void)enabled; }
     void rsx_live_draw_set_anisotropy(uint32_t level) { (void)level; }
     void rsx_live_draw_set_sharpening(uint32_t percent) { (void)percent; }
+    void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent)
+    {
+        (void)enabled;
+        (void)peakNits;
+        (void)paperWhiteNits;
+        (void)highlightPercent;
+    }
     void rsx_live_draw_set_texture_lod_bias(int hundredths) { (void)hundredths; }
     void rsx_live_draw_set_texture_pack(const char* folder) { (void)folder; }
     void rsx_live_draw_set_hud_layout(int layout) { (void)layout; }

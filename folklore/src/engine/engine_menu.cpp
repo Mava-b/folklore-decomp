@@ -16,6 +16,7 @@
  */
 #include "engine_settings.h"
 #include "engine_saves.h"
+#include "engine_save_slots.h"
 #include "engine_portable.h"
 #include "engine_dlc.h"
 #include "engine_motion_watch.h"
@@ -57,6 +58,8 @@ extern "C"
     int rsx_null_backend_is_fullscreen(void);
     void rsx_null_backend_set_fullscreen(int enabled);
     void rsx_live_draw_get_shader_stats(uint32_t* pending, uint32_t* built, uint32_t* skippedDraws);
+    int rsx_live_draw_get_hdr_status(uint32_t* displayPeakNits);
+    void rsx_live_draw_get_hdr_levels(uint32_t* peakInUse, uint32_t* paperWhiteInUse, uint32_t* windowsSdrWhite);
     extern volatile int g_cellpad_block_guest_input;
     /* A controller read over HID (cellPad.c): a DualShock 3 or 4, DualSense
      * or Switch Pro. Buttons in CELL_PAD packing. */
@@ -136,6 +139,7 @@ namespace
         std::vector<SaveSnapshot> snapshots;
         int gameSaveCount = 0;
         std::string saveMessage;
+        std::string saveSlotText;   /* which slot this run uses */
         std::string pendingRestore;
         std::string gameFolderMessage;
     };
@@ -1069,6 +1073,98 @@ namespace
         return false;
     }
 
+    /* HDR output: on or off, and its three levels. Paper white and peak
+     * follow Windows' SDR content brightness and the display's peak unless
+     * set by hand. Under them, whether the game's display has Windows' HDR
+     * on (the renderer checks every second or so), since without it the
+     * picture looks washed out. */
+    bool drawHdr()
+    {
+        EngineSettings& settings = engineSettings();
+        bool changed = false;
+        ImGui::TextUnformatted("HDR");
+        changed |= ImGui::Checkbox("HDR output (brighter highlights on an HDR display)", &settings.hdr);
+        uint32_t displayPeak = 0;
+        const int status = rsx_live_draw_get_hdr_status(&displayPeak);
+        const bool displayHdr = status >= 0 && (status & 1) != 0;
+        if (!settings.hdr)
+        {
+            if (displayHdr)
+            {
+                ImGui::TextDisabled("This display has Windows' HDR on.");
+            }
+            return changed;
+        }
+        uint32_t peakInUse = 0;
+        uint32_t paperWhiteInUse = 0;
+        uint32_t windowsWhite = 0;
+        rsx_live_draw_get_hdr_levels(&peakInUse, &paperWhiteInUse, &windowsWhite);
+        const float sliderWidth = ImGui::GetFontSize() * 18.0f;
+        char label[128];
+
+        bool paperWhiteAutomatic = settings.hdrPaperWhiteNits == 0;
+        if (windowsWhite > 0)
+        {
+            std::snprintf(label, sizeof(label), "Paper white: Windows' SDR content brightness (%u nits)##hdrpaper",
+                          windowsWhite);
+        }
+        else
+        {
+            std::snprintf(label, sizeof(label), "Paper white: Windows' SDR content brightness##hdrpaper");
+        }
+        if (ImGui::Checkbox(label, &paperWhiteAutomatic))
+        {
+            settings.hdrPaperWhiteNits =
+                paperWhiteAutomatic ? 0
+                                    : std::clamp((int)paperWhiteInUse, kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum);
+            changed = true;
+        }
+        if (!paperWhiteAutomatic)
+        {
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Paper white (HUD, menus, mid-tones)##hdr", &settings.hdrPaperWhiteNits,
+                                        kHdrPaperWhiteMinimum, kHdrPaperWhiteMaximum, "%d nits");
+        }
+
+        bool peakAutomatic = settings.hdrPeakNits == 0;
+        if (displayPeak > 0)
+        {
+            std::snprintf(label, sizeof(label), "Peak brightness: the display's (%u nits)##hdrpeak", displayPeak);
+        }
+        else
+        {
+            std::snprintf(label, sizeof(label), "Peak brightness: the display's##hdrpeak");
+        }
+        if (ImGui::Checkbox(label, &peakAutomatic))
+        {
+            settings.hdrPeakNits =
+                peakAutomatic ? 0 : std::clamp((int)peakInUse, kHdrPeakMinimum, kHdrPeakMaximum);
+            changed = true;
+        }
+        if (!peakAutomatic)
+        {
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Peak brightness##hdr", &settings.hdrPeakNits, kHdrPeakMinimum,
+                                        kHdrPeakMaximum, "%d nits");
+        }
+
+        ImGui::SetNextItemWidth(sliderWidth);
+        changed |= ImGui::SliderInt("Highlights##hdr", &settings.hdrHighlights, 0, 100, "%d%%");
+        if (status >= 0 && !displayHdr)
+        {
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "Windows' HDR is off for this display: turn on Use HDR in Windows'");
+            ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f),
+                               "Settings > System > Display, or the picture looks washed out.");
+        }
+        else
+        {
+            ImGui::TextDisabled("Highlights: how far towards the peak the bright parts of the scene go");
+            ImGui::TextDisabled("(0%% = the same picture as HDR off).");
+        }
+        return changed;
+    }
+
     /* Render resolution, anti-aliasing and shader building. The resolution
      * is fixed when the renderer starts, so a new one shows on the next
      * launch; the others change at once. */
@@ -1201,6 +1297,7 @@ namespace
         changed |= radioSharpening("Medium", 60);
         ImGui::SameLine();
         changed |= radioSharpening("High", 100);
+        changed |= drawHdr();
         ImGui::TextUnformatted("Depth of field");
         {
             int depthOfFieldIndex = (int)settings.depthOfField;
@@ -1302,6 +1399,19 @@ namespace
     {
         menu.snapshots = saveSnapshotList();
         menu.gameSaveCount = saveDataCount();
+        const char* selected = std::getenv("PS3_SAVEDATA_SELECT");
+        const std::string directory = selected ? selected : "";
+        const size_t digits = directory.find_last_not_of("0123456789");
+        if (directory.empty() || digits == std::string::npos || digits + 1 >= directory.size())
+        {
+            menu.saveSlotText.clear();
+            return;
+        }
+        const int number = std::atoi(directory.c_str() + digits + 1);
+        const SaveSlot slot = engineSaveSlotRead(number);
+        menu.saveSlotText = "This run loads and saves slot " + std::to_string(number) +
+                            (slot.exists ? " (" + slot.subtitle + ")" : std::string(" (empty: a new game)")) +
+                            ". Choose another slot in the launcher's Saves page before starting.";
     }
 
     /* Snapshots of the game's own save data: take one at a save point, come
@@ -1310,6 +1420,10 @@ namespace
     void drawSaveSnapshots()
     {
         ImGui::SeparatorText("Save data snapshots");
+        if (!menu.saveSlotText.empty())
+        {
+            ImGui::TextWrapped("%s", menu.saveSlotText.c_str());
+        }
         ImGui::TextDisabled("Copies of the game's own saves (a full save state is not possible in this port).");
         ImGui::Text("The game has %d save%s.", menu.gameSaveCount, menu.gameSaveCount == 1 ? "" : "s");
         if (ImGui::Button("Snapshot the game's saves now"))
@@ -1460,6 +1574,15 @@ namespace
                      unsigned format, uint32_t width, uint32_t height)
     {
         (void)rtv;
+        /* The timer's rate, before anything uses it: it used to be set only
+         * when the menu was first drawn, so an F2 capture in a run where the
+         * menu had not been opened never reached its four seconds -- the
+         * capture ran on and the game crawled until it was killed. */
+        if (!menu.frequency.QuadPart)
+        {
+            QueryPerformanceFrequency(&menu.frequency);
+            QueryPerformanceCounter(&menu.lastFrame);
+        }
         if (menu.failed)
         {
             return;

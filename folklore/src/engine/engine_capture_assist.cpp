@@ -20,6 +20,15 @@
  * seconds, never lowered (a wrong move in the game can still take some off,
  * which the next step puts back), and the game finishes the capture itself
  * the moment the count reaches the target, the way it does for a player.
+ *
+ * Except state 2, the left / right swing (func_00103270 in 1.10,
+ * func_00102B70 in 1.00; run-20261108-131244: the bar filled and stayed
+ * full). It keeps a phase at +48 of the controller: 0 waiting for a swing,
+ * 1 a swing landed -- wait for one the other way, 2 won -- after a short
+ * wait it goes on to the state at +220 (the capture). The count is only
+ * compared with the target as a swing lands, and constant motion never
+ * swings back, so a full count was never noticed. Once the count is full,
+ * the phase is set to 2 here, as the game does when the last swing lands.
  */
 #include "engine_capture_assist.h"
 #include "engine_region.h"
@@ -60,6 +69,10 @@ namespace
     constexpr uint32_t kTargetOffset = 264u;
     constexpr uint32_t kCountOffset = 268u;
 #endif
+    /* State 2's phase (see above); the same offset in both versions. */
+    constexpr uint32_t kSwingState = 2u;
+    constexpr uint32_t kSwingPhaseOffset = 48u;
+    constexpr uint32_t kSwingPhaseWon = 2u;
     constexpr unsigned long long kStepMs = 100ull;
     constexpr int32_t kStepsToFill = 30;
 
@@ -137,6 +150,16 @@ void engineCaptureAssistUpdate()
     if (count < rampCount)
     {
         writeGuest32(kController + kCountOffset, (uint32_t)rampCount);
+    }
+    if (state == kSwingState && rampCount >= target)
+    {
+        const uint32_t phase = readGuest32(kController + kSwingPhaseOffset);
+        if (phase < kSwingPhaseWon)
+        {
+            writeGuest32(kController + kSwingPhaseOffset, kSwingPhaseWon);
+            std::fprintf(stderr, "[capture-assist] capture state 2: bar full, swing phase %u -> won\n", phase);
+            std::fflush(stderr);
+        }
     }
 }
 
