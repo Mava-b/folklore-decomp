@@ -946,9 +946,16 @@ void rsx_metal_backend_prepare_app(void)
     if (s_prepared || ![NSThread isMainThread]) return;
     s_prepared = 1;
     @autoreleasepool {
-        [NSApplication sharedApplication];
-        [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
-        [NSApp finishLaunching];
+        /* Inside the host window (PS3RECOMP_HOST_SURFACES) the window process
+         * is the app the player sees; this one has no window, and as a
+         * regular app it showed a second "Folklore" in the Dock. It keeps out
+         * of NSApplication there, and only the App Nap opt-out below applies. */
+        const char* host = getenv("PS3RECOMP_HOST_SURFACES");
+        if (!(host && *host)) {
+            [NSApplication sharedApplication];
+            [NSApp setActivationPolicy:NSApplicationActivationPolicyRegular];
+            [NSApp finishLaunching];
+        }
         /* Opt out of App Nap and timer coalescing for the whole run: with the
          * window in the background macOS otherwise slows the game's timers
          * and the frame clock (from the inFAMOUS 2 port). */
@@ -3817,8 +3824,23 @@ static u32  s_sc_hits, s_sc_miss;
 static char s_eng_msl[512 * 1024];
 static char s_eng_log[8192];
 
-/* The main executable's LC_UUID as hex, or "nouuid". */
+/* What the cached translations depend on: the translator's own build (see
+ * rsx_hlsl_to_msl_build_tag), as 16 hex digits. It used to be the main
+ * executable's LC_UUID, which changes with every link: each rebuild of the
+ * game threw every translation away, and the next play stuttered through
+ * every scene again (up to 160 ms per new shader in Folklore's intro).
+ * PS3_SHADER_CACHE_PER_BUILD=1 keys on the executable as before. */
+static void sc_build_id_uuid(char* out, size_t n);
 static void sc_build_id(char* out, size_t n)
+{
+    const char* per = getenv("PS3_SHADER_CACHE_PER_BUILD");
+    if (per && *per && *per != '0') { sc_build_id_uuid(out, n); return; }
+    const char* tag = rsx_hlsl_to_msl_build_tag();
+    snprintf(out, n, "%016llx", (unsigned long long)fnv1a64(tag, (u32)strlen(tag), 1469598103934665603ull));
+}
+
+/* The main executable's LC_UUID as hex, or "nouuid". */
+static void sc_build_id_uuid(char* out, size_t n)
 {
     snprintf(out, n, "nouuid");
     const struct mach_header_64* h = (const struct mach_header_64*)_dyld_get_image_header(0);
@@ -3955,13 +3977,15 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
     dump_shader(name, hlsl);
     /* PS3_SHADER_CACHE: the translation from an earlier run. */
     const u64 sc_key = sc_on() ? fnv1a64(&stage, sizeof stage, fnv1a64(hlsl, (u32)strlen(hlsl), s_sc_salt)) : 0;
-    int msl_rc;
+    int msl_rc, cached = 0;
+    const double t0 = CFAbsoluteTimeGetCurrent();
     if (sc_key && sc_msl_get(sc_key, s_eng_msl, sizeof s_eng_msl)) {
-        msl_rc = 0; s_sc_hits++;
+        msl_rc = 0; s_sc_hits++; cached = 1;
     } else {
         msl_rc = rsx_hlsl_to_msl(hlsl, stage, s_eng_msl, sizeof s_eng_msl, s_eng_log, sizeof s_eng_log);
         if (sc_key && msl_rc == 0) { sc_msl_put(sc_key, s_eng_msl); s_sc_miss++; }
     }
+    const double t1 = CFAbsoluteTimeGetCurrent();
     if (msl_rc != 0) {
         fprintf(stderr, "[rsx engine/metal] %s %016llx: %s\n", what,
                 (unsigned long long)hash, s_eng_log);
@@ -3970,6 +3994,13 @@ static id<MTLFunction> eng_function(const char* hlsl, int stage,
         dump_shader(name, s_eng_msl);
         snprintf(name, sizeof name, "%s %016llx", what, (unsigned long long)hash);
         fn = compile_guest_function(s_eng_msl, name);
+    }
+    {   /* PS3_PIPELINE_TIME=1: where a new shader's time goes. */
+        static int s_ft = -1;
+        if (s_ft < 0) { const char* le = getenv("PS3_PIPELINE_TIME"); s_ft = le && *le && *le != '0'; }
+        if (s_ft) fprintf(stderr, "[pipeline cache] %s: translate %.1f ms%s, compile %.1f ms\n", what,
+                          (t1 - t0) * 1000.0, cached ? " (cached)" : "",
+                          (CFAbsoluteTimeGetCurrent() - t1) * 1000.0);
     }
     s_eng_func[s_eng_func_count].hash = hash;
     s_eng_func[s_eng_func_count].fn   = fn;
@@ -4010,6 +4041,101 @@ static MTLVertexDescriptor* eng_vertex_descriptor(const rsx_vertex_layout_plan* 
         vd.layouts[MTL_VB_INDEX - k].stride = rank[k] * 16u;
     }
     return vd;
+}
+
+/* ---- Compiled pipelines kept between runs (MTLBinaryArchive) -------------
+ * The shader cache above keeps the MSL translations, but Metal still compiled
+ * every pipeline again on each run, on the RSX thread, the first time a draw
+ * needed it: 20-60 ms each, and a cutscene that brings a dozen new materials
+ * stuttered (Folklore's intro, 37-42 fps for a few seconds, one 250 ms
+ * frame). Pipelines are now also added to a binary archive beside the
+ * translations (<PS3_SHADER_CACHE>/msl-<build>/pipelines.metalar), and a
+ * later run creates them from it instead of compiling. The archive is added
+ * to and written on a queue of its own, every 15 s at most while something is
+ * new. It follows the shader cache's build id, so a new build starts a new
+ * archive; one macOS cannot read (another OS or GPU) is started over.
+ * PS3_PIPELINE_CACHE=0 turns it off. */
+static id<MTLBinaryArchive> s_pa;
+static int s_pa_state = -1;
+static int s_pa_dirty;
+static double s_pa_last_save;
+static char s_pa_path[1300];
+static dispatch_queue_t s_pa_queue;
+
+static id<MTLBinaryArchive> pa_archive(void)
+{
+    if (__builtin_expect(s_pa_state >= 0, 1)) return s_pa;
+    s_pa_state = 0;
+    const char* e = getenv("PS3_PIPELINE_CACHE");
+    if ((e && !strcmp(e, "0")) || !s_dev || !sc_on()) return nil;
+    if (@available(macOS 11.0, *)) {
+        snprintf(s_pa_path, sizeof s_pa_path, "%s/pipelines.metalar", s_sc_dir);
+        NSString* path = [NSString stringWithUTF8String:s_pa_path];
+        MTLBinaryArchiveDescriptor* d = [MTLBinaryArchiveDescriptor new];
+        const BOOL had = [[NSFileManager defaultManager] fileExistsAtPath:path];
+        if (had) d.url = [NSURL fileURLWithPath:path];
+        NSError* err = nil;
+        s_pa = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        if (!s_pa && had) {
+            [[NSFileManager defaultManager] removeItemAtPath:path error:nil];
+            d.url = nil;
+            s_pa = [s_dev newBinaryArchiveWithDescriptor:d error:&err];
+        }
+        if (!s_pa) {
+            fprintf(stderr, "[pipeline cache] off: %s\n", err ? [[err localizedDescription] UTF8String] : "?");
+            return nil;
+        }
+        s_pa_queue = dispatch_queue_create("ps3recomp.pipeline-archive", DISPATCH_QUEUE_SERIAL);
+        s_pa_last_save = CFAbsoluteTimeGetCurrent();
+        s_pa_state = 1;
+        fprintf(stderr, "[pipeline cache] %s (%s)\n", s_pa_path, had && d.url ? "loaded" : "new");
+    }
+    return s_pa;
+}
+
+/* Let pipeline creation find a compiled copy in the archive. */
+static void pa_use(MTLRenderPipelineDescriptor* pd)
+{
+    id<MTLBinaryArchive> a = pa_archive();
+    if (a) pd.binaryArchives = @[a];
+}
+
+/* After a pipeline is built: add it, off this thread, and write the archive
+ * now and then. */
+static void pa_add(MTLRenderPipelineDescriptor* pd)
+{
+    if (!s_pa) return;
+    MTLRenderPipelineDescriptor* copy = [pd copy];
+    copy.binaryArchives = nil;
+    dispatch_async(s_pa_queue, ^{
+        NSError* e = nil;
+        if ([s_pa addRenderPipelineFunctionsWithDescriptor:copy error:&e]) s_pa_dirty = 1;
+        const double now = CFAbsoluteTimeGetCurrent();
+        if (s_pa_dirty && now - s_pa_last_save >= 15.0) {
+            NSError* se = nil;
+            if ([s_pa serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:s_pa_path]] error:&se])
+                s_pa_dirty = 0;
+            else
+                fprintf(stderr, "[pipeline cache] not written: %s\n", se ? [[se localizedDescription] UTF8String] : "?");
+            s_pa_last_save = now;
+        }
+    });
+}
+
+/* From the present: write what is new once things are quiet (no new
+ * pipeline for 15 s), so the last pipelines of a session are kept too. */
+static void pa_save_idle(void)
+{
+    if (!s_pa || !s_pa_dirty) return;
+    const double now = CFAbsoluteTimeGetCurrent();
+    if (now - s_pa_last_save < 15.0) return;
+    s_pa_last_save = now;
+    dispatch_async(s_pa_queue, ^{
+        if (!s_pa_dirty) return;
+        NSError* se = nil;
+        if ([s_pa serializeToURL:[NSURL fileURLWithPath:[NSString stringWithUTF8String:s_pa_path]] error:&se])
+            s_pa_dirty = 0;
+    });
 }
 
 static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_hlsl,
@@ -4110,14 +4236,21 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
     }
 
     id<MTLRenderPipelineState> pso = nil;
+    pa_use(pd);
     if (!async) {
         NSError* err = nil;
+        const double t0 = CFAbsoluteTimeGetCurrent();
         pso = [s_dev newRenderPipelineStateWithDescriptor:pd error:&err];
         if (!pso) {
             fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
                     [[err localizedDescription] UTF8String]);
             return 0;
         }
+        const double ms = (CFAbsoluteTimeGetCurrent() - t0) * 1000.0;
+        static int s_pso_log = -1;
+        if (s_pso_log < 0) { const char* le = getenv("PS3_PIPELINE_TIME"); s_pso_log = le && *le && *le != '0'; }
+        if (s_pso_log) fprintf(stderr, "[pipeline cache] built in %.1f ms\n", ms);
+        pa_add(pd);
     }
 
     /* Depth and stencil are pipeline state in D3D12 and an encoder object in
@@ -4181,6 +4314,7 @@ static u32 eng_pipeline_create(void* user, const char* vs_hlsl, const char* ps_h
                 built = [s_dev newRenderPipelineStateWithDescriptor:pd error:&e];
                 if (!built) fprintf(stderr, "[rsx engine/metal] pipeline state failed: %s\n",
                                     [[e localizedDescription] UTF8String]);
+                else pa_add(pd);
             }
             /* A failed build leaves pso nil: its draws are dropped, as the
              * synchronous path drops a pipeline it could not build. */
@@ -5647,6 +5781,7 @@ static void eng_dump_frame(id<MTLTexture> src)
 
 static void eng_present(void* user, u32 surface)
 {
+    pa_save_idle();
     (void)user;
     /* The draw engine presents once per guest flip: count it for the
      * PS3RECOMP_METAL_FPS "guest" figure (and the launcher's title). */

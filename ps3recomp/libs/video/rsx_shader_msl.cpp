@@ -358,6 +358,7 @@ bool translate(const char* hlsl, int stage, std::string& msl, char* log, u32 log
 } // namespace
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 1; }
+extern "C" const char* rsx_hlsl_to_msl_build_tag(void) { return "msl " __DATE__ " " __TIME__; }
 
 extern "C" int rsx_hlsl_to_msl(const char* hlsl, int stage,
                                char* out, u32 out_size,
@@ -423,6 +424,7 @@ extern "C" void rsx_hlsl_to_msl_cache_reset(void)
 #else /* !PS3RECOMP_HAVE_MSL_TRANSLATION */
 
 extern "C" int rsx_hlsl_to_msl_available(void) { return 0; }
+extern "C" const char* rsx_hlsl_to_msl_build_tag(void) { return "none"; }
 
 extern "C" void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out)
 {
