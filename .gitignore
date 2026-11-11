@@ -55,3 +55,6 @@ __pycache__/
 /launcher/dist/
 /launcher/src-tauri/target/
 /launcher/src-tauri/gen/
+
+# macOS Finder metadata.
+.DS_Store

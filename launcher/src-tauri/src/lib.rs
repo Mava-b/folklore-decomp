@@ -148,6 +148,10 @@ pub struct Settings {
     /// 0-3 (top left, top right (the default), bottom left, bottom right).
     pub overlay_hud: bool,
     pub overlay_hud_corner: u32,
+    /// Which one-off changes of defaults this settings file has had (1: the
+    /// frame-rate title and the HUD turned on, 2026-11-10).
+    #[serde(default)]
+    pub defaults_rev: u32,
     /// PS3RECOMP_ENG_VCACHE=0 / PS3RECOMP_ENG_VCACHE_SPLIT=0 when off.
     pub vertex_cache: bool,
     pub vertex_cache_split: bool,
@@ -229,10 +233,11 @@ impl Default for Settings {
             audio_volume: 100,
             audio_mute: false,
             audio_device: String::new(),
-            show_fps: false,
+            show_fps: true,
             overlay: true,
-            overlay_hud: false,
+            overlay_hud: true,
             overlay_hud_corner: 1,
+            defaults_rev: 0,
             vertex_cache: true,
             vertex_cache_split: true,
             bind_changed_only: true,
@@ -311,6 +316,15 @@ fn input_env() -> InputEnv {
 /// launcher.json, with the keys folklore_settings.ini holds read from it.
 fn load_settings_file() -> Settings {
     let mut st: Settings = fs::read_to_string(settings_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or_default();
+    // The frame rate is shown by default now (title and HUD), as in the
+    // inFAMOUS 2 and Resistance launchers: turn it on once in settings saved
+    // before, then leave it to the player.
+    if st.defaults_rev < 1 {
+        st.show_fps = true;
+        st.overlay_hud = true;
+        st.defaults_rev = 1;
+        let _ = write_settings(&st);
+    }
     if let Some(repo) = repo_root(&st) {
         if let Ok(text) = fs::read_to_string(ini_path(&repo)) {
             ini_into_settings(&ini_values(&text), &mut st);
@@ -1126,14 +1140,15 @@ fn launch_env(st: &Settings, input: &InputEnv) -> Vec<(String, String)> {
     // the in-game menu and its HUD (ps3_overlay.mm)
     if !st.overlay {
         set("PS3_OVERLAY", "0".into());
-    } else if st.overlay_hud {
-        set("PS3_OVERLAY_HUD", "1".into());
-        if st.overlay_hud_corner != 1 {
-            set("PS3_OVERLAY_HUD_CORNER", st.overlay_hud_corner.min(3).to_string());
-        }
+    } else if !st.overlay_hud {
+        // On is the default (run_mac.sh seeds overlay.ini, so the menu can
+        // still turn it off); off has to be said.
+        set("PS3_OVERLAY_HUD", "0".into());
+    } else if st.overlay_hud_corner != 1 {
+        set("PS3_OVERLAY_HUD_CORNER", st.overlay_hud_corner.min(3).to_string());
     }
-    if st.show_fps {
-        set("PS3RECOMP_METAL_FPS", "1".into()); // exactly "1"
+    if !st.show_fps {
+        set("PS3RECOMP_METAL_FPS", "0".into()); // run_mac.sh's default is 1
     }
     if !st.vertex_cache {
         set("PS3RECOMP_ENG_VCACHE", "0".into());

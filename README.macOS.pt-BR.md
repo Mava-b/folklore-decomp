@@ -56,7 +56,7 @@ feitas antes nos ports de Demon's Souls, Resistance 2 e PES 2013 (veja
 | Vibração | ⏳ Folklore só vibra na versão 1.10, que os scripts do Mac ainda não montam |
 | Controles de movimento (capturar mexendo o controle) | ⏳ ainda não lidos no Mac |
 | Pacote de app com Game Mode (`folklore.app`) | ✅ |
-| Desempenho | ❓ ainda não medido em números no Mac; `PS3RECOMP_METAL_FPS=1` mostra o fps no título |
+| Desempenho | ✅ 60 fps na abertura e em Doolin num M4 Pro (resolução interna 1,5x, MetalFX, SMAA); o fps aparece no título da janela e no HUD |
 | O menu do engine e os extras de PC da versão Windows (ultrawide, sombras suaves, ...) | ⏳ só no Windows (Direct3D 12) |
 | O app (`launcher/`): instalar, recompilar, jogar, ajustes, saves | 🧪 montado a partir do código, ainda sem release |
 | Jogo inteiro | ❓ não jogado até o fim no Mac |
@@ -321,11 +321,13 @@ enquanto roda.
 | `PS3_AUDIO_MUTE=1` | sem som (qualquer valor silencia; deixe sem definir para ouvir o jogo) |
 | `PS3_AUDIO_DEVICE=<nome>` | a saída de áudio, pelo nome ou parte dele (`AirPods`); não encontrada ou sem definir, a padrão do sistema |
 | `PS3_OVERLAY=0` | sem menu dentro do jogo e sem HUD |
-| `PS3_OVERLAY_HUD=1` | o HUD de desempenho ligado desde o início |
+| `PS3_OVERLAY_HUD=1` | o HUD de desempenho (fps, tempo de quadro, CPU/GPU). Ligado por padrão: o `run_mac.sh` o grava no `overlay.ini` na primeira execução, então o menu pode desligar; `0` esconde |
 | `PS3_OVERLAY_INI=<arquivo>` | onde o menu dentro do jogo salva; o `run_mac.sh` define `overlay.ini` ao lado dele. Vazio: as mudanças valem só na sessão |
-| `PS3_SHADER_CACHE=<pasta>` | guarda os shaders traduzidos entre execuções (menos engasgos no primeiro uso); o `run_mac.sh` define `folklore/build-mac/shader_cache`. Vazio ou `0`: desligado |
+| `PS3_SHADER_CACHE=<pasta>` | guarda os shaders traduzidos entre execuções, e os pipelines compilados junto (`pipelines.metalar`): uma cena só engasga na primeira vez que seus shaders aparecem (traduzir um pode levar 160 ms). Ele sobrevive às recompilações do jogo e só recomeça quando o tradutor de shaders muda; o `run_mac.sh` define `folklore/build-mac/shader_cache`. Vazio ou `0`: desligado |
+| `PS3_PIPELINE_CACHE=0` | sem o arquivo de pipelines compilados (as traduções continuam guardadas) |
+| `PS3_PIPELINE_TIME=1` | registra no log quanto cada shader novo leva para traduzir e compilar |
 | `PS3RECOMP_ENG_VCACHE=0` | desliga o cache de vértices entre quadros (ligado por padrão) |
-| `PS3RECOMP_METAL_FPS=1` | o fps no título da janela |
+| `PS3RECOMP_METAL_FPS=1` | o fps no título da janela e linhas `[RSX FPS]` no log, uma vez por segundo. Ligado por padrão no `run_mac.sh` (como nos ports do Resistance); `0` desliga |
 | `PS3_VERBOSE=1` | o log completo do runtime em `logs/run-mac.log`; o `run_mac.sh` define 0 (silencioso) |
 | `MSGDIALOG_NATIVE=0` | as perguntas do PS3 respondidas automaticamente em vez de mostradas a você |
 | `FOLKLORE_HOST_WINDOW=0` | o jogo abre a própria janela em vez da janela host: sem MetalFX, escolha de monitor ou modos de tela pelo menu; as perguntas do PS3 viram uma folha nessa janela. Padrão 1 |

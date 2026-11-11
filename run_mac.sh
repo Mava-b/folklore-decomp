@@ -31,6 +31,14 @@ export RSX_MSL_CACHE=$BUILD/msl_cache
 # in-game menu (F1, Cmd+, or L3+R3) changes, saved when it closes.
 export PS3_SHADER_CACHE=${PS3_SHADER_CACHE-$BUILD/shader_cache}
 export PS3_OVERLAY_INI=${PS3_OVERLAY_INI-$ROOT/overlay.ini}
+# The frame rate, as the inFAMOUS 2 and Resistance ports show it: in the
+# window's title (and [RSX FPS] lines in the log), and the in-game menu's
+# performance HUD in a corner -- on from the first run; the menu (F1, tab
+# Performance) turns the HUD off and remembers it in overlay.ini.
+export PS3RECOMP_METAL_FPS=${PS3RECOMP_METAL_FPS-1}
+if [ -n "$PS3_OVERLAY_INI" ] && ! grep -q '^PS3_OVERLAY_HUD=' "$PS3_OVERLAY_INI" 2>/dev/null; then
+    print -r -- "PS3_OVERLAY_HUD=1" >> "$PS3_OVERLAY_INI"
+fi
 # The switches run.ps1 sets for every run.
 export PS3_SPURS_JOBCTX_SBUF70=1
 export SPU_INTERP_UNLIFTED=1

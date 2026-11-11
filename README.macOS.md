@@ -55,7 +55,7 @@ first made in the Demon's Souls, Resistance 2 and PES 2013 ports (see
 | Rumble | ⏳ Folklore rumbles only in the 1.10 build, which the Mac scripts do not make yet |
 | Motion controls (capturing by moving the controller) | ⏳ not read on the Mac yet |
 | App bundle with Game Mode (`folklore.app`) | ✅ |
-| Performance | ❓ not measured in numbers on the Mac yet; `PS3RECOMP_METAL_FPS=1` puts the fps in the title |
+| Performance | ✅ 60 fps in the intro and Doolin on an M4 Pro (1.5x internal resolution, MetalFX, SMAA); the fps is in the window title and the HUD |
 | The engine menu and the PC extras of the Windows build (ultrawide, soft shadows, ...) | ⏳ Windows only (Direct3D 12) |
 | The app (`launcher/`): install, rebuild, play, settings, saves | 🧪 built from source, no release yet |
 | Whole game | ❓ not played to the end on the Mac |
@@ -306,11 +306,13 @@ from App-Napping it while it runs.
 | `PS3_AUDIO_MUTE=1` | no sound (any value mutes; leave it unset to hear the game) |
 | `PS3_AUDIO_DEVICE=<name>` | the audio output, by its name or a part of it (`AirPods`); not found or unset, the system default |
 | `PS3_OVERLAY=0` | no in-game menu and no HUD |
-| `PS3_OVERLAY_HUD=1` | the performance HUD on from the start |
+| `PS3_OVERLAY_HUD=1` | the performance HUD (fps, frame time, CPU/GPU). On by default: `run_mac.sh` writes it into `overlay.ini` on the first run, so the menu can turn it off; `0` hides it |
 | `PS3_OVERLAY_INI=<file>` | where the in-game menu saves; `run_mac.sh` sets `overlay.ini` beside it. Empty: changes last only for the session |
-| `PS3_SHADER_CACHE=<dir>` | keeps translated shaders between runs (fewer first-use hitches); `run_mac.sh` sets `folklore/build-mac/shader_cache`. Empty or `0`: off |
+| `PS3_SHADER_CACHE=<dir>` | keeps translated shaders between runs, and the compiled pipelines with them (`pipelines.metalar`): a scene stutters only the first time its shaders appear (translating one can take 160 ms). It is kept across rebuilds of the game and starts over only when the shader translator changes; `run_mac.sh` sets `folklore/build-mac/shader_cache`. Empty or `0`: off |
+| `PS3_PIPELINE_CACHE=0` | no compiled-pipeline archive (the translations are still kept) |
+| `PS3_PIPELINE_TIME=1` | logs how long each new shader takes to translate and compile |
 | `PS3RECOMP_ENG_VCACHE=0` | turns off the cross-frame vertex cache (on by default) |
-| `PS3RECOMP_METAL_FPS=1` | the fps in the window title |
+| `PS3RECOMP_METAL_FPS=1` | the fps in the window title and `[RSX FPS]` lines in the log, once a second. On by default in `run_mac.sh` (as in the Resistance ports); `0` turns it off |
 | `PS3_VERBOSE=1` | the full runtime log in `logs/run-mac.log`; `run_mac.sh` sets 0 (quiet) |
 | `MSGDIALOG_NATIVE=0` | the PS3's prompts answered automatically instead of shown to you |
 | `FOLKLORE_HOST_WINDOW=0` | the game opens its own window instead of the host window: no MetalFX, display choice or window modes from the menu; the PS3's prompts are a sheet on that window. Default 1 |
