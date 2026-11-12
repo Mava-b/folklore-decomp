@@ -8753,6 +8753,36 @@ static int ld_hud_placing(const surface_t* surface)
 
 static void ld_hdr_scene_snapshot(u32 target);
 
+/* Whether the draw's first texture unit samples a widened surface (an
+ * ultrawide canvas: the scene, an offscreen picture the Hor+ camera drew).
+ * Only unit 0: units the shader does not use keep their last binding, and
+ * the boss capture bar's flash (capture-20261108-140721, draw 246) has the
+ * 2560x720 depth canvas left on unit 3 under its own 128x128 texture. */
+static int ld_hud_samples_widened_surface(const surface_t* surface)
+{
+    const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
+    if (!(surface->scale_x > verticalScale * 1.01f))
+    {
+        return 0;
+    }
+    rsx_dsp_texture texture;
+    rsx_dsp_get_texture(&g.rsx, 0, &texture);
+    if (!texture.enabled)
+    {
+        return 0;
+    }
+    for (u32 index = 0; index < g.n_surfaces; index++)
+    {
+        const surface_t* sampled = &g.surfaces[index];
+        if (sampled->tex && sampled->location == texture.location && sampled->offset == texture.offset)
+        {
+            const float sampledVertical = (float)(sampled->scale ? sampled->scale : 1u);
+            return sampled->scale_x > sampledVertical * 1.01f;
+        }
+    }
+    return 0;
+}
+
 /* Decides where a 2D overlay draw goes (ld_hud_draw_place). With HDR output
  * on it also runs when nothing is moved (16:9, or the stretched layout), to
  * find the first overlay draw of the frame: the HDR pass leaves what the
@@ -8916,6 +8946,25 @@ static int ld_hud_draw_place_decide(const surface_t* surface, u32 target, const 
         {
             highestY = screenY;
         }
+    }
+    /* A full-screen pass that samples a widened surface copies a picture
+     * the widened (Hor+) camera already drew at the screen's proportions:
+     * it stays stretched, whatever its scissor. The comic-book story pages
+     * (capture-20261112-203512, draws 421/451/475/501) render each panel
+     * into a 2560x720 canvas through the Hor+ camera, then copy it onto the
+     * screen with a full-screen quad scissored to the panel; cut to that
+     * scissor it looked like a box in the middle of the screen and was
+     * placed as one -- the panel came out at 16:9 / target aspect of its
+     * width (three quarters at 21:9), squeezed towards the centre. */
+    if (!(highestX - lowestX < 1.9f) && ld_hud_samples_widened_surface(surface))
+    {
+        if (!useRows)
+        {
+            ld_hud_note("stretched: full-screen copy of a widened picture", vertexCount,
+                        (lowestX + 1.0f) * 0.5f, (highestX + 1.0f) * 0.5f, (1.0f - highestY) * 0.5f,
+                        (1.0f - lowestY) * 0.5f, firstW);
+        }
+        return 0;
     }
     /* What shows of a draw is what its scissor lets through. The boss
      * capture bar's flash (capture-20261108-140721, draw 246) is an effect
