@@ -194,6 +194,7 @@ if(WIN32)
         "src/engine/engine_dlc.cpp"
         "src/engine/engine_self.cpp"
         "src/engine/engine_save_slots.cpp"
+        "src/engine/engine_input.cpp"
         "${PS3RECOMP_DIR}/libs/filesystem/edat.c"
         "${IMGUI_DIR}/imgui.cpp"
         "${IMGUI_DIR}/imgui_draw.cpp"

@@ -241,6 +241,384 @@ static void pad_poll_keyboard(void)
           printf("[cellPad] keyboard fallback active on port 0 (no XInput device)\n");
           fflush(stdout); } }
 }
+
+/* ---------------------------------------------------------------------------
+ * Keyboard and mouse, bound by the title (cellPad_set_keyboard_mouse).
+ *
+ * Once a title passes bindings, the keyboard and mouse drive port 0 TOGETHER
+ * with whatever controller is there: buttons are combined, and each stick
+ * takes whichever source is pushed further. (Until then the fixed fallback
+ * above stands in when no controller is connected.)
+ *
+ * Every action has two bindings; a binding is a Windows virtual-key code
+ * (keys, and the mouse buttons VK_LBUTTON..VK_XBUTTON2) or
+ * CELLPAD_KBM_WHEEL_UP / _DOWN, which hold their action for a moment per
+ * notch. Keys count only while a window of this process has the focus, and a
+ * key already down when the focus arrives or a port menu closes is ignored
+ * until it is let go (the click that focuses the window, the Escape that
+ * closes the menu).
+ *
+ * The mouse turns the camera: rsx_null_backend's window, while it holds the
+ * mouse (cellPad_mouse_capture_wanted: hidden, kept in the window), passes
+ * raw movement here; it becomes the right stick in proportion to its speed,
+ * smoothed over ~25 ms so a 125 Hz mouse does not stutter, with a curve that
+ * lifts small movements over the game's own stick dead zone.
+ * -----------------------------------------------------------------------*/
+extern volatile int g_cellpad_block_guest_input;
+
+static volatile LONG s_kbm_configured = 0;
+static volatile LONG s_kbm_enabled = 0;
+static volatile LONG s_kbm_mouse_camera = 1;
+static volatile LONG s_kbm_sensitivity = 50;       /* 1-100, 50 = default speed */
+static volatile LONG s_kbm_invert_y = 0;
+static volatile LONG s_kbm_anti_deadzone = 15;     /* % of the stick a slight movement starts at */
+static SRWLOCK       s_kbm_lock = SRWLOCK_INIT;
+static u16           s_kbm_codes[CELLPAD_KBM_ACTION_COUNT][2];
+static volatile LONG s_mouse_dx = 0;
+static volatile LONG s_mouse_dy = 0;
+static volatile LONG s_wheel_up_notches = 0;
+static volatile LONG s_wheel_down_notches = 0;
+static volatile LONG s_wheel_total = 0;            /* for menus that rebind: up minus down, ever */
+static volatile LONG s_kbm_yank = 0;               /* the capture-motion action is held */
+
+void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
+                                int sensitivityPercent, int invertY, int antiDeadzonePercent)
+{
+    AcquireSRWLockExclusive(&s_kbm_lock);
+    memset(s_kbm_codes, 0, sizeof(s_kbm_codes));
+    for (int actionIndex = 0; actionIndex < actionCount && actionIndex < CELLPAD_KBM_ACTION_COUNT; actionIndex++)
+    {
+        s_kbm_codes[actionIndex][0] = codes[actionIndex][0];
+        s_kbm_codes[actionIndex][1] = codes[actionIndex][1];
+    }
+    ReleaseSRWLockExclusive(&s_kbm_lock);
+    if (sensitivityPercent < 1)
+    {
+        sensitivityPercent = 1;
+    }
+    if (sensitivityPercent > 100)
+    {
+        sensitivityPercent = 100;
+    }
+    if (antiDeadzonePercent < 0)
+    {
+        antiDeadzonePercent = 0;
+    }
+    if (antiDeadzonePercent > 60)
+    {
+        antiDeadzonePercent = 60;
+    }
+    InterlockedExchange(&s_kbm_sensitivity, sensitivityPercent);
+    InterlockedExchange(&s_kbm_invert_y, invertY ? 1 : 0);
+    InterlockedExchange(&s_kbm_anti_deadzone, antiDeadzonePercent);
+    InterlockedExchange(&s_kbm_mouse_camera, mouseCamera ? 1 : 0);
+    InterlockedExchange(&s_kbm_enabled, enabled ? 1 : 0);
+    InterlockedExchange(&s_kbm_configured, 1);
+}
+
+void cellPad_note_mouse_motion(long deltaX, long deltaY)
+{
+    InterlockedExchangeAdd(&s_mouse_dx, (LONG)deltaX);
+    InterlockedExchangeAdd(&s_mouse_dy, (LONG)deltaY);
+}
+
+void cellPad_note_mouse_wheel(int notches)
+{
+    if (notches > 0)
+    {
+        InterlockedExchangeAdd(&s_wheel_up_notches, notches);
+    }
+    else if (notches < 0)
+    {
+        InterlockedExchangeAdd(&s_wheel_down_notches, -notches);
+    }
+    InterlockedExchangeAdd(&s_wheel_total, notches);
+}
+
+long cellPad_mouse_wheel_total(void)
+{
+    return (long)InterlockedCompareExchange(&s_wheel_total, 0, 0);
+}
+
+int cellPad_mouse_capture_wanted(void)
+{
+    return s_pad_initialized && InterlockedCompareExchange(&s_kbm_configured, 0, 0) &&
+           InterlockedCompareExchange(&s_kbm_enabled, 0, 0) &&
+           InterlockedCompareExchange(&s_kbm_mouse_camera, 0, 0) && !g_cellpad_block_guest_input;
+}
+
+/* 1 while the capture-motion action is held (the sensor words then read as a
+ * full-scale yank). */
+static int pad_kbm_yank_held(void)
+{
+    return InterlockedCompareExchange(&s_kbm_yank, 0, 0) != 0;
+}
+
+/* A stick from two pairs of opposite directions: full (or half, walking),
+ * diagonals on the circle. */
+static void pad_kbm_digital_stick(int left, int right, int up, int down, float magnitude, float* outX, float* outY)
+{
+    float stickX = (float)(right - left);
+    float stickY = (float)(down - up);
+    if (stickX != 0.0f && stickY != 0.0f)
+    {
+        stickX *= 0.70710678f;
+        stickY *= 0.70710678f;
+    }
+    *outX = stickX * magnitude;
+    *outY = stickY * magnitude;
+}
+
+static u8 pad_kbm_to_u8(float value)
+{
+    if (value > 1.0f)
+    {
+        value = 1.0f;
+    }
+    if (value < -1.0f)
+    {
+        value = -1.0f;
+    }
+    const int result = 128 + (int)lrintf(value * 127.0f);
+    return (u8)(result < 0 ? 0 : (result > 255 ? 255 : result));
+}
+
+/* Put a keyboard/mouse stick into a host stick unless the host is pushed
+ * further. */
+static void pad_kbm_merge_stick(float stickX, float stickY, u8* hostX, u8* hostY)
+{
+    if (stickX == 0.0f && stickY == 0.0f)
+    {
+        return;
+    }
+    const float hostDeltaX = ((float)*hostX - 128.0f) / 127.0f;
+    const float hostDeltaY = ((float)*hostY - 128.0f) / 127.0f;
+    if (hostDeltaX * hostDeltaX + hostDeltaY * hostDeltaY > stickX * stickX + stickY * stickY)
+    {
+        return;
+    }
+    *hostX = pad_kbm_to_u8(stickX);
+    *hostY = pad_kbm_to_u8(stickY);
+}
+
+static void pad_poll_keyboard_mouse(void)
+{
+    static int disabledByEnvironment = -1;
+    if (disabledByEnvironment < 0)
+    {
+        disabledByEnvironment = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
+    }
+    /* Raw movement is taken every poll, so none piles up while it is not
+     * used. */
+    const LONG mouseDeltaX = InterlockedExchange(&s_mouse_dx, 0);
+    const LONG mouseDeltaY = InterlockedExchange(&s_mouse_dy, 0);
+    const LONG wheelUp = InterlockedExchange(&s_wheel_up_notches, 0);
+    const LONG wheelDown = InterlockedExchange(&s_wheel_down_notches, 0);
+    static unsigned long long wheelUpUntil = 0;
+    static unsigned long long wheelDownUntil = 0;
+    static int focusedBefore = 0;
+    static int blockedBefore = 0;
+    static unsigned char ignoredUntilReleased[256];
+    static double mouseRateX = 0.0;
+    static double mouseRateY = 0.0;
+    static unsigned long long mouseLastMs = 0;
+
+    const int focused = pad_host_window_focused();
+    const int blocked = g_cellpad_block_guest_input != 0;
+    const int enabled = !disabledByEnvironment && InterlockedCompareExchange(&s_kbm_enabled, 0, 0);
+    if (enabled)
+    {
+        s_host_state[0].connected = 1;     /* a pad is there even while the window is in the background */
+    }
+    if (!enabled || !focused || blocked)
+    {
+        InterlockedExchange(&s_kbm_yank, 0);
+        mouseRateX = 0.0;
+        mouseRateY = 0.0;
+        focusedBefore = focused;
+        blockedBefore = blocked;
+        return;
+    }
+    const unsigned long long nowMs = GetTickCount64();
+    if (wheelUp > 0)
+    {
+        wheelUpUntil = nowMs + 90ull;
+    }
+    if (wheelDown > 0)
+    {
+        wheelDownUntil = nowMs + 90ull;
+    }
+    /* Keys held as the focus arrives or a menu closes do not count until let
+     * go. */
+    if (!focusedBefore || blockedBefore)
+    {
+        for (int code = 1; code < 256; code++)
+        {
+            ignoredUntilReleased[code] = (GetAsyncKeyState(code) & 0x8000) ? 1 : 0;
+        }
+    }
+    focusedBefore = focused;
+    blockedBefore = blocked;
+
+    u16 codes[CELLPAD_KBM_ACTION_COUNT][2];
+    AcquireSRWLockShared(&s_kbm_lock);
+    memcpy(codes, s_kbm_codes, sizeof(codes));
+    ReleaseSRWLockShared(&s_kbm_lock);
+
+    int held[CELLPAD_KBM_ACTION_COUNT];
+    for (int actionIndex = 0; actionIndex < CELLPAD_KBM_ACTION_COUNT; actionIndex++)
+    {
+        held[actionIndex] = 0;
+        for (int slot = 0; slot < 2; slot++)
+        {
+            const u16 code = codes[actionIndex][slot];
+            if (code == 0)
+            {
+                continue;
+            }
+            if (code == CELLPAD_KBM_WHEEL_UP)
+            {
+                held[actionIndex] |= nowMs < wheelUpUntil;
+            }
+            else if (code == CELLPAD_KBM_WHEEL_DOWN)
+            {
+                held[actionIndex] |= nowMs < wheelDownUntil;
+            }
+            else if (code < 256)
+            {
+                const int down = (GetAsyncKeyState(code) & 0x8000) != 0;
+                if (!down)
+                {
+                    ignoredUntilReleased[code] = 0;
+                }
+                held[actionIndex] |= down && !ignoredUntilReleased[code];
+            }
+        }
+    }
+
+    static const u16 buttonOfAction[CELLPAD_KBM_ACTION_COUNT] = {
+        0, 0, 0, 0,                         /* move */
+        0, 0, 0, 0,                         /* camera */
+        CELL_PAD_CTRL_UP, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_RIGHT,
+        CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_SQUARE, CELL_PAD_CTRL_TRIANGLE,
+        CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1, CELL_PAD_CTRL_L2, CELL_PAD_CTRL_R2,
+        CELL_PAD_CTRL_L3, CELL_PAD_CTRL_R3, CELL_PAD_CTRL_START, CELL_PAD_CTRL_SELECT,
+        0,                                  /* walk */
+        0,                                  /* capture motion */
+    };
+    u16 buttons = 0;
+    for (int actionIndex = 0; actionIndex < CELLPAD_KBM_ACTION_COUNT; actionIndex++)
+    {
+        if (held[actionIndex])
+        {
+            buttons |= buttonOfAction[actionIndex];
+        }
+    }
+    InterlockedExchange(&s_kbm_yank, held[CELLPAD_KBM_CAPTURE_MOTION] ? 1 : 0);
+
+    PadHostState* hostState = &s_host_state[0];
+    hostState->connected = 1;
+    hostState->buttons |= buttons;
+    /* Keys are digital: a pressed one reads full pressure. */
+    const struct
+    {
+        u16 button;
+        u8* pressure;
+    } pressures[] = {
+        {CELL_PAD_CTRL_UP, &hostState->press_up},         {CELL_PAD_CTRL_DOWN, &hostState->press_down},
+        {CELL_PAD_CTRL_LEFT, &hostState->press_left},     {CELL_PAD_CTRL_RIGHT, &hostState->press_right},
+        {CELL_PAD_CTRL_CROSS, &hostState->press_cross},   {CELL_PAD_CTRL_CIRCLE, &hostState->press_circle},
+        {CELL_PAD_CTRL_SQUARE, &hostState->press_square}, {CELL_PAD_CTRL_TRIANGLE, &hostState->press_triangle},
+        {CELL_PAD_CTRL_L1, &hostState->press_l1},         {CELL_PAD_CTRL_R1, &hostState->press_r1},
+        {CELL_PAD_CTRL_L2, &hostState->trigger_l2},       {CELL_PAD_CTRL_R2, &hostState->trigger_r2},
+    };
+    for (unsigned pressureIndex = 0; pressureIndex < sizeof(pressures) / sizeof(pressures[0]); pressureIndex++)
+    {
+        if (buttons & pressures[pressureIndex].button)
+        {
+            *pressures[pressureIndex].pressure = 255;
+        }
+    }
+
+    const float moveMagnitude = held[CELLPAD_KBM_WALK] ? 0.5f : 1.0f;
+    float stickX = 0.0f;
+    float stickY = 0.0f;
+    pad_kbm_digital_stick(held[CELLPAD_KBM_MOVE_LEFT], held[CELLPAD_KBM_MOVE_RIGHT], held[CELLPAD_KBM_MOVE_UP],
+                          held[CELLPAD_KBM_MOVE_DOWN], moveMagnitude, &stickX, &stickY);
+    pad_kbm_merge_stick(stickX, stickY, &hostState->analog_lx, &hostState->analog_ly);
+
+    /* The camera: keys, or the mouse's speed. */
+    pad_kbm_digital_stick(held[CELLPAD_KBM_CAMERA_LEFT], held[CELLPAD_KBM_CAMERA_RIGHT], held[CELLPAD_KBM_CAMERA_UP],
+                          held[CELLPAD_KBM_CAMERA_DOWN], 1.0f, &stickX, &stickY);
+    if (stickX == 0.0f && stickY == 0.0f && InterlockedCompareExchange(&s_kbm_mouse_camera, 0, 0))
+    {
+        double seconds = mouseLastMs ? (double)(nowMs - mouseLastMs) / 1000.0 : 0.004;
+        if (seconds < 0.001)
+        {
+            seconds = 0.001;
+        }
+        if (seconds > 0.1)
+        {
+            seconds = 0.1;
+        }
+        mouseLastMs = nowMs;
+        /* Counts per second, smoothed: steady movement of d counts every dt
+         * settles at d / dt. */
+        const double settle = 1.0 - exp(-seconds / 0.025);
+        mouseRateX += ((double)mouseDeltaX / seconds - mouseRateX) * settle;
+        mouseRateY += ((double)mouseDeltaY / seconds - mouseRateY) * settle;
+        /* Sensitivity 50: 1500 counts a second (a brisk flick of an 800 dpi
+         * mouse) turns the camera at full speed; every 20 points doubles or
+         * halves that. */
+        const double sensitivity = pow(2.0, ((double)InterlockedCompareExchange(&s_kbm_sensitivity, 0, 0) - 50.0) / 20.0);
+        double rateX = mouseRateX * sensitivity / 1500.0;
+        double rateY = mouseRateY * sensitivity / 1500.0;
+        if (InterlockedCompareExchange(&s_kbm_invert_y, 0, 0))
+        {
+            rateY = -rateY;
+        }
+        const double magnitude = sqrt(rateX * rateX + rateY * rateY);
+        if (magnitude > 0.004)
+        {
+            const double antiDeadzone = (double)InterlockedCompareExchange(&s_kbm_anti_deadzone, 0, 0) / 100.0;
+            const double clamped = magnitude > 1.0 ? 1.0 : magnitude;
+            const double shaped = antiDeadzone + (1.0 - antiDeadzone) * pow(clamped, 0.75);
+            stickX = (float)(rateX / magnitude * shaped);
+            stickY = (float)(rateY / magnitude * shaped);
+        }
+    }
+    else
+    {
+        mouseRateX = 0.0;
+        mouseRateY = 0.0;
+        mouseLastMs = nowMs;
+    }
+    pad_kbm_merge_stick(stickX, stickY, &hostState->analog_rx, &hostState->analog_ry);
+}
+#else
+void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
+                                int sensitivityPercent, int invertY, int antiDeadzonePercent)
+{
+    (void)enabled; (void)codes; (void)actionCount; (void)mouseCamera;
+    (void)sensitivityPercent; (void)invertY; (void)antiDeadzonePercent;
+}
+void cellPad_note_mouse_motion(long deltaX, long deltaY)
+{
+    (void)deltaX;
+    (void)deltaY;
+}
+void cellPad_note_mouse_wheel(int notches)
+{
+    (void)notches;
+}
+long cellPad_mouse_wheel_total(void)
+{
+    return 0;
+}
+int cellPad_mouse_capture_wanted(void)
+{
+    return 0;
+}
 #endif
 
 /* ---------------------------------------------------------------------------
@@ -2058,7 +2436,25 @@ static void pad_poll_backend(void)
     pad_poll_sdl2();
 #endif
 #ifdef _WIN32
-    if (!s_host_state[0].connected) pad_poll_keyboard();
+    if (InterlockedCompareExchange(&s_kbm_configured, 0, 0))
+    {
+        /* Bound keyboard and mouse, together with any controller. Port 0 is
+         * cleared first when no controller wrote it this time, so nothing
+         * from an earlier poll stays held. */
+        if (!s_host_state[0].connected)
+        {
+            memset(&s_host_state[0], 0, sizeof(s_host_state[0]));
+            s_host_state[0].analog_lx = 128;
+            s_host_state[0].analog_ly = 128;
+            s_host_state[0].analog_rx = 128;
+            s_host_state[0].analog_ry = 128;
+        }
+        pad_poll_keyboard_mouse();
+    }
+    else if (!s_host_state[0].connected)
+    {
+        pad_poll_keyboard();
+    }
 #endif
     if (g_cellpad_block_guest_input)
     {
@@ -2428,6 +2824,11 @@ skip_inject: ;
         if (g_cellpad_block_guest_input)
         {
             /* menu open: at rest */
+        }
+        else if (port_no == 0 && pad_kbm_yank_held())
+        {
+            /* The keyboard/mouse capture-motion action: a full-scale yank. */
+            sensorWords[0] = sensorWords[1] = sensorWords[2] = sensorWords[3] = 0;
         }
         else if (motionMode == 2 || (motionMode == 0 && !haveMotion))
         {

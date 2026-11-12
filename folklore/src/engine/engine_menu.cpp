@@ -59,6 +59,7 @@ extern "C"
     void rsx_null_backend_set_fullscreen(int enabled);
     void rsx_live_draw_get_shader_stats(uint32_t* pending, uint32_t* built, uint32_t* skippedDraws);
     int rsx_live_draw_get_hdr_status(uint32_t* displayPeakNits);
+    long cellPad_mouse_wheel_total(void);
     void rsx_live_draw_get_hdr_levels(uint32_t* peakInUse, uint32_t* paperWhiteInUse, uint32_t* windowsSdrWhite);
     extern volatile int g_cellpad_block_guest_input;
     /* A controller read over HID (cellPad.c): a DualShock 3 or 4, DualSense
@@ -1073,6 +1074,57 @@ namespace
         return false;
     }
 
+    /* Keyboard and mouse: on or off, the mouse camera, and the bindings
+     * (folded away until opened). Applies at once. */
+    InputBindingCapture bindingCapture;
+    long bindingWheelSeen = 0;
+
+    bool drawKeyboardMouse()
+    {
+        EngineSettings& settings = engineSettings();
+        bool changed = false;
+        changed |= ImGui::Checkbox("Keyboard and mouse (with a controller too)", &settings.keyboardMouse);
+        if (settings.keyboardMouse)
+        {
+            const float sliderWidth = ImGui::GetFontSize() * 18.0f;
+            changed |= ImGui::Checkbox("Mouse turns the camera", &settings.mouseCamera);
+            if (settings.mouseCamera)
+            {
+                ImGui::SetNextItemWidth(sliderWidth);
+                changed |= ImGui::SliderInt("Mouse sensitivity", &settings.mouseSensitivity, 1, 100);
+                ImGui::SetNextItemWidth(sliderWidth);
+                changed |= ImGui::SliderInt("Small movement lift", &settings.mouseDeadzone, 0, 40, "%d%%");
+                changed |= ImGui::Checkbox("Invert mouse up and down", &settings.mouseInvertY);
+            }
+            if (ImGui::TreeNode("Key bindings"))
+            {
+                const long wheelTotal = cellPad_mouse_wheel_total();
+                const int wheelNotches = (int)(wheelTotal - bindingWheelSeen);
+                bindingWheelSeen = wheelTotal;
+                changed |= engineInputDrawBindings(settings.inputBindings, bindingCapture, wheelNotches,
+                                                   ImGui::GetFontSize() * 8.0f);
+                if (ImGui::Button("Reset to defaults##bindings"))
+                {
+                    settings.inputBindings = engineInputDefaultBindings();
+                    bindingCapture.action = -1;
+                    changed = true;
+                }
+                ImGui::TextDisabled("Choose a binding, then press the key, mouse button or wheel for it; Delete empties it.");
+                ImGui::TreePop();
+            }
+            else
+            {
+                bindingCapture.action = -1;
+                bindingWheelSeen = cellPad_mouse_wheel_total();
+            }
+        }
+        if (changed)
+        {
+            engineSettingsApplyInput();
+        }
+        return changed;
+    }
+
     /* HDR output: on or off, and its three levels. Paper white and peak
      * follow Windows' SDR content brightness and the display's peak unless
      * set by hand. Under them, whether the game's display has Windows' HDR
@@ -1517,6 +1569,7 @@ namespace
                                         "complete by themselves.");
                 }
             }
+            changed |= drawKeyboardMouse();
 
             ImGui::SeparatorText("Opening logos");
             {
@@ -1742,7 +1795,8 @@ namespace
         if (menu.menuOpen)
         {
             feedGamepad(io, controller);
-            feedKeyboard(io, focused);
+            /* A key being bound does nothing else in the menu. */
+            feedKeyboard(io, focused && !engineInputCaptureActive(bindingCapture));
         }
         else
         {

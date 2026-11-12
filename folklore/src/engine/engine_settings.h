@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <string>
 
+#include "engine_input.h"
+
 enum class FrameRateCap : int
 {
     Original = 0,       /* the game's own limiter: 30 fps (21 in its heavy mode) */
@@ -193,6 +195,17 @@ struct EngineSettings
      * Switch Pro) and a controller without them still captures by itself;
      * off, every capture completes by itself (cellPad_set_motion_mode). */
     bool motionControls = true;
+    /* Keyboard and mouse, together with any controller (engine_input.h):
+     * the bindings, and the mouse turning the camera at this sensitivity
+     * (1-100, 50 the default speed), optionally inverted vertically. The
+     * dead-zone lift (0-40 %) is where a slight mouse movement starts on the
+     * stick, so it is not lost in the game's own dead zone. Applies at once. */
+    bool keyboardMouse = true;
+    bool mouseCamera = true;
+    int mouseSensitivity = 50;
+    bool mouseInvertY = false;
+    int mouseDeadzone = 15;
+    InputBindings inputBindings = engineInputDefaultBindings();
     /* Ultrawide: the game's field of view is widened to this shape. Read
      * when the renderer starts, so a change applies on the next launch. */
     AspectRatio aspectRatio = AspectRatio::Original;

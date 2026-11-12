@@ -1775,6 +1775,37 @@ What 0006 fixes in ps3recomp to make that run:
     matched to the DXGI output by its GDI device name; checked about every
     five seconds) and the peak DXGI reports. Either can still be set by
     hand (paper white up to 500 nits).
+128. Keyboard and mouse together with a controller (patches/0105;
+    engine_input.cpp, the launcher's Controls page, the engine menu).
+    - cellPad.c: once the title calls cellPad_set_keyboard_mouse (the
+      engine does at start and on every change), port 0 is the controller
+      (XInput or HID) with the keyboard and mouse merged in: buttons OR'd
+      (pressures 255), each stick from whichever source is pushed further.
+      26 actions in CELLPAD_KBM_* order (pad buttons, both sticks'
+      directions, walk = half-speed movement, capture motion = sensor words
+      read as a full-scale yank, as automatic capture does), two codes each:
+      virtual keys (mouse buttons too, via GetAsyncKeyState) or wheel
+      up/down (held 90 ms a notch). Keys count only while this process has
+      the focus; keys already down when it arrives or when a port menu
+      closes are ignored until released (the focusing click, the Escape
+      that closes the engine menu). The fixed no-controller keyboard
+      fallback stands until the first call.
+    - The mouse camera: rsx_null_backend registers raw mouse input; while
+      cellPad_mouse_capture_wanted (keyboard and mouse on, mouse camera on,
+      no port menu) and the window is in front, the cursor is hidden and
+      clipped to the client area, and WM_INPUT deltas go to cellPad. There
+      they are a speed (counts/s, smoothed over 25 ms so a 125 Hz mouse
+      does not stutter): sensitivity 50 = 1500 counts/s for full deflection,
+      every 20 points doubling; magnitude shaped as lift + (1 - lift) *
+      m^0.75 so small movements clear the game's stick dead zone.
+    - Settings keyboard_mouse, mouse_camera, mouse_sensitivity,
+      mouse_invert_y, mouse_deadzone, key_<action> = name[, name]
+      (round trip of every default and key name tested). Rebinding: click a
+      binding, wait for everything to be let go, then the next key, mouse
+      button or wheel notch; Delete or a right click empties it; a key bound
+      is taken off other actions. Checked in the launcher under Wine
+      (keys, mouse buttons, wheel, clearing); the in-game camera feel needs
+      a real mouse.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

@@ -5,7 +5,8 @@
  *   Game      the disc dump, the 1.10 update (1.10 builds), where saves and
  *             installed data go, firmware fonts;
  *   DLC       the packs installed, Add DLC from RPCS3..., Add licences;
- *   Graphics, Display, Gameplay
+ *   Graphics, Display, Controls (controller motion, keyboard and mouse
+ *   bindings), Gameplay
  *             the settings the in-game engine menu (F1) has, including the
  *             ones that only apply when the game starts;
  *   Play      saves folklore_settings.ini and starts folklore.exe beside it
@@ -1376,17 +1377,67 @@ namespace
         return changed;
     }
 
-    bool drawGameplayPage()
+    /* Controls: the controller's motion, then the keyboard and mouse with
+     * their bindings. */
+    InputBindingCapture bindingCapture;
+
+    bool drawControlsPage()
     {
         EngineSettings& settings = engineSettings();
         bool changed = false;
-        sectionHeading("Controls");
+        sectionHeading("Controller");
         changed |= ImGui::Checkbox("Motion controls (move the controller to capture Folks)", &settings.motionControls);
         note(settings.motionControls
                  ? "Works with a DualShock 3 or 4, DualSense or Switch Pro controller; one without motion sensors "
                    "captures by itself."
                  : "Off: every capture completes by itself, boss captures too, with any controller.");
 
+        sectionHeading("Keyboard and mouse");
+        changed |= ImGui::Checkbox("Keyboard and mouse", &settings.keyboardMouse);
+        note("They work together with a controller: use either, or both, at any time.");
+        if (!settings.keyboardMouse)
+        {
+            bindingCapture.action = -1;
+            return changed;
+        }
+        const float sliderWidth = 320.0f * ImGui::GetIO().FontGlobalScale;
+        changed |= ImGui::Checkbox("Mouse turns the camera", &settings.mouseCamera);
+        if (settings.mouseCamera)
+        {
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Mouse sensitivity", &settings.mouseSensitivity, 1, 100);
+            ImGui::SetNextItemWidth(sliderWidth);
+            changed |= ImGui::SliderInt("Small movement lift", &settings.mouseDeadzone, 0, 40, "%d%%");
+            changed |= ImGui::Checkbox("Invert mouse up and down", &settings.mouseInvertY);
+            note("While you play, the game window holds the mouse (hidden, kept inside the window); it is let "
+                 "go when the engine menu opens (F1) or you switch to another window. Raise Small movement lift "
+                 "if slight mouse movements do not turn the camera.");
+        }
+
+        sectionHeading("Bindings");
+        note("Click a binding, then press the key, mouse button or wheel direction for it. Right-click a binding "
+             "(or press Delete while choosing) to empty it. Each action takes two.");
+        const float wheel = ImGui::GetIO().MouseWheel;
+        const int wheelNotches = engineInputCaptureActive(bindingCapture) ? (wheel > 0.0f ? 1 : (wheel < 0.0f ? -1 : 0))
+                                                                          : 0;
+        changed |= engineInputDrawBindings(settings.inputBindings, bindingCapture, wheelNotches,
+                                           150.0f * ImGui::GetIO().FontGlobalScale);
+        ImGui::Spacing();
+        if (ImGui::Button("Reset bindings to defaults"))
+        {
+            settings.inputBindings = engineInputDefaultBindings();
+            bindingCapture.action = -1;
+            changed = true;
+        }
+        note("Capture motion stands in for yanking the controller up when capturing a Folk (Wheel Up or G by "
+             "default); with motion controls off, captures complete by themselves anyway.");
+        return changed;
+    }
+
+    bool drawGameplayPage()
+    {
+        EngineSettings& settings = engineSettings();
+        bool changed = false;
         sectionHeading("Starting the game");
         changed |= enumChoice("Opening logos", &settings.logoSkip,
                               {"Play them (as on the PS3)", "Start skips them", "Never show them"});
@@ -1584,8 +1635,8 @@ namespace
             ImGui::TextColored(kTextDim, "  %s release, v%s build", FOLKLORE_RELEASE_NAME, FOLKLORE_VERSION_NAME);
             ImGui::Spacing();
 
-            const char* pages[6] = {"Game", "Saves", "DLC", "Graphics", "Display", "Gameplay"};
-            for (int pageIndex = 0; pageIndex < 6; pageIndex++)
+            const char* pages[7] = {"Game", "Saves", "DLC", "Graphics", "Display", "Controls", "Gameplay"};
+            for (int pageIndex = 0; pageIndex < 7; pageIndex++)
             {
                 if (pageIndex > 0)
                 {
@@ -1594,7 +1645,7 @@ namespace
                 const bool selected = pageIndex == currentPage;
                 ImGui::PushStyleColor(ImGuiCol_Button, selected ? kAccent : ImVec4(0.17f, 0.10f, 0.21f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kAccentHover);
-                if (ImGui::Button(pages[pageIndex], ImVec2(106.0f * scale, 0.0f)))
+                if (ImGui::Button(pages[pageIndex], ImVec2(94.0f * scale, 0.0f)))
                 {
                     currentPage = pageIndex;
                 }
@@ -1624,6 +1675,10 @@ namespace
             else if (currentPage == 4)
             {
                 changed = drawDisplayPage();
+            }
+            else if (currentPage == 5)
+            {
+                changed = drawControlsPage();
             }
             else
             {
