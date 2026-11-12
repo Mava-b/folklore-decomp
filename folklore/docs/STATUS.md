@@ -1811,6 +1811,17 @@ What 0006 fixes in ps3recomp to make that run:
     walk. A real stick in the corner of its gate reads near full on both
     axes (a DualShock 3 gives about 0 and 255), so patches/0106 pushes
     both axes all the way (half with Walk held).
+130. Ultrawide: the comic-book story pages showed their panels at three
+    quarters of their width, pulled in towards the centre
+    (capture-20261112-203512). Each panel is drawn into a 2560x720 canvas
+    through the widened camera, then copied onto the screen by a
+    full-screen quad scissored to the panel. Since patches/0099 a draw is
+    judged by what its scissor lets through, so the copy looked like a box
+    in the middle of the screen and was placed as HUD, narrowing it a
+    second time. patches/0107 leaves a full-screen draw stretched when its
+    first texture is a widened surface: it is already at the screen's
+    proportions. The boss bar's flash, which 0099 was for, samples its own
+    texture there and is placed as before.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
