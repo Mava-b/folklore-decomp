@@ -1806,6 +1806,11 @@ What 0006 fixes in ps3recomp to make that run:
       is taken off other actions. Checked in the launcher under Wine
       (keys, mouse buttons, wheel, clearing); the in-game camera feel needs
       a real mouse.
+129. Two movement keys (W and A) walked instead of running: diagonals were
+    scaled to the circle, 0.71 on each axis, which Folklore reads as a
+    walk. A real stick in the corner of its gate reads near full on both
+    axes (a DualShock 3 gives about 0 and 255), so patches/0106 pushes
+    both axes all the way (half with Walk held).
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

@@ -1,0 +1,29 @@
+diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
+--- a/libs/input/cellPad.c
++++ b/libs/input/cellPad.c
+@@ -354,19 +354,14 @@
+     return InterlockedCompareExchange(&s_kbm_yank, 0, 0) != 0;
+ }
+ 
+-/* A stick from two pairs of opposite directions: full (or half, walking),
+- * diagonals on the circle. */
++/* A stick from two pairs of opposite directions: full (or half, walking).
++ * Diagonals push both axes all the way, as a real stick in the corner of its
++ * gate does (a DualShock 3 reads near 0 and 255 on both there): scaled to the
++ * circle, 0.71 on each axis, Folklore took two keys for a walk. */
+ static void pad_kbm_digital_stick(int left, int right, int up, int down, float magnitude, float* outX, float* outY)
+ {
+-    float stickX = (float)(right - left);
+-    float stickY = (float)(down - up);
+-    if (stickX != 0.0f && stickY != 0.0f)
+-    {
+-        stickX *= 0.70710678f;
+-        stickY *= 0.70710678f;
+-    }
+-    *outX = stickX * magnitude;
+-    *outY = stickY * magnitude;
++    *outX = (float)(right - left) * magnitude;
++    *outY = (float)(down - up) * magnitude;
+ }
+ 
+ static u8 pad_kbm_to_u8(float value)
