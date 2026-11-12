@@ -19,7 +19,22 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-### New in v0.62: smoother play and a tidier ultrawide HUD
+### New in v0.64: HDR, keyboard and mouse
+
+- **HDR output**: on a display with Windows' HDR on, the sun, skies, glowing
+  Ids and magic go brighter than white towards your display's peak, while
+  the HUD, text and menus stay at paper white. Brightness follows Windows'
+  own HDR settings by default, so the picture matches HDR off; both levels
+  can be set by hand. On the launcher's Graphics page and in the engine menu.
+- **Keyboard and mouse**: play with them, a controller, or both at once.
+  The mouse turns the camera (sensitivity, invert, and a lift past the
+  game's dead zone); two movement keys together run, as a stick does. Every
+  button, both sticks' directions, *Walk* and *Capture motion* can be
+  rebound on the launcher's new **Controls** page or in the engine menu.
+- **Ultrawide comic-book scenes**: the story pages' panels are full width
+  again (they were drawn at three quarters of their width at 21:9).
+
+### v0.62: smoother play and a tidier ultrawide HUD
 
 - **No more quarter-second freezes in fights**: a hold-up between the game
   and the renderer, every few seconds in heavy combat, is gone.
@@ -268,6 +283,8 @@ ones `run.ps1` uses).
   (.rap)...**, and any pack still missing its licence.
 - **Graphics**, **Display**, **Gameplay**: every setting of the in-game
   engine menu, including the ones that only apply when the game starts.
+- **Controls**: motion controls, keyboard and mouse, and the key bindings
+  (click one, then press the key, mouse button or wheel direction for it).
 - **Dump textures this run** (Graphics page): the next Play starts the game
   with the texture dump on, into `textures\dump` (as `run.ps1
   -DumpTextures`); not kept between runs.
