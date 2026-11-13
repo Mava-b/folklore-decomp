@@ -1867,6 +1867,24 @@ What 0006 fixes in ps3recomp to make that run:
     and render_state_t.draw_scale follows the twin (viewport, WPOS, slope
     bias). The zetas were already canvas-scaled, so the reflection's depth
     now matches its colour.
+133. Texture pack hitches (run-20261113-170825, patches/0109). Of its 37
+    hitches, the ~100 ms ones with the game thread in usleep are the
+    game's own waits while loading; a few first frames of a new area
+    upload 30-85 MB of the game's textures. The ones in play: frames 1106,
+    7714, 13580, 14687 and 33559, 25-130 ms in textures with almost none of
+    the game's uploaded -- texture pack replacements (448 in use), each read
+    from disk, and given mipmaps when the file had none, on the render
+    thread the first time the game used the texture. ld_texture_pack_load
+    is split into ld_texture_pack_prepare (file, checks, mipmaps; any
+    thread) and ld_texture_pack_upload (render thread). A replacement not
+    yet read is queued for two below-normal-priority threads
+    (ld_texture_pack_request); the game's own texture is bound meanwhile
+    (texcache_t.pack_pending) and swapped for the replacement the first
+    time it is drawn after the file is ready (ld_texture_pack_take). Not
+    dumped while pending. LD_TEXTURE_PACK_SYNC=1 loads on the render thread
+    as before. Left alone: frames 58020 and 65035 (100-125 ms with the
+    renderer at 9-13 ms and the game thread in nothing measured) and 5978
+    (45 ms waiting for the GPU), one each.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

@@ -320,6 +320,9 @@ typedef struct {
     u32 dump_quick_changes;
     /* A texture pack's replacement is bound (its own format; 0 = none). */
     DXGI_FORMAT replaced_format;
+    /* The game's own texture is bound while its replacement loads in the
+     * background (ld_texture_pack_request); swapped in when it is ready. */
+    struct ld_texture_pack_file* pack_pending;
 } texcache_t;
 typedef struct {
     u32 location, offset, format, width, height, pitch;
@@ -3826,12 +3829,22 @@ static ID3D12Resource* decode_guest_texture_profiled(
  * since its dump is the disc's data; the other formats were dumped with it
  * already applied.
  * --------------------------------------------------------------------------- */
-typedef struct {
+struct ld_texture_pack_prepared;
+typedef struct ld_texture_pack_file {
     u64 key;
     char* path;
-    u32 failed;
+    volatile LONG failed;
     u32 loaded;
+    /* Background loading (ld_texture_pack_request): LD_TEXTURE_PACK_IDLE,
+     * _LOADING (queued or being read) or _READY (`prepared` holds it). */
+    volatile LONG state;
+    int wantCube;
+    struct ld_texture_pack_prepared* prepared;
 } ld_texture_pack_file;
+
+#define LD_TEXTURE_PACK_IDLE    0
+#define LD_TEXTURE_PACK_LOADING 1
+#define LD_TEXTURE_PACK_READY   2
 
 static SRWLOCK g_ld_texture_pack_lock = SRWLOCK_INIT;
 static char g_ld_texture_pack_folder[MAX_PATH];
@@ -4040,9 +4053,8 @@ static int ld_texture_pack_active(void)
 
 static void ld_texture_pack_broken(ld_texture_pack_file* file, const char* reason)
 {
-    if (!file->failed)
+    if (InterlockedExchange(&file->failed, 1) == 0)
     {
-        file->failed = 1;
         InterlockedIncrement(&g_ld_texture_pack_broken);
         fprintf(stderr, "[tex-pack] cannot use %s: %s\n", file->path, reason);
         fflush(stderr);
@@ -4156,7 +4168,43 @@ static void ld_texture_pack_half(const u8* source, u32 sourceWidth, u32 sourceHe
 }
 
 /* Loads a replacement and records its upload; NULL if it cannot be used. */
-static ID3D12Resource* ld_texture_pack_load(ld_texture_pack_file* file, int wantCube, DXGI_FORMAT* formatOut)
+/* A replacement read from its file and ready to go to the GPU: every level
+ * of every face, the ones the file lacks made here (ld_texture_pack_half). */
+typedef struct ld_texture_pack_prepared {
+    DXGI_FORMAT format;
+    u32 width;
+    u32 height;
+    u32 faceCount;
+    u32 levelsPerFace;
+    int madeMips;
+    int compressedWithoutMips;
+    tex_level_t* levels;
+    u8** madeLevels;
+    u8* contents;
+} ld_texture_pack_prepared;
+
+static void ld_texture_pack_prepared_free(ld_texture_pack_prepared* prepared)
+{
+    if (!prepared)
+    {
+        return;
+    }
+    if (prepared->madeLevels)
+    {
+        for (u32 levelIndex = 0; levelIndex < prepared->faceCount * prepared->levelsPerFace; levelIndex++)
+        {
+            free(prepared->madeLevels[levelIndex]);
+        }
+    }
+    free(prepared->madeLevels);
+    free(prepared->levels);
+    free(prepared->contents);
+    free(prepared);
+}
+
+/* The slow part, safe on any thread: read the file, check it, make the
+ * mipmaps it lacks. NULL if it cannot be used (logged once). */
+static ld_texture_pack_prepared* ld_texture_pack_prepare(ld_texture_pack_file* file, int wantCube)
 {
     if (file->failed)
     {
@@ -4332,12 +4380,58 @@ static ID3D12Resource* ld_texture_pack_load(ld_texture_pack_file* file, int want
             levelHeight = levelHeight > 1 ? levelHeight >> 1 : 1;
         }
     }
-    ID3D12Resource* texture = NULL;
-    if (truncated)
+    if (truncated || outOfMemory)
     {
-        ld_texture_pack_broken(file, "the file is shorter than its header says");
+        if (truncated)
+        {
+            ld_texture_pack_broken(file, "the file is shorter than its header says");
+        }
+        for (u32 levelIndex = 0; levelIndex < faceCount * levelsPerFace; levelIndex++)
+        {
+            free(madeLevels[levelIndex]);
+        }
+        free(madeLevels);
+        free(levels);
+        free(contents);
+        return NULL;
     }
-    else if (!outOfMemory)
+    ld_texture_pack_prepared* prepared = (ld_texture_pack_prepared*)calloc(1, sizeof(ld_texture_pack_prepared));
+    if (!prepared)
+    {
+        for (u32 levelIndex = 0; levelIndex < faceCount * levelsPerFace; levelIndex++)
+        {
+            free(madeLevels[levelIndex]);
+        }
+        free(madeLevels);
+        free(levels);
+        free(contents);
+        return NULL;
+    }
+    prepared->format = format;
+    prepared->width = width;
+    prepared->height = height;
+    prepared->faceCount = faceCount;
+    prepared->levelsPerFace = levelsPerFace;
+    prepared->madeMips = makeMips;
+    prepared->compressedWithoutMips = blockBytes && mipCount == 1 && fullChain > 1;
+    prepared->levels = levels;
+    prepared->madeLevels = madeLevels;
+    prepared->contents = contents;
+    return prepared;
+}
+
+/* The quick part, on the render thread: the prepared levels into a new
+ * texture through its own upload buffer. */
+static ID3D12Resource* ld_texture_pack_upload(ld_texture_pack_file* file, const ld_texture_pack_prepared* prepared,
+                                              DXGI_FORMAT* formatOut)
+{
+    const DXGI_FORMAT format = prepared->format;
+    const u32 width = prepared->width;
+    const u32 height = prepared->height;
+    const u32 faceCount = prepared->faceCount;
+    const u32 levelsPerFace = prepared->levelsPerFace;
+    const tex_level_t* levels = prepared->levels;
+    ID3D12Resource* texture = NULL;
     {
         D3D12_HEAP_PROPERTIES defaultHeap = {0};
         defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -4425,7 +4519,7 @@ static ID3D12Resource* ld_texture_pack_load(ld_texture_pack_file* file, int want
                 {
                     fprintf(stderr, "[tex-pack] %ld in use; now %016llX at %ux%u%s\n", (long)inUse,
                             (unsigned long long)file->key, width, height,
-                            (blockBytes && mipCount == 1 && fullChain > 1) ? " (no mipmaps in the file)" : "");
+                            prepared->compressedWithoutMips ? " (no mipmaps in the file)" : "");
                     fflush(stderr);
                 }
             }
@@ -4444,13 +4538,6 @@ static ID3D12Resource* ld_texture_pack_load(ld_texture_pack_file* file, int want
             ld_texture_pack_broken(file, "the GPU could not make it (out of video memory?)");
         }
     }
-    for (u32 levelIndex = 0; levelIndex < faceCount * levelsPerFace; levelIndex++)
-    {
-        free(madeLevels[levelIndex]);
-    }
-    free(madeLevels);
-    free(levels);
-    free(contents);
     return texture;
 }
 
@@ -4508,13 +4595,131 @@ static void ld_texture_dump_sweep_replaced(void)
     }
 }
 
+/* Replacements load in the background. Read on the render thread the moment
+ * the game first used a texture, a replacement (a 2048x2048 file, or a
+ * 2560x1440 one whose mipmaps had to be made here) held up that frame by
+ * 25-200 ms: the hitches of run-20261113-170825 (frames 13580, 14687,
+ * 33559 -- 90-130 ms in textures with nothing of the game's uploaded). Now
+ * the file is queued for two low-priority threads, which read it and make
+ * its mipmaps (ld_texture_pack_prepare); the game's own texture shows until
+ * it is ready, and the next time that texture is drawn after that the
+ * replacement is uploaded in its place (a millisecond or two).
+ * LD_TEXTURE_PACK_SYNC=1 loads them on the render thread as before. */
+#define LD_TEXTURE_PACK_QUEUE 4096u
+static ld_texture_pack_file* g_ld_texture_pack_queue[LD_TEXTURE_PACK_QUEUE];
+static u32 g_ld_texture_pack_queue_head = 0;
+static u32 g_ld_texture_pack_queue_count = 0;
+static SRWLOCK g_ld_texture_pack_queue_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE g_ld_texture_pack_queue_wake = CONDITION_VARIABLE_INIT;
+static int g_ld_texture_pack_workers_started = 0;
+
+static int ld_texture_pack_background(void)
+{
+    static int background = -1;
+    if (background < 0)
+    {
+        const char* text = getenv("LD_TEXTURE_PACK_SYNC");
+        background = (text && text[0] == '1') ? 0 : 1;
+    }
+    return background;
+}
+
+static DWORD WINAPI ld_texture_pack_worker(LPVOID unused)
+{
+    (void)unused;
+    for (;;)
+    {
+        AcquireSRWLockExclusive(&g_ld_texture_pack_queue_lock);
+        while (g_ld_texture_pack_queue_count == 0)
+        {
+            SleepConditionVariableSRW(&g_ld_texture_pack_queue_wake, &g_ld_texture_pack_queue_lock, INFINITE, 0);
+        }
+        ld_texture_pack_file* file = g_ld_texture_pack_queue[g_ld_texture_pack_queue_head];
+        g_ld_texture_pack_queue_head = (g_ld_texture_pack_queue_head + 1u) % LD_TEXTURE_PACK_QUEUE;
+        g_ld_texture_pack_queue_count--;
+        ReleaseSRWLockExclusive(&g_ld_texture_pack_queue_lock);
+        ld_texture_pack_prepared* prepared = ld_texture_pack_prepare(file, file->wantCube);
+        file->prepared = prepared;
+        InterlockedExchange(&file->state, prepared ? LD_TEXTURE_PACK_READY : LD_TEXTURE_PACK_IDLE);
+    }
+    return 0;
+}
+
+/* Queue a replacement to be read (render thread). 1 while it is loading or
+ * ready, 0 if it cannot be (a file that failed, a full queue). */
+static int ld_texture_pack_request(ld_texture_pack_file* file, int wantCube)
+{
+    if (InterlockedCompareExchange(&file->failed, 0, 0))
+    {
+        return 0;
+    }
+    if (InterlockedCompareExchange(&file->state, LD_TEXTURE_PACK_LOADING, LD_TEXTURE_PACK_IDLE) !=
+        LD_TEXTURE_PACK_IDLE)
+    {
+        return 1;
+    }
+    file->wantCube = wantCube ? 1 : 0;
+    AcquireSRWLockExclusive(&g_ld_texture_pack_queue_lock);
+    if (g_ld_texture_pack_queue_count >= LD_TEXTURE_PACK_QUEUE)
+    {
+        ReleaseSRWLockExclusive(&g_ld_texture_pack_queue_lock);
+        InterlockedExchange(&file->state, LD_TEXTURE_PACK_IDLE);
+        return 0;
+    }
+    g_ld_texture_pack_queue[(g_ld_texture_pack_queue_head + g_ld_texture_pack_queue_count) % LD_TEXTURE_PACK_QUEUE] =
+        file;
+    g_ld_texture_pack_queue_count++;
+    if (!g_ld_texture_pack_workers_started)
+    {
+        g_ld_texture_pack_workers_started = 1;
+        for (int workerIndex = 0; workerIndex < 2; workerIndex++)
+        {
+            const HANDLE worker = CreateThread(NULL, 0, ld_texture_pack_worker, NULL, 0, NULL);
+            if (worker)
+            {
+                SetThreadPriority(worker, THREAD_PRIORITY_BELOW_NORMAL);
+                CloseHandle(worker);
+            }
+        }
+    }
+    ReleaseSRWLockExclusive(&g_ld_texture_pack_queue_lock);
+    WakeConditionVariable(&g_ld_texture_pack_queue_wake);
+    return 1;
+}
+
+/* The replacement as a texture if it has been read (render thread; it is
+ * taken, so the file's memory is let go), else NULL. */
+static ID3D12Resource* ld_texture_pack_take(ld_texture_pack_file* file, int wantCube, DXGI_FORMAT* formatOut)
+{
+    if (InterlockedCompareExchange(&file->state, 0, 0) != LD_TEXTURE_PACK_READY)
+    {
+        return NULL;
+    }
+    ld_texture_pack_prepared* prepared = file->prepared;
+    const int preparedCube = file->wantCube;
+    file->prepared = NULL;
+    InterlockedExchange(&file->state, LD_TEXTURE_PACK_IDLE);
+    ID3D12Resource* texture = NULL;
+    if (prepared && preparedCube == (wantCube ? 1 : 0))
+    {
+        texture = ld_texture_pack_upload(file, prepared, formatOut);
+    }
+    ld_texture_pack_prepared_free(prepared);
+    return texture;
+}
+
 /* decode_guest_texture_profiled, or the texture pack's replacement for it
  * (*replacedFormat says which), writing the texture to the dump folder on
- * the way when dumping is on and this texture has not been written yet. */
+ * the way when dumping is on and this texture has not been written yet.
+ * *packPending: the replacement still loading in the background (the
+ * game's own texture is returned meanwhile), else NULL. */
 static ID3D12Resource* decode_guest_texture_dumping(
-    const rsx_dsp_texture* texture, u32 remap, u64 contentHash, int dumpAllowed, DXGI_FORMAT* replacedFormat)
+    const rsx_dsp_texture* texture, u32 remap, u64 contentHash, int dumpAllowed, DXGI_FORMAT* replacedFormat,
+    ld_texture_pack_file** packPending)
 {
     *replacedFormat = DXGI_FORMAT_UNKNOWN;
+    *packPending = NULL;
+    int hasReplacement = 0;
     const u32 baseFormat = texture->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
     if (dumpAllowed && ld_texture_dump_enabled() && ld_texture_pack_active())
     {
@@ -4526,15 +4731,30 @@ static ID3D12Resource* decode_guest_texture_dumping(
         ld_texture_pack_file* file = ld_texture_pack_find(ld_texture_replace_key(texture, remap, contentHash));
         if (file)
         {
-            ID3D12Resource* replaced = ld_texture_pack_load(file, texture->cubemap ? 1 : 0, replacedFormat);
+            const int wantCube = texture->cubemap ? 1 : 0;
+            ID3D12Resource* replaced = ld_texture_pack_take(file, wantCube, replacedFormat);
+            if (!replaced && !ld_texture_pack_background())
+            {
+                ld_texture_pack_prepared* prepared = ld_texture_pack_prepare(file, wantCube);
+                if (prepared)
+                {
+                    replaced = ld_texture_pack_upload(file, prepared, replacedFormat);
+                    ld_texture_pack_prepared_free(prepared);
+                }
+            }
             if (replaced)
             {
                 return replaced;
             }
             *replacedFormat = DXGI_FORMAT_UNKNOWN;
+            hasReplacement = 1;
+            if (ld_texture_pack_background() && ld_texture_pack_request(file, wantCube))
+            {
+                *packPending = file;
+            }
         }
     }
-    if (dumpAllowed && contentHash && ld_texture_dump_enabled())
+    if (dumpAllowed && !hasReplacement && contentHash && ld_texture_dump_enabled())
     {
         const u64 key = ld_texture_replace_key(texture, remap, contentHash);
         if (!ld_texture_dump_seen_before(key))
@@ -4693,6 +4913,30 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
             entry->height != t->height || entry->pitch != t->pitch ||
             entry->remap != remap || entry->cubemap != t->cubemap)
             continue;
+        /* Its replacement has finished loading in the background: put it in
+         * the game's texture's place. */
+        if (entry->pack_pending)
+        {
+            ld_texture_pack_file* pending = entry->pack_pending;
+            DXGI_FORMAT packFormat = DXGI_FORMAT_UNKNOWN;
+            ID3D12Resource* packed = ld_texture_pack_take(pending, entry->cubemap ? 1 : 0, &packFormat);
+            if (packed)
+            {
+                ID3D12Resource* old = entry->tex;
+                entry->tex = packed;
+                entry->replaced_format = packFormat;
+                entry->pack_pending = NULL;
+                write_texture_srv(i, entry);
+                if (old)
+                {
+                    retire_texture(old);
+                }
+            }
+            else if (!ld_texture_pack_request(pending, entry->cubemap ? 1 : 0))
+            {
+                entry->pack_pending = NULL;
+            }
+        }
         if (refresh_enabled && entry->tex &&
             entry->last_hash_frame != g_ld_frames) {
             /* Every bound texture used to be read in full every frame to see
@@ -4815,13 +5059,15 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
                     g_ld_texture_dump_changing++;
                 }
                 DXGI_FORMAT replacedFormat = DXGI_FORMAT_UNKNOWN;
+                ld_texture_pack_file* packPending = NULL;
                 ID3D12Resource* replacement =
-                    decode_guest_texture_dumping(t, remap, hash, dumpAllowed, &replacedFormat);
+                    decode_guest_texture_dumping(t, remap, hash, dumpAllowed, &replacedFormat, &packPending);
                 if (replacement) {
                     ID3D12Resource* old = entry->tex;
                     entry->tex = replacement;
                     entry->content_hash = hash;
                     entry->replaced_format = replacedFormat;
+                    entry->pack_pending = packPending;
                     write_texture_srv(i, entry);
                     retire_texture(old);
                     static u32 refresh_count = 0;
@@ -4886,7 +5132,7 @@ static u32 texture_srv_slot(const rsx_dsp_texture* t)
     int replacementReadable = 0;
     replacement.content_hash = texture_content_hash(t, &replacementReadable);
     replacement.tex = decode_guest_texture_dumping(t, remap, replacement.content_hash, replacementReadable,
-                                                   &replacement.replaced_format);
+                                                   &replacement.replaced_format, &replacement.pack_pending);
     if (replacement.tex) {
         texcache_t* entry = &g.textures[index];
         if (evicted)
