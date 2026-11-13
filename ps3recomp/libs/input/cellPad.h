@@ -217,6 +217,39 @@ const char* cellPad_host_pad_name(void);
 /* Bit 0: a controller holds Cross / A; bit 1: Circle / B (SDL backend; 0 elsewhere). */
 int cellPad_host_confirm_buttons(void);
 int cellPad_set_motion_mode(int mode);
+
+/* Keyboard and mouse as port 0, together with any controller (cellPad.c).
+ * codes[action][0..1]: Windows virtual-key codes (keys and mouse buttons),
+ * CELLPAD_KBM_WHEEL_UP / _DOWN, or 0 for none, in the order below. The mouse
+ * turns the right stick when mouseCamera is set; sensitivity 1-100 (50 =
+ * 1500 counts a second for full speed, every 20 doubling it); the
+ * anti-deadzone (0-60 %) is where a slight movement starts on the stick. The
+ * fixed keyboard fallback for a machine without a controller stands until
+ * this is first called. */
+enum
+{
+    CELLPAD_KBM_MOVE_UP, CELLPAD_KBM_MOVE_DOWN, CELLPAD_KBM_MOVE_LEFT, CELLPAD_KBM_MOVE_RIGHT,
+    CELLPAD_KBM_CAMERA_UP, CELLPAD_KBM_CAMERA_DOWN, CELLPAD_KBM_CAMERA_LEFT, CELLPAD_KBM_CAMERA_RIGHT,
+    CELLPAD_KBM_DPAD_UP, CELLPAD_KBM_DPAD_DOWN, CELLPAD_KBM_DPAD_LEFT, CELLPAD_KBM_DPAD_RIGHT,
+    CELLPAD_KBM_CROSS, CELLPAD_KBM_CIRCLE, CELLPAD_KBM_SQUARE, CELLPAD_KBM_TRIANGLE,
+    CELLPAD_KBM_L1, CELLPAD_KBM_R1, CELLPAD_KBM_L2, CELLPAD_KBM_R2,
+    CELLPAD_KBM_L3, CELLPAD_KBM_R3, CELLPAD_KBM_START, CELLPAD_KBM_SELECT,
+    CELLPAD_KBM_WALK,             /* held: the movement keys push the stick half way */
+    CELLPAD_KBM_CAPTURE_MOTION,   /* held: the motion sensors read a full-scale yank */
+    CELLPAD_KBM_ACTION_COUNT
+};
+#define CELLPAD_KBM_WHEEL_UP   0x101
+#define CELLPAD_KBM_WHEEL_DOWN 0x102
+void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
+                                int sensitivityPercent, int invertY, int antiDeadzonePercent);
+/* From the game window: raw mouse movement while it holds the mouse, and
+ * wheel notches (up positive). */
+void cellPad_note_mouse_motion(long deltaX, long deltaY);
+void cellPad_note_mouse_wheel(int notches);
+/* Wheel notches ever, up minus down, for a menu that rebinds. */
+long cellPad_mouse_wheel_total(void);
+/* 1 when the game window should hold the mouse (hidden, kept inside). */
+int cellPad_mouse_capture_wanted(void);
 int cellPad_motion_live(void);
 /* Stop any rumble the guest left running (the process is ending). */
 void cellPad_stop_rumble(void);

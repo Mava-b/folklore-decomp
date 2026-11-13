@@ -130,6 +130,41 @@ int rsx_null_backend_is_fullscreen(void)
 
 static int s_present_suppressed = 0;
 
+/* The mouse, for keyboard-and-mouse play (cellPad_set_keyboard_mouse):
+ * while cellPad wants it and this window has the focus, the cursor is
+ * hidden and kept inside the window, and raw movement (WM_INPUT) goes to
+ * cellPad as the camera. It is let go when the engine menu opens, the window
+ * loses the focus or is minimised. */
+extern int cellPad_mouse_capture_wanted(void);
+extern void cellPad_note_mouse_motion(long deltaX, long deltaY);
+extern void cellPad_note_mouse_wheel(int notches);
+static int s_mouse_held = 0;
+
+static void null_update_mouse_hold(HWND hwnd)
+{
+    const int want = hwnd && cellPad_mouse_capture_wanted() && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
+    if (want)
+    {
+        RECT client;
+        GetClientRect(hwnd, &client);
+        POINT corners[2] = {{client.left, client.top}, {client.right, client.bottom}};
+        MapWindowPoints(hwnd, NULL, corners, 2);
+        RECT clip = {corners[0].x, corners[0].y, corners[1].x, corners[1].y};
+        ClipCursor(&clip);           /* again each time: the window may have moved */
+        if (!s_mouse_held)
+        {
+            s_mouse_held = 1;
+            SetCursor(NULL);
+        }
+    }
+    else if (s_mouse_held)
+    {
+        s_mouse_held = 0;
+        ClipCursor(NULL);
+        SetCursor(LoadCursor(NULL, IDC_ARROW));
+    }
+}
+
 static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     switch (msg) {
@@ -191,6 +226,35 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         EndPaint(hwnd, &ps);
         return 0;
     }
+
+    case WM_INPUT: {
+        RAWINPUT input;
+        UINT size = sizeof(input);
+        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
+            input.header.dwType == RIM_TYPEMOUSE)
+        {
+            const RAWMOUSE* mouse = &input.data.mouse;
+            if (s_mouse_held && !(mouse->usFlags & MOUSE_MOVE_ABSOLUTE) && (mouse->lLastX || mouse->lLastY))
+            {
+                cellPad_note_mouse_motion(mouse->lLastX, mouse->lLastY);
+            }
+            if (mouse->usButtonFlags & RI_MOUSE_WHEEL)
+            {
+                const int wheel = (int)(short)mouse->usButtonData;
+                const int notches = wheel / WHEEL_DELTA;
+                cellPad_note_mouse_wheel(notches != 0 ? notches : (wheel > 0 ? 1 : -1));
+            }
+        }
+        break;   /* DefWindowProc cleans up after WM_INPUT */
+    }
+
+    case WM_SETCURSOR:
+        if (s_mouse_held && LOWORD(lp) == HTCLIENT)
+        {
+            SetCursor(NULL);
+            return TRUE;
+        }
+        break;
 
     case WM_KEYDOWN:
         /* Escape quits only when PS3_ESCAPE_QUITS is set: games use it
@@ -379,6 +443,17 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
     }
 
     s_state.hdc = GetDC(s_state.hwnd);
+
+    /* Raw mouse input, for the camera in keyboard-and-mouse play. */
+    RAWINPUTDEVICE mouseDevice;
+    mouseDevice.usUsagePage = 0x01;   /* generic desktop */
+    mouseDevice.usUsage = 0x02;       /* mouse */
+    mouseDevice.dwFlags = 0;
+    mouseDevice.hwndTarget = s_state.hwnd;
+    if (!RegisterRawInputDevices(&mouseDevice, 1, sizeof(mouseDevice)))
+    {
+        printf("[RSX null] raw mouse input unavailable (%lu)\n", GetLastError());
+    }
     s_state.last_fps_time = GetTickCount64();
     snprintf(s_state.title, sizeof(s_state.title), "%s", title ? title : "ps3recomp");
     s_state.title_time = s_state.last_fps_time;
@@ -398,6 +473,11 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
 
 void rsx_null_backend_shutdown(void)
 {
+    if (s_mouse_held)
+    {
+        s_mouse_held = 0;
+        ClipCursor(NULL);
+    }
     if (s_state.hwnd) {
         ReleaseDC(s_state.hwnd, s_state.hdc);
         DestroyWindow(s_state.hwnd);
@@ -418,6 +498,7 @@ int rsx_null_backend_pump_messages(void)
         DispatchMessageA(&msg);
     }
     null_apply_fullscreen();
+    null_update_mouse_hold(s_state.hwnd);
     /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
      * live-draw frame, window size. Here on the window's own thread, so the
      * WM_SETTEXT never blocks the renderer. */

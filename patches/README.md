@@ -54,13 +54,15 @@ commented in the code; the notable ones:
 - macOS: the PS3's yes/no and OK prompts are drawn by the in-game menu when
   the game runs inside the host window.
 
-`v0.15-39a36296/` keeps the earlier series (0001-0104), one fix per patch,
+`v0.15-39a36296/` keeps the earlier series (0001-0107), one fix per patch,
 in the order they applied on top of upstream commit
 `39a36296511c445707adabcd312f0b740cfbd694`; 0084 and 0085 were carried onto
-the merged code by hand, and 0086-0104 came in with a git merge of this
-port's main (they touch rsx_live_draw.c, cellGcmSys.c, cellSaveData.c and
-rsx_null_backend.c, which merged cleanly; the three HDR functions got no-op
-versions for the builds without D3D12). Each still explains its fix, and
+the merged code by hand, and 0086-0107 came in with git merges of this
+port's main (they touch rsx_live_draw.c, cellGcmSys.c, cellSaveData.c,
+rsx_null_backend.c and cellPad.c; the three HDR functions got no-op
+versions for the builds without D3D12, and 0105's keyboard and mouse sits
+in cellPad.c beside the merged toolkit's input code, Windows-only like the
+rest of its Windows key reading, with no-op versions elsewhere). Each still explains its fix, and
 `folklore/docs/STATUS.md` tells the story behind most of them.
 
 The `ps3recomp/` folder in this repository already has the patch applied, so

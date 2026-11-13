@@ -1,3 +1,1948 @@
+diff --git a/.github/CODEOWNERS b/.github/CODEOWNERS
+deleted file mode 100644
+index ddc4c8d9..00000000
+--- a/.github/CODEOWNERS
++++ /dev/null
+@@ -1,40 +0,0 @@
+-# Review ownership for the paths that execute.
+-#
+-# Everything listed here runs with a credential or ships to users. The release
+-# workflow fires on a v* tag, configures CMake, compiles the tree and runs every
+-# tools/test_*.py under `python`, then publishes the result -- so a change to any
+-# of these paths executes on a runner and lands inside the release zip. Code in
+-# runtime/, libs/ or include/ has to be compiled into something and deliberately
+-# run before it does anything; these paths do not.
+-#
+-# IMPORTANT: this file does not block a merge. On its own it only *requests*
+-# review from the owners below -- a PR touching these paths can still be merged
+-# with that request outstanding. Turning it into a gate takes a branch
+-# protection rule on `master` with "Require a pull request before merging" plus
+-# "Require review from Code Owners", which only the repository owner can
+-# configure. See the PR that added this file.
+-#
+-# Last matching pattern wins, so order matters: put narrower rules below wider
+-# ones. A pattern ending in `/` matches the directory and everything under it;
+-# a leading `/` anchors to the repository root.
+-
+-# Workflow definitions, their triggers and their permissions. A change here can
+-# hand a token to anything else in the tree, so it is the widest lever in the
+-# repository -- including this file.
+-/.github/              @sp00nznet
+-
+-# The build system: CMakeLists.txt and the modules it includes both run at
+-# configure time, before anyone has read the code they are about to compile.
+-/CMakeLists.txt        @sp00nznet
+-/cmake/                @sp00nznet
+-
+-# The Python pipeline. Every tools/test_*.py is executed by the release workflow
+-# and by each push workflow, and the whole directory is copied into the bundle.
+-/tools/                @sp00nznet
+-
+-# Dependency set for those scripts: one added line here is one added package
+-# installed on a runner and in every contributor's environment.
+-/requirements.txt      @sp00nznet
+-
+-# Vendored third-party source, compiled into the shipped runtime library.
+-/third_party/          @sp00nznet
+diff --git a/.github/workflows/linux-vulkan.yml b/.github/workflows/linux-vulkan.yml
+deleted file mode 100644
+index 771047da..00000000
+--- a/.github/workflows/linux-vulkan.yml
++++ /dev/null
+@@ -1,107 +0,0 @@
+-# Builds the opt-in Vulkan RSX backend and runs every ps3recomp_host scene on
+-# it, with Mesa's lavapipe standing in for a GPU (a CPU Vulkan driver, so the
+-# runner needs none).
+-#
+-# Two passes, one per draw path:
+-#   - without guest programs, the rsx_state vtable's fixed-function path: the
+-#     same scenes the null-backend job checks, now through Vulkan;
+-#   - with guest programs, the shared register-file draw engine (the path the
+-#     Metal backend takes): all twelve draw scenes, including the ones only a
+-#     translating backend can pass (--shader, --mip, --rtt, --depthtex, --mrt,
+-#     --mrt-a, --cube), plus --depthbounds, which only this backend's engine
+-#     implements, under the Khronos validation layer.
+-#
+-# The second pass fails on any of: a scene's own check, a single validation
+-# message, a scene that did not take the engine path, or one that reported
+-# "nothing to check" -- a skipped scene is not a passed one.
+-name: Linux (Vulkan)
+-
+-on:
+-  push:
+-    branches: [ master, main ]
+-  pull_request:
+-  workflow_dispatch:
+-
+-jobs:
+-  vulkan:
+-    name: Linux x64 Vulkan on lavapipe (${{ matrix.compiler }})
+-    runs-on: ubuntu-latest
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        compiler: [gcc, clang]
+-    env:
+-      VK_ICD_FILENAMES: /usr/share/vulkan/icd.d/lvp_icd.json
+-
+-    steps:
+-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+-
+-      # As in linux.yml: SDL2 is required off Windows, and Ubuntu's glslang
+-      # CMake config refuses to load without glslang-tools. spirv-tools is
+-      # what glslang's HLSL legalization runs on -- without it the translator
+-      # emits different, possibly invalid, SPIR-V. The Vulkan headers build
+-      # the backend (libvulkan itself is loaded at run time); lavapipe is in
+-      # mesa-vulkan-drivers; the validation layer is its own package.
+-      - name: Install dependencies
+-        run: |
+-          sudo apt-get update
+-          sudo apt-get install -y ninja-build libsdl2-dev clang \
+-            glslang-dev glslang-tools spirv-tools \
+-            libvulkan-dev mesa-vulkan-drivers vulkan-validationlayers
+-
+-      - name: Configure
+-        run: |
+-          if [ "${{ matrix.compiler }}" = "clang" ]; then export CC=clang CXX=clang++; else export CC=gcc CXX=g++; fi
+-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+-            -DPS3RECOMP_RSX_VULKAN=ON | tee configure.log
+-          # Without glslang the second pass would only ever skip: say so here.
+-          grep -q "Vulkan: *guest programs available" configure.log
+-
+-      - name: Build
+-        run: cmake --build build --target ps3recomp_host
+-
+-      # The HLSL -> SPIR-V translation cache: a repeat is served from memory,
+-      # PS3RECOMP_SPIRV_CACHE's files serve the next run, a damaged file is a
+-      # miss. Needs glslang, which configure has already checked for.
+-      - name: SPIR-V translation cache test
+-        run: |
+-          cmake --build build --target test_shader_spirv
+-          ./build/test_shader_spirv
+-
+-      - name: Fixed-function path (no guest programs)
+-        run: |
+-          fail=0
+-          for m in "" "--draw" "--draw --frames=60" "--depth" "--tex" "--tex-io" "--quads" "--threads" "--split-present"; do
+-            rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
+-            echo "::group::ps3recomp_host ${m:-(default)} -> exit $rc"; cat run.log; echo "::endgroup::"
+-            [ "$rc" -eq 0 ] || { echo "::error::${m:-default}: exit $rc"; fail=1; }
+-          done
+-          exit $fail
+-
+-      - name: Draw engine with guest programs, under the validation layer
+-        env:
+-          PS3RECOMP_VK_GUEST_PROGRAMS: "1"
+-          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+-        run: |
+-          fail=0
+-          # --threads is not here: it checks guest thread stacks and returns
+-          # before any backend exists (the first pass still runs it).
+-          for m in "" "--draw" "--depth" "--quads" "--shader" \
+-                   "--tex" "--tex-io" "--mip" "--rtt" "--depthtex" "--mrt" "--mrt-a" "--cube" \
+-                   "--depthbounds" "--split-present" "--feedback" "--clip" "--clip-keep" \
+-                   "--float-rt" "--float-rt-r"; do
+-            rc=0; ./build/ps3recomp_host $m > run.log 2>&1 || rc=$?
+-            name=${m:-default}
+-            echo "::group::ps3recomp_host $name -> exit $rc"; cat run.log; echo "::endgroup::"
+-            [ "$rc" -eq 0 ] || { echo "::error::$name: exit $rc"; fail=1; }
+-            if grep -q "VUID" run.log; then echo "::error::$name: Vulkan validation messages"; fail=1; fi
+-            grep -q "register-file draw engine path" run.log || { echo "::error::$name: not on the draw engine"; fail=1; }
+-            if grep -q "nothing to check" run.log; then echo "::error::$name: skipped, not checked"; fail=1; fi
+-            # The one scene that needs an optional device feature: lavapipe has no
+-            # depthBounds in every Mesa release, so its skip is a notice, not a
+-            # pass and not a failure.
+-            if [ "$name" = "--depthbounds" ] && grep -q "skipped, no depth bounds test" run.log; then
+-              echo "::notice::$name: skipped, this lavapipe has no depthBounds"
+-            fi
+-          done
+-          exit $fail
+diff --git a/.github/workflows/linux.yml b/.github/workflows/linux.yml
+deleted file mode 100644
+index 806d86b2..00000000
+--- a/.github/workflows/linux.yml
++++ /dev/null
+@@ -1,644 +0,0 @@
+-# Builds the runtime library on Linux.
+-#
+-# Linux was the last platform with no CI and no evidence: the POSIX paths were
+-# there, README listed the whole column as "untested", and nobody had ever run
+-# a compiler over it. Two real defects were sitting in that gap -- an
+-# Apple-only QueryPerformanceCounter shim reached from a shared translation
+-# unit, and a Darwin-only pthread_threadid_np called from the POSIX branch of
+-# win32_compat.h. This job is what stops the next two from accumulating.
+-#
+-# Both compilers, deliberately. GCC accepted the pthread_threadid_np call as an
+-# implicit declaration and produced an archive that would only have failed when
+-# something finally linked it; Clang rejected it outright. A single-compiler
+-# matrix would have shipped that bug.
+-#
+-# The graphics step runs against the null backend's headless software path,
+-# which is what gives Linux an end-to-end check without a GPU, a display, or a
+-# render backend of its own.
+-name: Linux
+-
+-on:
+-  push:
+-    branches: [ master, main ]
+-  pull_request:
+-  workflow_dispatch:
+-
+-jobs:
+-  build:
+-    name: Linux x64 (${{ matrix.compiler }}, ${{ matrix.build_type }})
+-    runs-on: ubuntu-latest
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        compiler: [gcc, clang]
+-        build_type: [Debug, Release]
+-
+-    steps:
+-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+-
+-      # SDL2 is not optional off Windows: cellPad and cellAudio select their
+-      # SDL2 backends unconditionally there, and CMakeLists.txt hard-fails
+-      # without it.
+-      # glslang and spirv-cross are what the Metal backend's guest-shader path
+-      # translates with. There is no Metal here, but the translation itself
+-      # has no GPU in it, so Linux is where the decompilers' HLSL meets
+-      # glslang's front end on every push. glslang-tools is not used, but
+-      # Ubuntu's glslang CMake config declares the standalone binary as an
+-      # imported target and refuses to load while /usr/bin/glslang is absent.
+-      - name: Install dependencies
+-        run: |
+-          sudo apt-get update
+-          sudo apt-get install -y ninja-build libsdl2-dev clang \
+-            glslang-dev glslang-tools spirv-tools libspirv-cross-c-shared-dev
+-
+-      - name: Configure
+-        run: |
+-          if [ "${{ matrix.compiler }}" = "clang" ]; then
+-            CC=clang CXX=clang++ cmake -S . -B build -G Ninja \
+-              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          else
+-            CC=gcc CXX=g++ cmake -S . -B build -G Ninja \
+-              -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          fi
+-
+-      - name: Build
+-        run: cmake --build build
+-
+-      - name: Verify the archive exists and is x86-64
+-        run: |
+-          test -f build/libps3recomp_runtime.a
+-          file build/libps3recomp_runtime.a
+-          # An archive links nothing, so a bad extern survives the build. Catch
+-          # the undefined symbols the compiler let through -- this is exactly
+-          # how pthread_threadid_np hid from GCC.
+-          nm --undefined-only build/libps3recomp_runtime.a \
+-            | awk '{print $2}' | sort -u > /tmp/undef.txt
+-          if grep -qE '^(pthread_threadid_np|QueryPerformance|GetTickCount64)' /tmp/undef.txt; then
+-            echo "Win32/Darwin-only symbol left undefined in a POSIX build:"
+-            grep -E '^(pthread_threadid_np|QueryPerformance|GetTickCount64)' /tmp/undef.txt
+-            exit 1
+-          fi
+-
+-      # PS3RECOMP_ATRAC_LGPL=OFF links a stub instead of the LGPL-2.1 ATRAC3plus
+-      # decoder: the library builds, and no decoder object is in the archive.
+-      - name: Build without the LGPL ATRAC decoder
+-        if: matrix.compiler == 'gcc' && matrix.build_type == 'Release'
+-        run: |
+-          CC=gcc CXX=g++ cmake -S . -B build-nolgpl -G Ninja -DCMAKE_BUILD_TYPE=Release -DPS3RECOMP_ATRAC_LGPL=OFF
+-          cmake --build build-nolgpl --target ps3recomp_runtime
+-          ar t build-nolgpl/libps3recomp_runtime.a | grep -q '^at3_stub.c.o$'
+-          if ar t build-nolgpl/libps3recomp_runtime.a | grep -qE '^(atrac3|atrac3plus|at3_bridge)'; then
+-            echo "an LGPL decoder object is in the library"
+-            exit 1
+-          fi
+-
+-      # The Python suites are the project's real correctness net -- the
+-      # conformance one compiles and runs 1300+ lifted instruction cases with
+-      # the host compiler, so it is genuinely testing this platform's codegen
+-      # and not just re-checking the lifter's Python.
+-      - name: Set up Python
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+-        with:
+-          python-version: '3.12'
+-
+-      - name: Run the lifter test suites
+-        env:
+-          CI: "1"          # makes a skipped conformance run fail instead of passing
+-        run: |
+-          set -e
+-          for t in tools/test_*.py; do
+-            echo "--- $t"
+-            python "$t"
+-          done
+-
+-      # ps3_env_once: one getenv per name, compiled as C and as C++ (ppu_fs.cpp
+-      # includes it too).
+-      - name: Run the ps3_env_once test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Werror -I include \
+-            -o /tmp/test_env_once tests/test_env_once.c
+-          /tmp/test_env_once
+-          ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }} -x c++ -std=c++17 -Wall -Werror -I include \
+-            -o /tmp/test_env_once_cpp tests/test_env_once.c
+-          /tmp/test_env_once_cpp
+-
+-      - name: Run self-contained SPU helper tests
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+-            -std=gnu17 -I include -I runtime/spu \
+-            -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
+-          /tmp/test_spu_helpers
+-
+-      # The AVX2 single-precision fast path must match the exact scalar path bit for bit.
+-      - name: Run the SPU float fast-path test (AVX2)
+-        run: |
+-          if grep -q avx2 /proc/cpuinfo; then
+-            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+-              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
+-              -o /tmp/test_spu_float_neon runtime/spu/tests/test_spu_float_neon.c -lm
+-            /tmp/test_spu_float_neon
+-          else
+-            echo "no AVX2 on this runner: skipped"
+-          fi
+-
+-      # The SSE4.1 single-precision form (the default x86-64 build) against the scalar per-lane
+-      # forms and against the exact references, bit for bit, built as the runtime is.
+-      - name: Run the SPU float vector tests (SSE4.1)
+-        run: |
+-          for t in test_spu_float_vector_scalar test_spu_float_exact; do
+-            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+-              -std=gnu17 -O2 -msse4.1 -ffp-contract=off -UNDEBUG -I include -I runtime/spu \
+-              -o /tmp/${t}_sse41 runtime/spu/tests/$t.c -lm
+-          done
+-          /tmp/test_spu_float_vector_scalar_sse41 4
+-          /tmp/test_spu_float_exact_sse41
+-
+-      # runtime/spu/tests/test_spu_int_x86.c checks #512's SSE4.1 and AVX2 integer
+-      # and quadword-shift forms against their scalar spu_X_ref references. #512
+-      # added the file and wired it into nothing -- no workflow step, no CMake
+-      # target. This step is @rigaz29's from #550, retargeted: #550 covered the
+-      # same helper set and was closed as a subset of #512, and carrying its CI
+-      # wiring over was promised in that review.
+-      - name: Run the SPU integer helper test (SSE4.1)
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+-            -std=gnu17 -O2 -msse4.1 -I include -I runtime -I runtime/spu \
+-            -o /tmp/test_spu_int_x86_sse41 runtime/spu/tests/test_spu_int_x86.c -lm
+-          /tmp/test_spu_int_x86_sse41
+-
+-      # The AVX2 forms of the same helpers, where the runner has AVX2.
+-      - name: Run the SPU integer helper test (AVX2)
+-        run: |
+-          if grep -q avx2 /proc/cpuinfo; then
+-            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+-              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime -I runtime/spu \
+-              -o /tmp/test_spu_int_x86_avx2 runtime/spu/tests/test_spu_int_x86.c -lm
+-            /tmp/test_spu_int_x86_avx2
+-          else
+-            echo "no AVX2 on this runner: skipped"
+-          fi
+-
+-      # The AVX2 estimate, interpolate and conversion helpers must match the scalar ones bit for bit.
+-      - name: Run the SPU estimate/conversion test (AVX2)
+-        run: |
+-          if grep -q avx2 /proc/cpuinfo; then
+-            ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} \
+-              -std=gnu17 -O2 -mavx2 -mfma -I include -I runtime/spu \
+-              -o /tmp/test_spu_float_est runtime/spu/tests/test_spu_float_est.c -lm
+-            /tmp/test_spu_float_est
+-          else
+-            echo "no AVX2 on this runner: skipped"
+-          fi
+-
+-      # cellFontInitializeWithRevision initialises the library the way cellFontInit does.
+-      - name: Run the cellFont init test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_font_initialize_with_revision libs/font/tests/test_font_initialize_with_revision.c -lm
+-          /tmp/test_font_initialize_with_revision
+-
+-      # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
+-      # handler is called through the NID it registered under.
+-      - name: Run the sys_net loopback test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
+-          /tmp/test_sys_net
+-
+-      # Matching2 over psnr without a server: response relocation, attribute
+-      # packing, and the room structs a title reads.
+-      - name: Run the Matching2 test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
+-          /tmp/test_np_matching2
+-
+-      # sceNpSignaling for Matching2 room members: context ids from 1,
+-      # ActivateConnection, the events a title's handlers get, the peer address.
+-      - name: Run the sceNpSignaling room connection test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_signaling_rooms libs/network/tests/test_np_signaling_rooms.c
+-          /tmp/test_np_signaling_rooms
+-
+-      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+-      # and PSN's online ID rules.
+-      - name: Run the player-name test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
+-          /tmp/test_np_identity
+-
+-      # The net-start dialog ends cancelled offline and connected with
+-      # PS3_NET_ONLINE=1, its result word big-endian.
+-      - name: Run the net-start dialog test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I libs/system -o /tmp/test_netctl_netstart libs/network/tests/test_netctl_netstart.c
+-          /tmp/test_netctl_netstart
+-          PS3_NET_ONLINE=1 /tmp/test_netctl_netstart
+-
+-      # cellVideoOutSetGamma's float argument comes from f1, and the value
+-      # reaches the presenter.
+-      - name: Run the video out gamma test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
+-          /tmp/test_avconf_gamma
+-
+-      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+-      # packets before the title sees them, punching toward peers.
+-      - name: Run the NAT traversal test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
+-          /tmp/test_np_nat
+-
+-      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+-      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+-      - name: Run the Avc2 Load test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_avc2_load libs/network/tests/test_avc2_load.c
+-          /tmp/test_avc2_load
+-
+-      # sceNpCommerce2CreateCtx takes the SDK's five arguments and stores the context id through the fifth.
+-      - name: Run the Commerce2 CreateCtx test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_np_commerce2 libs/network/tests/test_np_commerce2.c
+-          /tmp/test_np_commerce2
+-
+-      # cellPadSetActDirect: the small motor is on/off at full strength, and
+-      # a rumble lasts until the title changes it (renewed from the pad poll).
+-      - name: Run the pad rumble test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs) -lm
+-          /tmp/test_pad_rumble
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_sensor_mode libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs) -lm
+-          /tmp/test_pad_sensor_mode
+-
+-      # cellPad SDL hot-plug: a controller switched off and on again is
+-      # reopened into its old port (fake SDL that behaves like sdl2-compat).
+-      - name: Run the pad hot-plug test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include $(sdl2-config --cflags) -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs) -lm
+-          /tmp/test_pad_hotplug
+-
+-      # cellPad keyboard fallback on port 0 (SDL source, fake keyboard and focus).
+-      - name: Run the pad keyboard test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) -o /tmp/test_pad_keyboard libs/input/tests/test_pad_keyboard.c $(sdl2-config --libs) -lm
+-          /tmp/test_pad_keyboard
+-
+-
+-      # Guest vertex and fragment programs through the decompilers, glslang
+-      # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
+-      # and attribute slots the Metal backend binds to. The binary missing
+-      # means the shader tools were not found, which must fail, not skip.
+-      - name: Run the guest shader translation test
+-        run: |
+-          test -x build/test_shader_msl
+-          ./build/test_shader_msl
+-
+-      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+-      # it needs the lifter's per-game ppu_recomp.h -- so nothing here ever
+-      # compiled it and the POSIX port is unfinished. This ratchets the error
+-      # count: it fails if the scaffold gets WORSE, which is what keeps the
+-      # port from sliding backwards while it is being done.
+-      - name: Check the PPU boot scaffold (ratchet)
+-        env:
+-          CXX: ${{ matrix.compiler == 'clang' && 'clang++' || 'g++' }}
+-        run: python tools/check_ppu_scaffold.py
+-
+-      # ...and this one RUNS it, which the ratchet cannot. The smoke title is a
+-      # synthetic lifted program that drives the loader, the NID bridge, the
+-      # lv2 syscalls, a guest thread, the frame clock and the RSX backend from
+-      # guest code and checks all of it; here the backend is the null one's
+-      # headless software path, so no GPU and no display are involved. Exit 0
+-      # means every marker appeared in order, the guest thread ran on its own
+-      # host thread, three frames reached the backend and the guest's chosen
+-      # exit status came back through sys_process_exit. The binary missing
+-      # means CMake skipped the target, which must fail rather than pass.
+-      - name: Run the PPU boot smoke title (null backend)
+-        run: |
+-          test -x build/ps3recomp_boot_smoke
+-          ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+-
+-      # templates/project is what "start a port" means -- docs/GETTING_STARTED.md
+-      # says to copy it -- and until now nothing built it on any platform. This
+-      # is the same smoke title again, booted through the TEMPLATE's runner and
+-      # the template's own CMakeLists: the toolkit from PS3RECOMP_DIR, the lift
+-      # from RECOMP_DIR, exactly the two directories a real port passes. Exit 0
+-      # is the smoke title's own verdict, so a template that builds but boots
+-      # nothing cannot pass. Linux is also where the template's null-backend
+-      # branch is the one that runs.
+-      - name: Build and run the game template (null backend)
+-        run: |
+-          # pipefail, or tee below would swallow the runner's exit status --
+-          # which IS the smoke title's verdict.
+-          set -eo pipefail
+-          test -f build/smoke/lift/ppu_recomp.h
+-          if [ "${{ matrix.compiler }}" = "clang" ]; then
+-            export CC=clang CXX=clang++
+-          else
+-            export CC=gcc CXX=g++
+-          fi
+-          cmake -S templates/project -B build-template -G Ninja \
+-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+-            -DPS3RECOMP_DIR="$PWD" \
+-            -DRECOMP_DIR="$PWD/build/smoke/lift"
+-          cmake --build build-template
+-          ./build-template/MyGameRecomp build/smoke/smoke.elf 2>&1 | tee template.log
+-          # The runner's own banner, so a pass cannot come from some other
+-          # binary, and the marker-order verdict spelt out rather than inferred
+-          # from the exit status alone.
+-          grep -q "=== ps3recomp game runner ===" template.log
+-          grep -q "\[smoke\] OK: all 11 markers, in order" template.log
+-          grep -q "\[smoke\] PASS" template.log
+-
+-      # Drives a real NV4097 command buffer through cellGcm -> RSX -> the null
+-      # backend's headless software path and asserts the presented pixel. No
+-      # display and no GPU are involved, so exit 0 means the whole graphics
+-      # bridge is intact on Linux, not merely that it compiled.
+-      - name: Run the POSIX host (headless end-to-end)
+-        run: |
+-          # Clear + flip: asserts the guest clear colour reaches the framebuffer.
+-          ./build/ps3recomp_host
+-          # Clear + a real NV4097 draw: asserts the triangle covers the centre
+-          # pixel, which exercises guest vertex fetch, primitive expansion and
+-          # the draw path, not just the clear.
+-          ./build/ps3recomp_host --draw
+-          ./build/ps3recomp_host --draw --frames=60
+-          # Two triangles drawn near-first: the centre pixel is red only if the
+-          # depth test rejected the later far one.
+-          ./build/ps3recomp_host --depth
+-          # Bind a texture and sample it: the quad is green, the texture is
+-          # not, so a path that dropped the texture still draws something
+-          # plausible and still fails here. Exercises rsx_texture_layout and
+-          # rsx_texture_decode end to end with no GPU involved.
+-          ./build/ps3recomp_host --tex
+-          # The same texture after the guest also derived a VRAM offset in its
+-          # 1 MB page number: the texture says main memory, so it must still
+-          # resolve through the IO map rather than into VRAM.
+-          ./build/ps3recomp_host --tex-io
+-          # A polygon and a quad strip, neither of which any host API draws:
+-          # both have to be expanded into triangles first. The pentagon is
+-          # green and the strip red over it, and the centre pixel belongs to
+-          # the strip's second quad, so a dropped or half-expanded strip is
+-          # green and fails.
+-          ./build/ps3recomp_host --quads
+-          # No graphics: create a guest PPU thread through the lv2 path and
+-          # check the host stack it got. A recompiled call chain nests on the
+-          # host stack one frame per guest call, so the default stack is not
+-          # enough and nothing says so until a title dies with no diagnosis.
+-          ./build/ps3recomp_host --threads
+-          # The SDL2 audio and pad backends, which the Windows build never
+-          # reaches (it takes WASAPI and XInput). The dummy audio driver and
+-          # no controller are the runner's situation and must both be fine.
+-          SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
+-
+-      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+-      # arithmetic with no host API in it, so it runs everywhere, and it is the
+-      # regression net for having lifted that maths out of the D3D12 uploader.
+-      - name: Run self-contained RSX tests
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
+-          /tmp/test_texture_layout
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
+-          /tmp/test_rsx_primitives
+-          # The fragment-program decoder on its own: the word swap, source
+-          # swizzles and types, the dest mask, inline constants, which
+-          # register file the colour export comes from, and how many
+-          # SV_TARGETs a program that writes more than one export gets. It
+-          # had rotted to the point of not compiling while nothing ran it.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+-          /tmp/test_fp_decompiler
+-          # The D3D12 device order (adapter preference, software adapters
+-          # skipped, default adapter, WARP, RSX_D3D12_WARP) as pure logic.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_d3d12_device_pick libs/video/tests/test_d3d12_device_pick.c
+-          /tmp/test_d3d12_device_pick
+-          # The register-file draw engine's platform-neutral halves, driven
+-          # through its dispatch sink against a stub backend: the surface set's
+-          # keying and reallocation, a texture unit that names a render target
+-          # sampling it rather than guest memory, the texture cache's
+-          # once-per-frame revalidation and its LRU eviction, the pipeline key
+-          # holding still while constants change, and restart cuts bounding
+-          # every topology expansion. No GPU and no host graphics API, so this
+-          # is where those get checked at all.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+-          /tmp/test_rsx_draw_engine
+-          # The vertex fetch plan's stable ranges against the per-attribute
+-          # walk they are now computed without.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+-          /tmp/test_vertex_fetch_plan
+-          # Preserve explicitly written current colors, including black,
+-          # while keeping the unwritten ATTR3 compatibility default.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+-          /tmp/test_vertex_current_color
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+-          /tmp/test_color_feedback_engine
+-          # The NV4097 method decoder on its own: the vertex-constant window is
+-          # 32 dwords and the registers after it are not constants.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
+-          /tmp/test_rsx_transform_constants
+-          # Vertex-program microcode and constant runs taken in one call leave the
+-          # state exactly as the same words do one by one.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c
+-          /tmp/test_rsx_vp_run
+-          # Texture offsets are 31 bits; bit 31 is not an address bit.
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
+-          /tmp/test_rsx_texture_offset
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
+-          /tmp/test_rsx_command_texture_offset
+-
+-      # The Win32 shim every POSIX host runs the runtime through: interlocked
+-      # widths and return conventions, SRW/CS/condition variables, events,
+-      # semaphores, joinable threads, WaitOnAddress, timers, VirtualAlloc.
+-      - name: Run the Win32 compatibility layer tests
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
+-          /tmp/test_win32_compat
+-
+-      # Which signal an inaccessible guest window faults with, and whether one
+-      # can be reserved at all. runtime/ppu/ppu_loader.cpp's untranslated-guest-
+-      # pointer trap takes both SIGSEGV and SIGBUS because the two hosts answer
+-      # that differently; this is the evidence, and it needs no game, so it is
+-      # the one thing about that trap CI can actually run.
+-      - name: Run the guest-pointer trap signal test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
+-          /tmp/test_guest_ptr_trap
+-
+-      # Buffered stdout/stderr with a timed flush (runtime/platform/ps3_stdio.c):
+-      # buffered by default, a line reaches the pipe within the flush interval,
+-      # and nothing is lost at exit, on abort() or on a crash through the
+-      # unhandled-exception filter; PS3_STDIO_UNBUFFERED=1 restores unbuffered.
+-      - name: Run the stdio flush test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
+-          /tmp/test_stdio_flush
+-
+-      # PS3_DEV_FLASH may name several roots; the first one that holds the file wins
+-      # (runtime/platform/ps3_dev_flash.c, shared by cellFs and the raw sys_fs).
+-      - name: Run the dev_flash path test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -Wall -Wextra -o /tmp/test_dev_flash_path runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
+-          /tmp/test_dev_flash_path
+-
+-      # PARAM.SFO is written as a binary PSF and read back (PSF and the old text file).
+-      - name: Run the savedata PARAM.SFO test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -o /tmp/test_savedata_param_sfo libs/system/tests/test_savedata_param_sfo.c
+-          /tmp/test_savedata_param_sfo
+-
+-      # The lv2 sync-primitive stress suite (mutex, cond, semaphore, event
+-      # queue) on host threads. It was Windows-only until the shim grew joinable
+-      # handles and multi-object waits; here it is the memory-model regression
+-      # net for the same primitives a game hammers.
+-      - name: Build and run sync_stress
+-        run: |
+-          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          cmake --build build-sync-stress
+-          ctest --test-dir build-sync-stress --output-on-failure
+-
+-      # cellFiber's cooperative switching on ucontext. glibc's ucontext_t is
+-      # not the one that bites, but running the suite on both hosts is what
+-      # tells a Darwin header problem from a logic error in the switch.
+-      - name: Build and run fiber_switch
+-        run: |
+-          cmake -S tests/fiber_switch -B build-fiber -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          cmake --build build-fiber
+-          ./build-fiber/fiber_switch
+-
+-      # An SPU parked on a GETLLAR reservation has to be told when the PPU
+-      # writes that line. Nothing else in the tree fails when that notify is
+-      # missing -- the SPU just never wakes -- so it gets its own check.
+-      - name: Run the PPU/SPU lock-line coherence tests
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu \
+-                -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
+-          /tmp/test_spu_coherency
+-
+-      # The other writer: an SPU. Five SPURS kernels share one management line,
+-      # so a commit that does not break its peers' reservations lets two of them
+-      # win the same compare-and-swap, and the queue is quietly wrong afterwards.
+-      - name: Run the SPU-to-SPU lock-line coherence tests
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_lockline_peer \
+-            runtime/spu/tests/test_spu_lockline_peer.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_lockline_peer
+-
+-      # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
+-      # that with PUTLLC on the taskset line, which never woke the parked
+-      # task's host thread: it saw the signal only when its 1 s wait timed out.
+-      - name: Run the SPURS task wake test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_taskset_wake \
+-            runtime/spu/tests/test_spu_taskset_wake.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_taskset_wake
+-
+-      # The host setting or consuming a task's signal bit against an SPU commit
+-      # to the same word. The read was outside the lock-line lock, so a commit
+-      # between the read and the write was lost and that task never woke.
+-      - name: Run the SPURS signalled-bit atomicity test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spurs_signalled_atomic \
+-            runtime/spu/tests/test_spurs_signalled_atomic.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spurs_signalled_atomic
+-
+-      # The host's task-id search, task registration and task exit against each
+-      # other on the taskset's bitset line. A plain read then write undid a task
+-      # exit, so the exited task's enabled bit came back and JoinTask2 hung.
+-      - name: Run the SPURS taskset bitset atomicity test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spurs_taskset_bits_atomic \
+-            runtime/spu/tests/test_spurs_taskset_bits_atomic.c libs/spurs/spurs_taskset.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spurs_taskset_bits_atomic
+-
+-      # A thread group starting its threads on their image's LIFTED code. This
+-      # is the path a real title needs and the one that used to be missing: the
+-      # group's threads completed instantly with status 0, the group reported a
+-      # clean exit, and the program the guest asked to run had simply not run.
+-      # Nothing else in the tree fails when that happens, so it gets its own
+-      # check. The real lv2 SPU-thread layer and the real SPU dispatcher are
+-      # compiled in, and the two threads have to run concurrently on host
+-      # threads of their own, with the image in their local stores, the entry
+-      # point and image the registry says, and each thread's own arguments.
+-      - name: Run the lifted SPU thread-group start test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_lifted_start \
+-            runtime/spu/tests/test_spu_lifted_start.c \
+-            runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
+-            runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
+-            runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
+-            runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
+-            runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
+-            runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
+-            runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_lifted_start
+-
+-      # The per-context MFC engine table, which the group above writes from
+-      # every one of its threads at once. Two threads claiming the same slot
+-      # share one engine's queue and tag mask, so one SPU's tag wait is
+-      # satisfied by the other's transfer and nothing says so; slots that are
+-      # never given back put every context past the eighth on one shared
+-      # engine. Eight contexts claim on the same instant, thirty-two times
+-      # over, and the check is that the same eight engines come back around,
+-      # each one clean and holding only its own owner's state.
+-      - name: Run the SPU MFC engine slot test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_mfc_slots \
+-            runtime/spu/tests/test_spu_mfc_slots.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_mfc_slots
+-
+-      # A SPURS job's entry saves its link register at 16($sp), in the caller's
+-      # frame. The runner put $sp 16 bytes under the stack top, where the cache
+-      # buffers start, so that save overwrote the first quadword of
+-      # cacheBuffer[0]: Twisted Metal's Edge jobs lost their viewport there.
+-      - name: Run the SPURS job stack frame test
+-        run: |
+-          ${{ matrix.compiler == 'clang' && 'clang' || 'gcc' }} -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spurs_job_stack \
+-            runtime/spu/tests/test_spurs_job_stack.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spurs_job_stack
+diff --git a/.github/workflows/macos.yml b/.github/workflows/macos.yml
+deleted file mode 100644
+index 6bc8b612..00000000
+--- a/.github/workflows/macos.yml
++++ /dev/null
+@@ -1,713 +0,0 @@
+-# Builds the runtime library on Apple Silicon.
+-#
+-# ps3recomp had no CI of any kind, and docs/BUILDING.md advertised macOS as
+-# "Full support" while the tree did not compile there at all. This job exists so
+-# that stays fixed: it is the only thing preventing the next Windows-only commit
+-# from silently re-breaking the POSIX paths.
+-name: macOS
+-
+-on:
+-  push:
+-    branches: [ master, main ]
+-  pull_request:
+-  workflow_dispatch:
+-
+-jobs:
+-  build:
+-    name: macOS arm64 (${{ matrix.build_type }})
+-    runs-on: macos-15          # Apple Silicon runner
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        build_type: [Debug, Release]
+-
+-    steps:
+-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+-
+-      # glslang and spirv-cross turn the decompilers' HLSL into MSL for the
+-      # Metal backend's guest-shader path; without them CMake builds the
+-      # fixed-function backend only.
+-      - name: Install dependencies
+-        run: brew install ninja sdl2 glslang spirv-cross
+-
+-      - name: Configure
+-        run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-
+-      - name: Build
+-        run: cmake --build build
+-
+-      - name: Verify architecture
+-        run: |
+-          lipo -info build/libps3recomp_runtime.a
+-          lipo -info build/libps3recomp_runtime.a | grep -q arm64
+-
+-      # The Python suites are the project's real correctness net -- the
+-      # conformance one COMPILES AND RUNS 1300+ lifted instruction cases and has
+-      # caught silent miscompiles that a build check never would (15 VMX
+-      # endianness bugs most recently). Running them here means they guard both
+-      # platforms, not just whoever last ran them on Windows.
+-      - name: Set up Python
+-        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+-        with:
+-          python-version: '3.12'
+-
+-      - name: Run the lifter test suites
+-        env:
+-          CI: "1"          # makes a skipped conformance run fail instead of passing
+-        run: |
+-          set -e
+-          for t in tools/test_*.py; do
+-            echo "--- $t"
+-            python "$t"
+-          done
+-
+-      # libs/system/tests/ existed and NOTHING ran it -- two suites checked in,
+-      # both documenting a macOS clang line in their own header comment, neither
+-      # wired to any job. They need -Wl,-dead_strip (macOS ld) to drop the
+-      # unreferenced runtime symbols they do not stub, which is why they belong
+-      # here and not on the Linux or Windows jobs.
+-      - name: Run self-contained sysutil tests
+-        run: |
+-          clang -std=gnu17 -I include                 libs/system/tests/test_dialog_callbacks.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_dialog_callbacks
+-          /tmp/test_dialog_callbacks
+-          clang -std=gnu17 -I include                 libs/system/tests/test_savedata_fixed.c                 -Wl,-dead_strip -o /tmp/test_savedata_fixed
+-          /tmp/test_savedata_fixed
+-          clang -std=gnu17 -I include                 libs/system/tests/test_savedata_root.c                 -Wl,-dead_strip -o /tmp/test_savedata_root
+-          /tmp/test_savedata_root
+-          clang -std=gnu17 -I include                 libs/system/tests/test_sysconf.c libs/system/cellSysutil.c                 -Wl,-dead_strip -pthread -o /tmp/test_sysconf
+-          /tmp/test_sysconf
+-          clang -std=gnu17 -I include                 libs/system/tests/test_game_space.c                   -Wl,-dead_strip -o /tmp/test_game_space
+-          /tmp/test_game_space
+-
+-      # ps3_env_once: one getenv per name, compiled as C and as C++ (ppu_fs.cpp
+-      # includes it too).
+-      - name: Run the ps3_env_once test
+-        run: |
+-          clang -std=gnu17 -Wall -Werror -I include -o /tmp/test_env_once tests/test_env_once.c
+-          /tmp/test_env_once
+-          clang++ -x c++ -std=c++17 -Wall -Werror -I include -o /tmp/test_env_once_cpp tests/test_env_once.c
+-          /tmp/test_env_once_cpp
+-
+-      - name: Run self-contained SPU helper tests
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu \
+-                -o /tmp/test_spu_helpers runtime/spu/tests/test_spu_helpers.c -lm
+-          /tmp/test_spu_helpers
+-
+-      # runtime/spu/tests/test_spu_int_neon.c and test_spu_float_neon.c check the
+-      # SIMD helper forms against the exact scalar references. linux.yml runs the
+-      # float one under -mavx2; the integer one was referenced by no workflow at
+-      # all, so neither had ever been compiled for NEON on a real arm64 host.
+-      # v0.18.0 lands four SIMD rewrites of spu_helpers.h, and a mis-merge there
+-      # produces silently wrong float results rather than a build error, so these
+-      # are the acceptance gate for that wave and they need to actually run.
+-      - name: Run the SPU integer helper test (NEON)
+-        run: |
+-          clang -std=gnu17 -O2 -I include -I runtime/spu \
+-                -o /tmp/test_spu_int_neon runtime/spu/tests/test_spu_int_neon.c -lm
+-          /tmp/test_spu_int_neon
+-
+-      - name: Run the SPU float fast-path test (NEON)
+-        run: |
+-          clang -std=gnu17 -O2 -I include -I runtime/spu \
+-                -o /tmp/test_spu_float_neon runtime/spu/tests/test_spu_float_neon.c -lm
+-          /tmp/test_spu_float_neon
+-
+-      # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
+-      # handler is called through the NID it registered under.
+-      - name: Run the sys_net loopback test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_sys_net libs/network/tests/test_sys_net.c
+-          /tmp/test_sys_net
+-
+-      # Matching2 over psnr without a server: response relocation, attribute
+-      # packing, and the room structs a title reads.
+-      - name: Run the Matching2 test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_np_matching2 libs/network/tests/test_np_matching2.c
+-          /tmp/test_np_matching2
+-
+-      # sceNpSignaling for Matching2 room members: context ids from 1,
+-      # ActivateConnection, the events a title's handlers get, the peer address.
+-      - name: Run the sceNpSignaling room connection test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_np_signaling_rooms libs/network/tests/test_np_signaling_rooms.c
+-          /tmp/test_np_signaling_rooms
+-
+-      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+-      # and PSN's online ID rules.
+-      - name: Run the player-name test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_np_identity libs/network/tests/test_np_identity.c
+-          /tmp/test_np_identity
+-
+-      # The net-start dialog ends cancelled offline and connected with
+-      # PS3_NET_ONLINE=1, its result word big-endian.
+-      - name: Run the net-start dialog test
+-        run: |
+-          clang -std=gnu17 -I include -I libs/system -o /tmp/test_netctl_netstart libs/network/tests/test_netctl_netstart.c
+-          /tmp/test_netctl_netstart
+-          PS3_NET_ONLINE=1 /tmp/test_netctl_netstart
+-
+-      # cellVideoOutSetGamma's float argument comes from f1, and the value
+-      # reaches the presenter.
+-      - name: Run the video out gamma test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_avconf_gamma libs/misc/tests/test_avconf_gamma.c
+-          /tmp/test_avconf_gamma
+-
+-      # The draw engine's present with PS3_AA=fxaa/smaa, PS3_SHARPEN,
+-      # PS3_VIBRANCE and PS3_CONTRAST, on the runner's GPU: FXAA and SMAA
+-      # blend a staircase and nothing flat, CAS steepens a soft edge by the
+-      # amount asked, vibrance and contrast move colours as asked, and with
+-      # all of them off it is a copy.
+-      - name: Run the Metal present post-processing test
+-        run: |
+-          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_present_post.m \
+-            -Wl,-dead_strip -framework Metal -framework Cocoa -framework QuartzCore \
+-            -o /tmp/test_metal_present_post
+-          /tmp/test_metal_present_post
+-
+-      # Host-surface mode (tools/host_window, rsx_host_surface.h) against a
+-      # launcher fixture in the same process: init attaches and opens no
+-      # window, engine and vtable presents land in the shared IOSurfaces,
+-      # unread frames are reclaimed rather than stalling, a resize asks for
+-      # new surfaces, `closed` reaches the pump, and a second init (what an
+-      # exec brings up) attaches again.
+-      - name: Run the Metal host-surface test
+-        run: |
+-          # The translator is C++17 (ps3types.h); a .cpp on a plain clang line
+-          # is compiled as C++98, so it is built on its own line.
+-          clang++ -std=c++17 -I include -I libs/video -c libs/video/rsx_shader_msl.cpp \
+-            -o /tmp/rsx_shader_msl.o
+-          clang -fobjc-arc -I include -I libs/video libs/video/tests/test_metal_host_surface.m \
+-            libs/video/rsx_texture_layout.c libs/video/rsx_vertex_fetch.c libs/video/rsx_vp_decompiler.c \
+-            libs/video/rsx_fp_decompiler.c /tmp/rsx_shader_msl.o -lc++ -Wl,-dead_strip \
+-            -framework Metal -framework Cocoa -framework QuartzCore -framework IOSurface \
+-            -o /tmp/test_metal_host_surface
+-          /tmp/test_metal_host_surface
+-
+-      # The host window off screen: it logs leaving and coming back, its
+-      # [RSX FPS] lines say hidden=1 meanwhile, and coming back shows the
+-      # newest frame the game published while it was away.
+-      - name: Run the host window off-screen test
+-        run: |
+-          clang -fobjc-arc -I libs/video tools/host_window/test_host_window_offscreen.m \
+-            -framework AppKit -framework Metal -framework QuartzCore -framework IOSurface \
+-            -o /tmp/test_host_window_offscreen
+-          /tmp/test_host_window_offscreen
+-
+-      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+-      # packets before the title sees them, punching toward peers.
+-      - name: Run the NAT traversal test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_np_nat libs/network/tests/test_np_nat.c
+-          /tmp/test_np_nat
+-
+-      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+-      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+-      - name: Run the Avc2 Load test
+-        run: |
+-          clang -std=gnu17 -I include -o /tmp/test_avc2_load libs/network/tests/test_avc2_load.c
+-          /tmp/test_avc2_load
+-
+-      # cellPadSetActDirect: the small motor is on/off at full strength, and
+-      # a rumble lasts until the title changes it (renewed from the pad poll).
+-      - name: Run the pad rumble test
+-        run: |
+-          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_rumble libs/input/tests/test_pad_rumble.c $(sdl2-config --libs)
+-          /tmp/test_pad_rumble
+-          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_sensor_mode libs/input/tests/test_pad_sensor_mode.c $(sdl2-config --libs)
+-          /tmp/test_pad_sensor_mode
+-
+-      # cellPad SDL hot-plug: a controller switched off and on again is
+-      # reopened into its old port (fake SDL that behaves like sdl2-compat).
+-      - name: Run the pad hot-plug test
+-        run: |
+-          clang -std=gnu17 -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_hotplug libs/input/tests/test_pad_hotplug.c $(sdl2-config --libs)
+-          /tmp/test_pad_hotplug
+-
+-      # cellPad keyboard fallback on port 0 (read through SDL here too, with a
+-      # fake keyboard and focus; the real macOS source is CGEventSourceKeyState).
+-      - name: Run the pad keyboard test
+-        run: |
+-          clang -std=gnu17 -DPS3RECOMP_PAD_KEYBOARD_SDL -I include $(sdl2-config --cflags) -I "$(sdl2-config --prefix)/include" -o /tmp/test_pad_keyboard libs/input/tests/test_pad_keyboard.c $(sdl2-config --libs)
+-          /tmp/test_pad_keyboard
+-
+-      # Drives a real NV4097 command buffer through cellGcm -> RSX -> the Metal
+-      # backend and asserts the presented pixel matches the guest clear colour.
+-      # Headless, so it needs no display: exit 0 means the whole graphics bridge
+-      # is intact, not merely that it compiled. No environment set, so this is
+-      # the DEFAULT path -- rsx_dispatch's register file into rsx_draw_engine.c
+-      # and the record-oriented backend under it.
+-      - name: Run the POSIX host (headless Metal end-to-end)
+-        run: |
+-          # Clear + flip: asserts the guest clear colour reaches the drawable.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host
+-          # Clear + a real NV4097 draw: asserts the triangle covers the centre
+-          # pixel, which exercises guest vertex fetch, the pipeline-state cache
+-          # and the draw path, not just the clear.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --draw --frames=60
+-          # Two triangles drawn near-first: the centre pixel is red only if the
+-          # depth test rejected the later far one.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depth
+-          # Guest programs: a vertex program and a fragment program loaded
+-          # through the FIFO, decompiled, translated to MSL, compiled and
+-          # bound. The fragment program swaps the triangle's red and blue,
+-          # and the host asks the backend how many draws ran guest code, so
+-          # a fall-back to the built-in shader cannot pass. The forced
+-          # built-in run proves the check has teeth: it must fail.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader --frames=60
+-          # User clip planes: the same triangle with plane 1 enabled through
+-          # SET_USER_CLIP_PLANE_CONTROL. ENABLE_LT clips all of it (the clear
+-          # colour stays), ENABLE_GE keeps it (red). With the register
+-          # ignored --clip draws red, so that run must fail.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip-keep
+-          if PS3RECOMP_ENG_USER_CLIP=0 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --clip; then
+-            echo "--clip passed with user clip planes off; the check is not checking"
+-            exit 1
+-          fi
+-          # A guest texture sampled by a guest fragment program: layout,
+-          # decode, upload, the CONTROL1 crossbar as a swizzle, and the
+-          # sampler registers. The quad is green and the texture is not.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --tex
+-          # A texture with TWO mip levels, each a different colour, sampled
+-          # through a quad small enough that the LOD reaches level 1. A
+-          # backend that uploads level 0 and stops presents level 0's colour
+-          # and fails, so this cannot pass without the whole mip chain.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip
+-          # PS3_ANISO: the same two levels under a quad stretched along y.
+-          # Only anisotropic filtering reads level 0 there, so it must pass
+-          # with PS3_ANISO and fail without it.
+-          PS3_ANISO=16 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso
+-          if PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mip-aniso; then
+-            echo "--mip-aniso passed without PS3_ANISO; the check is not checking"
+-            exit 1
+-          fi
+-          # SET_TEXTURE_BORDER_COLOR: a quad sampling only outside [0,1]
+-          # with wrap BORDER and a white border colour, blended over the
+-          # clear. It must present white, and with PS3RECOMP_ENG_BORDER=0
+-          # (every border transparent black, as before) it must fail.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --border
+-          if PS3RECOMP_ENG_BORDER=0 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --border; then
+-            echo "--border passed with the border colour ignored; the check is not checking"
+-            exit 1
+-          fi
+-          # Render-to-texture: a red triangle drawn into a colour surface of
+-          # the guest's own, then sampled by a full-screen quad through the
+-          # guest programs. The guest bytes behind that surface are green, so
+-          # a backend that uploads them instead of binding the surface it
+-          # rendered into presents green and fails.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --rtt --frames=60
+-          # A polygon and a quad strip, the two primitives with no host
+-          # equivalent that are not simply a list of quads. The pentagon is
+-          # green and the quad strip red over it, and the centre pixel belongs
+-          # to the strip's SECOND quad, so a renderer that drops quad strips
+-          # or expands only the first quad presents green and fails.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --quads
+-          # Depth-as-texture: a flat triangle written into a zeta of the
+-          # guest's own with the depth test on, then that zeta sampled as a
+-          # DEPTH24_D8 texture by a guest fragment program in a second pass.
+-          # The centre pixel is the depth itself, 0.25 as a byte; a zeta
+-          # nothing wrote, and the guest bytes behind its address, both read
+-          # 1.0 and present saturated red. This one runs on the draw engine
+-          # only: the vtable path tracks no zeta as a texture and uploads
+-          # those bytes instead, which is exactly the failure above.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --depthtex --frames=60
+-          # Multiple render targets: an MRT1 set at two offscreen offsets,
+-          # both members written by ONE draw whose fragment program exports
+-          # r0 and r2 -- a deferred renderer's G-buffer pass. The display
+-          # quad then samples one of them, and a centre pixel can only speak
+-          # for one, so --mrt asserts target B (blue, the export that had
+-          # nowhere to go until the decompiler grew a second SV_TARGET) and
+-          # --mrt-a asserts target A (red, that growing it disturbed
+-          # nothing). Every way of getting it wrong has its own colour: the
+-          # set's clear colour for a target attached and cleared but never
+-          # fed, and the surfaces' green guest bytes for a renderer that
+-          # uploads those instead of binding what the pass wrote.
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt-a
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --mrt --frames=60
+-          # A guest program pair that will not translate has no fallback in
+-          # the draw engine, so forcing the built-in shader leaves --shader
+-          # with nothing to draw: it must still fail, or the check is not
+-          # checking. On the vtable path it falls back and draws the wrong
+-          # colour instead, which fails the same assertion.
+-          if PS3RECOMP_METAL_FIXED_FUNCTION=1 PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_host --shader; then
+-            echo "--shader passed with the built-in shader forced; the check is not checking"
+-            exit 1
+-          fi
+-          # No graphics: create a guest PPU thread through the lv2 path and
+-          # check the host stack it got. A recompiled call chain nests on the
+-          # host stack one frame per guest call, and Darwin's default thread
+-          # stack is 512 KB, which nothing tells you until a title dies.
+-          ./build/ps3recomp_host --threads
+-          # The SDL2 audio and pad backends, which the Windows build never
+-          # reaches (it takes WASAPI and XInput). The dummy audio driver and
+-          # no controller are the runner's situation and must both be fine.
+-          SDL_AUDIODRIVER=dummy ./build/ps3recomp_host --audio-pad
+-
+-      # ...and the same modes again through the older vtable path, the one
+-      # driven by rsx_state rather than by the register file. Both have to
+-      # pass every mode for as long as both exist, and the pixel assertions
+-      # are what say the two agree; this is also the check that the way back
+-      # still works.
+-      - name: Run the POSIX host (vtable path)
+-        env:
+-          PS3RECOMP_METAL_HEADLESS: "1"
+-          PS3RECOMP_RSX_ENGINE: vtable
+-        run: |
+-          ./build/ps3recomp_host
+-          ./build/ps3recomp_host --draw
+-          ./build/ps3recomp_host --draw --frames=60
+-          ./build/ps3recomp_host --depth
+-          ./build/ps3recomp_host --shader
+-          ./build/ps3recomp_host --shader --frames=60
+-          ./build/ps3recomp_host --tex
+-          ./build/ps3recomp_host --mip
+-          ./build/ps3recomp_host --rtt
+-          ./build/ps3recomp_host --rtt --frames=60
+-          ./build/ps3recomp_host --quads
+-          ./build/ps3recomp_host --mrt
+-          ./build/ps3recomp_host --mrt-a
+-          ./build/ps3recomp_host --mrt --frames=60
+-          if PS3RECOMP_METAL_FIXED_FUNCTION=1 ./build/ps3recomp_host --shader; then
+-            echo "--shader passed with the built-in shader forced; the check is not checking"
+-            exit 1
+-          fi
+-          # And the PPU boot path, whose three frames reach the backend from
+-          # guest code rather than from the harness.
+-          ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+-
+-      # Guest vertex and fragment programs through the decompilers, glslang
+-      # and spirv-cross: asserts the MSL carries the buffer, texture, sampler
+-      # and attribute slots the Metal backend binds to. The binary missing
+-      # means the shader tools were not found, which must fail, not skip.
+-      - name: Run the guest shader translation test
+-        run: |
+-          test -x build/test_shader_msl
+-          ./build/test_shader_msl
+-
+-      # The polygon offset reaches the GPU: a constant-depth triangle drawn
+-      # with SET_POLY_OFFSET_FILL and a bias lands 256 Z24 (or one Z16) steps
+-      # deeper, and PS3RECOMP_ENG_POLY_OFFSET=0 draws it without.
+-      - name: Run the Metal polygon offset test
+-        run: |
+-          test -x build/test_metal_poly_offset
+-          ./build/test_metal_poly_offset
+-          PS3RECOMP_ENG_POLY_OFFSET=0 ./build/test_metal_poly_offset
+-
+-      # SET_ZMIN_MAX_CONTROL reaches the GPU: a triangle in front of the near
+-      # plane is clipped by default and clamped to depth 0 when the guest
+-      # turns clipping off or the clamp on; PS3RECOMP_ENG_DEPTH_CLAMP=0 clips.
+-      - name: Run the Metal depth clamp test
+-        run: |
+-          test -x build/test_metal_depth_clamp
+-          ./build/test_metal_depth_clamp
+-          PS3RECOMP_ENG_DEPTH_CLAMP=0 ./build/test_metal_depth_clamp
+-
+-      # The depth-bounds test, which Metal lacks, emulated in the fragment
+-      # program: a bounded draw lands only where the STORED depth is inside
+-      # the bounds; PS3RECOMP_ENG_DEPTH_BOUNDS=0 ignores the test.
+-      - name: Run the Metal depth bounds test
+-        run: |
+-          test -x build/test_metal_depth_bounds
+-          ./build/test_metal_depth_bounds
+-          PS3RECOMP_ENG_DEPTH_BOUNDS=0 ./build/test_metal_depth_bounds
+-
+-      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+-      # it needs the lifter's per-game ppu_recomp.h. macOS has no recorded
+-      # baseline yet, so this reports its numbers and passes; the first run's
+-      # output is what to record with --update.
+-      - name: Check the PPU boot scaffold (ratchet)
+-        run: python tools/check_ppu_scaffold.py
+-
+-      # ...and this one RUNS it. The ratchet above only compiles the scaffold;
+-      # the smoke title is a synthetic lifted program that drives the loader,
+-      # the NID bridge, the lv2 syscalls, a guest thread, the frame clock and
+-      # the Metal backend from guest code, and checks all of it. Exit 0 means
+-      # every marker appeared in order, the guest thread ran on its own host
+-      # thread, three frames reached the backend and the guest's chosen exit
+-      # status came back through sys_process_exit. The binary missing means
+-      # CMake skipped the target, which must fail rather than pass quietly.
+-      - name: Run the PPU boot smoke title (headless Metal)
+-        run: |
+-          test -x build/ps3recomp_boot_smoke
+-          PS3RECOMP_METAL_HEADLESS=1 ./build/ps3recomp_boot_smoke build/smoke/smoke.elf
+-
+-      # templates/project is what "start a port" means -- docs/GETTING_STARTED.md
+-      # says to copy it -- and until now nothing built it on any platform. This
+-      # is the same smoke title again, booted through the TEMPLATE's runner and
+-      # the template's own CMakeLists: the toolkit from PS3RECOMP_DIR, the lift
+-      # from RECOMP_DIR, exactly the two directories a real port passes. Exit 0
+-      # is the smoke title's own verdict, so a template that builds but boots
+-      # nothing cannot pass.
+-      - name: Build and run the game template (headless Metal)
+-        run: |
+-          # pipefail, or tee below would swallow the runner's exit status --
+-          # which IS the smoke title's verdict.
+-          set -eo pipefail
+-          test -f build/smoke/lift/ppu_recomp.h
+-          cmake -S templates/project -B build-template -G Ninja \
+-            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+-            -DPS3RECOMP_DIR="$PWD" \
+-            -DRECOMP_DIR="$PWD/build/smoke/lift"
+-          cmake --build build-template
+-          PS3RECOMP_METAL_HEADLESS=1 \
+-            ./build-template/MyGameRecomp build/smoke/smoke.elf 2>&1 | tee template.log
+-          # The runner's own banner, so a pass cannot come from some other
+-          # binary, and the marker-order verdict spelt out rather than inferred
+-          # from the exit status alone.
+-          grep -q "=== ps3recomp game runner ===" template.log
+-          grep -q "\[smoke\] OK: all 11 markers, in order" template.log
+-          grep -q "\[smoke\] PASS" template.log
+-
+-      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+-      # arithmetic with no host API in it, so it runs everywhere, and it is the
+-      # regression net for having lifted that maths out of the D3D12 uploader.
+-      - name: Run self-contained RSX tests
+-        run: |
+-          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_texture_layout libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
+-          /tmp/test_texture_layout
+-          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_primitives libs/video/tests/test_rsx_primitives.c
+-          /tmp/test_rsx_primitives
+-          # The fragment-program decoder on its own: the word swap, source
+-          # swizzles and types, the dest mask, inline constants, which
+-          # register file the colour export comes from, and how many
+-          # SV_TARGETs a program that writes more than one export gets.
+-          clang -std=gnu17 -Wall -Wextra -I include -o /tmp/test_fp_decompiler libs/video/tests/test_fp_decompiler.c libs/video/rsx_fp_decompiler.c
+-          /tmp/test_fp_decompiler
+-          # The D3D12 device order as pure logic (no D3D12 needed).
+-          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_d3d12_device_pick libs/video/tests/test_d3d12_device_pick.c
+-          /tmp/test_d3d12_device_pick
+-          # The register-file draw engine's platform-neutral halves against a
+-          # stub backend -- surface keying and reallocation, render-target
+-          # aliasing on a texture bind, the texture cache's revalidation and
+-          # eviction, the pipeline key's stability under constant changes, and
+-          # restart cuts bounding topology expansion. Runs on Linux too.
+-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_draw_engine libs/video/tests/test_rsx_draw_engine.c libs/video/rsx_draw_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+-          /tmp/test_rsx_draw_engine
+-          # The vertex fetch plan's stable ranges against the per-attribute
+-          # walk they are now computed without.
+-          clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_fetch_plan libs/video/tests/test_vertex_fetch_plan.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+-          /tmp/test_vertex_fetch_plan
+-          # Preserve explicitly written current colors, including black,
+-          # while keeping the unwritten ATTR3 compatibility default.
+-          clang -std=gnu17 -O2 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_vertex_current_color libs/video/tests/test_vertex_current_color.c libs/video/rsx_vertex_compact.c libs/video/rsx_dispatch.c
+-          /tmp/test_vertex_current_color
+-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -I libs/video/tests -o /tmp/test_color_feedback_engine libs/video/tests/test_color_feedback_engine.c libs/video/rsx_dispatch.c libs/video/rsx_vertex_compact.c libs/video/rsx_texture_layout.c libs/video/rsx_vp_decompiler.c libs/video/rsx_fp_decompiler.c
+-          /tmp/test_color_feedback_engine
+-          # The NV4097 method decoder on its own: the vertex-constant window is
+-          # 32 dwords and the registers after it are not constants.
+-          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_transform_constants libs/video/tests/test_rsx_transform_constants.c libs/video/rsx_commands.c
+-          /tmp/test_rsx_transform_constants
+-          # Vertex-program microcode and constant runs taken in one call leave the
+-          # state exactly as the same words do one by one.
+-          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_vp_run libs/video/tests/test_rsx_vp_run.c libs/video/rsx_commands.c
+-          /tmp/test_rsx_vp_run
+-          # Texture offsets are 31 bits; bit 31 is not an address bit.
+-          clang -std=gnu17 -Wall -Wextra -Wno-unused-parameter -I include -I libs/video -o /tmp/test_rsx_texture_offset libs/video/tests/test_rsx_texture_offset.c libs/video/rsx_dispatch.c
+-          /tmp/test_rsx_texture_offset
+-          clang -std=gnu17 -Wall -Wextra -I include -I libs/video -o /tmp/test_rsx_command_texture_offset libs/video/tests/test_rsx_command_texture_offset.c libs/video/rsx_commands.c
+-          /tmp/test_rsx_command_texture_offset
+-
+-      # The Win32 shim the runtime runs through on macOS: interlocked widths
+-      # and return conventions, SRW/CS/condition variables, events, semaphores,
+-      # joinable threads, WaitOnAddress, timers, VirtualAlloc -- on arm64,
+-      # where the memory model is weak and 16 KB pages are real.
+-      - name: Run the Win32 compatibility layer tests
+-        run: |
+-          clang -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_win32_compat runtime/platform/tests/test_win32_compat.c runtime/platform/win32_compat.c -lpthread
+-          /tmp/test_win32_compat
+-
+-      # Which signal an inaccessible guest window faults with, and whether one
+-      # can be reserved at all. This is the host that makes the question real:
+-      # a PROT_NONE page here raises SIGBUS, not SIGSEGV, so the untranslated-
+-      # guest-pointer trap in runtime/ppu/ppu_loader.cpp has to take both.
+-      - name: Run the guest-pointer trap signal test
+-        run: |
+-          clang -std=gnu17 -Wall -Wextra -o /tmp/test_guest_ptr_trap runtime/platform/tests/test_guest_ptr_trap.c
+-          /tmp/test_guest_ptr_trap
+-
+-      # Buffered stdout/stderr with a timed flush (runtime/platform/ps3_stdio.c):
+-      # buffered by default, a line reaches the pipe within the flush interval,
+-      # and nothing is lost at exit, on abort() or on a crash through the
+-      # unhandled-exception filter; PS3_STDIO_UNBUFFERED=1 restores unbuffered.
+-      - name: Run the stdio flush test
+-        run: |
+-          clang -std=gnu17 -Wall -Wextra -I runtime/platform -o /tmp/test_stdio_flush runtime/platform/tests/test_stdio_flush.c runtime/platform/ps3_stdio.c runtime/platform/win32_compat.c -lpthread
+-          /tmp/test_stdio_flush
+-
+-      # PS3_DEV_FLASH may name several roots; the first one that holds the file wins
+-      # (runtime/platform/ps3_dev_flash.c, shared by cellFs and the raw sys_fs).
+-      - name: Run the dev_flash path test
+-        run: |
+-          clang -std=gnu17 -Wall -Wextra -o /tmp/test_dev_flash_path runtime/platform/tests/test_dev_flash_path.c runtime/platform/ps3_dev_flash.c
+-          /tmp/test_dev_flash_path
+-
+-      # The lv2 sync-primitive stress suite on host threads. Windows-only until
+-      # the shim grew joinable handles and multi-object waits; on Apple Silicon
+-      # it is the arm64 memory-model regression net for the primitives a game
+-      # hammers hardest.
+-      - name: Build and run sync_stress
+-        run: |
+-          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          cmake --build build-sync-stress
+-          ctest --test-dir build-sync-stress --output-on-failure
+-
+-      # cellFiber's cooperative switching on ucontext. Apple deprecated those
+-      # routines in 10.6 and gates the shape of ucontext_t itself on
+-      # _XOPEN_SOURCE, so this is the evidence that the path works on arm64
+-      # rather than an assumption that it does.
+-      - name: Build and run fiber_switch
+-        run: |
+-          cmake -S tests/fiber_switch -B build-fiber -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          cmake --build build-fiber
+-          ./build-fiber/fiber_switch
+-
+-      # An SPU parked on a GETLLAR reservation has to be told when the PPU
+-      # writes that line. Nothing else in the tree fails when that notify is
+-      # missing -- the SPU just never wakes -- so it gets its own check.
+-      - name: Run the PPU/SPU lock-line coherence tests
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu \
+-                -o /tmp/test_spu_coherency runtime/spu/tests/test_spu_coherency.c
+-          /tmp/test_spu_coherency
+-
+-      # The other writer: an SPU. Five SPURS kernels share one management line,
+-      # so a commit that does not break its peers' reservations lets two of them
+-      # win the same compare-and-swap, and the queue is quietly wrong afterwards.
+-      - name: Run the SPU-to-SPU lock-line coherence tests
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_lockline_peer \
+-            runtime/spu/tests/test_spu_lockline_peer.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_lockline_peer
+-
+-      # A task parked in WAIT_SIGNAL, signalled by another SPU. libspurs does
+-      # that with PUTLLC on the taskset line, which never woke the parked
+-      # task's host thread: it saw the signal only when its 1 s wait timed out.
+-      - name: Run the SPURS task wake test
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_taskset_wake \
+-            runtime/spu/tests/test_spu_taskset_wake.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_taskset_wake
+-
+-      # The host setting or consuming a task's signal bit against an SPU commit
+-      # to the same word. The read was outside the lock-line lock, so a commit
+-      # between the read and the write was lost and that task never woke.
+-      - name: Run the SPURS signalled-bit atomicity test
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spurs_signalled_atomic \
+-            runtime/spu/tests/test_spurs_signalled_atomic.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spurs_signalled_atomic
+-
+-      # The host's task-id search, task registration and task exit against each
+-      # other on the taskset's bitset line. A plain read then write undid a task
+-      # exit, so the exited task's enabled bit came back and JoinTask2 hung.
+-      - name: Run the SPURS taskset bitset atomicity test
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spurs_taskset_bits_atomic \
+-            runtime/spu/tests/test_spurs_taskset_bits_atomic.c libs/spurs/spurs_taskset.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spurs_taskset_bits_atomic
+-
+-      # A thread group starting its threads on their image's LIFTED code. This
+-      # is the path a real title needs and the one that used to be missing: the
+-      # group's threads completed instantly with status 0, the group reported a
+-      # clean exit, and the program the guest asked to run had simply not run.
+-      # Nothing else in the tree fails when that happens, so it gets its own
+-      # check. The real lv2 SPU-thread layer and the real SPU dispatcher are
+-      # compiled in, and the two threads have to run concurrently on host
+-      # threads of their own, with the image in their local stores, the entry
+-      # point and image the registry says, and each thread's own arguments.
+-      - name: Run the lifted SPU thread-group start test
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_lifted_start \
+-            runtime/spu/tests/test_spu_lifted_start.c \
+-            runtime/spu/spu_channels.c runtime/spu/spu_drain.c \
+-            runtime/spu/spu_lockstep.c runtime/spu/spu_coherency.c \
+-            runtime/spu/spu_workload.c runtime/spu/spurs_policy.c \
+-            runtime/spu/spurs_job.c runtime/spu/spu_tsp_weak.c \
+-            runtime/spu/spu_vm_pagemap.c runtime/spu/spurs_policy_blob_weak.c \
+-            runtime/spu/spu_interp.c runtime/spu/spu_lifted_thread.c \
+-            runtime/syscalls/spu_fallback.c runtime/syscalls/sdk_version_weak.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_lifted_start
+-
+-      # The per-context MFC engine table, which the group above writes from
+-      # every one of its threads at once. Two threads claiming the same slot
+-      # share one engine's queue and tag mask, so one SPU's tag wait is
+-      # satisfied by the other's transfer and nothing says so; slots that are
+-      # never given back put every context past the eighth on one shared
+-      # engine. Eight contexts claim on the same instant, thirty-two times
+-      # over, and the check is that the same eight engines come back around,
+-      # each one clean and holding only its own owner's state.
+-      - name: Run the SPU MFC engine slot test
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spu_mfc_slots \
+-            runtime/spu/tests/test_spu_mfc_slots.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spu_mfc_slots
+-
+-      # A SPURS job's entry saves its link register at 16($sp), in the caller's
+-      # frame. The runner put $sp 16 bytes under the stack top, where the cache
+-      # buffers start, so that save overwrote the first quadword of
+-      # cacheBuffer[0]: Twisted Metal's Edge jobs lost their viewport there.
+-      - name: Run the SPURS job stack frame test
+-        run: |
+-          clang -std=gnu17 -I include -I runtime/spu -I runtime/platform \
+-            -o /tmp/test_spurs_job_stack \
+-            runtime/spu/tests/test_spurs_job_stack.c \
+-            runtime/spu/spu_drain.c runtime/spu/spu_lockstep.c \
+-            runtime/spu/spu_coherency.c runtime/spu/spu_workload.c \
+-            runtime/spu/spurs_policy.c runtime/spu/spurs_job.c \
+-            runtime/spu/spu_tsp_weak.c runtime/spu/spu_vm_pagemap.c \
+-            runtime/spu/spurs_policy_blob_weak.c runtime/spu/spu_interp.c \
+-            runtime/platform/win32_compat.c \
+-            -lpthread -lm
+-          /tmp/test_spurs_job_stack
+diff --git a/.github/workflows/release.yml b/.github/workflows/release.yml
+deleted file mode 100644
+index 6c3fa680..00000000
+--- a/.github/workflows/release.yml
++++ /dev/null
+@@ -1,198 +0,0 @@
+-# Builds a downloadable SDK bundle for each supported platform and attaches it
+-# to the GitHub release when a v* tag is pushed.
+-#
+-# Why: a release with no binaries makes every would-be port author reproduce the
+-# whole toolchain setup (clang-cl + Ninja under vcvars) before they can even try
+-# the thing. The bundle is what a port actually consumes -- the runtime library,
+-# its public headers, and the Python pipeline -- so a port can be attempted with
+-# nothing but a tag download.
+-#
+-# Only Windows and macOS are built, because those are the only two platforms
+-# with CI proving they compile. Shipping an untested Linux binary would repeat
+-# the mistake of documenting macOS support the tree did not have.
+-name: Release
+-
+-on:
+-  push:
+-    tags: [ 'v*' ]
+-  workflow_dispatch:      # dry run: builds and uploads to the run, publishes nothing
+-
+-# Least privilege. The write token exists for one step in one job -- attaching
+-# assets to the release -- so only that job gets it. Everything else in this
+-# file is read-only by default, which is also what any job added here later
+-# inherits unless it says otherwise.
+-permissions:
+-  contents: read
+-
+-jobs:
+-  package:
+-    name: ${{ matrix.platform }}
+-    runs-on: ${{ matrix.runs-on }}
+-    # A tag can point at any commit, and this job configures CMake, compiles the
+-    # tree and runs every tools/test_*.py under `python`. None of that writes to
+-    # the repository, so it must not hold a token that can push commits or move
+-    # tags. `contents: read` is what actions/checkout needs and no more; the
+-    # artifact upload authenticates with the runner's own token, not this one.
+-    permissions:
+-      contents: read
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        include:
+-          - platform: win-x64
+-            runs-on: windows-latest
+-          - platform: mac-arm64
+-            runs-on: macos-15
+-          # Linux ships as the toolkit and the runtime library, not a game
+-          # runner: it has no renderer (the null backend's headless software path
+-          # is a CI check, not a graphics backend) and the PPU boot scaffold does
+-          # not yet load a title on POSIX. VERSION.txt says so in the bundle.
+-          - platform: linux-x64
+-            runs-on: ubuntu-latest
+-
+-    steps:
+-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+-
+-      - name: Set up MSVC environment
+-        if: runner.os == 'Windows'
+-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+-        with:
+-          arch: x64
+-
+-      - name: Install dependencies (Windows)
+-        if: runner.os == 'Windows'
+-        run: choco install ninja -y --no-progress
+-
+-      - name: Install dependencies (macOS)
+-        if: runner.os == 'macOS'
+-        run: brew install ninja sdl2
+-
+-      - name: Install dependencies (Linux)
+-        if: runner.os == 'Linux'
+-        run: |
+-          sudo apt-get update -qq
+-          sudo apt-get install -y --no-install-recommends ninja-build libsdl2-dev
+-
+-      # clang-cl on Windows: the loader uses __builtin_bswap* and weak symbols
+-      # that plain MSVC does not provide (docs/BUILDING.md).
+-      - name: Configure
+-        shell: bash
+-        run: |
+-          if [ "$RUNNER_OS" = "Windows" ]; then
+-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+-              -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
+-          else
+-            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+-          fi
+-
+-      - name: Build
+-        run: cmake --build build
+-
+-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+-        with:
+-          python-version: '3.12'
+-
+-      # A tag can be pushed at any commit, including one that never went through
+-      # the push workflows. Re-running the suites here is what makes "downloaded
+-      # from a release" mean the same thing as "green on master".
+-      - name: Run the lifter test suites
+-        shell: bash
+-        env:
+-          CI: "1"
+-        run: |
+-          set -e
+-          for t in tools/test_*.py; do
+-            echo "--- $t"
+-            python "$t"
+-          done
+-
+-      - name: Stage the bundle
+-        shell: bash
+-        run: |
+-          set -e
+-          # On a tag this is "v0.12.0". On a workflow_dispatch dry run it is the
+-          # BRANCH name, which may contain a slash -- "release/v0.12.0" made
+-          # dist/${NAME} a nested directory, so the zip landed in dist/release/
+-          # and the dist/*.zip upload glob found nothing. Every platform built and
+-          # tested fine and the run still failed, which is the least useful way
+-          # for a dry run to fail.
+-          VER="${GITHUB_REF_NAME//\//-}"
+-          NAME="ps3recomp-${VER}-${{ matrix.platform }}"
+-          STAGE="dist/${NAME}"
+-
+-          # lib/ + include/ come from the project's own install rules, so the
+-          # bundle layout cannot drift from what a local `cmake --install` gives.
+-          cmake --install build --prefix "${STAGE}"
+-
+-          # The static library alone cannot recompile anything; the pipeline that
+-          # turns an EBOOT into C is these scripts.
+-          cp -r tools "${STAGE}/tools"
+-          find "${STAGE}/tools" -name __pycache__ -type d -prune -exec rm -rf {} +   # test-run leftovers
+-          cp README.md LICENSE CONTRIBUTORS.md "${STAGE}/"
+-          mkdir -p "${STAGE}/docs" && cp docs/*.md "${STAGE}/docs/"
+-
+-          # What this bundle can actually do, per platform. Someone who
+-          # downloads the Linux zip expecting to run a game should find that out
+-          # here rather than after building one.
+-          case "${{ matrix.platform }}" in
+-            win-x64)    CAN="renders and runs recompiled titles (D3D12)" ;;
+-            mac-arm64)  CAN="renders through Metal; cannot yet load a title -- the PPU boot scaffold does not run on POSIX" ;;
+-            linux-x64)  CAN="toolkit and runtime library only -- no renderer in this bundle (the Vulkan backend is opt-in, build from source with -DPS3RECOMP_RSX_VULKAN=ON), and the PPU boot scaffold does not run on POSIX" ;;
+-            *)          CAN="unknown" ;;
+-          esac
+-
+-          { echo "ps3recomp ${VER}"
+-            echo "platform: ${{ matrix.platform }}"
+-            echo "commit:   ${GITHUB_SHA}"
+-            echo "run:      ${{ github.run_id }}"
+-            echo
+-            echo "status:   ${CAN}"; } > "${STAGE}/VERSION.txt"
+-
+-          # cmake -E tar rather than zip/Compress-Archive: CMake is already a
+-          # hard requirement on both runners, so this is one code path instead of
+-          # a per-platform branch.
+-          ( cd dist && cmake -E tar cf "${NAME}.zip" --format=zip "${NAME}" )
+-          ls -la dist/
+-
+-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+-        with:
+-          name: ps3recomp-${{ matrix.platform }}
+-          path: dist/*.zip
+-          if-no-files-found: error
+-
+-  publish:
+-    name: Attach to release
+-    needs: package
+-    if: startsWith(github.ref, 'refs/tags/v')
+-    runs-on: ubuntu-latest
+-    # `gh release create` and `gh release upload` below are the only things in
+-    # this workflow that need to write. Releases sit in the `contents` scope --
+-    # there is no narrower `releases` scope to ask for -- so this is the
+-    # smallest permission that still publishes. The artifact download needs
+-    # nothing from this token: it reads artifacts from its own run, and
+-    # `actions: read` is only required when pulling from another run or repo.
+-    permissions:
+-      contents: write
+-    steps:
+-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+-        with:
+-          path: dist
+-          merge-multiple: true
+-
+-      - name: Checksums
+-        run: |
+-          cd dist
+-          sha256sum *.zip | tee SHA256SUMS.txt
+-
+-      - name: Upload
+-        env:
+-          GH_TOKEN: ${{ github.token }}
+-          GH_REPO: ${{ github.repository }}
+-        run: |
+-          set -e
+-          TAG="${GITHUB_REF_NAME}"
+-          # The release usually already exists (tagged and written by hand);
+-          # create one only if it does not, so hand-written notes survive.
+-          gh release view "$TAG" >/dev/null 2>&1 || \
+-            gh release create "$TAG" --title "$TAG" --generate-notes
+-          gh release upload "$TAG" dist/*.zip dist/SHA256SUMS.txt --clobber
+diff --git a/.github/workflows/windows.yml b/.github/workflows/windows.yml
+deleted file mode 100644
+index 3e8858a7..00000000
+--- a/.github/workflows/windows.yml
++++ /dev/null
+@@ -1,207 +0,0 @@
+-# Builds the runtime library on Windows, the only platform that can currently
+-# run a recompiled game.
+-#
+-# The macOS job guards the POSIX paths; this one guards the platform everything
+-# actually ships on. Without it, a change made to satisfy Clang could break the
+-# MSVC/clang-cl build and nothing would notice until someone tried to build a
+-# port -- which is the same class of drift that let docs/BUILDING.md advertise
+-# macOS support the tree did not have.
+-#
+-# clang-cl rather than plain cl: the loader uses __builtin_bswap* and weak
+-# symbols that MSVC does not provide (see docs/BUILDING.md).
+-name: Windows
+-
+-on:
+-  push:
+-    branches: [ master, main ]
+-  pull_request:
+-  workflow_dispatch:
+-
+-jobs:
+-  build:
+-    name: Windows x64 (${{ matrix.build_type }})
+-    runs-on: windows-latest
+-    strategy:
+-      fail-fast: false
+-      matrix:
+-        build_type: [Debug, Release]
+-
+-    steps:
+-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+-
+-      # Puts cl, the Windows SDK and the MSVC headers on PATH. clang-cl needs
+-      # the MSVC headers even though it is doing the compiling, and the
+-      # conformance suite shells out to cl to build its generated driver.
+-      - name: Set up MSVC environment
+-        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0
+-        with:
+-          arch: x64
+-
+-      - name: Install Ninja
+-        run: choco install ninja -y --no-progress
+-
+-      - name: Show toolchain
+-        run: |
+-          clang-cl --version
+-          ninja --version
+-          cmake --version
+-
+-      - name: Configure
+-        run: >
+-          cmake -S . -B build -G Ninja
+-          -DCMAKE_C_COMPILER=clang-cl
+-          -DCMAKE_CXX_COMPILER=clang-cl
+-          -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-
+-      - name: Build
+-        run: cmake --build build
+-
+-      - name: Verify the library exists
+-        shell: bash
+-        run: |
+-          ls -la build/ps3recomp_runtime.lib
+-          test -s build/ps3recomp_runtime.lib
+-
+-      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+-        with:
+-          python-version: '3.12'
+-
+-      # The same eight suites the macOS job runs. The conformance one compiles
+-      # and EXECUTES 1300+ lifted instruction cases; CI=1 makes it fail rather
+-      # than skip if no compiler is reachable, because a green tick meaning
+-      # "compiled nothing" is worse than a red one.
+-      - name: Run the lifter test suites
+-        shell: bash
+-        env:
+-          CI: "1"
+-        run: |
+-          set -e
+-          for t in tools/test_*.py; do
+-            echo "--- $t"
+-            python "$t"
+-          done
+-
+-      # runtime/ppu/ is the one part of the runtime no CMake target builds --
+-      # it needs the lifter's per-game ppu_recomp.h -- so it was only ever
+-      # compiled inside somebody's game port. Windows is where it works, so
+-      # this is a real gate here: the baseline is near zero and any new error
+-      # fails the job.
+-      - name: Check the PPU boot scaffold (ratchet)
+-        run: python tools/check_ppu_scaffold.py
+-
+-      # RSX texture layout -- format class, row sizes, Morton addressing. Pure
+-      # Linux and macOS have run these since they were written; Windows never
+-      # did. That gap let a broken xswd case sit red on both POSIX runners
+-      # while Windows reported green, which is exactly the wrong way round for
+-      # the platform most contributors build on.
+-      # ps3_env_once with plain MSVC (cl) as well as clang-cl: the helper must
+-      # cache on the compiler the Windows CRT's environment lock matters for.
+-      - name: Run the ps3_env_once test (cl and clang-cl)
+-        run: |
+-          cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl.exe tests/test_env_once.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_env_once_cl.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          cl /nologo /W3 /WX /TP /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_cl_cpp.exe tests/test_env_once.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_env_once_cl_cpp.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          clang-cl /nologo /W3 /WX /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_env_once_clang.exe tests/test_env_once.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_env_once_clang.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      - name: Run self-contained SPU helper tests
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I runtime/spu /Fe:test_spu_helpers.exe runtime/spu/tests/test_spu_helpers.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_spu_helpers.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # libnet over host sockets (PS3_NET_ONLINE), end to end on loopback: every
+-      # handler is called through the NID it registered under.
+-      - name: Run the sys_net loopback test
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_sys_net.exe libs/network/tests/test_sys_net.c ws2_32.lib
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_sys_net.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # Matching2 over psnr without a server: response relocation, attribute
+-      # packing, and the room structs a title reads.
+-      - name: Run the Matching2 test
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_matching2.exe libs/network/tests/test_np_matching2.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_np_matching2.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # sceNpSignaling for Matching2 room members: context ids from 1,
+-      # ActivateConnection, the events a title's handlers get, the peer address.
+-      - name: Run the sceNpSignaling room connection test
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_signaling_rooms.exe libs/network/tests/test_np_signaling_rooms.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_np_signaling_rooms.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # The player name: --username, PS3_NP_ONLINE_ID, the OS login online,
+-      # and PSN's online ID rules.
+-      - name: Run the player-name test
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_identity.exe libs/network/tests/test_np_identity.c ws2_32.lib
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_np_identity.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # NAT traversal: probing psnr from the P2P socket, dropping psnr's
+-      # packets before the title sees them, punching toward peers.
+-      - name: Run the NAT traversal test
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_np_nat.exe libs/network/tests/test_np_nat.c ws2_32.lib
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_np_nat.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # cellSysutilAvc2: the synchronous Load is exported under the NID titles
+-      # import and its callback gets LOAD_SUCCEEDED and JOIN_SUCCEEDED.
+-      - name: Run the Avc2 Load test
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /Fe:test_avc2_load.exe libs/network/tests/test_avc2_load.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_avc2_load.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      # arithmetic with no host API in it, so it runs everywhere, and it is the
+-      # regression net for having lifted that maths out of the D3D12 uploader.
+-      # sync_stress has always been the Windows-native suite; now that its
+-      # source also builds on POSIX through the shim, this is what proves the
+-      # shared source still means the same thing here.
+-      - name: Build and run sync_stress
+-        run: |
+-          cmake -S tests/sync_stress -B build-sync-stress -G Ninja -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} -DCMAKE_C_COMPILER=clang-cl
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          cmake --build build-sync-stress
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          ctest --test-dir build-sync-stress --output-on-failure
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      - name: Run self-contained RSX tests
+-        # NOT shell: bash. Git Bash rewrites a leading-slash argument into a
+-        # Windows path, so /nologo arrived at the linker as an .obj under the
+-        # Git install directory. PowerShell leaves MSVC-style flags alone.
+-        run: |
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/video /Fe:test_texture_layout.exe libs/video/tests/test_texture_layout.c libs/video/rsx_texture_layout.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_texture_layout.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          clang-cl /nologo /W0 /D_CRT_SECURE_NO_WARNINGS /I include /I libs/video /Fe:test_rsx_primitives.exe libs/video/tests/test_rsx_primitives.c
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-          .\test_rsx_primitives.exe
+-          if ($LASTEXITCODE -ne 0) { exit 1 }
+-
+-      - name: Run condition semantics regressions
+-        run: |
+-          cmake -S tests/sync_stress -B build-sync -G Ninja -DCMAKE_C_COMPILER=clang-cl -DCMAKE_BUILD_TYPE=${{ matrix.build_type }}
+-          cmake --build build-sync --target test_cond_semantics
+-          ctest --test-dir build-sync -R "^cond_" --output-on-failure
 diff --git a/.gitignore b/.gitignore
 index 1bd8dfe5..fe14320e 100644
 --- a/.gitignore
@@ -3690,7 +5635,7 @@ index 00000000..b95def5f
 +    return 2;
 +}
 diff --git a/libs/input/cellPad.c b/libs/input/cellPad.c
-index 5f8a2fa2..6a371a09 100644
+index 5f8a2fa2..1a3eac26 100644
 --- a/libs/input/cellPad.c
 +++ b/libs/input/cellPad.c
 @@ -9,6 +9,31 @@
@@ -3922,10 +5867,14 @@ index 5f8a2fa2..6a371a09 100644
 +    if (v > 200) v = 200;
 +    return (int)v;
 +}
-+
+ 
+-/* The two host motor levels (0-65535) for a PS3 actuator request. */
+-static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
 +static int s_rumble_pct = -1;
 +static int pad_rumble_strength(void)
-+{
+ {
+-    *lo = (u16)(large * 257u);
+-    *hi = small_on ? 0xFFFFu : 0u;
 +    int s = s_rumble_pct;
 +    if (s < 0) {
 +        s = pad_rumble_strength_from(getenv("PS3_RUMBLE"), getenv("PS3_RUMBLE_STRENGTH"));
@@ -3937,15 +5886,11 @@ index 5f8a2fa2..6a371a09 100644
 +/* The in-game menu (ps3_overlay.mm): rumble strength in percent, 0 = off. */
 +int  cellPad_host_rumble_strength(void)       { return pad_rumble_strength(); }
 +void cellPad_host_set_rumble_strength(int pct) { s_rumble_pct = pct < 0 ? 0 : pct > 200 ? 200 : pct; }
- 
--/* The two host motor levels (0-65535) for a PS3 actuator request. */
--static void pad_rumble_levels(u8 small_on, u8 large, u16* lo, u16* hi)
++
 +/* The two host motor levels (0-65535) for a PS3 actuator request, at `pct`
 + * percent strength. */
 +static void pad_rumble_levels(u8 small_on, u8 large, int pct, u16* lo, u16* hi)
- {
--    *lo = (u16)(large * 257u);
--    *hi = small_on ? 0xFFFFu : 0u;
++{
 +    unsigned long l = (unsigned long)large * 257ul * (unsigned long)pct / 100ul;
 +    unsigned long h = small_on ? 65535ul * (unsigned long)pct / 100ul : 0;
 +    *lo = (u16)(l > 65535ul ? 65535ul : l);
@@ -4023,20 +5968,386 @@ index 5f8a2fa2..6a371a09 100644
  #elif PAD_BACKEND_SDL2
  /* Everywhere else the keyboard is SDL's: scancodes are physical keys, like the macOS codes above. The state is kept
   * current by whoever pumps SDL's events (the window of the RSX backend); without a video subsystem nothing is ever
-@@ -342,80 +510,1667 @@ static void pad_poll_keyboard(void)
-     hs->trigger_l2 = (u8)((btns & CELL_PAD_CTRL_L2) ? 255 : 0);
-     hs->trigger_r2 = (u8)((btns & CELL_PAD_CTRL_R2) ? 255 : 0);
- 
--    { static int said = 0;
--      if (!said && btns) { said = 1;
--          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
--          fflush(stdout); } }
-+    { static int said = 0;
-+      if (!said && btns) { said = 1;
-+          printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
-+          fflush(stdout); } }
-+}
+@@ -347,75 +515,2037 @@ static void pad_poll_keyboard(void)
+           printf("[cellPad] keyboard fallback active on port 0 (no controller)\n");
+           fflush(stdout); } }
+ }
 +#endif /* PAD_KEYBOARD_FALLBACK */
++
++#ifdef _WIN32
++/* ---------------------------------------------------------------------------
++ * Keyboard and mouse, bound by the title (cellPad_set_keyboard_mouse).
++ *
++ * Once a title passes bindings, the keyboard and mouse drive port 0 TOGETHER
++ * with whatever controller is there: buttons are combined, and each stick
++ * takes whichever source is pushed further. (Until then the fixed fallback
++ * above stands in when no controller is connected.)
++ *
++ * Every action has two bindings; a binding is a Windows virtual-key code
++ * (keys, and the mouse buttons VK_LBUTTON..VK_XBUTTON2) or
++ * CELLPAD_KBM_WHEEL_UP / _DOWN, which hold their action for a moment per
++ * notch. Keys count only while a window of this process has the focus, and a
++ * key already down when the focus arrives or a port menu closes is ignored
++ * until it is let go (the click that focuses the window, the Escape that
++ * closes the menu).
++ *
++ * The mouse turns the camera: rsx_null_backend's window, while it holds the
++ * mouse (cellPad_mouse_capture_wanted: hidden, kept in the window), passes
++ * raw movement here; it becomes the right stick in proportion to its speed,
++ * smoothed over ~25 ms so a 125 Hz mouse does not stutter, with a curve that
++ * lifts small movements over the game's own stick dead zone.
++ * -----------------------------------------------------------------------*/
++extern volatile int g_cellpad_block_guest_input;
++
++static volatile LONG s_kbm_configured = 0;
++static volatile LONG s_kbm_enabled = 0;
++static volatile LONG s_kbm_mouse_camera = 1;
++static volatile LONG s_kbm_sensitivity = 50;       /* 1-100, 50 = default speed */
++static volatile LONG s_kbm_invert_y = 0;
++static volatile LONG s_kbm_anti_deadzone = 15;     /* % of the stick a slight movement starts at */
++static SRWLOCK       s_kbm_lock = SRWLOCK_INIT;
++static u16           s_kbm_codes[CELLPAD_KBM_ACTION_COUNT][2];
++static volatile LONG s_mouse_dx = 0;
++static volatile LONG s_mouse_dy = 0;
++static volatile LONG s_wheel_up_notches = 0;
++static volatile LONG s_wheel_down_notches = 0;
++static volatile LONG s_wheel_total = 0;            /* for menus that rebind: up minus down, ever */
++static volatile LONG s_kbm_yank = 0;               /* the capture-motion action is held */
++
++void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
++                                int sensitivityPercent, int invertY, int antiDeadzonePercent)
++{
++    AcquireSRWLockExclusive(&s_kbm_lock);
++    memset(s_kbm_codes, 0, sizeof(s_kbm_codes));
++    for (int actionIndex = 0; actionIndex < actionCount && actionIndex < CELLPAD_KBM_ACTION_COUNT; actionIndex++)
++    {
++        s_kbm_codes[actionIndex][0] = codes[actionIndex][0];
++        s_kbm_codes[actionIndex][1] = codes[actionIndex][1];
++    }
++    ReleaseSRWLockExclusive(&s_kbm_lock);
++    if (sensitivityPercent < 1)
++    {
++        sensitivityPercent = 1;
++    }
++    if (sensitivityPercent > 100)
++    {
++        sensitivityPercent = 100;
++    }
++    if (antiDeadzonePercent < 0)
++    {
++        antiDeadzonePercent = 0;
++    }
++    if (antiDeadzonePercent > 60)
++    {
++        antiDeadzonePercent = 60;
++    }
++    InterlockedExchange(&s_kbm_sensitivity, sensitivityPercent);
++    InterlockedExchange(&s_kbm_invert_y, invertY ? 1 : 0);
++    InterlockedExchange(&s_kbm_anti_deadzone, antiDeadzonePercent);
++    InterlockedExchange(&s_kbm_mouse_camera, mouseCamera ? 1 : 0);
++    InterlockedExchange(&s_kbm_enabled, enabled ? 1 : 0);
++    InterlockedExchange(&s_kbm_configured, 1);
++}
++
++void cellPad_note_mouse_motion(long deltaX, long deltaY)
++{
++    InterlockedExchangeAdd(&s_mouse_dx, (LONG)deltaX);
++    InterlockedExchangeAdd(&s_mouse_dy, (LONG)deltaY);
++}
++
++void cellPad_note_mouse_wheel(int notches)
++{
++    if (notches > 0)
++    {
++        InterlockedExchangeAdd(&s_wheel_up_notches, notches);
++    }
++    else if (notches < 0)
++    {
++        InterlockedExchangeAdd(&s_wheel_down_notches, -notches);
++    }
++    InterlockedExchangeAdd(&s_wheel_total, notches);
++}
++
++long cellPad_mouse_wheel_total(void)
++{
++    return (long)InterlockedCompareExchange(&s_wheel_total, 0, 0);
++}
++
++int cellPad_mouse_capture_wanted(void)
++{
++    return s_pad_initialized && InterlockedCompareExchange(&s_kbm_configured, 0, 0) &&
++           InterlockedCompareExchange(&s_kbm_enabled, 0, 0) &&
++           InterlockedCompareExchange(&s_kbm_mouse_camera, 0, 0) && !g_cellpad_block_guest_input;
++}
++
++/* 1 while the capture-motion action is held (the sensor words then read as a
++ * full-scale yank). */
++static int pad_kbm_yank_held(void)
++{
++    return InterlockedCompareExchange(&s_kbm_yank, 0, 0) != 0;
++}
++
++/* A stick from two pairs of opposite directions: full (or half, walking).
++ * Diagonals push both axes all the way, as a real stick in the corner of its
++ * gate does (a DualShock 3 reads near 0 and 255 on both there): scaled to the
++ * circle, 0.71 on each axis, Folklore took two keys for a walk. */
++static void pad_kbm_digital_stick(int left, int right, int up, int down, float magnitude, float* outX, float* outY)
++{
++    *outX = (float)(right - left) * magnitude;
++    *outY = (float)(down - up) * magnitude;
++}
++
++static u8 pad_kbm_to_u8(float value)
++{
++    if (value > 1.0f)
++    {
++        value = 1.0f;
++    }
++    if (value < -1.0f)
++    {
++        value = -1.0f;
++    }
++    const int result = 128 + (int)lrintf(value * 127.0f);
++    return (u8)(result < 0 ? 0 : (result > 255 ? 255 : result));
++}
++
++/* Put a keyboard/mouse stick into a host stick unless the host is pushed
++ * further. */
++static void pad_kbm_merge_stick(float stickX, float stickY, u8* hostX, u8* hostY)
++{
++    if (stickX == 0.0f && stickY == 0.0f)
++    {
++        return;
++    }
++    const float hostDeltaX = ((float)*hostX - 128.0f) / 127.0f;
++    const float hostDeltaY = ((float)*hostY - 128.0f) / 127.0f;
++    if (hostDeltaX * hostDeltaX + hostDeltaY * hostDeltaY > stickX * stickX + stickY * stickY)
++    {
++        return;
++    }
++    *hostX = pad_kbm_to_u8(stickX);
++    *hostY = pad_kbm_to_u8(stickY);
++}
++
++static void pad_poll_keyboard_mouse(void)
++{
++    static int disabledByEnvironment = -1;
++    if (disabledByEnvironment < 0)
++    {
++        disabledByEnvironment = getenv("PAD_NO_KEYBOARD") ? 1 : 0;
++    }
++    /* Raw movement is taken every poll, so none piles up while it is not
++     * used. */
++    const LONG mouseDeltaX = InterlockedExchange(&s_mouse_dx, 0);
++    const LONG mouseDeltaY = InterlockedExchange(&s_mouse_dy, 0);
++    const LONG wheelUp = InterlockedExchange(&s_wheel_up_notches, 0);
++    const LONG wheelDown = InterlockedExchange(&s_wheel_down_notches, 0);
++    static unsigned long long wheelUpUntil = 0;
++    static unsigned long long wheelDownUntil = 0;
++    static int focusedBefore = 0;
++    static int blockedBefore = 0;
++    static unsigned char ignoredUntilReleased[256];
++    static double mouseRateX = 0.0;
++    static double mouseRateY = 0.0;
++    static unsigned long long mouseLastMs = 0;
++
++    const int focused = pad_host_window_focused();
++    const int blocked = g_cellpad_block_guest_input != 0;
++    const int enabled = !disabledByEnvironment && InterlockedCompareExchange(&s_kbm_enabled, 0, 0);
++    if (enabled)
++    {
++        s_host_state[0].connected = 1;     /* a pad is there even while the window is in the background */
++    }
++    if (!enabled || !focused || blocked)
++    {
++        InterlockedExchange(&s_kbm_yank, 0);
++        mouseRateX = 0.0;
++        mouseRateY = 0.0;
++        focusedBefore = focused;
++        blockedBefore = blocked;
++        return;
++    }
++    const unsigned long long nowMs = GetTickCount64();
++    if (wheelUp > 0)
++    {
++        wheelUpUntil = nowMs + 90ull;
++    }
++    if (wheelDown > 0)
++    {
++        wheelDownUntil = nowMs + 90ull;
++    }
++    /* Keys held as the focus arrives or a menu closes do not count until let
++     * go. */
++    if (!focusedBefore || blockedBefore)
++    {
++        for (int code = 1; code < 256; code++)
++        {
++            ignoredUntilReleased[code] = (GetAsyncKeyState(code) & 0x8000) ? 1 : 0;
++        }
++    }
++    focusedBefore = focused;
++    blockedBefore = blocked;
++
++    u16 codes[CELLPAD_KBM_ACTION_COUNT][2];
++    AcquireSRWLockShared(&s_kbm_lock);
++    memcpy(codes, s_kbm_codes, sizeof(codes));
++    ReleaseSRWLockShared(&s_kbm_lock);
++
++    int held[CELLPAD_KBM_ACTION_COUNT];
++    for (int actionIndex = 0; actionIndex < CELLPAD_KBM_ACTION_COUNT; actionIndex++)
++    {
++        held[actionIndex] = 0;
++        for (int slot = 0; slot < 2; slot++)
++        {
++            const u16 code = codes[actionIndex][slot];
++            if (code == 0)
++            {
++                continue;
++            }
++            if (code == CELLPAD_KBM_WHEEL_UP)
++            {
++                held[actionIndex] |= nowMs < wheelUpUntil;
++            }
++            else if (code == CELLPAD_KBM_WHEEL_DOWN)
++            {
++                held[actionIndex] |= nowMs < wheelDownUntil;
++            }
++            else if (code < 256)
++            {
++                const int down = (GetAsyncKeyState(code) & 0x8000) != 0;
++                if (!down)
++                {
++                    ignoredUntilReleased[code] = 0;
++                }
++                held[actionIndex] |= down && !ignoredUntilReleased[code];
++            }
++        }
++    }
++
++    static const u16 buttonOfAction[CELLPAD_KBM_ACTION_COUNT] = {
++        0, 0, 0, 0,                         /* move */
++        0, 0, 0, 0,                         /* camera */
++        CELL_PAD_CTRL_UP, CELL_PAD_CTRL_DOWN, CELL_PAD_CTRL_LEFT, CELL_PAD_CTRL_RIGHT,
++        CELL_PAD_CTRL_CROSS, CELL_PAD_CTRL_CIRCLE, CELL_PAD_CTRL_SQUARE, CELL_PAD_CTRL_TRIANGLE,
++        CELL_PAD_CTRL_L1, CELL_PAD_CTRL_R1, CELL_PAD_CTRL_L2, CELL_PAD_CTRL_R2,
++        CELL_PAD_CTRL_L3, CELL_PAD_CTRL_R3, CELL_PAD_CTRL_START, CELL_PAD_CTRL_SELECT,
++        0,                                  /* walk */
++        0,                                  /* capture motion */
++    };
++    u16 buttons = 0;
++    for (int actionIndex = 0; actionIndex < CELLPAD_KBM_ACTION_COUNT; actionIndex++)
++    {
++        if (held[actionIndex])
++        {
++            buttons |= buttonOfAction[actionIndex];
++        }
++    }
++    InterlockedExchange(&s_kbm_yank, held[CELLPAD_KBM_CAPTURE_MOTION] ? 1 : 0);
++
++    PadHostState* hostState = &s_host_state[0];
++    hostState->connected = 1;
++    hostState->buttons |= buttons;
++    /* Keys are digital: a pressed one reads full pressure. */
++    const struct
++    {
++        u16 button;
++        u8* pressure;
++    } pressures[] = {
++        {CELL_PAD_CTRL_UP, &hostState->press_up},         {CELL_PAD_CTRL_DOWN, &hostState->press_down},
++        {CELL_PAD_CTRL_LEFT, &hostState->press_left},     {CELL_PAD_CTRL_RIGHT, &hostState->press_right},
++        {CELL_PAD_CTRL_CROSS, &hostState->press_cross},   {CELL_PAD_CTRL_CIRCLE, &hostState->press_circle},
++        {CELL_PAD_CTRL_SQUARE, &hostState->press_square}, {CELL_PAD_CTRL_TRIANGLE, &hostState->press_triangle},
++        {CELL_PAD_CTRL_L1, &hostState->press_l1},         {CELL_PAD_CTRL_R1, &hostState->press_r1},
++        {CELL_PAD_CTRL_L2, &hostState->trigger_l2},       {CELL_PAD_CTRL_R2, &hostState->trigger_r2},
++    };
++    for (unsigned pressureIndex = 0; pressureIndex < sizeof(pressures) / sizeof(pressures[0]); pressureIndex++)
++    {
++        if (buttons & pressures[pressureIndex].button)
++        {
++            *pressures[pressureIndex].pressure = 255;
++        }
++    }
++
++    const float moveMagnitude = held[CELLPAD_KBM_WALK] ? 0.5f : 1.0f;
++    float stickX = 0.0f;
++    float stickY = 0.0f;
++    pad_kbm_digital_stick(held[CELLPAD_KBM_MOVE_LEFT], held[CELLPAD_KBM_MOVE_RIGHT], held[CELLPAD_KBM_MOVE_UP],
++                          held[CELLPAD_KBM_MOVE_DOWN], moveMagnitude, &stickX, &stickY);
++    pad_kbm_merge_stick(stickX, stickY, &hostState->analog_lx, &hostState->analog_ly);
++
++    /* The camera: keys, or the mouse's speed. */
++    pad_kbm_digital_stick(held[CELLPAD_KBM_CAMERA_LEFT], held[CELLPAD_KBM_CAMERA_RIGHT], held[CELLPAD_KBM_CAMERA_UP],
++                          held[CELLPAD_KBM_CAMERA_DOWN], 1.0f, &stickX, &stickY);
++    if (stickX == 0.0f && stickY == 0.0f && InterlockedCompareExchange(&s_kbm_mouse_camera, 0, 0))
++    {
++        double seconds = mouseLastMs ? (double)(nowMs - mouseLastMs) / 1000.0 : 0.004;
++        if (seconds < 0.001)
++        {
++            seconds = 0.001;
++        }
++        if (seconds > 0.1)
++        {
++            seconds = 0.1;
++        }
++        mouseLastMs = nowMs;
++        /* Counts per second, smoothed: steady movement of d counts every dt
++         * settles at d / dt. */
++        const double settle = 1.0 - exp(-seconds / 0.025);
++        mouseRateX += ((double)mouseDeltaX / seconds - mouseRateX) * settle;
++        mouseRateY += ((double)mouseDeltaY / seconds - mouseRateY) * settle;
++        /* Sensitivity 50: 1500 counts a second (a brisk flick of an 800 dpi
++         * mouse) turns the camera at full speed; every 20 points doubles or
++         * halves that. */
++        const double sensitivity = pow(2.0, ((double)InterlockedCompareExchange(&s_kbm_sensitivity, 0, 0) - 50.0) / 20.0);
++        double rateX = mouseRateX * sensitivity / 1500.0;
++        double rateY = mouseRateY * sensitivity / 1500.0;
++        if (InterlockedCompareExchange(&s_kbm_invert_y, 0, 0))
++        {
++            rateY = -rateY;
++        }
++        const double magnitude = sqrt(rateX * rateX + rateY * rateY);
++        if (magnitude > 0.004)
++        {
++            const double antiDeadzone = (double)InterlockedCompareExchange(&s_kbm_anti_deadzone, 0, 0) / 100.0;
++            const double clamped = magnitude > 1.0 ? 1.0 : magnitude;
++            const double shaped = antiDeadzone + (1.0 - antiDeadzone) * pow(clamped, 0.75);
++            stickX = (float)(rateX / magnitude * shaped);
++            stickY = (float)(rateY / magnitude * shaped);
++        }
++    }
++    else
++    {
++        mouseRateX = 0.0;
++        mouseRateY = 0.0;
++        mouseLastMs = nowMs;
++    }
++    pad_kbm_merge_stick(stickX, stickY, &hostState->analog_rx, &hostState->analog_ry);
++}
++#else
++void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
++                                int sensitivityPercent, int invertY, int antiDeadzonePercent)
++{
++    (void)enabled; (void)codes; (void)actionCount; (void)mouseCamera;
++    (void)sensitivityPercent; (void)invertY; (void)antiDeadzonePercent;
++}
++void cellPad_note_mouse_motion(long deltaX, long deltaY)
++{
++    (void)deltaX;
++    (void)deltaY;
++}
++void cellPad_note_mouse_wheel(int notches)
++{
++    (void)notches;
++}
++long cellPad_mouse_wheel_total(void)
++{
++    return 0;
++}
++int cellPad_mouse_capture_wanted(void)
++{
++    return 0;
++}
++#endif
 +
 +/* ---------------------------------------------------------------------------
 + * XInput backend
@@ -5513,7 +7824,7 @@ index 5f8a2fa2..6a371a09 100644
 +        return;
 +    }
 +    s_hidpad_thread = CreateThread(NULL, 0, pad_hidpad_thread, NULL, 0, NULL);
- }
++}
  
 -/* ---------------------------------------------------------------------------
 - * XInput backend
@@ -5751,7 +8062,7 @@ index 5f8a2fa2..6a371a09 100644
  
  static void pad_poll_xinput(void)
  {
-@@ -466,10 +2221,10 @@ static void pad_poll_xinput(void)
+@@ -466,10 +2596,10 @@ static void pad_poll_xinput(void)
           * 128 (256 - x), NOT 255 - x: the latter turns a centered stick into 127,
           * whose bits (0x7F) alias SELECT+START and can make the guest self-exit.
           * (via sagemono, PR #42) */
@@ -5766,7 +8077,7 @@ index 5f8a2fa2..6a371a09 100644
  
          /* Triggers */
          s_host_state[i].trigger_l2 = gp->bLeftTrigger;
-@@ -491,8 +2246,12 @@ static void pad_poll_xinput(void)
+@@ -491,8 +2621,12 @@ static void pad_poll_xinput(void)
  
  static void pad_init_backend(void)
  {
@@ -5780,7 +8091,7 @@ index 5f8a2fa2..6a371a09 100644
  }
  
  static void pad_shutdown_backend(void)
-@@ -502,6 +2261,68 @@ static void pad_shutdown_backend(void)
+@@ -502,6 +2636,68 @@ static void pad_shutdown_backend(void)
  
  #endif /* PAD_BACKEND_XINPUT */
  
@@ -5849,7 +8160,7 @@ index 5f8a2fa2..6a371a09 100644
  /* ---------------------------------------------------------------------------
   * SDL2 backend
   * -----------------------------------------------------------------------*/
-@@ -526,12 +2347,34 @@ static u8 pad_sdl_trigger_to_u8(int raw)
+@@ -526,12 +2722,34 @@ static u8 pad_sdl_trigger_to_u8(int raw)
      return (u8)val;
  }
  
@@ -5885,7 +8196,7 @@ index 5f8a2fa2..6a371a09 100644
      const int on = r->lo || r->hi;
      SDL_GameControllerRumble(gc, r->lo, r->hi, on ? PAD_RUMBLE_HOLD_MS : 0);
      r->sent_ms = on ? pad_now_ms() : 0;
-@@ -645,9 +2488,15 @@ static void pad_sdl_hotplug(int force)
+@@ -645,9 +2863,15 @@ static void pad_sdl_hotplug(int force)
  
  static void pad_poll_sdl2(void)
  {
@@ -5901,7 +8212,7 @@ index 5f8a2fa2..6a371a09 100644
      for (int i = 0; i < PAD_MAX_HOST_PORTS; i++) {
          SDL_GameController* gc = s_sdl_controllers[i];
          if (!gc) {
-@@ -658,43 +2507,60 @@ static void pad_poll_sdl2(void)
+@@ -658,43 +2882,60 @@ static void pad_poll_sdl2(void)
  
          s_host_state[i].connected = 1;
  
@@ -5991,7 +8302,7 @@ index 5f8a2fa2..6a371a09 100644
  
          /* Pressure: SDL has digital buttons, so 0 or 255 */
          s_host_state[i].press_up       = (btns & CELL_PAD_CTRL_UP)       ? 255 : 0;
-@@ -708,10 +2574,12 @@ static void pad_poll_sdl2(void)
+@@ -708,10 +2949,12 @@ static void pad_poll_sdl2(void)
          s_host_state[i].press_l1       = (btns & CELL_PAD_CTRL_L1)       ? 255 : 0;
          s_host_state[i].press_r1       = (btns & CELL_PAD_CTRL_R1)       ? 255 : 0;
      }
@@ -6004,7 +8315,7 @@ index 5f8a2fa2..6a371a09 100644
      if (!s_sdl_inited) {
          if (SDL_WasInit(SDL_INIT_GAMECONTROLLER) == 0) {
              /* The game is not always the focused app: on macOS its window
-@@ -726,6 +2594,17 @@ static void pad_init_backend(void)
+@@ -726,6 +2969,17 @@ static void pad_init_backend(void)
               * cared. SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS=0 in the
               * environment still wins over this. */
              SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
@@ -6022,7 +8333,7 @@ index 5f8a2fa2..6a371a09 100644
              SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER);
          }
          s_sdl_inited = 1;
-@@ -733,6 +2612,11 @@ static void pad_init_backend(void)
+@@ -733,6 +2987,11 @@ static void pad_init_backend(void)
      memset(s_sdl_controllers, 0, sizeof(s_sdl_controllers));
      for (int p = 0; p < PAD_MAX_HOST_PORTS; p++) s_sdl_ids[p] = -1;
  
@@ -6034,7 +8345,7 @@ index 5f8a2fa2..6a371a09 100644
      /* Open any controllers already connected */
      pad_sdl_hotplug(1);
  }
-@@ -776,6 +2660,384 @@ static unsigned long long pad_now_ms(void)
+@@ -776,6 +3035,384 @@ static unsigned long long pad_now_ms(void)
  #endif
  }
  
@@ -6419,7 +8730,7 @@ index 5f8a2fa2..6a371a09 100644
  static void pad_poll_backend(void)
  {
      static unsigned long long s_last_ms = 0;
-@@ -790,10 +3052,33 @@ static void pad_poll_backend(void)
+@@ -790,10 +3427,51 @@ static void pad_poll_backend(void)
  
  #if PAD_BACKEND_XINPUT
      pad_poll_xinput();
@@ -6427,8 +8738,27 @@ index 5f8a2fa2..6a371a09 100644
  #elif PAD_BACKEND_SDL2
      pad_poll_sdl2();
  #endif
+-    if (!s_host_state[0].connected) pad_poll_keyboard();
 +#ifdef _WIN32
-     if (!s_host_state[0].connected) pad_poll_keyboard();
++    if (InterlockedCompareExchange(&s_kbm_configured, 0, 0))
++    {
++        /* Bound keyboard and mouse, together with any controller. Port 0 is
++         * cleared first when no controller wrote it this time, so nothing
++         * from an earlier poll stays held. */
++        if (!s_host_state[0].connected)
++        {
++            memset(&s_host_state[0], 0, sizeof(s_host_state[0]));
++            s_host_state[0].analog_lx = 128;
++            s_host_state[0].analog_ly = 128;
++            s_host_state[0].analog_rx = 128;
++            s_host_state[0].analog_ry = 128;
++        }
++        pad_poll_keyboard_mouse();
++    }
++    else if (!s_host_state[0].connected)
++    {
++        pad_poll_keyboard();
++    }
 +    pad_overlay_gate();
 +#else
 +    pad_overlay_gate();   /* the controllers alone: before the keys join in */
@@ -6453,7 +8783,7 @@ index 5f8a2fa2..6a371a09 100644
      pad_track_assign();
      pad_unlock();
  }
-@@ -816,6 +3101,7 @@ s32 cellPadInit(u32 max_connect)
+@@ -816,6 +3494,7 @@ s32 cellPadInit(u32 max_connect)
      if (max_connect == 0 || max_connect > 127)
          return CELL_PAD_ERROR_INVALID_PARAMETER;
  
@@ -6461,7 +8791,7 @@ index 5f8a2fa2..6a371a09 100644
      s_pad_initialized = 1;
      s_max_connect = max_connect > CELL_PAD_MAX_PORT_NUM ? CELL_PAD_MAX_PORT_NUM : max_connect;
      memset(s_port_setting, 0, sizeof(s_port_setting));
-@@ -1048,6 +3334,7 @@ skip_inject: ;
+@@ -1048,6 +3727,7 @@ skip_inject: ;
       *   echo 0x0040 4 > pad.txt  # DOWN for 4 reports (menus auto-repeat a
       *                            # long hold; the default is 40)
       */
@@ -6469,7 +8799,7 @@ index 5f8a2fa2..6a371a09 100644
      { static int s_pf = -1; static char pf_path[512];
        static unsigned held_mask = 0; static int held_n = 0;
        if (s_pf < 0) { const char* e = getenv("PAD_FILE");
-@@ -1059,11 +3346,25 @@ skip_inject: ;
+@@ -1059,11 +3739,25 @@ skip_inject: ;
                if (f) {
                    char buf[64]; buf[0] = 0;
                    if (fgets(buf, sizeof buf, f)) {
@@ -6500,7 +8830,7 @@ index 5f8a2fa2..6a371a09 100644
                    }
                    fclose(f);
                    if (held_n > 0) { FILE* w = fopen(pf_path, "wb"); if (w) fclose(w); }
-@@ -1096,6 +3397,12 @@ skip_inject: ;
+@@ -1096,6 +3790,12 @@ skip_inject: ;
        if (s_st && pad_clock(s_t0) >= s_from && pad_clock(s_t0) < s_until) { hs->analog_lx = s_v[0]; hs->analog_ly = s_v[1];
                    hs->analog_rx = s_v[2]; hs->analog_ry = s_v[3];
                    hs->connected = 1; }
@@ -6513,7 +8843,7 @@ index 5f8a2fa2..6a371a09 100644
        /* PAD_SWEEP=<seconds per step>: walk the sticks through a fixed set of
         * deflections instead of holding one. Guessing a single stick position and
         * re-running costs ~5 minutes a try; a sweep answers "can input move the
-@@ -1168,10 +3475,34 @@ skip_inject: ;
+@@ -1168,10 +3868,39 @@ skip_inject: ;
      /* Sensor data (only meaningful if SENSOR_ON) */
      if (setting & CELL_PAD_SETTING_SENSOR_ON) {
          /* Default sensor values: accelerometer at rest (512 = 1g center) */
@@ -6529,6 +8859,11 @@ index 5f8a2fa2..6a371a09 100644
 +        if (g_cellpad_block_guest_input)
 +        {
 +            /* menu open: at rest */
++        }
++        else if (port_no == 0 && pad_kbm_yank_held())
++        {
++            /* The keyboard/mouse capture-motion action: a full-scale yank. */
++            sensorWords[0] = sensorWords[1] = sensorWords[2] = sensorWords[3] = 0;
 +        }
 +        else if (motionMode == 2 || (motionMode == 0 && !haveMotion))
 +        {
@@ -6552,7 +8887,7 @@ index 5f8a2fa2..6a371a09 100644
      }
      }  /* end connected block */
  
-@@ -1203,6 +3534,21 @@ emit:
+@@ -1203,6 +3932,21 @@ emit:
       * PAD_ALWAYS_CHANGE=1 restores the old always-a-packet behaviour. */
      {
          unsigned int ea = (unsigned int)(uintptr_t)data_guest;
@@ -6574,7 +8909,7 @@ index 5f8a2fa2..6a371a09 100644
          vm_write32((unsigned long long)ea + 0, (unsigned int)data->len);   /* len (s32) */
          for (int _i = 0; _i < CELL_PAD_MAX_CODES; _i++)                    /* button[] u16 */
              vm_write16((unsigned long long)ea + 4 + (unsigned int)_i * 2, data->button[_i]);
-@@ -1418,7 +3764,11 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
+@@ -1418,7 +4162,11 @@ s32 cellPadSetPressMode(u32 port_no, u32 mode)
   * sensors" from a pad whose capability word says otherwise -- and Set never
   * turned the sensor block of CellPadData on. With SENSOR_ON the packet grows to
   * CELL_PAD_LEN_CHANGE_SENSOR_ON and carries the at-rest readings (see
@@ -6587,7 +8922,7 @@ index 5f8a2fa2..6a371a09 100644
  s32 cellPadInfoSensorMode(u32 port_no)
  {
      if (!s_pad_initialized)
-@@ -1453,7 +3803,7 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
+@@ -1453,7 +4201,7 @@ s32 cellPadGetCapabilityInfo(u32 port_no, CellPadCapabilityInfo* info)
          return CELL_PAD_ERROR_INVALID_PARAMETER;
  
      u32 info_ea = (u32)(uintptr_t)info;
@@ -6596,7 +8931,7 @@ index 5f8a2fa2..6a371a09 100644
          vm_write32(info_ea + i * 4, 0);
  
      /* Report standard DualShock 3 capabilities */
-@@ -1476,17 +3826,45 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
+@@ -1476,17 +4224,45 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
  
      param = GUEST_PTR(param, CellPadActParam*);
  
@@ -6647,7 +8982,7 @@ index 5f8a2fa2..6a371a09 100644
      if (s_host_state[port_no].connected) {
          XINPUT_VIBRATION vib;
          vib.wLeftMotorSpeed  = (WORD)lo;
-@@ -1496,11 +3874,15 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
+@@ -1496,11 +4272,15 @@ s32 cellPadSetActDirect(u32 port_no, CellPadActParam* param)
  #endif
  
  #if PAD_BACKEND_SDL2
@@ -6668,7 +9003,7 @@ index 5f8a2fa2..6a371a09 100644
  }
  
 diff --git a/libs/input/cellPad.h b/libs/input/cellPad.h
-index b35fcb6d..97fb314e 100644
+index b35fcb6d..6474bffd 100644
 --- a/libs/input/cellPad.h
 +++ b/libs/input/cellPad.h
 @@ -156,9 +156,15 @@ typedef struct CellPadPeriphInfo {
@@ -6689,7 +9024,7 @@ index b35fcb6d..97fb314e 100644
  } CellPadCapabilityInfo;
  
  /* Actuator (vibration) parameter */
-@@ -201,6 +207,19 @@ s32 cellPadClearBuf(u32 port_no);
+@@ -201,6 +207,52 @@ s32 cellPadClearBuf(u32 port_no);
  
  /* Internal: call once per frame to update pad state from host input */
  void cellPad_poll(void);
@@ -6703,6 +9038,39 @@ index b35fcb6d..97fb314e 100644
 +/* Bit 0: a controller holds Cross / A; bit 1: Circle / B (SDL backend; 0 elsewhere). */
 +int cellPad_host_confirm_buttons(void);
 +int cellPad_set_motion_mode(int mode);
++
++/* Keyboard and mouse as port 0, together with any controller (cellPad.c).
++ * codes[action][0..1]: Windows virtual-key codes (keys and mouse buttons),
++ * CELLPAD_KBM_WHEEL_UP / _DOWN, or 0 for none, in the order below. The mouse
++ * turns the right stick when mouseCamera is set; sensitivity 1-100 (50 =
++ * 1500 counts a second for full speed, every 20 doubling it); the
++ * anti-deadzone (0-60 %) is where a slight movement starts on the stick. The
++ * fixed keyboard fallback for a machine without a controller stands until
++ * this is first called. */
++enum
++{
++    CELLPAD_KBM_MOVE_UP, CELLPAD_KBM_MOVE_DOWN, CELLPAD_KBM_MOVE_LEFT, CELLPAD_KBM_MOVE_RIGHT,
++    CELLPAD_KBM_CAMERA_UP, CELLPAD_KBM_CAMERA_DOWN, CELLPAD_KBM_CAMERA_LEFT, CELLPAD_KBM_CAMERA_RIGHT,
++    CELLPAD_KBM_DPAD_UP, CELLPAD_KBM_DPAD_DOWN, CELLPAD_KBM_DPAD_LEFT, CELLPAD_KBM_DPAD_RIGHT,
++    CELLPAD_KBM_CROSS, CELLPAD_KBM_CIRCLE, CELLPAD_KBM_SQUARE, CELLPAD_KBM_TRIANGLE,
++    CELLPAD_KBM_L1, CELLPAD_KBM_R1, CELLPAD_KBM_L2, CELLPAD_KBM_R2,
++    CELLPAD_KBM_L3, CELLPAD_KBM_R3, CELLPAD_KBM_START, CELLPAD_KBM_SELECT,
++    CELLPAD_KBM_WALK,             /* held: the movement keys push the stick half way */
++    CELLPAD_KBM_CAPTURE_MOTION,   /* held: the motion sensors read a full-scale yank */
++    CELLPAD_KBM_ACTION_COUNT
++};
++#define CELLPAD_KBM_WHEEL_UP   0x101
++#define CELLPAD_KBM_WHEEL_DOWN 0x102
++void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
++                                int sensitivityPercent, int invertY, int antiDeadzonePercent);
++/* From the game window: raw mouse movement while it holds the mouse, and
++ * wheel notches (up positive). */
++void cellPad_note_mouse_motion(long deltaX, long deltaY);
++void cellPad_note_mouse_wheel(int notches);
++/* Wheel notches ever, up minus down, for a menu that rebinds. */
++long cellPad_mouse_wheel_total(void);
++/* 1 when the game window should hold the mouse (hidden, kept inside). */
++int cellPad_mouse_capture_wanted(void);
 +int cellPad_motion_live(void);
 +/* Stop any rumble the guest left running (the process is ending). */
 +void cellPad_stop_rumble(void);
@@ -17514,7 +19882,7 @@ index de063626..3b62c955 100644
  
  /* Messages. Both ends are built from this header, so the layouts agree. */
 diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
-index be125294..1702383d 100644
+index be125294..2b28cec1 100644
 --- a/libs/video/rsx_live_draw.c
 +++ b/libs/video/rsx_live_draw.c
 @@ -22,7 +22,7 @@
@@ -19515,7 +21883,7 @@ index be125294..1702383d 100644
  static ID3D12Resource* decode_guest_texture(const rsx_dsp_texture* t, u32 remap)
  {
      const u32 base_fmt = t->format & TEX_FMT_BASE_MASK & ~(u32)TEX_FMT_UNNORM;
-@@ -2405,5672 +3719,11469 @@ static ID3D12Resource* decode_guest_texture_profiled(
+@@ -2405,5672 +3719,11518 @@ static ID3D12Resource* decode_guest_texture_profiled(
      return result;
  }
  
@@ -28116,6 +30484,36 @@ index be125294..1702383d 100644
 +
 +static void ld_hdr_scene_snapshot(u32 target);
 +
++/* Whether the draw's first texture unit samples a widened surface (an
++ * ultrawide canvas: the scene, an offscreen picture the Hor+ camera drew).
++ * Only unit 0: units the shader does not use keep their last binding, and
++ * the boss capture bar's flash (capture-20261108-140721, draw 246) has the
++ * 2560x720 depth canvas left on unit 3 under its own 128x128 texture. */
++static int ld_hud_samples_widened_surface(const surface_t* surface)
++{
++    const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
++    if (!(surface->scale_x > verticalScale * 1.01f))
++    {
++        return 0;
++    }
++    rsx_dsp_texture texture;
++    rsx_dsp_get_texture(&g.rsx, 0, &texture);
++    if (!texture.enabled)
++    {
++        return 0;
++    }
++    for (u32 index = 0; index < g.n_surfaces; index++)
++    {
++        const surface_t* sampled = &g.surfaces[index];
++        if (sampled->tex && sampled->location == texture.location && sampled->offset == texture.offset)
++        {
++            const float sampledVertical = (float)(sampled->scale ? sampled->scale : 1u);
++            return sampled->scale_x > sampledVertical * 1.01f;
++        }
++    }
++    return 0;
++}
++
 +/* Decides where a 2D overlay draw goes (ld_hud_draw_place). With HDR output
 + * on it also runs when nothing is moved (16:9, or the stretched layout), to
 + * find the first overlay draw of the frame: the HDR pass leaves what the
@@ -28279,6 +30677,25 @@ index be125294..1702383d 100644
 +        {
 +            highestY = screenY;
 +        }
++    }
++    /* A full-screen pass that samples a widened surface copies a picture
++     * the widened (Hor+) camera already drew at the screen's proportions:
++     * it stays stretched, whatever its scissor. The comic-book story pages
++     * (capture-20261112-203512, draws 421/451/475/501) render each panel
++     * into a 2560x720 canvas through the Hor+ camera, then copy it onto the
++     * screen with a full-screen quad scissored to the panel; cut to that
++     * scissor it looked like a box in the middle of the screen and was
++     * placed as one -- the panel came out at 16:9 / target aspect of its
++     * width (three quarters at 21:9), squeezed towards the centre. */
++    if (!(highestX - lowestX < 1.9f) && ld_hud_samples_widened_surface(surface))
++    {
++        if (!useRows)
++        {
++            ld_hud_note("stretched: full-screen copy of a widened picture", vertexCount,
++                        (lowestX + 1.0f) * 0.5f, (highestX + 1.0f) * 0.5f, (1.0f - highestY) * 0.5f,
++                        (1.0f - lowestY) * 0.5f, firstW);
++        }
++        return 0;
 +    }
 +    /* What shows of a draw is what its scissor lets through. The boss
 +     * capture bar's flash (capture-20261108-140721, draw 246) is an effect
@@ -36165,7 +38582,7 @@ index be125294..1702383d 100644
  static int make_root_signature(void)
  {
      D3D12_DESCRIPTOR_RANGE xrange = {0};
-@@ -8235,6 +15346,52 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8235,6 +15395,52 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      }
  #endif
      g.width = width; g.height = height;
@@ -36218,7 +38635,7 @@ index be125294..1702383d 100644
      g.guest_ptr = guest_fn; g.guest_user = guest_user;
      {
          const char* requested = getenv("RSX_FP_CONSTANT_MODE");
-@@ -8357,8 +15514,14 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8357,8 +15563,14 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      ld_open_info_queue();
      D3D12_COMMAND_QUEUE_DESC qd = {0};
      g.dev->lpVtbl->CreateCommandQueue(g.dev, &qd, &IID_ID3D12CommandQueue, (void**)&g.queue);
@@ -36235,7 +38652,7 @@ index be125294..1702383d 100644
      g.dev->lpVtbl->CreateCommandList(g.dev, 0, D3D12_COMMAND_LIST_TYPE_DIRECT, g.alloc, NULL,
                                       &IID_ID3D12GraphicsCommandList, (void**)&g.list);
      if (g.queue) g.queue->lpVtbl->SetName(g.queue, L"rsx-live-queue");
-@@ -8369,6 +15532,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8369,6 +15581,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      /* swap chain bound to the runtime's HWND */
      DXGI_SWAP_CHAIN_DESC1 scd = {0};
      scd.Width = width; scd.Height = height; scd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -36243,7 +38660,7 @@ index be125294..1702383d 100644
      scd.SampleDesc.Count = 1; scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
      scd.BufferCount = LD_SWAP_BUFFERS; scd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
      IDXGISwapChain1* sc1 = NULL;
-@@ -8383,7 +15547,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8383,7 +15596,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      /* RTV heap: [0..1] backbuffers, [2..] surface cache */
      D3D12_DESCRIPTOR_HEAP_DESC hd = {0};
      hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
@@ -36252,7 +38669,7 @@ index be125294..1702383d 100644
      g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.rtv_heap);
      g.rtv_step = g.dev->lpVtbl->GetDescriptorHandleIncrementSize(g.dev, D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
      for (u32 i = 0; i < LD_SWAP_BUFFERS; i++) {
-@@ -8413,6 +15577,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8413,6 +15626,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
          D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.ib);
      g.ib->lpVtbl->Map(g.ib, 0, &rr, (void**)&g.ib_mapped);
  
@@ -36272,7 +38689,7 @@ index be125294..1702383d 100644
      bd.Width = CB_RING_BYTES;
      g.dev->lpVtbl->CreateCommittedResource(g.dev, &hp, D3D12_HEAP_FLAG_NONE, &bd,
          D3D12_RESOURCE_STATE_GENERIC_READ, NULL, &IID_ID3D12Resource, (void**)&g.cb);
-@@ -8429,7 +15606,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8429,7 +15655,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
  
      /* SRV heaps */
      hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV;
@@ -36281,7 +38698,7 @@ index be125294..1702383d 100644
      g.dev->lpVtbl->CreateDescriptorHeap(g.dev, &hd, &IID_ID3D12DescriptorHeap, (void**)&g.srv_cpu_heap);
      hd.NumDescriptors = SRV_RING_TABLES * SRV_TABLE_SIZE;
      hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
-@@ -8474,7 +15651,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8474,7 +15700,7 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
          D3D12_HEAP_PROPERTIES dhp = {0}; dhp.Type = D3D12_HEAP_TYPE_DEFAULT;
          D3D12_RESOURCE_DESC drd = {0};
          drd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -36290,7 +38707,7 @@ index be125294..1702383d 100644
          drd.MipLevels = 1; drd.Format = DXGI_FORMAT_D32_FLOAT_S8X24_UINT; drd.SampleDesc.Count = 1;
          drd.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
          D3D12_CLEAR_VALUE dcv = {0}; dcv.Format = drd.Format; dcv.DepthStencil.Depth = 1.0f;
-@@ -8491,6 +15668,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
+@@ -8491,6 +15717,19 @@ int rsx_live_draw_init(void* hwnd, u32 width, u32 height,
      if (make_root_signature() != 0 ||
          make_depth_snapshot_pipeline() != 0)
          return -1;
@@ -36310,7 +38727,7 @@ index be125294..1702383d 100644
  
      static const u8 white[4] = {255, 255, 255, 255};
      g.white_tex = create_texture_rgba(white, 1, 1);
-@@ -8742,6 +15932,31 @@ static u32 g_ld_last_frame_draws = 0;
+@@ -8742,6 +15981,31 @@ static u32 g_ld_last_frame_draws = 0;
   * journal-consumer limp state renders ~0 draws/frame while flips tick). */
  u32 rsx_live_draw_get_last_draws(void) { return g_ld_last_frame_draws; }
  
@@ -36342,7 +38759,7 @@ index be125294..1702383d 100644
  double rsx_live_draw_get_present_fps(void)
  {
      const u64 total = g_ld_present_total;
-@@ -8812,6 +16027,12 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+@@ -8812,6 +16076,12 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
          InterlockedExchange(&g_ld_host_waiting, 0);
          return;
      }
@@ -36355,7 +38772,7 @@ index be125294..1702383d 100644
      if (w > g.width)  w = g.width;
      if (h > g.height) h = g.height;
      const u32 pitch = (w * 4 + 255) & ~255u;          /* D3D12 copy pitch align */
-@@ -8859,16 +16080,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+@@ -8859,16 +16129,7 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
      const u32 bbi = g.swap->lpVtbl->GetCurrentBackBufferIndex(g.swap);
      ID3D12Resource* bb = g.backbuf[bbi];
  
@@ -36372,7 +38789,7 @@ index be125294..1702383d 100644
      src.pResource = composite ? g.movie_upload : g.upload;
      src.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
      src.PlacedFootprint.Offset = 0;
-@@ -8877,11 +16089,101 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
+@@ -8877,11 +16138,101 @@ void rsx_live_draw_present_rgba(const uint8_t* rgba, u32 w, u32 h)
      src.PlacedFootprint.Footprint.Height = h;
      src.PlacedFootprint.Footprint.Depth = 1;
      src.PlacedFootprint.Footprint.RowPitch = pitch;
@@ -36478,7 +38895,7 @@ index be125294..1702383d 100644
  
      ld_flush(LD_FLUSH_MOVIE_PRESENT);
      {
-@@ -8936,8 +16238,8 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
+@@ -8936,8 +16287,8 @@ static u64 ld_dump_surface_ppm(const char* path, const surface_t* surface)
  {
      ID3D12Resource* rt = surface ? surface->tex : NULL;
      if (!rt) return UINT64_MAX;
@@ -36489,7 +38906,7 @@ index be125294..1702383d 100644
      if (!width || !height) return UINT64_MAX;
      const int fp16 = surface->fmt == DXGI_FORMAT_R16G16B16A16_FLOAT;
      const u32 texel = fp16 ? 8u : 4u;
-@@ -9299,6 +16601,32 @@ void rsx_live_draw_present(u32 buffer_id)
+@@ -9299,6 +16650,32 @@ void rsx_live_draw_present(u32 buffer_id)
          return;
      }
      g_ld_last_present_target = target;
@@ -36522,7 +38939,7 @@ index be125294..1702383d 100644
      if (dump_now) {
          char path[MAX_PATH * 2];
          snprintf(path, sizeof(path), "%s\\frame_%06u.ppm", dump_dir, dump_n - 1u);
-@@ -9403,33 +16731,143 @@ void rsx_live_draw_present(u32 buffer_id)
+@@ -9403,33 +16780,143 @@ void rsx_live_draw_present(u32 buffer_id)
            last_present_target = target;
        } }
      ID3D12Resource* srcimg = presented_surface->tex;
@@ -36677,7 +39094,7 @@ index be125294..1702383d 100644
          if (SUCCEEDED(present_hr))
              ld_present_measure_record(g_ld_frames + 1u);
          else {
-@@ -9478,6 +16916,7 @@ void rsx_live_draw_present(u32 buffer_id)
+@@ -9478,6 +16965,7 @@ void rsx_live_draw_present(u32 buffer_id)
        g_ld_last_frame_draws = (u32)(g_ld_stats.packets_seen - packets_at_last_frame);
        packets_at_last_frame = g_ld_stats.packets_seen; }
      g_ld_frames++;
@@ -36685,7 +39102,7 @@ index be125294..1702383d 100644
  #if defined(YZ_PERF_PROFILE)
      ld_profile_present(g_ld_frames);
  #endif
-@@ -9834,6 +17273,174 @@ void rsx_live_draw_present(u32 buffer_id)
+@@ -9834,6 +17322,174 @@ void rsx_live_draw_present(u32 buffer_id)
                      g_ld_stats.packets_movie + g_ld_stats.packets_queue_full ? "ok" : "BAD",
                  g_ld_stats.groups_seen == ld_groups_accounted() ? "ok" : "BAD",
                  g_ld_bind_white, g_ld_bind_real, g_ld_bind_surf);
@@ -36860,7 +39277,7 @@ index be125294..1702383d 100644
      /* [fps] heartbeat: direct frame-rate logging, one line per ~5s wall.
       * Exists because pace repeatedly had to be inferred from frame-counter
       * arithmetic and log ordering, and two such inferences were wrong in one
-@@ -10159,6 +17766,128 @@ void rsx_live_draw_present(u32 buffer_id)
+@@ -10159,6 +17815,128 @@ void rsx_live_draw_present(u32 buffer_id)
            fprintf(stderr, "[fps] %.1f (frames %u..%u over %.1fs)\n",
                    (g_ld_frames - fps_f0) * 1000.0 / (double)(now - fps_t0),
                    fps_f0, g_ld_frames, (now - fps_t0) / 1000.0);
@@ -36989,7 +39406,7 @@ index be125294..1702383d 100644
            fps_t0 = now; fps_f0 = g_ld_frames;
        } }
      /* RSX_DUMP_EVERY=N: also dump every Nth frame, not just the first 8 --
-@@ -10278,9 +18007,8 @@ void rsx_live_draw_present(u32 buffer_id)
+@@ -10278,9 +18056,8 @@ void rsx_live_draw_present(u32 buffer_id)
      }
  #endif
  
@@ -37001,7 +39418,7 @@ index be125294..1702383d 100644
  #if !defined(YZ_PERF_CLEAN)
      g_ld_frame_vertex_constant_ring_recycles = 0;
  #endif
-@@ -10501,7 +18229,17 @@ void rsx_live_draw_shutdown(void)
+@@ -10501,7 +18278,17 @@ void rsx_live_draw_shutdown(void)
                  (unsigned long long)g_ld_shader_disk_writes[1],
                  (unsigned long long)g_ld_shader_disk_rejects);
      }
@@ -39627,7 +42044,7 @@ index 0ba88a8c..9396507f 100644
 +#endif
 +}
 diff --git a/libs/video/rsx_null_backend.c b/libs/video/rsx_null_backend.c
-index 32e8a959..6e8acd3d 100644
+index 32e8a959..04e4986a 100644
 --- a/libs/video/rsx_null_backend.c
 +++ b/libs/video/rsx_null_backend.c
 @@ -8,6 +8,7 @@
@@ -39638,7 +42055,7 @@ index 32e8a959..6e8acd3d 100644
  #include <string.h>
  #include "../../runtime/ps3_log.h"
  
-@@ -46,6 +47,83 @@ typedef struct {
+@@ -46,12 +47,124 @@ typedef struct {
  
  static NullBackendState s_state;
  
@@ -39722,7 +42139,48 @@ index 32e8a959..6e8acd3d 100644
  /* ---------------------------------------------------------------------------
   * Win32 window procedure
   * -----------------------------------------------------------------------*/
-@@ -64,6 +142,28 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ 
+ static int s_present_suppressed = 0;
+ 
++/* The mouse, for keyboard-and-mouse play (cellPad_set_keyboard_mouse):
++ * while cellPad wants it and this window has the focus, the cursor is
++ * hidden and kept inside the window, and raw movement (WM_INPUT) goes to
++ * cellPad as the camera. It is let go when the engine menu opens, the window
++ * loses the focus or is minimised. */
++extern int cellPad_mouse_capture_wanted(void);
++extern void cellPad_note_mouse_motion(long deltaX, long deltaY);
++extern void cellPad_note_mouse_wheel(int notches);
++static int s_mouse_held = 0;
++
++static void null_update_mouse_hold(HWND hwnd)
++{
++    const int want = hwnd && cellPad_mouse_capture_wanted() && GetForegroundWindow() == hwnd && !IsIconic(hwnd);
++    if (want)
++    {
++        RECT client;
++        GetClientRect(hwnd, &client);
++        POINT corners[2] = {{client.left, client.top}, {client.right, client.bottom}};
++        MapWindowPoints(hwnd, NULL, corners, 2);
++        RECT clip = {corners[0].x, corners[0].y, corners[1].x, corners[1].y};
++        ClipCursor(&clip);           /* again each time: the window may have moved */
++        if (!s_mouse_held)
++        {
++            s_mouse_held = 1;
++            SetCursor(NULL);
++        }
++    }
++    else if (s_mouse_held)
++    {
++        s_mouse_held = 0;
++        ClipCursor(NULL);
++        SetCursor(LoadCursor(NULL, IDC_ARROW));
++    }
++}
++
+ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+ {
+     switch (msg) {
+@@ -64,6 +177,28 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
          PostQuitMessage(0);
          return 0;
  
@@ -39751,9 +42209,39 @@ index 32e8a959..6e8acd3d 100644
      case WM_PAINT: {
          PAINTSTRUCT ps;
          HDC hdc = BeginPaint(hwnd, &ps);
-@@ -93,9 +193,20 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+@@ -92,10 +227,50 @@ static LRESULT CALLBACK null_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+         return 0;
      }
  
++    case WM_INPUT: {
++        RAWINPUT input;
++        UINT size = sizeof(input);
++        if (GetRawInputData((HRAWINPUT)lp, RID_INPUT, &input, &size, sizeof(RAWINPUTHEADER)) != (UINT)-1 &&
++            input.header.dwType == RIM_TYPEMOUSE)
++        {
++            const RAWMOUSE* mouse = &input.data.mouse;
++            if (s_mouse_held && !(mouse->usFlags & MOUSE_MOVE_ABSOLUTE) && (mouse->lLastX || mouse->lLastY))
++            {
++                cellPad_note_mouse_motion(mouse->lLastX, mouse->lLastY);
++            }
++            if (mouse->usButtonFlags & RI_MOUSE_WHEEL)
++            {
++                const int wheel = (int)(short)mouse->usButtonData;
++                const int notches = wheel / WHEEL_DELTA;
++                cellPad_note_mouse_wheel(notches != 0 ? notches : (wheel > 0 ? 1 : -1));
++            }
++        }
++        break;   /* DefWindowProc cleans up after WM_INPUT */
++    }
++
++    case WM_SETCURSOR:
++        if (s_mouse_held && LOWORD(lp) == HTCLIENT)
++        {
++            SetCursor(NULL);
++            return TRUE;
++        }
++        break;
++
      case WM_KEYDOWN:
 +        /* Escape quits only when PS3_ESCAPE_QUITS is set: games use it
 +         * themselves (Folklore's engine menu closes on it), and quitting the
@@ -39774,7 +42262,7 @@ index 32e8a959..6e8acd3d 100644
          }
          return 0;
      }
-@@ -243,6 +354,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+@@ -243,6 +418,9 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
      wc.lpfnWndProc = null_wndproc;
      wc.hInstance = GetModuleHandle(NULL);
      wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -39784,15 +42272,46 @@ index 32e8a959..6e8acd3d 100644
      wc.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
      wc.lpszClassName = "ps3recomp_null";
      RegisterClassExA(&wc);
-@@ -303,6 +417,7 @@ int rsx_null_backend_pump_messages(void)
+@@ -265,6 +443,17 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+     }
+ 
+     s_state.hdc = GetDC(s_state.hwnd);
++
++    /* Raw mouse input, for the camera in keyboard-and-mouse play. */
++    RAWINPUTDEVICE mouseDevice;
++    mouseDevice.usUsagePage = 0x01;   /* generic desktop */
++    mouseDevice.usUsage = 0x02;       /* mouse */
++    mouseDevice.dwFlags = 0;
++    mouseDevice.hwndTarget = s_state.hwnd;
++    if (!RegisterRawInputDevices(&mouseDevice, 1, sizeof(mouseDevice)))
++    {
++        printf("[RSX null] raw mouse input unavailable (%lu)\n", GetLastError());
++    }
+     s_state.last_fps_time = GetTickCount64();
+     snprintf(s_state.title, sizeof(s_state.title), "%s", title ? title : "ps3recomp");
+     s_state.title_time = s_state.last_fps_time;
+@@ -284,6 +473,11 @@ int rsx_null_backend_init(u32 width, u32 height, const char* title)
+ 
+ void rsx_null_backend_shutdown(void)
+ {
++    if (s_mouse_held)
++    {
++        s_mouse_held = 0;
++        ClipCursor(NULL);
++    }
+     if (s_state.hwnd) {
+         ReleaseDC(s_state.hwnd, s_state.hdc);
+         DestroyWindow(s_state.hwnd);
+@@ -303,6 +497,8 @@ int rsx_null_backend_pump_messages(void)
          TranslateMessage(&msg);
          DispatchMessageA(&msg);
      }
 +    null_apply_fullscreen();
++    null_update_mouse_hold(s_state.hwnd);
      /* RPCS3-style caption, once a second: guest FPS (flips), draws in the last
       * live-draw frame, window size. Here on the window's own thread, so the
       * WM_SETTEXT never blocks the renderer. */
-@@ -315,9 +430,28 @@ int rsx_null_backend_pump_messages(void)
+@@ -315,9 +511,28 @@ int rsx_null_backend_pump_messages(void)
          if (fps <= 0.0)
              fps = (s_state.frame_count - s_state.title_frames) * 1000.0 /
                    (double)(now - s_state.title_time);
@@ -39823,7 +42342,7 @@ index 32e8a959..6e8acd3d 100644
          SetWindowTextA(s_state.hwnd, tb);
          s_state.title_frames = s_state.frame_count;
          s_state.title_time = now;
-@@ -719,6 +853,9 @@ int rsx_null_backend_pump_messages(void) { return 0; }
+@@ -719,6 +934,9 @@ int rsx_null_backend_pump_messages(void) { return 0; }
  
  void rsx_null_backend_present(void) { nullsw_present(NULL, 0); }
  void* rsx_null_backend_get_hwnd(void) { return 0; }

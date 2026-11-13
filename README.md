@@ -19,7 +19,22 @@ the original motion controls. Expect rough edges.
 [`folklore/docs/STATUS.md`](folklore/docs/STATUS.md) is the full engineering
 log.
 
-### New in v0.62: smoother play and a tidier ultrawide HUD
+### New in v0.64: HDR, keyboard and mouse
+
+- **HDR output**: on a display with Windows' HDR on, the sun, skies, glowing
+  Ids and magic go brighter than white towards your display's peak, while
+  the HUD, text and menus stay at paper white. Brightness follows Windows'
+  own HDR settings by default, so the picture matches HDR off; both levels
+  can be set by hand. On the launcher's Graphics page and in the engine menu.
+- **Keyboard and mouse**: play with them, a controller, or both at once.
+  The mouse turns the camera (sensitivity, invert, and a lift past the
+  game's dead zone); two movement keys together run, as a stick does. Every
+  button, both sticks' directions, *Walk* and *Capture motion* can be
+  rebound on the launcher's new **Controls** page or in the engine menu.
+- **Ultrawide comic-book scenes**: the story pages' panels are full width
+  again (they were drawn at three quarters of their width at 21:9).
+
+### v0.62: smoother play and a tidier ultrawide HUD
 
 - **No more quarter-second freezes in fights**: a hold-up between the game
   and the renderer, every few seconds in heavy combat, is gone.
@@ -92,6 +107,9 @@ be turned back to the original.
 - **Quality of life**: skip the opening logos with Start, save backups and
   restores, no RPCS3 needed to decrypt the game, downloadable content added
   from the menu, motion controls on any controller with motion sensors.
+- **Keyboard and mouse**: play with them, a controller, or both at once;
+  the mouse turns the camera, and every button can be rebound in the
+  launcher or the engine menu.
 
 Builds can be made from the v1.00 disc or from the game's **1.10 update**
 (rumble, and the newer Folk data), and the **downloadable content** you bought
@@ -285,6 +303,8 @@ ones `run.ps1` uses).
   (.rap)...**, and any pack still missing its licence.
 - **Graphics**, **Display**, **Gameplay**: every setting of the in-game
   engine menu, including the ones that only apply when the game starts.
+- **Controls**: motion controls, keyboard and mouse, and the key bindings
+  (click one, then press the key, mouse button or wheel direction for it).
 - **Dump textures this run** (Graphics page): the next Play starts the game
   with the texture dump on, into `textures\dump` (as `run.ps1
   -DumpTextures`); not kept between runs.
@@ -351,6 +371,21 @@ saved to `folklore_settings.ini`.
   (Time, Beat, Balance, Stop & Go: the capture bar fills over a few seconds
   and the game finishes the capture as if you had). The menu shows which
   controller is connected and whether its sensors are live.
+- **Keyboard and mouse** (on by default; also the launcher's *Controls*
+  page): they drive the game together with any controller, so either or both
+  work at any time. The mouse turns the camera (*Mouse sensitivity*, *Invert
+  mouse up and down*, and *Small movement lift*, which starts slight
+  movements far enough along the stick to get past the game's own dead
+  zone); while you play the window holds the mouse, hidden, and lets it go
+  when the engine menu opens or you switch windows. Every pad button, both
+  sticks' directions, *Walk* (hold for half-speed movement) and *Capture
+  motion* (stands in for yanking the controller up) take two bindings each:
+  keys, mouse buttons or the wheel. Defaults: WASD to move, the mouse for the
+  camera, left/right mouse buttons for Square/Triangle, Space or Enter for
+  Cross, E or Backspace for Circle, Q/F for L1/R1, 1/3 for L2/R2, Escape for
+  Start, Tab or M for Select, the arrows for the d-pad, Left Ctrl to walk,
+  Wheel Up or G for the capture motion. The game still shows PS3 button
+  symbols.
 - **Opening logos**: *Play them* (as on the PS3), *Start skips them*
   (the default: press **Start**, or Enter, once the logos have been on for a
   moment, and the logo movie and the still logos after it are all skipped,

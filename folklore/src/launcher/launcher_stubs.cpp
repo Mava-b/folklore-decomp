@@ -37,6 +37,17 @@ extern "C"
     void rsx_null_backend_set_fullscreen(int fullscreen) { (void)fullscreen; }
     void cellGcm_set_flip_per_present(int enabled) { (void)enabled; }
     int cellPad_set_motion_mode(int mode) { (void)mode; return 0; }
+    void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
+                                    int sensitivityPercent, int invertY, int antiDeadzonePercent)
+    {
+        (void)enabled;
+        (void)codes;
+        (void)actionCount;
+        (void)mouseCamera;
+        (void)sensitivityPercent;
+        (void)invertY;
+        (void)antiDeadzonePercent;
+    }
     void folklore_apply_aspect(float aspect) { (void)aspect; }
 }
 

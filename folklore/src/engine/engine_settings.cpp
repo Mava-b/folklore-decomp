@@ -406,6 +406,36 @@ void engineSettingsLoad()
                                                 std::strcmp(value, "false") == 0 ||
                                                 std::strcmp(value, "auto_capture") == 0);
         }
+        else if (std::strcmp(key, "keyboard_mouse") == 0)
+        {
+            settingsInstance.keyboardMouse = parseBool(value);
+        }
+        else if (std::strcmp(key, "mouse_camera") == 0)
+        {
+            settingsInstance.mouseCamera = parseBool(value);
+        }
+        else if (std::strcmp(key, "mouse_sensitivity") == 0)
+        {
+            settingsInstance.mouseSensitivity = std::clamp(std::atoi(value), 1, 100);
+        }
+        else if (std::strcmp(key, "mouse_invert_y") == 0)
+        {
+            settingsInstance.mouseInvertY = parseBool(value);
+        }
+        else if (std::strcmp(key, "mouse_deadzone") == 0)
+        {
+            settingsInstance.mouseDeadzone = std::clamp(std::atoi(value), 0, 40);
+        }
+        else if (std::strncmp(key, "key_", 4) == 0)
+        {
+            for (int action = 0; action < kInputActionCount; action++)
+            {
+                if (std::strcmp(key + 4, engineInputAction(action).key) == 0)
+                {
+                    settingsInstance.inputBindings[action] = engineInputParseBinding(value);
+                }
+            }
+        }
         else if (std::strcmp(key, "physics_frame_step") == 0)
         {
             settingsInstance.physicsFrameStep = parseBool(value);
@@ -541,6 +571,18 @@ void engineSettingsSave()
     std::fprintf(file, "skip_logos = %s\n", logoSkipText);
     std::fprintf(file, "# on: capture Folks by moving the controller (DualShock 3/4, DualSense, Switch Pro); off: captures complete by themselves\n");
     std::fprintf(file, "motion_controls = %s\n", current.motionControls ? "on" : "off");
+    std::fprintf(file, "# keyboard and mouse, together with any controller; the mouse turns the camera\n");
+    std::fprintf(file, "keyboard_mouse = %d\n", current.keyboardMouse ? 1 : 0);
+    std::fprintf(file, "mouse_camera = %d\n", current.mouseCamera ? 1 : 0);
+    std::fprintf(file, "mouse_sensitivity = %d\n", current.mouseSensitivity);
+    std::fprintf(file, "mouse_invert_y = %d\n", current.mouseInvertY ? 1 : 0);
+    std::fprintf(file, "mouse_deadzone = %d\n", current.mouseDeadzone);
+    std::fprintf(file, "# bindings: up to two keys, mouse buttons (Mouse Left/Right/Middle/4/5) or Wheel Up/Down each\n");
+    for (int action = 0; action < kInputActionCount; action++)
+    {
+        std::fprintf(file, "key_%s = %s\n", engineInputAction(action).key,
+                     engineInputFormatBinding(current.inputBindings[action]).c_str());
+    }
     const char* aspectText = current.aspectRatio == AspectRatio::MatchDisplay ? "display"
                            : current.aspectRatio == AspectRatio::Ultrawide ? "21:9"
                            : current.aspectRatio == AspectRatio::SuperUltrawide ? "32:9"
@@ -575,6 +617,8 @@ extern "C"
     void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent);
     void rsx_live_draw_set_texture_pack(const char* folder);
     int cellPad_set_motion_mode(int mode);
+    void cellPad_set_keyboard_mouse(int enabled, const unsigned short codes[][2], int actionCount, int mouseCamera,
+                                    int sensitivityPercent, int invertY, int antiDeadzonePercent);
     void rsx_live_draw_set_aspect(float aspect);
     float rsx_live_draw_get_aspect(void);
     void folklore_apply_aspect(float aspect);
@@ -673,7 +717,18 @@ void engineSettingsApplyInput()
 {
     /* cellPad.c's modes: 0 = the controller's sensors when it has them,
      * otherwise automatic capture; 2 = automatic capture always. */
-    cellPad_set_motion_mode(engineSettings().motionControls ? 0 : 2);
+    const EngineSettings& current = engineSettings();
+    cellPad_set_motion_mode(current.motionControls ? 0 : 2);
+    unsigned short codes[kInputActionCount][2];
+    for (int action = 0; action < kInputActionCount; action++)
+    {
+        for (int slot = 0; slot < 2; slot++)
+        {
+            codes[action][slot] = (unsigned short)current.inputBindings[action][slot];
+        }
+    }
+    cellPad_set_keyboard_mouse(current.keyboardMouse ? 1 : 0, codes, kInputActionCount, current.mouseCamera ? 1 : 0,
+                               current.mouseSensitivity, current.mouseInvertY ? 1 : 0, current.mouseDeadzone);
 }
 
 bool engineSettingsLanguageSelectable()
