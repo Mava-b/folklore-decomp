@@ -1591,6 +1591,46 @@ async fn list_screens() -> Vec<String> {
     .unwrap_or_default()
 }
 
+/// The sound outputs `system_profiler SPAudioDataType -json` lists (devices
+/// with output channels), by the names PS3_AUDIO_DEVICE matches; the
+/// system's default output first.
+fn parse_audio_outputs(json: &str) -> Vec<String> {
+    let v: serde_json::Value = match serde_json::from_str(json) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+    let mut out: Vec<(bool, String)> = Vec::new();
+    for group in v["SPAudioDataType"].as_array().into_iter().flatten() {
+        for it in group["_items"].as_array().into_iter().flatten() {
+            let name = it["_name"].as_str().unwrap_or("").trim();
+            if name.is_empty() || name.contains(['\n', '\r']) || it.get("coreaudio_device_output").is_none() {
+                continue;
+            }
+            if out.iter().any(|(_, n)| n == name) {
+                continue;
+            }
+            out.push((it["coreaudio_default_audio_output_device"].as_str() == Some("spaudio_yes"), name.to_string()));
+        }
+    }
+    out.sort_by_key(|(d, _)| !*d);
+    out.into_iter().map(|(_, n)| n).collect()
+}
+
+/// The sound outputs the Mac has now (see parse_audio_outputs).
+#[tauri::command]
+async fn list_audio_outputs() -> Vec<String> {
+    if !cfg!(target_os = "macos") {
+        return Vec::new();
+    }
+    tauri::async_runtime::spawn_blocking(|| {
+        command_stdout(Command::new("/usr/sbin/system_profiler").args(["SPAudioDataType", "-json"]))
+            .map(|s| parse_audio_outputs(&s))
+            .unwrap_or_default()
+    })
+    .await
+    .unwrap_or_default()
+}
+
 #[tauri::command]
 fn get_settings() -> Settings {
     load_settings_file()
@@ -2551,6 +2591,7 @@ pub fn run() {
             reset_input_map,
             list_mods,
             list_screens,
+            list_audio_outputs,
             get_status,
             find_repos,
             reset_overlay_ini,
@@ -2605,6 +2646,18 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_outputs_from_system_profiler() {
+        let json = r#"{"SPAudioDataType":[{"_items":[
+            {"_name":"Alto-falantes (MacBook Pro)","coreaudio_device_output":2},
+            {"_name":"Microfone (MacBook Pro)","coreaudio_device_input":1},
+            {"_name":"LG TV","coreaudio_device_output":2,"coreaudio_default_audio_output_device":"spaudio_yes"},
+            {"_name":"DualSense Wireless Controller","coreaudio_device_output":4},
+            {"_name":"DualSense Wireless Controller","coreaudio_device_input":2}]}]}"#;
+        assert_eq!(parse_audio_outputs(json), vec!["LG TV", "Alto-falantes (MacBook Pro)", "DualSense Wireless Controller"]);
+        assert!(parse_audio_outputs("not json").is_empty());
+    }
 
     fn tmp(tag: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("fl-{tag}-{}", std::process::id()));
