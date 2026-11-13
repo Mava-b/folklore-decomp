@@ -1436,6 +1436,9 @@ namespace
                 ImGui::TextDisabled("(applies when you next start the game)");
             }
         }
+        changed |= ImGui::Checkbox("Soft-edged foliage (smooth grass, leaves and fences, no shimmer)",
+                                   &settings.softCutouts);
+        changed |= ImGui::Checkbox("Full-resolution effects (sharp water reflections)", &settings.fullResEffects);
         changed |= ImGui::Checkbox("Build new shaders in the background (no hitch when an effect first appears)",
                                    &settings.backgroundShaders);
         changed |= ImGui::Checkbox("Fast repeated objects (faster in busy towns; turn off if anything looks wrong)",

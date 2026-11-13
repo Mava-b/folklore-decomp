@@ -1322,6 +1322,9 @@ namespace
                               {"Original (static)", "Smooth (soft shimmer)", "Clear (no pattern)"});
         changed |= enumChoice("Shadows", &settings.shadows, {"Original (hard)", "Soft", "Softer"});
         changed |= enumChoice("Ambient occlusion", &settings.ambientOcclusion, {"Off", "Subtle", "Strong"});
+        changed |= ImGui::Checkbox("Soft-edged foliage (smooth grass, leaves and fences, no shimmer)",
+                                   &settings.softCutouts);
+        changed |= ImGui::Checkbox("Full-resolution effects (sharp water reflections)", &settings.fullResEffects);
 
         sectionHeading("Performance");
         changed |= ImGui::Checkbox("Build new shaders in the background (no hitch when an effect first appears)",

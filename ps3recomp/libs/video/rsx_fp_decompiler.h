@@ -179,6 +179,19 @@ u64 rsx_fp_literal_source_hash(
 int rsx_fp_apply_alpha_test_buffered(
     char* hlsl, u32 out_size, u32 func);
 
+/* The alpha test of a cut-out (GREATER or GEQUAL, nothing blended) with soft
+ * edges: the alpha sharpened to one pixel across the reference and kept by
+ * an ordered 4x4 pattern, as alpha to coverage does. A reference outside
+ * 0.1-0.9 keeps the hard test. Other functions return -1 (use
+ * rsx_fp_apply_alpha_test). */
+int rsx_fp_apply_alpha_coverage(char* hlsl, u32 out_size, u32 func, float ref);
+int rsx_fp_apply_alpha_coverage_buffered(char* hlsl, u32 out_size, u32 func);
+/* After the other Sample() rewrites: texture unit 0's 2D samples in a
+ * program given soft cut-out edges go through a helper that records their
+ * mip level (_rsx_cut_lod), which keeps distant cut-outs from thinning out.
+ * Returns the number of samples rewritten (0: left as it was). */
+int rsx_fp_apply_cutout_lod(char* hlsl, u32 out_size);
+
 /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
  * -1 when one allocation can never fit. */

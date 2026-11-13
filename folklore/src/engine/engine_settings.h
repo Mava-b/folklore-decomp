@@ -171,6 +171,15 @@ struct EngineSettings
         Softer,
     };
     Shadows shadows = Shadows::Soft;
+    /* Soft-edged foliage: grass, leaves and fences (cut-out textures) with
+     * anti-aliased edges, by coverage as the PS3's alpha to coverage did,
+     * instead of cut pixel by pixel, which crawls and shimmers in motion
+     * (rsx_fp_apply_alpha_coverage). Applies at once. */
+    bool softCutouts = true;
+    /* Full-resolution effects: the 3D passes the game draws smaller than the
+     * screen -- its water reflections, at 640x480 -- drawn at the render
+     * resolution instead (ld_raised_target_wanted). Applies at once. */
+    bool fullResEffects = true;
     /* Physics: step Havok by the real frame time instead of the game's fixed
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */

@@ -1822,6 +1822,51 @@ What 0006 fixes in ps3recomp to make that run:
     first texture is a widened surface: it is already at the screen's
     proportions. The boss bar's flash, which 0099 was for, samples its own
     texture there and is placed as before.
+131. Soft-edged foliage (patches/0108, engine setting soft_foliage). The
+    cut-outs: alpha test GREATER 0.75 (ref 0xBF) with blending off on grass
+    and leaves (capture-20261031-095951: 1590 draws, pso cb933e02 and
+    fb65f31f), and alpha to coverage (ANTI_ALIASING_CONTROL 0x111) on the
+    2x-wide AA surface, which the renderer stands in for with a hard GEQUAL
+    0.5 (render_state_t, decode_render_state). Both kept or dropped whole
+    pixels. Now an alpha test GREATER/GEQUAL with blending off
+    (render_state_t.alpha_coverage, keyed) is translated by
+    rsx_fp_apply_alpha_coverage: the alpha is sharpened to one pixel across
+    the reference ((a - ref) / fwidth(a) + 0.5), and that coverage is kept
+    against a 4x4 ordered pattern on host pixels -- alpha to coverage
+    without MSAA; the 2x-wide surface's resolve, SMAA and the downsample
+    average it into partial edges. A reference outside 0.1-0.9 keeps the
+    hard test (particles test GREATER ~0 while blending and are excluded
+    anyway). The pattern reads "(input).position" so ld_scale_wpos does not
+    turn it into guest pixels. Edges alone hardly changed the shimmer in a
+    simulation (thin blades sliding by sub-pixel steps, scored against
+    36-sample coverage at display size): far away the mips blur a blade's
+    alpha under 0.75 everywhere, so the hard test keeps none of its ~10%
+    true coverage and it blinks in and out. So unit 0's samples record their
+    mip level (rsx_fp_apply_cutout_lod, after the other Sample() rewrites;
+    the level from GetDimensions and the coordinate's derivatives), and the
+    alpha is scaled by 1 + 0.1 per level and its ramp widened by 0.4 per
+    level (capped at 4 levels). Simulated: close up the error against true
+    coverage 0.0075 -> 0.0048; at 2.5-8 texels per pixel coverage 0 ->
+    0.08-0.14 (true 0.10) and the error about halved. Generated HLSL (single
+    target, MRT, literal and fp_alpha.x reference, a cube map on unit 0
+    left alone) compiled with D3DCompile ps_5_0 under Wine; not yet seen in
+    the game.
+132. Full-resolution effects (patches/0108, engine setting
+    full_res_effects). The colour surfaces under the canvas size stay at
+    1x (entry 51). Apart from the bloom (replaced, entry 79) the only 3D
+    pass among them is the water reflection: the scene again, depth-tested,
+    into 640x480 0x31C0000 (capture-20261106-131249 draws 1811-1827,
+    capture-20261101-144056 1627-1675), sampled by the water (pso
+    61d61106, unit 4) -- and the bloom reuses the same 640x480 memory later
+    in the frame. With the setting on, a depth-tested draw into a reduced
+    surface goes to a twin of it at the render scale (surface_t.raised,
+    surface_get_variant; not widened, so ultrawide HUD placement ignores
+    it), as does a blended pass when the twin was written last (the tint
+    quad, draw 1827); the bloom's passes stay on the 1x surface. Texture
+    reads of the address take the twin written last, clears clear both,
+    and render_state_t.draw_scale follows the twin (viewport, WPOS, slope
+    bias). The zetas were already canvas-scaled, so the reflection's depth
+    now matches its colour.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

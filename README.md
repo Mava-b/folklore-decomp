@@ -93,6 +93,10 @@ be turned back to the original.
   ledges, around characters' feet.
 - **Soft shadows**: the characters' shadows with soft edges instead of hard,
   stair-stepped ones.
+- **Soft-edged foliage**: grass, leaves and fences with smooth edges instead
+  of ones cut pixel by pixel, which crawl and shimmer as the camera moves.
+- **Full-resolution reflections**: the water reflections, which the game
+  draws at a quarter of the screen's size, drawn at the render resolution.
 - **Smooth depth of field**: a soft, round blur using the game's own focus,
   without the original's doubled image.
 - **Smooth bloom**: a steady glow, without the original's flicker.
@@ -420,6 +424,15 @@ saved to `folklore_settings.ini`.
   - *Ambient occlusion*: *Subtle* (the default), *Strong* or *Off* — soft
     shading where surfaces meet (corners, under ledges, where characters
     stand), worked out from the depth buffer. Next start.
+  - *Soft-edged foliage* (on by default): grass, leaves and fences are
+    cut-out textures, kept or dropped pixel by pixel, so their edges are
+    stair-stepped and thin parts flicker in and out as they move. With this
+    on their edges are smoothed by how much of each pixel they cover, as the
+    PS3's alpha to coverage did. Applies at once.
+  - *Full-resolution effects* (on by default): the game draws its water
+    reflections at 640x480 whatever the resolution; this draws them at the
+    render resolution, so they are as sharp as the rest of the picture.
+    Applies at once.
   - *Build new shaders in the background* (no hitch when an effect first
     appears).
   - *Fast repeated objects* (on by default): objects the game draws again

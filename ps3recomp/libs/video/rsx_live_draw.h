@@ -178,6 +178,14 @@ void rsx_live_draw_set_hud_edge(int percent);
 /* Soft shadows: 0 the game's stencil shadow edges, 1 soft, 2 softer (the
  * shadow quad's stencil test made into a mask and blurred; live). */
 void rsx_live_draw_set_shadow_softness(int level);
+/* Soft-edged cut-outs: grass, leaves and fences (alpha-tested, nothing
+ * blended) with their edges anti-aliased by coverage instead of cut per
+ * pixel (rsx_fp_apply_alpha_coverage). 1 on, 0 the game's hard edges. Live:
+ * pipelines are rebuilt as they are next drawn. */
+void rsx_live_draw_set_soft_cutouts(int enabled);
+/* Full-resolution effects: 3D passes the game draws into surfaces smaller
+ * than the screen (the water reflections) drawn at the render scale. Live. */
+void rsx_live_draw_set_full_res_effects(int enabled);
 /* Repeat draws: a draw whose state is the previous draw's apart from its
  * transform constants reuses that draw's upload, pipeline and tables (1, the
  * default) or goes through the whole draw path again (0). Live. */

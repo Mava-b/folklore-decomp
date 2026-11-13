@@ -63,6 +63,8 @@ void rsx_live_draw_set_texture_lod_bias(int h) { (void)h; }
 void rsx_live_draw_set_hud_layout(int m) { (void)m; }
 void rsx_live_draw_set_hud_edge(int p) { (void)p; }
 void rsx_live_draw_set_shadow_softness(int l) { (void)l; }
+void rsx_live_draw_set_soft_cutouts(int e) { (void)e; }
+void rsx_live_draw_set_full_res_effects(int e) { (void)e; }
 void rsx_live_draw_set_repeat_draws(int e) { (void)e; }
 void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
 void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
@@ -262,6 +264,7 @@ typedef struct {
     DXGI_FORMAT fmt;
     u32 scale;                /* host pixels per guest pixel, vertically (ld_surface_scale_for) */
     float scale_x;            /* ... and horizontally: scale x the ultrawide widening */
+    u32 raised;               /* a reduced-size surface's render-scale twin (ld_raised_target_wanted) */
     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
 #if !defined(YZ_PERF_CLEAN)
     u32 resource_serial;
@@ -568,6 +571,8 @@ static volatile LONG g_ld_hud_layout = 1;        /* ultrawide HUD: 0 stretched, 
 static volatile LONG g_ld_hud_edge = 100;        /* edges: how far out, 0 (centred) - 100 (screen edge) % */
 static volatile LONG g_ld_shadow_softness = 0;   /* stencil shadow edges: 0 the game's, 1 soft, 2 softer */
 static volatile LONG g_ld_repeat_draws = 1;      /* the repeat-draw fast path (ld_repeat_draw) */
+static volatile LONG g_ld_soft_cutouts = 1;      /* cut-outs with soft edges (render_state_t.alpha_coverage) */
+static volatile LONG g_ld_full_res_effects = 1;  /* reduced-size 3D passes at the render scale (surface_t.raised) */
 /* Bumped whenever the per-draw rings or the command list start over: a draw
  * recorded under another epoch may not reuse the previous draw's ring
  * offsets and descriptor tables. */
@@ -1675,6 +1680,7 @@ static u32 ld_rt_count(u32 sel)
 
 typedef struct {
     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
+    u32 alpha_coverage;       /* a cut-out drawn with soft edges (rsx_fp_apply_alpha_coverage) */
     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
@@ -1702,6 +1708,73 @@ typedef struct {
     u32 draw_scale_x_bits;    /* float: horizontal scale (ultrawide) */
 } render_state_t;
 
+/* Full-resolution effects. Colour surfaces smaller than the canvas stay at
+ * the PS3's size (ld_surface_is_canvas): the bloom's blurs step their taps by
+ * PS3 texels. Folklore also draws its water reflections that small -- the
+ * scene again, depth-tested, into 640x480 (0x31C0000, capture-20261106-
+ * 131249 draws 1811-1827), which the water then samples -- so they came out
+ * a quarter of the render size and blurry. With the setting on, a
+ * depth-tested draw into such a surface goes to a twin of it at the render
+ * scale (surface_t.raised; not widened, so the ultrawide HUD rules leave it
+ * alone), and so does a blended pass over that twin when it was drawn last
+ * (the reflection's tint quad, draw 1827). Anything else -- the bloom's
+ * passes, which later reuse the same 640x480 memory -- stays on the
+ * PS3-sized surface, and a texture read takes whichever of the two was
+ * written last. */
+static int ld_raised_target_wanted(u32 location, u32 offset, u32 guestWidth, u32 guestHeight)
+{
+    if (!InterlockedCompareExchange(&g_ld_full_res_effects, 0, 0))
+    {
+        return 0;
+    }
+    if ((g.scale ? g.scale : 1u) <= 1u)
+    {
+        return 0;
+    }
+    if (!guestWidth)
+    {
+        guestWidth = g.width;
+    }
+    if (!guestHeight)
+    {
+        guestHeight = g.height;
+    }
+    if (ld_surface_is_canvas(guestWidth, guestHeight))
+    {
+        return 0;
+    }
+    if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u)
+    {
+        return 1;
+    }
+    if (!(rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u))
+    {
+        return 0;
+    }
+    int raisedFound = 0;
+    u32 raisedGeneration = 0;
+    u32 plainGeneration = 0;
+    for (u32 index = 0; index < g.n_surfaces; index++)
+    {
+        const surface_t* candidate = &g.surfaces[index];
+        if (!candidate->tex || candidate->location != location || candidate->offset != offset ||
+            candidate->w != guestWidth || candidate->h != guestHeight)
+        {
+            continue;
+        }
+        if (candidate->raised)
+        {
+            raisedFound = 1;
+            raisedGeneration = candidate->last_write_generation;
+        }
+        else if (candidate->last_write_generation > plainGeneration)
+        {
+            plainGeneration = candidate->last_write_generation;
+        }
+    }
+    return raisedFound && raisedGeneration > plainGeneration;
+}
+
 static void decode_render_state(render_state_t* rs)
 {
     memset(rs, 0, sizeof(*rs));
@@ -1711,8 +1784,16 @@ static void decode_render_state(render_state_t* rs)
     rsx_dsp_surface alpha_surface;
     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
     rs->alpha_ref_format = alpha_surface.color_format;
-    rs->draw_scale = ld_surface_scale_for(alpha_surface.clip_w, alpha_surface.clip_h);
+    if (ld_raised_target_wanted(alpha_surface.color_location[0], alpha_surface.color_offset[0],
+                                alpha_surface.clip_w, alpha_surface.clip_h))
     {
+        rs->draw_scale = g.scale;
+        const float drawScaleX = (float)g.scale;
+        memcpy(&rs->draw_scale_x_bits, &drawScaleX, sizeof drawScaleX);
+    }
+    else
+    {
+        rs->draw_scale = ld_surface_scale_for(alpha_surface.clip_w, alpha_surface.clip_h);
         const float drawScaleX = ld_surface_scale_x_for(alpha_surface.clip_w, alpha_surface.clip_h);
         memcpy(&rs->draw_scale_x_bits, &drawScaleX, sizeof drawScaleX);
     }
@@ -1754,6 +1835,17 @@ static void decode_render_state(render_state_t* rs)
     rs->rt_fp16 = alpha_surface.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
     rs->rt_count = ld_rt_count(alpha_surface.color_target);
     rs->blend_enable = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1;
+    /* Soft-edged cut-outs (engine setting): an alpha test keeping alpha above
+     * its reference with nothing blended -- the game's own (GREATER 0.75 on
+     * grass and leaves) or alpha to coverage's stand-in above. Particles
+     * test GREATER ~0 while blending and are left alone; the shader keeps a
+     * reference outside 0.1-0.9 hard as well, since in the buffered path the
+     * reference is a constant. */
+    if (InterlockedCompareExchange(&g_ld_soft_cutouts, 0, 0) && rs->alpha_test_enable && !rs->blend_enable &&
+        (rs->alpha_func == 0x0204u || rs->alpha_func == 0x0206u))
+    {
+        rs->alpha_coverage = 1;
+    }
     const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR);
     const u32 df = rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR);
     const u32 eq = rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION);
@@ -2603,6 +2695,16 @@ void rsx_live_draw_set_repeat_draws(int enabled)
 void rsx_live_draw_set_shadow_softness(int level)
 {
     InterlockedExchange(&g_ld_shadow_softness, (level == 1 || level == 2) ? level : 0);
+}
+
+void rsx_live_draw_set_soft_cutouts(int enabled)
+{
+    InterlockedExchange(&g_ld_soft_cutouts, enabled ? 1 : 0);
+}
+
+void rsx_live_draw_set_full_res_effects(int enabled)
+{
+    InterlockedExchange(&g_ld_full_res_effects, enabled ? 1 : 0);
 }
 
 void rsx_live_draw_set_hud_edge(int percent)
@@ -5033,11 +5135,17 @@ static u32 vertex_texture_srv_slot(const rsx_dsp_vertex_texture* vt)
 /* fp constants are stored as raw bits; the shader reads them as floats. */
 static float ld_c2f(u32 bits) { float f; memcpy(&f, &bits, sizeof f); return f; }
 
-static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
-                       DXGI_FORMAT want_fmt)
+/* `raised`: the render-scale twin of a reduced-size surface
+ * (ld_raised_target_wanted); 0 for the surface at its usual scale. */
+static u32 surface_get_variant(u32 location, u32 offset, u32 want_w, u32 want_h,
+                               DXGI_FORMAT want_fmt, int raised)
 {
     if (!want_w) want_w = g.width;
     if (!want_h) want_h = g.height;
+    if (raised && ld_surface_is_canvas(want_w, want_h))
+    {
+        raised = 0;
+    }
     /* Key on the DIMENSIONS as well as location/offset.
      *
      * Keying on location/offset alone meant a redeclaration of the same offset
@@ -5063,7 +5171,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     for (u32 i = 0; i < g.n_surfaces; i++)
         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset &&
             g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
-            g.surfaces[i].fmt == want_fmt)
+            g.surfaces[i].fmt == want_fmt && g.surfaces[i].raised == (u32)(raised ? 1 : 0))
             return i;
     /* Never destroy a usable render target because a malformed live command
      * briefly decoded a guest pointer as clip dimensions.  The known-good
@@ -5099,8 +5207,8 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
     D3D12_RESOURCE_DESC rd = {0};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-    const u32 surfaceScale = ld_surface_scale_for(want_w, want_h);
-    const float surfaceScaleX = ld_surface_scale_x_for(want_w, want_h);
+    const u32 surfaceScale = raised ? (g.scale ? g.scale : 1u) : ld_surface_scale_for(want_w, want_h);
+    const float surfaceScaleX = raised ? (float)surfaceScale : ld_surface_scale_x_for(want_w, want_h);
     rd.Width = ld_scale_pixels(want_w, surfaceScaleX); rd.Height = want_h * surfaceScale; rd.DepthOrArraySize = 1;
     rd.MipLevels = 1; rd.Format = want_fmt; rd.SampleDesc.Count = 1;
     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -5139,6 +5247,7 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     s->fmt = want_fmt;
     s->scale = surfaceScale;
     s->scale_x = surfaceScaleX;
+    s->raised = raised ? 1u : 0u;
 #if !defined(YZ_PERF_CLEAN)
     s->resource_serial = ++g_ld_surface_resource_serial;
 #endif
@@ -5149,6 +5258,12 @@ static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
     srv_write(SRV_SURFACE_BASE + slot, s->tex);
     if (slot == g.n_surfaces) g.n_surfaces++;
     return slot;
+}
+
+static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+                       DXGI_FORMAT want_fmt)
+{
+    return surface_get_variant(location, offset, want_w, want_h, want_fmt, 0);
 }
 
 /* A draw that samples its own render target. RSX reads and writes the same
@@ -5429,11 +5544,13 @@ static u32 current_surface(void)
 {
     rsx_dsp_surface sf;
     rsx_dsp_get_surface(&g.rsx, &sf);
-    return surface_get(sf.color_location[0], sf.color_offset[0],
-                       sf.clip_w, sf.clip_h,
-                       sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                           ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                           : DXGI_FORMAT_R8G8B8A8_UNORM);
+    return surface_get_variant(sf.color_location[0], sf.color_offset[0],
+                               sf.clip_w, sf.clip_h,
+                               sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                                   ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
+                               ld_raised_target_wanted(sf.color_location[0], sf.color_offset[0],
+                                                       sf.clip_w, sf.clip_h));
 }
 
 /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
@@ -5944,6 +6061,7 @@ static u64 ld_hash_structural_render_state(
      * field is listed explicitly so struct padding can never become identity. */
     LD_HASH_RENDER_FIELD(alpha_test_enable);
     LD_HASH_RENDER_FIELD(alpha_func);
+    LD_HASH_RENDER_FIELD(alpha_coverage);
     LD_HASH_RENDER_FIELD(blend_enable);
     LD_HASH_RENDER_FIELD(sf_rgb);
     LD_HASH_RENDER_FIELD(df_rgb);
@@ -7584,8 +7702,9 @@ static ID3D12PipelineState* get_pso(
             decompiled_constant_count != g.fp_constants.count)
             fi = -1;
         if (fi > 0 && rs.alpha_test_enable &&
-            rsx_fp_apply_alpha_test_buffered(
-                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func) < 0)
+            (rs.alpha_coverage
+                 ? rsx_fp_apply_alpha_coverage_buffered(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func)
+                 : rsx_fp_apply_alpha_test_buffered(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func)) < 0)
             fi = -1;
         if (fi > 0) {
             const int np = rsx_fp_apply_unnorm_scale(
@@ -7607,9 +7726,9 @@ static ID3D12PipelineState* get_pso(
             fp_uc, fp_size, fp_ctrl, cube_mask,
             ps_hlsl, sizeof(ps_hlsl));
         if (fi > 0 && rs.alpha_test_enable &&
-            rsx_fp_apply_alpha_test(
-                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
-                g.fp_alpha_ref) < 0)
+            (rs.alpha_coverage
+                 ? rsx_fp_apply_alpha_coverage(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func, g.fp_alpha_ref)
+                 : rsx_fp_apply_alpha_test(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func, g.fp_alpha_ref)) < 0)
             fi = -1;
         if (fi > 0 && rsx_fp_apply_unnorm_scale(
                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
@@ -7637,6 +7756,12 @@ static ID3D12PipelineState* get_pso(
                         (unsigned long long)live_legacy_pso_key(), zetaAliasMask, aliasSites);
             }
         }
+    }
+    /* Soft cut-outs: unit 0's samples record their mip level, last, after
+     * every other rewrite of Sample() calls (rsx_fp_apply_cutout_lod). */
+    if (fi > 0 && rs.alpha_test_enable && rs.alpha_coverage && rsx_fp_apply_cutout_lod(ps_hlsl, sizeof(ps_hlsl)) < 0)
+    {
+        fi = -1;
     }
 #if defined(YZ_PERF_PROFILE)
     g_ld_profile.total.decompile_qpc +=
@@ -11845,11 +11970,12 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
         rsx_dsp_get_surface(&g.rsx, &msf);
         const u32 want = ld_rt_count(msf.color_target);
         for (u32 r = 1; r < want; r++) {
-            const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
-                                      msf.clip_w, msf.clip_h,
-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
+            const u32 s = surface_get_variant(msf.color_location[r], msf.color_offset[r],
+                                              msf.clip_w, msf.clip_h,
+                                              msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+                                                  ? DXGI_FORMAT_R16G16B16A16_FLOAT
+                                                  : DXGI_FORMAT_R8G8B8A8_UNORM,
+                                              (int)g.surfaces[target].raised);
             if (s == LD_INVALID_SURFACE || s == target) break;
             mrt[n_mrt++] = s;
         }
@@ -11997,7 +12123,23 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
               if (sf_i->location != t.location || sf_i->offset != t.offset ||
                   i == target)
                   continue;
-              if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
+              if (sf_i->w == t.width && sf_i->h == t.height) {
+                  /* A reduced-size surface and its render-scale twin
+                   * (surface_t.raised): the one written last. */
+                  int twin = -1;
+                  for (u32 twinIndex = i + 1; twinIndex < g.n_surfaces; twinIndex++) {
+                      const surface_t* other = &g.surfaces[twinIndex];
+                      if (twinIndex != target && other->tex && other->location == t.location &&
+                          other->offset == t.offset && other->w == t.width && other->h == t.height &&
+                          other->fmt == sf_i->fmt && other->raised != sf_i->raised) {
+                          twin = (int)twinIndex;
+                          break;
+                      }
+                  }
+                  sampled = (twin >= 0 && g.surfaces[twin].last_write_generation > sf_i->last_write_generation)
+                                ? twin : (int)i;
+                  break;
+              }
               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
                   sampled = (int)i;
                   best_gen = sf_i->last_draw_generation;
@@ -12322,7 +12464,7 @@ static void sink_end_impl(void* user, const rsx_dispatch* r)
     /* A 1x post-effect target with a canvas-sized (scaled) zeta bound: fine
      * while the pass ignores depth, which is what such passes do. Say so if
      * one does not -- its depth test would read the wrong part of the zeta. */
-    if (current_zslot && !ld_surface_is_canvas_scale(drawSurface) &&
+    if (current_zslot && !ld_surface_is_canvas_scale(drawSurface) && !drawSurface->raised &&
         ((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) || (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u)))
     {
         static u32 depthScaleLogs = 0;
@@ -12690,6 +12832,22 @@ static void sink_clear(void* user, const rsx_dispatch* r, u32 mask)
           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
+        /* A reduced-size surface's render-scale twin (surface_t.raised) is
+         * the same guest memory: clear it too, so neither keeps a picture
+         * from before the clear. */
+        for (u32 twinIndex = 0; twinIndex < g.n_surfaces; twinIndex++)
+        {
+            const surface_t* cleared = &g.surfaces[target];
+            const surface_t* twin = &g.surfaces[twinIndex];
+            if (twinIndex == target || !twin->tex || twin->raised == cleared->raised ||
+                twin->location != cleared->location || twin->offset != cleared->offset ||
+                twin->w != cleared->w || twin->h != cleared->h || twin->fmt != cleared->fmt)
+            {
+                continue;
+            }
+            g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(LD_SWAP_BUFFERS + twinIndex), col, 0, NULL);
+            ld_surface_note_write(twinIndex, LD_SURFACE_WRITE_CLEAR);
+        }
     }
     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
         rsx_dsp_surface sf;

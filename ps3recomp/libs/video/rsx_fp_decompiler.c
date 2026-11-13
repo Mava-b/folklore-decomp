@@ -1351,6 +1351,184 @@ int rsx_fp_apply_alpha_test_buffered(
     return 1;
 }
 
+/* Insert `text` on its own lines just before the program's main(). */
+static int fp_insert_before_main(char* hlsl, u32 out_size, const char* text)
+{
+    char* mainLine = strstr(hlsl, "float4 main(PSInput input)");
+    if (!mainLine)
+    {
+        mainLine = strstr(hlsl, "PSOutput main(PSInput input)");
+    }
+    if (!mainLine)
+    {
+        return -1;
+    }
+    const size_t used = strlen(hlsl);
+    const size_t textLength = strlen(text);
+    if (used + textLength + 1 > out_size)
+    {
+        return -1;
+    }
+    memmove(mainLine + textLength, mainLine, used - (size_t)(mainLine - hlsl) + 1);
+    memcpy(mainLine, text, textLength);
+    return 1;
+}
+
+int rsx_fp_apply_cutout_lod(char* hlsl, u32 out_size)
+{
+    if (!hlsl || !strstr(hlsl, "static float _rsx_cut_lod"))
+    {
+        return 0;
+    }
+    if (strstr(hlsl, "TextureCube rsx_tex0 "))
+    {
+        return 0;
+    }
+    static const char* const needles[2] = { "rsx_tex[0].Sample(rsx_samp[0],", "rsx_tex0.Sample(rsx_samp[0]," };
+    static const char* const replacements[2] = { "_rsx_cut_sample(rsx_tex[0], rsx_samp[0],",
+                                                 "_rsx_cut_sample(rsx_tex0, rsx_samp[0]," };
+    int rewritten = 0;
+    for (int form = 0; form < 2; form++)
+    {
+        const size_t needleLength = strlen(needles[form]);
+        const size_t replacementLength = strlen(replacements[form]);
+        char* cursor = strstr(hlsl, needles[form]);
+        while (cursor)
+        {
+            const size_t used = strlen(hlsl);
+            if (used - needleLength + replacementLength + 1 > out_size)
+            {
+                return -1;
+            }
+            memmove(cursor + replacementLength, cursor + needleLength,
+                    used - (size_t)(cursor - hlsl) - needleLength + 1);
+            memcpy(cursor, replacements[form], replacementLength);
+            rewritten++;
+            cursor = strstr(cursor + replacementLength, needles[form]);
+        }
+    }
+    if (!rewritten)
+    {
+        return 0;
+    }
+    if (fp_insert_before_main(hlsl, out_size,
+            "float4 _rsx_cut_sample(Texture2D cutTexture, SamplerState cutSampler, float2 cutCoordinate) {\n"
+            "    float cutWidth, cutHeight, cutLevels;\n"
+            "    cutTexture.GetDimensions(0, cutWidth, cutHeight, cutLevels);\n"
+            "    const float2 cutAcross = ddx(cutCoordinate) * float2(cutWidth, cutHeight);\n"
+            "    const float2 cutDown = ddy(cutCoordinate) * float2(cutWidth, cutHeight);\n"
+            "    const float cutLevel = 0.5 * log2(max(max(dot(cutAcross, cutAcross), dot(cutDown, cutDown)), 1e-8));\n"
+            "    _rsx_cut_lod = max(_rsx_cut_lod, clamp(cutLevel, 0.0, max(cutLevels - 1.0, 0.0)));\n"
+            "    return cutTexture.Sample(cutSampler, cutCoordinate);\n"
+            "}\n") < 0)
+    {
+        return -1;
+    }
+    return rewritten;
+}
+
+/* Cut-outs with soft edges. A cut-out (grass, leaves, fences: the alpha test
+ * passing alpha above a middle reference, nothing blended) keeps or drops
+ * whole pixels, so its edges are stair-stepped and thin parts flicker in and
+ * out as they move. Here the alpha is first sharpened to the screen -- its
+ * step across the reference made one pixel wide, from fwidth -- giving how
+ * much of the pixel the cut-out covers, and that coverage is turned into
+ * kept pixels by a 4x4 ordered pattern: what alpha to coverage does on an
+ * antialiased surface, and what the PS3 did for the game's foliage. The
+ * scene's 2x-wide surface and its resolve then average neighbouring pixels
+ * into partial edges. Inside the cut-out and outside it nothing changes; a
+ * reference outside 0.1-0.9 (particles dropping their empty texels) keeps
+ * the hard test. `refText` is the reference as HLSL (a literal or
+ * fp_alpha.x). The pattern is laid on host pixels: "(input).position" is
+ * spelled so the live renderer's WPOS scaling (ld_scale_wpos, which rewrites
+ * "input.position" into guest pixels) leaves it alone.
+ *
+ * Far away the texture's smaller mip levels blur a thin blade's alpha below
+ * the reference everywhere, and it vanishes (then flickers back as it moves).
+ * _rsx_cut_lod, the mip level of the texture the alpha comes from
+ * (rsx_fp_apply_cutout_lod; 0 when that is not known), puts it back: alpha
+ * scaled up by a tenth per level and the coverage ramp widened by 0.4 per
+ * level, so a distant cut-out keeps about the share of each pixel it really
+ * covers. Both factors from a simulation of thin blades against 36-sample
+ * coverage: at 2.5-8 texels per pixel the hard test kept none of the 10%
+ * true coverage; these keep 8-14% with half the error. */
+static int fp_apply_alpha_coverage(char* hlsl, u32 out_size, u32 func, const char* refText)
+{
+    if (!hlsl || out_size == 0 || !refText)
+    {
+        return -1;
+    }
+    if (func != 0x0204u && func != 0x0206u)
+    {
+        return -1;
+    }
+    const u32 cmp = func - 0x0200u;
+    char* marker = NULL;
+    for (char* search = strstr(hlsl, "    return "); search; search = strstr(search + 1, "    return "))
+    {
+        marker = search;
+    }
+    if (!marker)
+    {
+        return -1;
+    }
+    char* expression = marker + strlen("    return ");
+    char* terminator = strstr(expression, ";\n}\n");
+    if (!terminator || terminator == expression || (size_t)(terminator - expression) >= 96)
+    {
+        return -1;
+    }
+    char output[96];
+    memcpy(output, expression, (size_t)(terminator - expression));
+    output[terminator - expression] = '\0';
+
+    const int multipleTargets = fp_returns_struct(hlsl);
+    const char* alphaSource = multipleTargets ? "_rsx_out.t0" : "_rsx_out";
+    char pass[96];
+    fp_alpha_pass_expr(cmp, alphaSource, pass, sizeof(pass));
+    char suffix[1536];
+    const int length = snprintf(suffix, sizeof(suffix),
+        "    %s _rsx_out = %s;\n"
+        "    const float _rsx_alpha_ref = %s;\n"
+        "    {\n"
+        "        static const float _rsx_pattern[16] = { 0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,\n"
+        "                                                3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0 };\n"
+        "        const float _rsx_level = min(_rsx_cut_lod, 4.0);\n"
+        "        const float _rsx_alpha = %s.a * (1.0 + 0.1 * _rsx_level);\n"
+        "        const float _rsx_alpha_width = max(max(fwidth(_rsx_alpha), 0.004), 0.4 * _rsx_level);\n"
+        "        const float _rsx_coverage = saturate((_rsx_alpha - _rsx_alpha_ref) / _rsx_alpha_width + 0.5);\n"
+        "        const uint2 _rsx_cell = uint2((input).position.xy) & 3u;\n"
+        "        const float _rsx_threshold = (_rsx_pattern[_rsx_cell.y * 4u + _rsx_cell.x] + 0.5) / 16.0;\n"
+        "        const bool _rsx_soft = _rsx_alpha_ref > 0.1 && _rsx_alpha_ref < 0.9;\n"
+        "        if (_rsx_soft ? !(_rsx_coverage > _rsx_threshold) : !(%s)) discard;\n"
+        "    }\n"
+        "    return _rsx_out;\n}\n",
+        multipleTargets ? "PSOutput" : "float4", output, refText, alphaSource, pass);
+    if (length < 0 || (u32)length >= sizeof(suffix))
+    {
+        return -1;
+    }
+    const size_t prefix = (size_t)(marker - hlsl);
+    if (prefix + (size_t)length + 1 > out_size)
+    {
+        return -1;
+    }
+    memcpy(marker, suffix, (size_t)length + 1);
+    return fp_insert_before_main(hlsl, out_size, "static float _rsx_cut_lod = 0.0;\n") < 0 ? -1 : 1;
+}
+
+int rsx_fp_apply_alpha_coverage(char* hlsl, u32 out_size, u32 func, float ref)
+{
+    char refText[32];
+    snprintf(refText, sizeof(refText), "%.9g", (double)ref);
+    return fp_apply_alpha_coverage(hlsl, out_size, func, refText);
+}
+
+int rsx_fp_apply_alpha_coverage_buffered(char* hlsl, u32 out_size, u32 func)
+{
+    return fp_apply_alpha_coverage(hlsl, out_size, func, "fp_alpha.x");
+}
+
 /* --- kept from this tree when adopting the newer decompiler ---------------
  * rsx_d3d12_backend.c calls both of these: extract_consts feeds the per-draw
  * fp_k[] slots, code_hash keys the PSO cache on the ucode rather than the

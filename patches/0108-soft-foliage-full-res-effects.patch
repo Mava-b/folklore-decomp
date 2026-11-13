@@ -1,0 +1,594 @@
+diff --git a/libs/video/rsx_fp_decompiler.c b/libs/video/rsx_fp_decompiler.c
+--- a/libs/video/rsx_fp_decompiler.c
++++ b/libs/video/rsx_fp_decompiler.c
+@@ -1351,6 +1351,184 @@
+     return 1;
+ }
+ 
++/* Insert `text` on its own lines just before the program's main(). */
++static int fp_insert_before_main(char* hlsl, u32 out_size, const char* text)
++{
++    char* mainLine = strstr(hlsl, "float4 main(PSInput input)");
++    if (!mainLine)
++    {
++        mainLine = strstr(hlsl, "PSOutput main(PSInput input)");
++    }
++    if (!mainLine)
++    {
++        return -1;
++    }
++    const size_t used = strlen(hlsl);
++    const size_t textLength = strlen(text);
++    if (used + textLength + 1 > out_size)
++    {
++        return -1;
++    }
++    memmove(mainLine + textLength, mainLine, used - (size_t)(mainLine - hlsl) + 1);
++    memcpy(mainLine, text, textLength);
++    return 1;
++}
++
++int rsx_fp_apply_cutout_lod(char* hlsl, u32 out_size)
++{
++    if (!hlsl || !strstr(hlsl, "static float _rsx_cut_lod"))
++    {
++        return 0;
++    }
++    if (strstr(hlsl, "TextureCube rsx_tex0 "))
++    {
++        return 0;
++    }
++    static const char* const needles[2] = { "rsx_tex[0].Sample(rsx_samp[0],", "rsx_tex0.Sample(rsx_samp[0]," };
++    static const char* const replacements[2] = { "_rsx_cut_sample(rsx_tex[0], rsx_samp[0],",
++                                                 "_rsx_cut_sample(rsx_tex0, rsx_samp[0]," };
++    int rewritten = 0;
++    for (int form = 0; form < 2; form++)
++    {
++        const size_t needleLength = strlen(needles[form]);
++        const size_t replacementLength = strlen(replacements[form]);
++        char* cursor = strstr(hlsl, needles[form]);
++        while (cursor)
++        {
++            const size_t used = strlen(hlsl);
++            if (used - needleLength + replacementLength + 1 > out_size)
++            {
++                return -1;
++            }
++            memmove(cursor + replacementLength, cursor + needleLength,
++                    used - (size_t)(cursor - hlsl) - needleLength + 1);
++            memcpy(cursor, replacements[form], replacementLength);
++            rewritten++;
++            cursor = strstr(cursor + replacementLength, needles[form]);
++        }
++    }
++    if (!rewritten)
++    {
++        return 0;
++    }
++    if (fp_insert_before_main(hlsl, out_size,
++            "float4 _rsx_cut_sample(Texture2D cutTexture, SamplerState cutSampler, float2 cutCoordinate) {\n"
++            "    float cutWidth, cutHeight, cutLevels;\n"
++            "    cutTexture.GetDimensions(0, cutWidth, cutHeight, cutLevels);\n"
++            "    const float2 cutAcross = ddx(cutCoordinate) * float2(cutWidth, cutHeight);\n"
++            "    const float2 cutDown = ddy(cutCoordinate) * float2(cutWidth, cutHeight);\n"
++            "    const float cutLevel = 0.5 * log2(max(max(dot(cutAcross, cutAcross), dot(cutDown, cutDown)), 1e-8));\n"
++            "    _rsx_cut_lod = max(_rsx_cut_lod, clamp(cutLevel, 0.0, max(cutLevels - 1.0, 0.0)));\n"
++            "    return cutTexture.Sample(cutSampler, cutCoordinate);\n"
++            "}\n") < 0)
++    {
++        return -1;
++    }
++    return rewritten;
++}
++
++/* Cut-outs with soft edges. A cut-out (grass, leaves, fences: the alpha test
++ * passing alpha above a middle reference, nothing blended) keeps or drops
++ * whole pixels, so its edges are stair-stepped and thin parts flicker in and
++ * out as they move. Here the alpha is first sharpened to the screen -- its
++ * step across the reference made one pixel wide, from fwidth -- giving how
++ * much of the pixel the cut-out covers, and that coverage is turned into
++ * kept pixels by a 4x4 ordered pattern: what alpha to coverage does on an
++ * antialiased surface, and what the PS3 did for the game's foliage. The
++ * scene's 2x-wide surface and its resolve then average neighbouring pixels
++ * into partial edges. Inside the cut-out and outside it nothing changes; a
++ * reference outside 0.1-0.9 (particles dropping their empty texels) keeps
++ * the hard test. `refText` is the reference as HLSL (a literal or
++ * fp_alpha.x). The pattern is laid on host pixels: "(input).position" is
++ * spelled so the live renderer's WPOS scaling (ld_scale_wpos, which rewrites
++ * "input.position" into guest pixels) leaves it alone.
++ *
++ * Far away the texture's smaller mip levels blur a thin blade's alpha below
++ * the reference everywhere, and it vanishes (then flickers back as it moves).
++ * _rsx_cut_lod, the mip level of the texture the alpha comes from
++ * (rsx_fp_apply_cutout_lod; 0 when that is not known), puts it back: alpha
++ * scaled up by a tenth per level and the coverage ramp widened by 0.4 per
++ * level, so a distant cut-out keeps about the share of each pixel it really
++ * covers. Both factors from a simulation of thin blades against 36-sample
++ * coverage: at 2.5-8 texels per pixel the hard test kept none of the 10%
++ * true coverage; these keep 8-14% with half the error. */
++static int fp_apply_alpha_coverage(char* hlsl, u32 out_size, u32 func, const char* refText)
++{
++    if (!hlsl || out_size == 0 || !refText)
++    {
++        return -1;
++    }
++    if (func != 0x0204u && func != 0x0206u)
++    {
++        return -1;
++    }
++    const u32 cmp = func - 0x0200u;
++    char* marker = NULL;
++    for (char* search = strstr(hlsl, "    return "); search; search = strstr(search + 1, "    return "))
++    {
++        marker = search;
++    }
++    if (!marker)
++    {
++        return -1;
++    }
++    char* expression = marker + strlen("    return ");
++    char* terminator = strstr(expression, ";\n}\n");
++    if (!terminator || terminator == expression || (size_t)(terminator - expression) >= 96)
++    {
++        return -1;
++    }
++    char output[96];
++    memcpy(output, expression, (size_t)(terminator - expression));
++    output[terminator - expression] = '\0';
++
++    const int multipleTargets = fp_returns_struct(hlsl);
++    const char* alphaSource = multipleTargets ? "_rsx_out.t0" : "_rsx_out";
++    char pass[96];
++    fp_alpha_pass_expr(cmp, alphaSource, pass, sizeof(pass));
++    char suffix[1536];
++    const int length = snprintf(suffix, sizeof(suffix),
++        "    %s _rsx_out = %s;\n"
++        "    const float _rsx_alpha_ref = %s;\n"
++        "    {\n"
++        "        static const float _rsx_pattern[16] = { 0.0, 8.0, 2.0, 10.0, 12.0, 4.0, 14.0, 6.0,\n"
++        "                                                3.0, 11.0, 1.0, 9.0, 15.0, 7.0, 13.0, 5.0 };\n"
++        "        const float _rsx_level = min(_rsx_cut_lod, 4.0);\n"
++        "        const float _rsx_alpha = %s.a * (1.0 + 0.1 * _rsx_level);\n"
++        "        const float _rsx_alpha_width = max(max(fwidth(_rsx_alpha), 0.004), 0.4 * _rsx_level);\n"
++        "        const float _rsx_coverage = saturate((_rsx_alpha - _rsx_alpha_ref) / _rsx_alpha_width + 0.5);\n"
++        "        const uint2 _rsx_cell = uint2((input).position.xy) & 3u;\n"
++        "        const float _rsx_threshold = (_rsx_pattern[_rsx_cell.y * 4u + _rsx_cell.x] + 0.5) / 16.0;\n"
++        "        const bool _rsx_soft = _rsx_alpha_ref > 0.1 && _rsx_alpha_ref < 0.9;\n"
++        "        if (_rsx_soft ? !(_rsx_coverage > _rsx_threshold) : !(%s)) discard;\n"
++        "    }\n"
++        "    return _rsx_out;\n}\n",
++        multipleTargets ? "PSOutput" : "float4", output, refText, alphaSource, pass);
++    if (length < 0 || (u32)length >= sizeof(suffix))
++    {
++        return -1;
++    }
++    const size_t prefix = (size_t)(marker - hlsl);
++    if (prefix + (size_t)length + 1 > out_size)
++    {
++        return -1;
++    }
++    memcpy(marker, suffix, (size_t)length + 1);
++    return fp_insert_before_main(hlsl, out_size, "static float _rsx_cut_lod = 0.0;\n") < 0 ? -1 : 1;
++}
++
++int rsx_fp_apply_alpha_coverage(char* hlsl, u32 out_size, u32 func, float ref)
++{
++    char refText[32];
++    snprintf(refText, sizeof(refText), "%.9g", (double)ref);
++    return fp_apply_alpha_coverage(hlsl, out_size, func, refText);
++}
++
++int rsx_fp_apply_alpha_coverage_buffered(char* hlsl, u32 out_size, u32 func)
++{
++    return fp_apply_alpha_coverage(hlsl, out_size, func, "fp_alpha.x");
++}
++
+ /* --- kept from this tree when adopting the newer decompiler ---------------
+  * rsx_d3d12_backend.c calls both of these: extract_consts feeds the per-draw
+  * fp_k[] slots, code_hash keys the PSO cache on the ucode rather than the
+diff --git a/libs/video/rsx_fp_decompiler.h b/libs/video/rsx_fp_decompiler.h
+--- a/libs/video/rsx_fp_decompiler.h
++++ b/libs/video/rsx_fp_decompiler.h
+@@ -179,6 +179,19 @@
+ int rsx_fp_apply_alpha_test_buffered(
+     char* hlsl, u32 out_size, u32 func);
+ 
++/* The alpha test of a cut-out (GREATER or GEQUAL, nothing blended) with soft
++ * edges: the alpha sharpened to one pixel across the reference and kept by
++ * an ordered 4x4 pattern, as alpha to coverage does. A reference outside
++ * 0.1-0.9 keeps the hard test. Other functions return -1 (use
++ * rsx_fp_apply_alpha_test). */
++int rsx_fp_apply_alpha_coverage(char* hlsl, u32 out_size, u32 func, float ref);
++int rsx_fp_apply_alpha_coverage_buffered(char* hlsl, u32 out_size, u32 func);
++/* After the other Sample() rewrites: texture unit 0's 2D samples in a
++ * program given soft cut-out edges go through a helper that records their
++ * mip level (_rsx_cut_lod), which keeps distant cut-outs from thinning out.
++ * Returns the number of samples rewritten (0: left as it was). */
++int rsx_fp_apply_cutout_lod(char* hlsl, u32 out_size);
++
+ /* Plan one 256-byte-aligned allocation in a fence-retired PS constant ring.
+  * Returns 1 when it fits, 0 when the caller must submit/wait/reset first, and
+  * -1 when one allocation can never fit. */
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -63,6 +63,8 @@
+ void rsx_live_draw_set_hud_layout(int m) { (void)m; }
+ void rsx_live_draw_set_hud_edge(int p) { (void)p; }
+ void rsx_live_draw_set_shadow_softness(int l) { (void)l; }
++void rsx_live_draw_set_soft_cutouts(int e) { (void)e; }
++void rsx_live_draw_set_full_res_effects(int e) { (void)e; }
+ void rsx_live_draw_set_repeat_draws(int e) { (void)e; }
+ void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
+ void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
+@@ -262,6 +264,7 @@
+     DXGI_FORMAT fmt;
+     u32 scale;                /* host pixels per guest pixel, vertically (ld_surface_scale_for) */
+     float scale_x;            /* ... and horizontally: scale x the ultrawide widening */
++    u32 raised;               /* a reduced-size surface's render-scale twin (ld_raised_target_wanted) */
+     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+@@ -568,6 +571,8 @@
+ static volatile LONG g_ld_hud_edge = 100;        /* edges: how far out, 0 (centred) - 100 (screen edge) % */
+ static volatile LONG g_ld_shadow_softness = 0;   /* stencil shadow edges: 0 the game's, 1 soft, 2 softer */
+ static volatile LONG g_ld_repeat_draws = 1;      /* the repeat-draw fast path (ld_repeat_draw) */
++static volatile LONG g_ld_soft_cutouts = 1;      /* cut-outs with soft edges (render_state_t.alpha_coverage) */
++static volatile LONG g_ld_full_res_effects = 1;  /* reduced-size 3D passes at the render scale (surface_t.raised) */
+ /* Bumped whenever the per-draw rings or the command list start over: a draw
+  * recorded under another epoch may not reuse the previous draw's ring
+  * offsets and descriptor tables. */
+@@ -1675,6 +1680,7 @@
+ 
+ typedef struct {
+     u32 alpha_test_enable, alpha_func, alpha_ref_raw, alpha_ref_format;
++    u32 alpha_coverage;       /* a cut-out drawn with soft edges (rsx_fp_apply_alpha_coverage) */
+     u32 blend_enable, sf_rgb, df_rgb, sf_a, df_a, eq_rgb, eq_a;
+     u32 depth_test, depth_write, depth_func;
+     u32 cull_enable, cull_face, front_face;
+@@ -1702,6 +1708,73 @@
+     u32 draw_scale_x_bits;    /* float: horizontal scale (ultrawide) */
+ } render_state_t;
+ 
++/* Full-resolution effects. Colour surfaces smaller than the canvas stay at
++ * the PS3's size (ld_surface_is_canvas): the bloom's blurs step their taps by
++ * PS3 texels. Folklore also draws its water reflections that small -- the
++ * scene again, depth-tested, into 640x480 (0x31C0000, capture-20261106-
++ * 131249 draws 1811-1827), which the water then samples -- so they came out
++ * a quarter of the render size and blurry. With the setting on, a
++ * depth-tested draw into such a surface goes to a twin of it at the render
++ * scale (surface_t.raised; not widened, so the ultrawide HUD rules leave it
++ * alone), and so does a blended pass over that twin when it was drawn last
++ * (the reflection's tint quad, draw 1827). Anything else -- the bloom's
++ * passes, which later reuse the same 640x480 memory -- stays on the
++ * PS3-sized surface, and a texture read takes whichever of the two was
++ * written last. */
++static int ld_raised_target_wanted(u32 location, u32 offset, u32 guestWidth, u32 guestHeight)
++{
++    if (!InterlockedCompareExchange(&g_ld_full_res_effects, 0, 0))
++    {
++        return 0;
++    }
++    if ((g.scale ? g.scale : 1u) <= 1u)
++    {
++        return 0;
++    }
++    if (!guestWidth)
++    {
++        guestWidth = g.width;
++    }
++    if (!guestHeight)
++    {
++        guestHeight = g.height;
++    }
++    if (ld_surface_is_canvas(guestWidth, guestHeight))
++    {
++        return 0;
++    }
++    if (rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u)
++    {
++        return 1;
++    }
++    if (!(rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1u))
++    {
++        return 0;
++    }
++    int raisedFound = 0;
++    u32 raisedGeneration = 0;
++    u32 plainGeneration = 0;
++    for (u32 index = 0; index < g.n_surfaces; index++)
++    {
++        const surface_t* candidate = &g.surfaces[index];
++        if (!candidate->tex || candidate->location != location || candidate->offset != offset ||
++            candidate->w != guestWidth || candidate->h != guestHeight)
++        {
++            continue;
++        }
++        if (candidate->raised)
++        {
++            raisedFound = 1;
++            raisedGeneration = candidate->last_write_generation;
++        }
++        else if (candidate->last_write_generation > plainGeneration)
++        {
++            plainGeneration = candidate->last_write_generation;
++        }
++    }
++    return raisedFound && raisedGeneration > plainGeneration;
++}
++
+ static void decode_render_state(render_state_t* rs)
+ {
+     memset(rs, 0, sizeof(*rs));
+@@ -1711,8 +1784,16 @@
+     rsx_dsp_surface alpha_surface;
+     rsx_dsp_get_surface(&g.rsx, &alpha_surface);
+     rs->alpha_ref_format = alpha_surface.color_format;
+-    rs->draw_scale = ld_surface_scale_for(alpha_surface.clip_w, alpha_surface.clip_h);
++    if (ld_raised_target_wanted(alpha_surface.color_location[0], alpha_surface.color_offset[0],
++                                alpha_surface.clip_w, alpha_surface.clip_h))
+     {
++        rs->draw_scale = g.scale;
++        const float drawScaleX = (float)g.scale;
++        memcpy(&rs->draw_scale_x_bits, &drawScaleX, sizeof drawScaleX);
++    }
++    else
++    {
++        rs->draw_scale = ld_surface_scale_for(alpha_surface.clip_w, alpha_surface.clip_h);
+         const float drawScaleX = ld_surface_scale_x_for(alpha_surface.clip_w, alpha_surface.clip_h);
+         memcpy(&rs->draw_scale_x_bits, &drawScaleX, sizeof drawScaleX);
+     }
+@@ -1754,6 +1835,17 @@
+     rs->rt_fp16 = alpha_surface.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16;
+     rs->rt_count = ld_rt_count(alpha_surface.color_target);
+     rs->blend_enable = rsx_dsp_reg(&g.rsx, M_BLEND_ENABLE) & 1;
++    /* Soft-edged cut-outs (engine setting): an alpha test keeping alpha above
++     * its reference with nothing blended -- the game's own (GREATER 0.75 on
++     * grass and leaves) or alpha to coverage's stand-in above. Particles
++     * test GREATER ~0 while blending and are left alone; the shader keeps a
++     * reference outside 0.1-0.9 hard as well, since in the buffered path the
++     * reference is a constant. */
++    if (InterlockedCompareExchange(&g_ld_soft_cutouts, 0, 0) && rs->alpha_test_enable && !rs->blend_enable &&
++        (rs->alpha_func == 0x0204u || rs->alpha_func == 0x0206u))
++    {
++        rs->alpha_coverage = 1;
++    }
+     const u32 sf = rsx_dsp_reg(&g.rsx, M_BLEND_SFACTOR);
+     const u32 df = rsx_dsp_reg(&g.rsx, M_BLEND_DFACTOR);
+     const u32 eq = rsx_dsp_reg(&g.rsx, M_BLEND_EQUATION);
+@@ -2605,6 +2697,16 @@
+     InterlockedExchange(&g_ld_shadow_softness, (level == 1 || level == 2) ? level : 0);
+ }
+ 
++void rsx_live_draw_set_soft_cutouts(int enabled)
++{
++    InterlockedExchange(&g_ld_soft_cutouts, enabled ? 1 : 0);
++}
++
++void rsx_live_draw_set_full_res_effects(int enabled)
++{
++    InterlockedExchange(&g_ld_full_res_effects, enabled ? 1 : 0);
++}
++
+ void rsx_live_draw_set_hud_edge(int percent)
+ {
+     InterlockedExchange(&g_ld_hud_edge, percent < 0 ? 0 : (percent > 100 ? 100 : percent));
+@@ -5033,11 +5135,17 @@
+ /* fp constants are stored as raw bits; the shader reads them as floats. */
+ static float ld_c2f(u32 bits) { float f; memcpy(&f, &bits, sizeof f); return f; }
+ 
+-static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
+-                       DXGI_FORMAT want_fmt)
++/* `raised`: the render-scale twin of a reduced-size surface
++ * (ld_raised_target_wanted); 0 for the surface at its usual scale. */
++static u32 surface_get_variant(u32 location, u32 offset, u32 want_w, u32 want_h,
++                               DXGI_FORMAT want_fmt, int raised)
+ {
+     if (!want_w) want_w = g.width;
+     if (!want_h) want_h = g.height;
++    if (raised && ld_surface_is_canvas(want_w, want_h))
++    {
++        raised = 0;
++    }
+     /* Key on the DIMENSIONS as well as location/offset.
+      *
+      * Keying on location/offset alone meant a redeclaration of the same offset
+@@ -5063,7 +5171,7 @@
+     for (u32 i = 0; i < g.n_surfaces; i++)
+         if (g.surfaces[i].location == location && g.surfaces[i].offset == offset &&
+             g.surfaces[i].w == want_w && g.surfaces[i].h == want_h &&
+-            g.surfaces[i].fmt == want_fmt)
++            g.surfaces[i].fmt == want_fmt && g.surfaces[i].raised == (u32)(raised ? 1 : 0))
+             return i;
+     /* Never destroy a usable render target because a malformed live command
+      * briefly decoded a guest pointer as clip dimensions.  The known-good
+@@ -5099,8 +5207,8 @@
+     D3D12_HEAP_PROPERTIES hp = {0}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    const u32 surfaceScale = ld_surface_scale_for(want_w, want_h);
+-    const float surfaceScaleX = ld_surface_scale_x_for(want_w, want_h);
++    const u32 surfaceScale = raised ? (g.scale ? g.scale : 1u) : ld_surface_scale_for(want_w, want_h);
++    const float surfaceScaleX = raised ? (float)surfaceScale : ld_surface_scale_x_for(want_w, want_h);
+     rd.Width = ld_scale_pixels(want_w, surfaceScaleX); rd.Height = want_h * surfaceScale; rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1; rd.Format = want_fmt; rd.SampleDesc.Count = 1;
+     rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+@@ -5139,6 +5247,7 @@
+     s->fmt = want_fmt;
+     s->scale = surfaceScale;
+     s->scale_x = surfaceScaleX;
++    s->raised = raised ? 1u : 0u;
+ #if !defined(YZ_PERF_CLEAN)
+     s->resource_serial = ++g_ld_surface_resource_serial;
+ #endif
+@@ -5151,6 +5260,12 @@
+     return slot;
+ }
+ 
++static u32 surface_get(u32 location, u32 offset, u32 want_w, u32 want_h,
++                       DXGI_FORMAT want_fmt)
++{
++    return surface_get_variant(location, offset, want_w, want_h, want_fmt, 0);
++}
++
+ /* A draw that samples its own render target. RSX reads and writes the same
+  * surface in one pass (GH3's post pass reads the scene at 0x200000 while
+  * drawing into 0x200000); D3D12 cannot, and the lookup used to fall back to
+@@ -5429,11 +5544,13 @@
+ {
+     rsx_dsp_surface sf;
+     rsx_dsp_get_surface(&g.rsx, &sf);
+-    return surface_get(sf.color_location[0], sf.color_offset[0],
+-                       sf.clip_w, sf.clip_h,
+-                       sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+-                           ? DXGI_FORMAT_R16G16B16A16_FLOAT
+-                           : DXGI_FORMAT_R8G8B8A8_UNORM);
++    return surface_get_variant(sf.color_location[0], sf.color_offset[0],
++                               sf.clip_w, sf.clip_h,
++                               sf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
++                                   ? DXGI_FORMAT_R16G16B16A16_FLOAT
++                                   : DXGI_FORMAT_R8G8B8A8_UNORM,
++                               ld_raised_target_wanted(sf.color_location[0], sf.color_offset[0],
++                                                       sf.clip_w, sf.clip_h));
+ }
+ 
+ /* On RSX each zeta (depth) address is distinct memory. The offline renderer's
+@@ -5944,6 +6061,7 @@
+      * field is listed explicitly so struct padding can never become identity. */
+     LD_HASH_RENDER_FIELD(alpha_test_enable);
+     LD_HASH_RENDER_FIELD(alpha_func);
++    LD_HASH_RENDER_FIELD(alpha_coverage);
+     LD_HASH_RENDER_FIELD(blend_enable);
+     LD_HASH_RENDER_FIELD(sf_rgb);
+     LD_HASH_RENDER_FIELD(df_rgb);
+@@ -7584,8 +7702,9 @@
+             decompiled_constant_count != g.fp_constants.count)
+             fi = -1;
+         if (fi > 0 && rs.alpha_test_enable &&
+-            rsx_fp_apply_alpha_test_buffered(
+-                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func) < 0)
++            (rs.alpha_coverage
++                 ? rsx_fp_apply_alpha_coverage_buffered(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func)
++                 : rsx_fp_apply_alpha_test_buffered(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func)) < 0)
+             fi = -1;
+         if (fi > 0) {
+             const int np = rsx_fp_apply_unnorm_scale(
+@@ -7607,9 +7726,9 @@
+             fp_uc, fp_size, fp_ctrl, cube_mask,
+             ps_hlsl, sizeof(ps_hlsl));
+         if (fi > 0 && rs.alpha_test_enable &&
+-            rsx_fp_apply_alpha_test(
+-                ps_hlsl, sizeof(ps_hlsl), rs.alpha_func,
+-                g.fp_alpha_ref) < 0)
++            (rs.alpha_coverage
++                 ? rsx_fp_apply_alpha_coverage(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func, g.fp_alpha_ref)
++                 : rsx_fp_apply_alpha_test(ps_hlsl, sizeof(ps_hlsl), rs.alpha_func, g.fp_alpha_ref)) < 0)
+             fi = -1;
+         if (fi > 0 && rsx_fp_apply_unnorm_scale(
+                 ps_hlsl, sizeof(ps_hlsl), unnorm_mask,
+@@ -7638,6 +7757,12 @@
+             }
+         }
+     }
++    /* Soft cut-outs: unit 0's samples record their mip level, last, after
++     * every other rewrite of Sample() calls (rsx_fp_apply_cutout_lod). */
++    if (fi > 0 && rs.alpha_test_enable && rs.alpha_coverage && rsx_fp_apply_cutout_lod(ps_hlsl, sizeof(ps_hlsl)) < 0)
++    {
++        fi = -1;
++    }
+ #if defined(YZ_PERF_PROFILE)
+     g_ld_profile.total.decompile_qpc +=
+         (u64)(ld_profile_qpc() - decompile_begin);
+@@ -11845,11 +11970,12 @@
+         rsx_dsp_get_surface(&g.rsx, &msf);
+         const u32 want = ld_rt_count(msf.color_target);
+         for (u32 r = 1; r < want; r++) {
+-            const u32 s = surface_get(msf.color_location[r], msf.color_offset[r],
+-                                      msf.clip_w, msf.clip_h,
+-                                      msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
+-                                          ? DXGI_FORMAT_R16G16B16A16_FLOAT
+-                                          : DXGI_FORMAT_R8G8B8A8_UNORM);
++            const u32 s = surface_get_variant(msf.color_location[r], msf.color_offset[r],
++                                              msf.clip_w, msf.clip_h,
++                                              msf.color_format == RSX_SURFACE_FMT_F_W16Z16Y16X16
++                                                  ? DXGI_FORMAT_R16G16B16A16_FLOAT
++                                                  : DXGI_FORMAT_R8G8B8A8_UNORM,
++                                              (int)g.surfaces[target].raised);
+             if (s == LD_INVALID_SURFACE || s == target) break;
+             mrt[n_mrt++] = s;
+         }
+@@ -11997,7 +12123,23 @@
+               if (sf_i->location != t.location || sf_i->offset != t.offset ||
+                   i == target)
+                   continue;
+-              if (sf_i->w == t.width && sf_i->h == t.height) { sampled = (int)i; break; }
++              if (sf_i->w == t.width && sf_i->h == t.height) {
++                  /* A reduced-size surface and its render-scale twin
++                   * (surface_t.raised): the one written last. */
++                  int twin = -1;
++                  for (u32 twinIndex = i + 1; twinIndex < g.n_surfaces; twinIndex++) {
++                      const surface_t* other = &g.surfaces[twinIndex];
++                      if (twinIndex != target && other->tex && other->location == t.location &&
++                          other->offset == t.offset && other->w == t.width && other->h == t.height &&
++                          other->fmt == sf_i->fmt && other->raised != sf_i->raised) {
++                          twin = (int)twinIndex;
++                          break;
++                      }
++                  }
++                  sampled = (twin >= 0 && g.surfaces[twin].last_write_generation > sf_i->last_write_generation)
++                                ? twin : (int)i;
++                  break;
++              }
+               if (sampled < 0 || sf_i->last_draw_generation > best_gen) {
+                   sampled = (int)i;
+                   best_gen = sf_i->last_draw_generation;
+@@ -12322,7 +12464,7 @@
+     /* A 1x post-effect target with a canvas-sized (scaled) zeta bound: fine
+      * while the pass ignores depth, which is what such passes do. Say so if
+      * one does not -- its depth test would read the wrong part of the zeta. */
+-    if (current_zslot && !ld_surface_is_canvas_scale(drawSurface) &&
++    if (current_zslot && !ld_surface_is_canvas_scale(drawSurface) && !drawSurface->raised &&
+         ((rsx_dsp_reg(&g.rsx, M_DEPTH_TEST_ENABLE) & 1u) || (rsx_dsp_reg(&g.rsx, M_DEPTH_WRITE) & 1u)))
+     {
+         static u32 depthScaleLogs = 0;
+@@ -12690,6 +12832,22 @@
+           if (ct) { col[0] = 1.0f; col[1] = 0.0f; col[2] = 1.0f; col[3] = 1.0f; } }
+         g.list->lpVtbl->ClearRenderTargetView(g.list, rtv, col, 0, NULL);
+         ld_surface_note_write(target, LD_SURFACE_WRITE_CLEAR);
++        /* A reduced-size surface's render-scale twin (surface_t.raised) is
++         * the same guest memory: clear it too, so neither keeps a picture
++         * from before the clear. */
++        for (u32 twinIndex = 0; twinIndex < g.n_surfaces; twinIndex++)
++        {
++            const surface_t* cleared = &g.surfaces[target];
++            const surface_t* twin = &g.surfaces[twinIndex];
++            if (twinIndex == target || !twin->tex || twin->raised == cleared->raised ||
++                twin->location != cleared->location || twin->offset != cleared->offset ||
++                twin->w != cleared->w || twin->h != cleared->h || twin->fmt != cleared->fmt)
++            {
++                continue;
++            }
++            g.list->lpVtbl->ClearRenderTargetView(g.list, rtv_handle(LD_SWAP_BUFFERS + twinIndex), col, 0, NULL);
++            ld_surface_note_write(twinIndex, LD_SURFACE_WRITE_CLEAR);
++        }
+     }
+     if ((mask & (RSX_CLEAR_DEPTH | RSX_CLEAR_STENCIL)) && g.depth) {
+         rsx_dsp_surface sf;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -178,6 +178,14 @@
+ /* Soft shadows: 0 the game's stencil shadow edges, 1 soft, 2 softer (the
+  * shadow quad's stencil test made into a mask and blurred; live). */
+ void rsx_live_draw_set_shadow_softness(int level);
++/* Soft-edged cut-outs: grass, leaves and fences (alpha-tested, nothing
++ * blended) with their edges anti-aliased by coverage instead of cut per
++ * pixel (rsx_fp_apply_alpha_coverage). 1 on, 0 the game's hard edges. Live:
++ * pipelines are rebuilt as they are next drawn. */
++void rsx_live_draw_set_soft_cutouts(int enabled);
++/* Full-resolution effects: 3D passes the game draws into surfaces smaller
++ * than the screen (the water reflections) drawn at the render scale. Live. */
++void rsx_live_draw_set_full_res_effects(int enabled);
+ /* Repeat draws: a draw whose state is the previous draw's apart from its
+  * transform constants reuses that draw's upload, pipeline and tables (1, the
+  * default) or goes through the whole draw path again (0). Live. */

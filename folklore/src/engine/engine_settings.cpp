@@ -298,6 +298,14 @@ void engineSettingsLoad()
                 settingsInstance.shadows = EngineSettings::Shadows::Soft;
             }
         }
+        else if (std::strcmp(key, "soft_foliage") == 0)
+        {
+            settingsInstance.softCutouts = parseBool(value);
+        }
+        else if (std::strcmp(key, "full_res_effects") == 0)
+        {
+            settingsInstance.fullResEffects = parseBool(value);
+        }
         else if (std::strcmp(key, "ambient_occlusion") == 0)
         {
             if (std::strcmp(value, "off") == 0)
@@ -522,6 +530,10 @@ void engineSettingsSave()
                  current.shadows == EngineSettings::Shadows::Original ? "original"
                  : current.shadows == EngineSettings::Shadows::Softer ? "softer"
                                                                       : "soft");
+    std::fprintf(file, "# grass, leaves and fences with smooth edges instead of cut pixel by pixel\n");
+    std::fprintf(file, "soft_foliage = %d\n", current.softCutouts ? 1 : 0);
+    std::fprintf(file, "# water reflections (drawn smaller than the screen by the game) at the render resolution\n");
+    std::fprintf(file, "full_res_effects = %d\n", current.fullResEffects ? 1 : 0);
     std::fprintf(file, "# off, subtle or strong (next start)\n");
     std::fprintf(file, "ambient_occlusion = %s\n",
                  current.ambientOcclusion == EngineSettings::AmbientOcclusion::Off      ? "off"
@@ -577,6 +589,8 @@ extern "C"
     void rsx_live_draw_set_hud_edge(int percent);
     void rsx_live_draw_set_shadow_softness(int level);
     void rsx_live_draw_set_repeat_draws(int enabled);
+    void rsx_live_draw_set_soft_cutouts(int enabled);
+    void rsx_live_draw_set_full_res_effects(int enabled);
     void rsx_live_draw_set_sharpening(uint32_t percent);
     void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent);
     void rsx_live_draw_set_texture_pack(const char* folder);
@@ -628,6 +642,8 @@ void engineSettingsApplyGraphics()
     rsx_live_draw_set_post_aa((int)current.antiAliasing);
     rsx_live_draw_set_async_shaders(current.backgroundShaders ? 1 : 0);
     rsx_live_draw_set_repeat_draws(current.repeatDraws ? 1 : 0);
+    rsx_live_draw_set_soft_cutouts(current.softCutouts ? 1 : 0);
+    rsx_live_draw_set_full_res_effects(current.fullResEffects ? 1 : 0);
     rsx_live_draw_set_anisotropy((uint32_t)current.anisotropy);
     static const int kTextureLodBias[3] = {0, -50, -100};
     rsx_live_draw_set_texture_lod_bias(kTextureLodBias[(int)current.textureDetail]);

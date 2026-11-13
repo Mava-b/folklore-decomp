@@ -18,6 +18,8 @@ extern "C"
     void rsx_live_draw_set_post_aa(int mode) { (void)mode; }
     void rsx_live_draw_set_async_shaders(int enabled) { (void)enabled; }
     void rsx_live_draw_set_repeat_draws(int enabled) { (void)enabled; }
+    void rsx_live_draw_set_soft_cutouts(int enabled) { (void)enabled; }
+    void rsx_live_draw_set_full_res_effects(int enabled) { (void)enabled; }
     void rsx_live_draw_set_anisotropy(uint32_t level) { (void)level; }
     void rsx_live_draw_set_sharpening(uint32_t percent) { (void)percent; }
     void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent)
