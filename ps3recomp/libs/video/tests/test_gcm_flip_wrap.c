@@ -15,6 +15,7 @@
  *   -o /tmp/test_gcm_flip_wrap        (clang on macOS: -Wl,-dead_strip)
  */
 #include "../cellGcmSys.c"
+#include "../rsx_tiling.c"
 #include <stdio.h>
 #include <stdlib.h>
 uint8_t* vm_base;
@@ -37,8 +38,16 @@ void ppu_dump_bctrl_ring(uint32_t n, const char* why) { (void)n; (void)why; }
 void ppu_dump_guest_stack(ppu_context* c, const char* why) { (void)c; (void)why; }
 void rsx_state_init(rsx_state* state) { (void)state; }
 int  rsx_process_method(rsx_state* state, u32 method, u32 data) { (void)state; (void)method; (void)data; return 0; }
+/* No microcode or constant runs here: the walker hands every word to
+ * rsx_process_method instead. */
+int  rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{ (void)state; (void)method; (void)src; (void)count; return 0; }
 int  rsx_draw_engine_enabled(void) { return 0; }
+rsx_backend* rsx_get_backend(void) { return NULL; }
 void rsx_draw_engine_method(u32 method, u32 arg) { (void)method; (void)arg; }
+int  rsx_draw_engine_zpass_supported(void) { return 0; }
+u32  rsx_draw_engine_zpass_report(void) { return 0; }
+int  rsx_draw_engine_zpass_result(u32 t, int m, u32* v) { (void)t; (void)m; (void)v; return -1; }
 void rsx_draw_engine_note_flip(u32 buffer_id) { (void)buffer_id; }
 void rsx_draw_engine_guest_read(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
 void rsx_draw_engine_guest_wrote(u32 l, u32 o, u32 p, u32 w, u32 h) { (void)l; (void)o; (void)p; (void)w; (void)h; }
@@ -97,6 +106,14 @@ int main(void)
     u32 ctx_out = host_alloc(4, 4);
     u32 rt = cellGcmSetupContext(ctx_out, CMD_SIZE, IO_SIZE, IO_ADDR, host_alloc, host_w32);
     s_display_buffer_set[1] = 1;
+
+    /* CellGcmContextData: end reserves the last word for the wrap JUMP */
+    const u32 rt_begin = vm_read32(rt);
+    const u32 rt_end = vm_read32(rt + 4);
+    if (rt_end != rt_begin + CMD_SIZE - 4) {
+        printf("FAIL: rt_end (0x%08X) != rt_begin + CMD_SIZE - 4 (0x%08X)\n", rt_end, rt_begin + CMD_SIZE - 4);
+        fails++;
+    }
 
     /* The title's draw context: 0x30000 bytes inside the IO window, with its
      * own callback descriptor. */

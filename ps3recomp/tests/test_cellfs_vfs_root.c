@@ -3,6 +3,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+/* sys_fs.c asks cellGame whether the booted title is an HDD game; this fixture
+ * has no cellGame, and ld64 will not leave a weak reference undefined. */
+const char* cellGame_get_hdd_title_id(void) { return 0; }
 
 static unsigned checks;
 #define CHECK(x) do { ++checks; if (!(x)) { fprintf(stderr,"FAIL line %d: %s\n",__LINE__,#x); return 1; } } while (0)

@@ -102,6 +102,9 @@ typedef struct CellVdecCb {
 
 s32 cellVdecOpen(const CellVdecType* type, const CellVdecResource* res,
                   const CellVdecCb* cb, CellVdecHandle* handle);
+s32 cellVdecQueryAttrEx(const CellVdecType* type, void* attr);
+s32 cellVdecOpenEx(const CellVdecType* type, const CellVdecResource* res,
+                   const CellVdecCb* cb, CellVdecHandle* handle);
 s32 cellVdecClose(CellVdecHandle handle);
 
 s32 cellVdecStartSeq(CellVdecHandle handle);

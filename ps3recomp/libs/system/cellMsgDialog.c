@@ -65,6 +65,51 @@ static CellMsgDialogType     s_type        = 0;
  * legitimate notice open longer than the default. */
 static ULONGLONG s_nobutton_deadline = 0;
 
+/* macOS with a window: yes/no and OK prompts go to the player as a sheet on
+ * the game window (rsx_metal_backend.m) instead of being answered here.
+ * MSGDIALOG_NATIVE=0, or MSGDIALOG_ANSWER set, keeps the automatic answers. */
+#if defined(__APPLE__)
+int  rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
+                           void (*done)(int seq, int yes));
+void rsx_metal_dismiss_dialog(int seq);
+static volatile int s_native_seq = 0;     /* the prompt on screen, 0 = none */
+static int          s_native_yes_no = 0;
+
+static int native_dialogs_on(void)
+{
+    static int on = -1;
+    if (on < 0) {
+        const char* e = getenv("MSGDIALOG_NATIVE");
+        on = (e && e[0] == '0') || getenv("MSGDIALOG_ANSWER") ? 0 : 1;
+    }
+    return on;
+}
+
+/* Main thread: the player answered prompt `seq`. */
+static void native_dialog_done(int seq, int yes)
+{
+    if (seq != s_native_seq || !s_dialog_open) return;   /* closed by the game meanwhile */
+    s_native_seq = 0;
+    s_dialog_open = 0;
+    int32_t result = !s_native_yes_no ? CELL_MSGDIALOG_BUTTON_OK
+                   : yes              ? CELL_MSGDIALOG_BUTTON_YES
+                                      : CELL_MSGDIALOG_BUTTON_NO;
+    printf("[cellMsgDialog] player answered: %s\n",
+           !s_native_yes_no ? "OK" : yes ? "YES" : "NO");
+    if (s_callback) {
+        CellMsgDialogCallback cb = s_callback;
+        s_callback = NULL;
+        queue_dialog_callback(cb, result, s_userdata);
+    }
+}
+
+static void native_dialog_take_down(void)
+{
+    int seq = s_native_seq;
+    if (seq) { s_native_seq = 0; rsx_metal_dismiss_dialog(seq); }
+}
+#endif
+
 
 
 static unsigned nobutton_grace_ms(void)
@@ -172,6 +217,24 @@ s32 cellMsgDialogOpen2(CellMsgDialogType type, const char* msgString,
                      (nobutton_waits &&
                       button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_NONE);
 
+#if defined(__APPLE__)
+    native_dialog_take_down();
+    if (!stays_open && native_dialogs_on() &&
+        (button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO ||
+         button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_OK)) {
+        static int next_seq = 0;
+        int seq = ++next_seq;
+        s_native_seq = seq;
+        s_native_yes_no = button_type == CELL_MSGDIALOG_TYPE_BUTTON_TYPE_YESNO;
+        if (rsx_metal_show_dialog(guest_str(msgString), s_native_yes_no,
+                                  (type & 0x100) != 0 /* DEFAULT_CURSOR_NO */,
+                                  seq, native_dialog_done) == 0) {
+            printf("[cellMsgDialog] shown to the player (waits for an answer)\n");
+            return CELL_OK;
+        }
+        s_native_seq = 0;   /* no window: answer automatically below */
+    }
+#endif
     if (!stays_open) {
         /* Queue the headless auto-response for non-progress dialogs */
         s32 result = CELL_MSGDIALOG_BUTTON_OK;
@@ -264,6 +327,9 @@ s32 cellMsgDialogOpen(CellMsgDialogType type, const char* msgString,
 s32 cellMsgDialogClose(float delayMs)
 {
     printf("[cellMsgDialog] Close(delay=%.1f ms)\n", delayMs);
+#if defined(__APPLE__)
+    native_dialog_take_down();
+#endif
 
     if (!s_dialog_open) {
         return CELL_MSGDIALOG_ERROR_DIALOG_NOT_OPENED;
@@ -284,6 +350,9 @@ s32 cellMsgDialogClose(float delayMs)
 s32 cellMsgDialogAbort(void)
 {
     printf("[cellMsgDialog] Abort()\n");
+#if defined(__APPLE__)
+    native_dialog_take_down();
+#endif
 
     /* Abort removes a dialog without reporting a button press. It also
      * succeeds when no dialog is open (RPCS3 documents this as HW-tested).

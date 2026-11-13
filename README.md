@@ -255,6 +255,26 @@ Once the 1.10 copies exist (`package_all.ps1 -UsUpdateDir/-EuUpdateDir`, see
   copies of this folder.
 - setup and build are safe to re-run; each step skips what is already done.
 
+### macOS (Apple silicon) — early
+
+The game also builds natively for Apple-silicon Macs, drawing with Metal. A
+new game starts and plays: cutscenes, Doolin, the story pages. Motion
+sensors are not read on the Mac yet (captures complete by themselves), and
+the engine menu and most of the **What's better than on the PS3** list are
+Direct3D 12 only. With [Homebrew](https://brew.sh) and the Xcode command-line
+tools:
+
+```sh
+./setup_mac.sh ~/path/to/Folklore.iso      # or the folder that contains PS3_GAME
+./run_mac.sh
+```
+
+Everything about the Mac build (status, the in-game menu, the variables, the
+fixes) is in [README.macOS.md](README.macOS.md)
+([Português](README.macOS.pt-BR.md)); what is missing is in
+[ROADMAP.macOS.md](ROADMAP.macOS.md). [`launcher/`](launcher/README.md) is a
+Mac app that installs, sets up and starts it without a terminal.
+
 ---
 
 ## Playing
@@ -703,8 +723,8 @@ Point people at this repository instead.
 | `folklore/` | The port: CMake project, Folklore-specific HLE, the engine menu and settings (`src/engine`), the lifting scripts (`tools/`) and the engineering log (`docs/STATUS.md`) |
 | `folklore/src/recomp/` | Empty here; setup fills it with the game's code translated from **your** EBOOT |
 | `folklore/firmware_lle/` | Not in the repository; only made by `setup.ps1 -LibsrePrx`, from **your** libsre.prx, for comparison runs |
-| `ps3recomp/` | The recompiler and runtime: [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp) at commit `39a3629`, with everything in `patches/` already applied |
-| `patches/` | The changes this port made to ps3recomp, one patch per fix, kept as a record (and so they can go upstream) |
+| `ps3recomp/` | The recompiler and runtime: [sp00nznet/ps3recomp](https://github.com/sp00nznet/ps3recomp) at commit `de4f090` (v0.19.0+3), with everything in `patches/` already applied |
+| `patches/` | The changes this port made to ps3recomp: one patch on `de4f090`, and the earlier one-patch-per-fix series in `v0.15-39a36296/`, kept as a record (and so they can go upstream) |
 
 Created by the scripts and ignored by git: `tools/`, `logs/`, `hdd0/`,
 `hdd1/`, `gamedata/`, `dist/`, `folklore/build/`, `ps3recomp/build/`, the

@@ -65,6 +65,14 @@ typedef enum {
 typedef struct rsx_be_sampler_desc {
     u8  min_linear, mag_linear, mip_linear, mip_present;
     u8  wrap_s, wrap_t, wrap_r;
+    /* What the BORDER wrap returns outside 0..1, reduced to the colours
+     * every backend can express: SET_TEXTURE_BORDER_COLOR read the way the
+     * unit's format reads it (a depth format takes its depth from the low 24
+     * bits). 0 transparent black (also the old behaviour), 1 opaque black,
+     * 2 opaque white, 3 any other colour, which the backend clamps to the
+     * edge texel instead -- nearer than black for the colours seen (a video
+     * title's chroma planes border at 0x80, neutral). */
+    u8  border;
     float min_lod, max_lod;
 } rsx_be_sampler_desc;
 
@@ -79,9 +87,17 @@ typedef struct rsx_be_render_state {
     u32 depth_test, depth_write, depth_func;
     u32 cull_enable, cull_face, front_face;
     u32 color_mask;
+    /* Targets 1..3 of an MRT set: COLOR_MASK_MRT (0x0370), one nibble per
+     * target at [4i..4i+3] = A,R,G,B, and BLEND_ENABLE_MRT (0x036C), bit i.
+     * Target 0 keeps color_mask/blend_enable. Both reset to 0 (RPCS3). */
+    u32 color_mask_mrt, blend_mrt;
     u32 rt_fp16;                    /* the target is an FP16 HDR surface */
     u32 stencil_enable, stencil_two_sided;
     u32 depth_bounds_test;          /* SET_DEPTH_BOUNDS_TEST_ENABLE */
+    /* 1: clamp the depth to [0, 1] instead of clipping at the near and far
+     * planes (SET_ZMIN_MAX_CONTROL 0x1D78: clamp set, or near/far clipping
+     * off). A backend without depth clamping draws it clipped. */
+    u32 depth_clamp;
     u32 s_func, s_func_mask, s_write_mask, s_fail, s_zfail, s_zpass;
     u32 bs_func, bs_fail, bs_zfail, bs_zpass;
 } rsx_be_render_state;
@@ -108,6 +124,14 @@ typedef struct rsx_be_render_state {
 /* ---- the backend interface ---------------------------------------------- */
 
 #define RSX_BE_HAS_COLOR_SNAPSHOT 1
+/* One vertex stream of a split draw (rsx_draw_backend.draw_vbufs). */
+#define RSX_BE_MAX_VSTREAMS 4
+typedef struct rsx_be_vstream {
+    u32 vbuf;           /* a persistent buffer (vbuf_create), else 0 */
+    const void* data;   /* vbuf == 0: this draw's vertices for the stream */
+    u32 stride;         /* bytes a vertex: 16 x the stream's slot count */
+} rsx_be_vstream;
+
 typedef struct rsx_draw_backend {
     void* user;
 
@@ -154,6 +178,17 @@ typedef struct rsx_draw_backend {
     /* Resolve a depth target into a sampleable texture and return it; 0 when
      * the backend cannot. The engine only asks after a depth-writing draw. */
     u32  (*depth_snapshot)(void* user, u32 depth, u32 w, u32 h);
+    /* Optional. The top-left w x h of a depth target, 1:1, as the bytes a
+     * colour format reads from a Z24S8 buffer: an R,G,B,A8 texture with
+     * R = D[15:8], G = D[7:0], B = 0 (the stencil byte the guest-memory copy
+     * stores) and A = D[23:16], D the depth quantized to 24 bits exactly as
+     * that copy rounds it (round(d * 16777215), d clamped to [0,1]). Sampled
+     * through A8R8G8B8 it decodes to the texture the guest-memory path
+     * uploads, without the readback. The copy is a record in the stream like
+     * depth_snapshot's. The backend owns the texture: the depth target's
+     * release or the next call with another size frees it. 0 when the backend
+     * cannot; NULL, and the engine stores depth to guest memory instead. */
+    u32  (*depth_snapshot_rgba8)(void* user, u32 depth, u32 w, u32 h);
 
     /* Pipelines, from the decompilers' HLSL plus the state that selects a
      * variant. This is the one call that hides D3DCompile against glslang
@@ -197,6 +232,19 @@ typedef struct rsx_draw_backend {
      * (rsx_be_render_state.depth_bounds_test); a backend that leaves this
      * NULL draws as if the test were off. */
     void (*set_depth_bounds)(void* user, float min, float max);
+    /* Optional: SET_BLEND_COLOR as RGBA floats, for the CONSTANT_COLOR /
+     * CONSTANT_ALPHA blend factors (0x8001-0x8004). Dynamic, like the stencil
+     * reference. */
+    void (*set_blend_color)(void* user, const float rgba[4]);
+    /* Optional. The NV4097 polygon offset for the next draw, called before
+     * every draw like the stencil reference (SET_POLY_OFFSET_{POINT,LINE,
+     * FILL}_ENABLE 0x0A60/0x0A64/0x0A68, SCALE_FACTOR 0x0A78, BIAS 0x0A7C).
+     * glPolygonOffset's terms: `slope` multiplies the primitive's maximum
+     * depth slope and `units` the smallest resolvable difference of a depth
+     * buffer of `depth_bits` bits (16 for Z16, 24 for Z24S8), so a backend
+     * whose depth format is another converts the units. Both are 0 when the
+     * offset is off. Left NULL, every draw is drawn without it. */
+    void (*set_depth_bias)(void* user, float slope, float units, u32 depth_bits);
     /* One draw. `indices` is NULL for a non-indexed one. Everything the
      * hardware has and the host does not -- quads, quad strips, fans,
      * polygons -- has already been expanded into a triangle list by the time
@@ -231,6 +279,106 @@ typedef struct rsx_draw_backend {
      * engine owns the returned handle and releases it with texture_release.
      * 0 rejects the consuming draw; NULL retains the legacy guest-upload route. */
     u32 (*color_snapshot)(void* user, u32 surface);
+
+    /* Optional. 3D textures (SET_TEXTURE_FORMAT dimension 3, CONTROL3 depth):
+     * a volume of `depth` slices per level, each slice one upload of decoded
+     * rows. A backend that leaves these NULL gets the first slice as a 2D
+     * texture through texture_create/texture_upload, as before. */
+    u32  (*texture_create_3d)(void* user, rsx_be_format fmt, u32 w, u32 h,
+                              u32 depth, u32 mips, u32 remap, u32 rsx_fmt);
+    void (*texture_upload_3d)(void* user, u32 texture, u32 z, u32 mip,
+                              u32 w, u32 h, const void* src, u32 row_bytes);
+    /* Nonzero when texture_upload is ordered after every draw already handed
+     * to the backend, so rewriting a texture those draws sample is safe. The
+     * engine then refreshes a changed 2D texture in place instead of creating
+     * a new one and releasing the old (an allocation, a free and a wait for
+     * the GPU each time). Zero keeps the create-and-swap. */
+    int texture_upload_ordered;
+    /* Optional. A depth target's top-left w x h read as a texture of base
+     * format `rsx_fmt` reads the bytes the zeta holds: a fresh texture (a
+     * colour target for surface_view) whose texel is what depth_readback,
+     * stored as eng_zdepth_to_guest stores it and decoded, gives.
+     *  - A8R8G8B8 (0x85) of a Z24S8 zeta: R8G8B8A8, R = depth bits 15..8,
+     *    G = bits 7..0, B = 0 (the stencil byte), A = bits 23..16, with
+     *    round(depth * 0xFFFFFF) taken exactly;
+     *  - DEPTH16 (0x92) of a Z16 zeta: R16 unorm of round(depth * 0xFFFF).
+     * Any other format: 0. Made in command order, like
+     * depth_snapshot, so no wait, and from the depth the draws so far left,
+     * which may be the target the current pass still attaches; the engine
+     * owns the handle. 0 when the backend cannot; NULL keeps the store
+     * through guest memory. */
+    u32  (*depth_as_color)(void* user, u32 depth, u32 w, u32 h, u32 rsx_fmt);
+
+    /* Optional, all three or none. Persistent vertex buffers: the engine
+     * keeps the decoded vertices of geometry whose guest bytes did not change
+     * since an earlier frame and draws from them instead of fetching, decoding
+     * and staging it again (the vertex cache, PS3RECOMP_ENG_VCACHE).
+     * vbuf_create copies `bytes` and returns a handle, 0 when it cannot. A
+     * released handle must stay valid for draws already recorded: the backend
+     * frees the buffer only once nothing recorded or in flight names it.
+     * draw_vbuf is draw() with the vertices taken from such a buffer, from its
+     * start; `indices` is NULL for a non-indexed draw. Left NULL, the cache is
+     * off and every draw goes through draw(). */
+    u32  (*vbuf_create)(void* user, const void* data, u32 bytes);
+    void (*vbuf_release)(void* user, u32 vbuf);
+    void (*draw_vbuf)(void* user, rsx_topology topology, u32 vbuf,
+                      u32 vertex_count, u32 stride, const u32* indices,
+                      u32 index_count);
+
+    /* Optional, needs the three above. A draw whose vertices come from
+     * several vertex streams (rsx_vertex_layout_plan.stream_map, which the
+     * bound pipeline was created with): stream k is streams[k], either a
+     * persistent buffer (vbuf != 0, from its start) or `data` to stage for
+     * this draw, `stride` bytes a vertex either way. Lets the vertex cache
+     * keep a draw's static streams resident while a stream the guest
+     * rewrites every frame is fetched and staged on its own. Left NULL, the
+     * cache keys whole draws only. */
+    void (*draw_vbufs)(void* user, rsx_topology topology,
+                       const rsx_be_vstream* streams, u32 n_streams,
+                       u32 vertex_count, const u32* indices, u32 index_count);
+
+    /* Optional. Image files for texture packs (PS3_MODS) and their dump
+     * (PS3_MODS_DUMP). image_load reads a PNG into malloc'd, tightly packed
+     * R,G,B,A rows with straight (not premultiplied) alpha, the bytes as the
+     * file holds them (no colour management); the caller frees them.
+     * image_save writes such rows as a PNG; it copies them and may finish
+     * later. Both return 1 on success. A backend that leaves them NULL has
+     * no texture packs. */
+    int  (*image_load)(void* user, const char* path, u8** rgba, u32* w, u32* h);
+    int  (*image_save)(void* user, const char* path, const u8* rgba,
+                       u32 w, u32 h, u32 row_bytes);
+
+    /* Optional, both or neither: ZPASS occlusion counting, what GET_REPORT
+     * type 1 reports. set_occlusion is called before every draw, 0 when the
+     * draw's samples are not counted, else the query they are counted into;
+     * query ids only grow. occlusion_result answers for one query:
+     *   1  every draw recorded for it has executed; *samples is how many
+     *      samples passed the depth and stencil tests, in the guest's own
+     *      sample grid (a backend that renders at a higher resolution
+     *      scales the count back);
+     *   0  a draw is still in flight on the GPU (submitted);
+     *   2  a draw is recorded but not submitted yet: only submit_and_wait
+     *      will ever make it complete;
+     *  -1  the backend does not know the query (any more), or lost a count.
+     * A query no draw was recorded for is unknown (-1); the engine never asks
+     * for one. */
+    void (*set_occlusion)(void* user, u32 query);
+    int  (*occlusion_result)(void* user, u32 query, u64* samples);
+
+    /* Optional, both or neither: clear_color and clear_depth_stencil limited
+     * to the rectangle (x, y, w, h) of the target, in the engine's pixels
+     * (the sample grid of an antialiased surface), w and h never 0. RSX
+     * clears only what the scissor and the surface clip let through: a
+     * split-screen title renders the left view, then clears and renders the
+     * right one in the same target with the scissor on that half. The engine
+     * calls these only for a clear whose scissor leaves part of the clip
+     * alone; left NULL, such a clear covers the whole target, as before. */
+    void (*clear_color_rect)(void* user, u32 surface, const float rgba[4],
+                             u32 x, u32 y, u32 w, u32 h);
+    void (*clear_depth_stencil_rect)(void* user, u32 depth, u32 flags,
+                                     float depth_value, u8 stencil,
+                                     u32 x, u32 y, u32 w, u32 h);
+
 } rsx_draw_backend;
 
 /* ---- the engine --------------------------------------------------------- */
@@ -269,6 +417,29 @@ void rsx_draw_engine_set_display_buffer(u32 buffer_id, u32 location, u32 offset,
  * on its fence sees the GPU catch up. */
 void rsx_draw_engine_flush(void);
 
+/* ZPASS pixel counts measured on the host GPU: the NV4097 report of type 1
+ * (CELL_GCM_ZPASS_PIXEL_CNT). While SET_ZPASS_PIXEL_COUNT_ENABLE (0x17CC) is
+ * on, every draw's passing samples are counted; CLEAR_REPORT_VALUE (0x17C8)
+ * of type 1 restarts the count. The FIFO walker, at GET_REPORT, takes a
+ * ticket for the count so far and asks for it later, because the draws it
+ * counts have only been recorded, not executed.
+ *
+ * zpass_supported: the backend can count and PS3RECOMP_ENG_ZPASS is not 0.
+ * zpass_report: a ticket (never 0) for the count since the last clear, as of
+ * the methods dispatched so far; 0 when counting is not supported.
+ * zpass_result: 1 and *value once every draw the ticket covers has executed;
+ * 0 while one is still pending; -1 when the count is lost (the caller answers
+ * conservatively). `submit`: RSX_ZPASS_POLL only looks; RSX_ZPASS_KICK
+ * submits and waits (submit_and_wait) only when a draw of the ticket is still
+ * recorded but unsubmitted, leaving one already in flight to finish on its
+ * own; RSX_ZPASS_WAIT submits and waits whatever the state. */
+#define RSX_ZPASS_POLL   0
+#define RSX_ZPASS_KICK   1
+#define RSX_ZPASS_WAIT   2
+int  rsx_draw_engine_zpass_supported(void);
+u32  rsx_draw_engine_zpass_report(void);
+int  rsx_draw_engine_zpass_result(u32 ticket, int submit, u32* value);
+
 /* Present whatever the frame has recorded, for a host that drives the flip
  * itself rather than through the FIFO's 0xE944. */
 void rsx_draw_engine_present(void);
@@ -305,6 +476,27 @@ u32  rsx_draw_engine_guest_draws(void);
  * two. Zero when nothing has been presented or the surface is not an
  * 8-bit-per-channel one. */
 u32  rsx_draw_engine_readback_center(void);
+
+/* The vertex cache's counters since rsx_draw_engine_init (see
+ * rsx_draw_backend.vbuf_create). `enabled` is 0 when PS3RECOMP_ENG_VCACHE=0
+ * or the backend has no persistent vertex buffers. hits: draws that used a
+ * cached buffer; misses: cacheable draws fetched again; resting: draws whose
+ * key changed too often to be hashed for now; created: buffers made. */
+typedef struct {
+    int enabled;
+    u64 hits, misses, resting, created;
+    u64 hashed_bytes;
+    u32 keys;
+    u64 resident_bytes;
+    /* Split draws (rsx_draw_backend.draw_vbufs; PS3RECOMP_ENG_VCACHE_SPLIT=0
+     * turns them off): draws whose attributes come from more than one
+     * stream and are cached per stream. A split draw counts once in
+     * split_draws and once per stream in stream_hits / stream_misses (not in
+     * hits / misses, which stay whole-draw counts). */
+    int split_enabled;
+    u64 split_draws, stream_hits, stream_misses;
+} rsx_draw_engine_vcache_stats;
+void rsx_draw_engine_get_vcache_stats(rsx_draw_engine_vcache_stats* out);
 
 /* ---- pieces the engine exposes for its own tests ------------------------ */
 /*

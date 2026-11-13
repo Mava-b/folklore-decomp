@@ -1,7 +1,7 @@
 # ps3recomp - tests/fiber_switch
 #
-# cellFiber cooperative switching on the host's own mechanism: Windows fibers
-# on Windows, ucontext elsewhere. Standalone project with its own build dir,
+# cellFiber's scheduler API on the host's own switching mechanism: Windows
+# fibers on Windows, ucontext elsewhere. Standalone project with its own build dir,
 # and also added from the top-level CMakeLists under PS3RECOMP_BUILD_TESTS.
 #
 #   cmake -S tests/fiber_switch -B build-fiber -G Ninja
@@ -29,6 +29,10 @@ add_executable(fiber_switch
     main.c
     "${PS3RECOMP_TREE_ROOT}/libs/spurs/cellFiber.c"
 )
+
+# The case that signals a fiber from another host thread.
+find_package(Threads REQUIRED)
+target_link_libraries(fiber_switch PRIVATE Threads::Threads)
 
 target_include_directories(fiber_switch PRIVATE
     "${PS3RECOMP_TREE_ROOT}/libs/spurs"

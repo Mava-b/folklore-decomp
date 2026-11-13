@@ -30,6 +30,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 extern int spu_run_with_halt(void (*)(spu_context*), spu_context*);
 
@@ -48,9 +49,9 @@ struct PmSlot { SRWLOCK lock; spu_context* ctx; uint64_t data; struct PmInstance
     const uint8_t* pm; uint32_t size, wid; spu_lifted_entry_fn entry; int image_id; };
 static struct PmInstance {
     int used, retiring;
-    unsigned users, workload_users[16];
+    unsigned users, workload_users[32];   /* a CellSpurs2 has 32 workloads */
     uint32_t ea;
-    struct PmSlot slots[16][6];
+    struct PmSlot slots[32][6];
 } s_pm_instances[SPURS_PM_INSTANCES];
 static SRWLOCK s_pm_directory_lock = SRWLOCK_INIT;
 static CONDITION_VARIABLE s_pm_directory_wake;
@@ -97,7 +98,7 @@ static void policy_slot_release(struct PmSlot* slot)
  * a direct caller that still owns a reference makes removal BUSY instead. */
 int spurs_policy_release_workload(uint32_t ea, uint32_t wid)
 {
-    if (wid >= 16) return -1;
+    if (wid >= 32) return -1;
     AcquireSRWLockExclusive(&s_pm_directory_lock);
     for (unsigned i = 0; i < SPURS_PM_INSTANCES; i++) {
         struct PmInstance* pi = &s_pm_instances[i];
@@ -133,7 +134,7 @@ void spurs_policy_release_instance(uint32_t ea)
         pi->retiring = 1;
         while (pi->users)
             SleepConditionVariableSRW(&s_pm_directory_wake, &s_pm_directory_lock, INFINITE, 0);
-        for (unsigned w = 0; w < 16; w++) for (unsigned n = 0; n < 6; n++) {
+        for (unsigned w = 0; w < 32; w++) for (unsigned n = 0; n < 6; n++) {
             struct PmSlot* slot = &pi->slots[w][n];
             AcquireSRWLockExclusive(&slot->lock);
             if (slot->ctx) {
@@ -171,7 +172,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * never progress its claim/stage pipeline). Image + context init happen
      * once; re-entries keep LS and only refresh the entry registers and the
      * (possibly game-updated) kernel-context fields. */
-    enum { SPURS_PM_MAX_WKL = 16 };
+    enum { SPURS_PM_MAX_WKL = 32 };   /* a CellSpurs2 has 32 workloads (slots[32][6]) */
     if (wid >= SPURS_PM_MAX_WKL || spu_num >= 6) return -1;
     struct PmSlot* resident = policy_slot(spurs_ea, wid, spu_num);
     if (!resident) return -1;
@@ -217,7 +218,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
                resident->entry != entry || resident->image_id != image_id) {
         if (!s_fresh) {
             static SPU_THREAD_LOCAL int _n = 0;
-            if (_n++ < 8)
+            if (PS3_LOG_FIRST(_n, 8))
                 fprintf(stderr, "[spurs-pm] wid=%u spu=%u workload data changed "
                         "0x%llX -> 0x%llX: fresh PM context\n", wid, spu_num,
                         (unsigned long long)resident->data,
@@ -254,6 +255,13 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
      * selectWorkload -- so it called our exit intercept for every poll and
      * branched to 0 for every select. It also tests wklCurrentId (0x1DC) against
      * 1, which only reads sensibly at the correct offset. */
+    /* tempArea (LS 0x100..0x17F): the kernel copies the instance's first line
+     * there when it selects a workload, and policy modules and their jobs read
+     * it rather than DMA the instance again. God of War: Ascension's job code
+     * tests flags1 there (SF1_32_WORKLOADS at 0x174) before it looks up a
+     * workload of the second set; read as zero, the lookup took its error path. */
+    { extern uint8_t* vm_base;
+      if (spurs_ea) memcpy(ls + 0x100, vm_base + spurs_ea, 0x80); }
     KBE32(0x1C0, 0);                    /* spurs EA hi32 (u64 ptr)  */
     KBE32(0x1C4, spurs_ea);             /* spurs EA lo32            */
     KBE32(0x1C8, spu_num);              /* spuNum (virtual SPU / lane row) */
@@ -346,7 +354,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
     if (tracing) {
         g_pm_flow_n = 0;
         s_flow_arm_ms = ps3_ms_now();
-        { static SPU_THREAD_LOCAL int _a = 0; if (_a++ < 8) {
+        { static SPU_THREAD_LOCAL int _a = 0; if (PS3_LOG_FIRST(_a, 8)) {
             fprintf(stderr, "[pm-flow] ARM wid=%u spu=%u (watch=0x%08X)\n",
                     wid, spu_num, g_barrier_sync_watch); fflush(stderr); } }
         /* Watchdog: the traced run has been observed to HANG the jobmanager
@@ -408,7 +416,7 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         unsigned stages = g_wws_batch_gets - batch_before;
         if (claims || stages) {
             static SPU_THREAD_LOCAL unsigned s_cl = 0;
-            if (s_cl++ < 64) {
+            if (PS3_LOG_FIRST(s_cl, 64)) {
                 const uint8_t* L = ctx->ls;
                 #define W(o)  ((L[(o)]<<24)|(L[(o)+1]<<16)|(L[(o)+2]<<8)|L[(o)+3])
                 fprintf(stderr, "[pm-claim] wid=%u spu=%u first=%d claims=%u stages=%u%s halt_pc=0x%05X "
@@ -428,8 +436,8 @@ int spu_run_policy_module(spu_lifted_entry_fn entry, int image_id,
         /* PER-WID cap: a shared cap gets exhausted by idle wid=0/1 before the
          * jobmanager (wid=12) ever runs in a long/good run. Give each wid its
          * own budget so wid=12's pipeline is always captured. */
-        static SPU_THREAD_LOCAL unsigned long s_pn_wid[16] = {0};
-        unsigned long s_pn = ++s_pn_wid[wid & 15];
+        static SPU_THREAD_LOCAL unsigned long s_pn_wid[32] = {0};
+        unsigned long s_pn = ++s_pn_wid[wid & 31];
         if (s_pn < 300) {
             const uint8_t* L = ctx->ls;
             #define HW(o) ((L[(o)+2]<<8)|L[(o)+3])

@@ -11,6 +11,7 @@
 #include "ps3emu/guest_call.h"   /* ps3_invoke_guest: handlers are guest OPDs */
 #include <stdio.h>
 #include <string.h>
+#include "ps3emu/log_first.h"
 
 /* ---------------------------------------------------------------------------
  * Internal state
@@ -204,7 +205,7 @@ s32 cellRescSetConvertAndFlip(s32 index)
     s_last_flip_time++;
 
     { static int n = 0;
-      if (n++ < 4)
+      if (PS3_LOG_FIRST(n, 4))
           printf("[cellResc] SetConvertAndFlip(src=%d) -> flip, %u display buffer(s)\n",
                  index, nbuf); }
 

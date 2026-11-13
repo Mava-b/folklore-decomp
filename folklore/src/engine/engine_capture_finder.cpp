@@ -27,7 +27,12 @@
  */
 #include "engine_capture_finder.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#endif
 
 #include <cmath>
 #include <cstdint>
@@ -93,18 +98,47 @@ namespace
             const uint64_t rangeEnd = (uint64_t)range.guestStart + range.bytes;
             while (guestAddress < rangeEnd)
             {
+                uint64_t regionEnd = 0;
+                bool readable = false;
+#ifdef _WIN32
                 MEMORY_BASIC_INFORMATION memoryInfo;
                 if (!VirtualQuery(vm_base + guestAddress, &memoryInfo, sizeof(memoryInfo)))
                 {
                     break;
                 }
-                const uint64_t regionEnd = (uint64_t)((uint8_t*)memoryInfo.BaseAddress - vm_base) +
-                                           memoryInfo.RegionSize;
+                regionEnd = (uint64_t)((uint8_t*)memoryInfo.BaseAddress - vm_base) + memoryInfo.RegionSize;
+                readable = memoryInfo.State == MEM_COMMIT &&
+                           !(memoryInfo.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
+                           (memoryInfo.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                                                  PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
+#elif defined(__APPLE__)
+                /* The region at or after the address; a gap before it is
+                 * unmapped (not readable). */
+                mach_vm_address_t regionAddress = (mach_vm_address_t)(uintptr_t)(vm_base + guestAddress);
+                mach_vm_size_t regionSize = 0;
+                vm_region_basic_info_data_64_t info;
+                mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+                mach_port_t objectName = MACH_PORT_NULL;
+                if (mach_vm_region(mach_task_self(), &regionAddress, &regionSize, VM_REGION_BASIC_INFO_64,
+                                   (vm_region_info_t)&info, &infoCount, &objectName) != KERN_SUCCESS)
+                {
+                    break;
+                }
+                const uint8_t* wanted = vm_base + guestAddress;
+                if ((const uint8_t*)(uintptr_t)regionAddress > wanted)
+                {
+                    regionEnd = (uint64_t)((const uint8_t*)(uintptr_t)regionAddress - vm_base);
+                    readable = false;
+                }
+                else
+                {
+                    regionEnd = (uint64_t)((const uint8_t*)(uintptr_t)regionAddress - vm_base) + regionSize;
+                    readable = (info.protection & VM_PROT_READ) != 0;
+                }
+#else
+                break;   /* no region query: nothing is searched */
+#endif
                 const uint64_t blockEnd = regionEnd < rangeEnd ? regionEnd : rangeEnd;
-                const bool readable = memoryInfo.State == MEM_COMMIT &&
-                                      !(memoryInfo.Protect & (PAGE_GUARD | PAGE_NOACCESS)) &&
-                                      (memoryInfo.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
-                                                             PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE));
                 if (readable && blockEnd > guestAddress)
                 {
                     blocks.push_back({guestAddress, (uint32_t)(blockEnd - guestAddress), totalBytes});

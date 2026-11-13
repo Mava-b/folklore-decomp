@@ -39,6 +39,10 @@ extern "C" {
 /* 1 when the translator was built with glslang and spirv-cross, 0 when the
  * stub is in. A backend asks this once and picks its shader path. */
 int rsx_hlsl_to_msl_available(void);
+/* When this translator was compiled ("<date> <time>"): the shader cache keys
+ * its translations on it, so they survive rebuilds that leave the translator
+ * (and glslang / spirv-cross, whose headers it includes) alone. */
+const char* rsx_hlsl_to_msl_build_tag(void);
 
 /* Translate one HLSL shader whose entry point is `main` into MSL.
  *   hlsl     : NUL-terminated HLSL source, as the decompilers emit it.
@@ -50,6 +54,21 @@ int rsx_hlsl_to_msl_available(void);
 int rsx_hlsl_to_msl(const char* hlsl, int stage,
                     char* out, u32 out_size,
                     char* log, u32 log_size);
+
+/* The translation cache (rsx_shader_msl.cpp). A request is answered from
+ * memory, else from PS3RECOMP_MSL_CACHE's directory, else by glslang and
+ * spirv-cross. Deleting the directory is always safe. */
+typedef struct RsxMslCacheStats {
+    u32 memory_hits;
+    u32 disk_hits;
+    u32 translations;   /* glslang + spirv-cross runs that succeeded */
+} RsxMslCacheStats;
+
+void rsx_hlsl_to_msl_cache_stats(RsxMslCacheStats* out);
+
+/* Empties the memory cache, zeroes the counters and reads
+ * PS3RECOMP_MSL_CACHE again on the next request. Disk files stay. */
+void rsx_hlsl_to_msl_cache_reset(void);
 
 #ifdef __cplusplus
 }

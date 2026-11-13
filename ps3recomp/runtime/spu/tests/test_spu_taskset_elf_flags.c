@@ -15,11 +15,23 @@ uint32_t g_ydkj_real_taskset_ea, g_ydkj_real_taskid;
 static unsigned dispatches;
 static const uint8_t* dispatched_image;
 static uint32_t dispatched_size, dispatched_context;
+/* The scheduler updates the taskset's bitset line under the lock-line lock;
+ * single-threaded here, so the lock and the coherency note are no-ops. */
+void spu_lockline_lock(void) {}
+void spu_lockline_unlock(void) {}
+void spu_coh_notify_write(uint32_t ea) { (void)ea; }
 static int spu_workload_dispatch_async(const uint8_t* image, uint32_t size, uint32_t context)
 {
     dispatches++; dispatched_image = image; dispatched_size = size;
     dispatched_context = context; return 1;
 }
+/* Taskset2 exit-code slot: these tasksets are not registered as Taskset2,
+ * where production returns without touching memory. */
+static void spu_taskset2_set_exit(uint32_t taskset_ea, uint32_t task, int exited, uint32_t code)
+{ (void)taskset_ea; (void)task; (void)exited; (void)code; }
+/* A task that exits leaves the set of tasks that work in signal rounds. */
+void spu_taskset_round_drop(uint32_t taskset_ea, uint32_t task)
+{ (void)taskset_ea; (void)task; }
 /* PRODUCTION_FUNCTIONS */
 static unsigned passed, failed;
 #define CHECK(test, message) do { if (test) passed++; else { failed++; fprintf(stderr, "FAIL: %s\n", message); } } while (0)

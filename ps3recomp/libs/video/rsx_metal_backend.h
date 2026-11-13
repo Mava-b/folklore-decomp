@@ -11,6 +11,15 @@
  * MTLTexture with no window or NSApplication. Everything below behaves
  * identically, which is what makes the backend testable in CI on a machine
  * with no display.
+ *
+ * Host-surface mode: with PS3RECOMP_HOST_SURFACES set (the launcher in
+ * tools/host_window sets it) the window belongs to the launcher process and
+ * this process opens none and never touches NSApplication. Frames are
+ * rendered on the GPU into IOSurfaces the launcher shares, and the launcher
+ * shows them. Because the launcher never execs, its window stays up across
+ * an exitspawn: the new image finds the launcher through the same variable.
+ * See rsx_host_surface.h. If the launcher cannot be reached the backend
+ * falls back to a window of its own.
  */
 #ifndef PS3RECOMP_RSX_METAL_BACKEND_H
 #define PS3RECOMP_RSX_METAL_BACKEND_H
@@ -28,9 +37,24 @@ int  rsx_metal_backend_init(u32 width, u32 height, const char* title);
 /* Unregister, then tear down the surface and device. Safe if init failed. */
 void rsx_metal_backend_shutdown(void);
 
+/* Before replacing the process image (exitspawn): put the window's frame and
+ * fullscreen state in PS3RECOMP_WINDOW_STATE so the next executable's window
+ * opens in the same place. No-op headless, in host-surface mode (the window
+ * outlives the exec there) or without a window. */
+void rsx_metal_backend_export_window_state(void);
+
 /* Pump the native event queue. Returns -1 when the window has been closed,
- * 0 otherwise. Always returns 0 in headless mode. */
+ * 0 otherwise. Always returns 0 in headless mode. In host-surface mode the
+ * window is the launcher's: -1 once it is closing or the launcher is gone. */
 int  rsx_metal_backend_pump_messages(void);
+/* macOS: set NSApp up on the main thread before other threads start (boot harness). */
+void rsx_metal_backend_prepare_app(void);
+/* macOS: show a cellMsgDialog prompt as a sheet on the game window. Returns 0
+ * when shown (done(seq, yes) runs later on the main thread), -1 without a
+ * window. rsx_metal_dismiss_dialog takes prompt `seq` down unanswered. */
+int  rsx_metal_show_dialog(const char* text, int yes_no, int default_no, int seq,
+                           void (*done)(int seq, int yes));
+void rsx_metal_dismiss_dialog(int seq);
 
 /* Present one frame: clear the drawable to the colour last received through the
  * RSX clear method, then hand it to the compositor. */

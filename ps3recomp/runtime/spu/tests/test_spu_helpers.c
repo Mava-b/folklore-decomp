@@ -9,11 +9,13 @@
  *
  * Build:
  *   gcc -std=c11 -I../.. test_spu_helpers.c -o test_spu_helpers
+ *   (add -mssse3 on x86 to cover the SPU_LS_VEC quadword path of spu_context.h)
  *
  * Exit code: 0 if all passed, 1 if any failed. Final line prints summary.
  */
 
 #include "../spu_helpers.h"
+#include "../../../tests/spu_ls_watch_fixture.h"
 #include <stdio.h>
 #include <string.h>
 
@@ -419,9 +421,93 @@ static void test_float_fused(void) {
 }
 
 /* ===========================================================================
+ * Float compares: extended range, any two zeros equal, and the vector forms
+ * bit for bit against the _ref loops
+ * ===========================================================================*/
+static uint32_t cmp_rand(uint32_t* s) { *s = *s * 1664525u + 1013904223u; return *s; }
+static void test_float_compares(void) {
+    TEST("fceq: +0, -0 and denormals are all zero");
+    EXPECT_EQ(spu_fceq(make128_words(0x00000000, 0x80000000, 0x007FFFFF, 0x80000001),
+                       make128_words(0x80000000, 0x00000001, 0x00000000, 0x00000000)),
+              spu_il(-1));
+    TEST("fcgt: signed order, zero never greater, exponent 255 is a number");
+    EXPECT_EQ(spu_fcgt(make128_words(0x3F800000, 0xC0000000, 0x00800000, 0x7FFFFFFF),
+                       make128_words(0xBF800000, 0xC0400000, 0x807FFFFF, 0x7F800000)),
+              spu_il(-1));
+    EXPECT_EQ(spu_fcgt(make128_words(0xBF800000, 0xC0400000, 0x80000000, 0x00000001),
+                       make128_words(0x3F800000, 0xC0000000, 0x00000000, 0x80000000)),
+              spu_il(0));
+    TEST("fcmgt/fcmeq: magnitudes");
+    EXPECT_EQ(spu_fcmgt(make128_words(0xC0000000, 0xFFFFFFFF, 0x80800000, 0x00000000),
+                        make128_words(0x3F800000, 0x7F800000, 0x007FFFFF, 0x80000000)),
+              make128_words(0xFFFFFFFF, 0xFFFFFFFF, 0xFFFFFFFF, 0));
+    EXPECT_EQ(spu_fcmeq(make128_words(0xC0000000, 0x80000001, 0x3F800000, 0xFF800000),
+                        make128_words(0x40000000, 0x00000000, 0xBF800000, 0x7F800000)),
+              spu_il(-1));
+
+    TEST("fceq/fcgt/fcmeq/fcmgt = _ref, every pair of edge values");
+    static const uint32_t edge[] = {
+        0x00000000, 0x80000000, 0x00000001, 0x807FFFFF, 0x00800000, 0x80800000,
+        0x00800001, 0x3F800000, 0xBF800000, 0x7F7FFFFF, 0xFF7FFFFF, 0x7F800000,
+        0xFF800000, 0x7FC00000, 0xFFFFFFFF, 0x7FFFFFFF, 0x40000000, 0xC0000000 };
+    const int ne = (int)(sizeof(edge) / sizeof(edge[0]));
+    int bad = 0;
+    for (int i = 0; i < ne; i++)
+        for (int j = 0; j < ne; j += 4) {
+            u128 a = make128_words(edge[i], edge[i], edge[i], edge[i]);
+            u128 b = make128_words(edge[j], edge[(j + 1) % ne], edge[(j + 2) % ne], edge[(j + 3) % ne]);
+            bad += !u128_eq(spu_fceq(a, b),  spu_fceq_ref(a, b));
+            bad += !u128_eq(spu_fcgt(a, b),  spu_fcgt_ref(a, b));
+            bad += !u128_eq(spu_fcmeq(a, b), spu_fcmeq_ref(a, b));
+            bad += !u128_eq(spu_fcmgt(a, b), spu_fcmgt_ref(a, b));
+        }
+    if (!bad) g_pass++; else { g_fail++; fprintf(stderr, "FAIL: %s (%d)\n", g_current, bad); }
+
+    TEST("fceq/fcgt/fcmeq/fcmgt = _ref, 1,000,000 random pairs");
+    uint32_t seed = 12345;
+    bad = 0;
+    for (int n = 0; n < 1000000; n++) {
+        u128 a, b;
+        for (int k = 0; k < 4; k++) {
+            a._u32[k] = cmp_rand(&seed);
+            /* Often the same exponent, or a near value, or its negation. */
+            switch (cmp_rand(&seed) >> 30) {
+            case 0:  b._u32[k] = a._u32[k] ^ (cmp_rand(&seed) & 0x807FFFFFu); break;
+            case 1:  b._u32[k] = a._u32[k] + (cmp_rand(&seed) & 3u) - 1u; break;
+            case 2:  b._u32[k] = a._u32[k] & (cmp_rand(&seed) & 1u ? 0x807FFFFFu : 0xFFFFFFFFu); break;
+            default: b._u32[k] = cmp_rand(&seed); break;
+            }
+        }
+        bad += !u128_eq(spu_fceq(a, b),  spu_fceq_ref(a, b));
+        bad += !u128_eq(spu_fcgt(a, b),  spu_fcgt_ref(a, b));
+        bad += !u128_eq(spu_fcmeq(a, b), spu_fcmeq_ref(a, b));
+        bad += !u128_eq(spu_fcmgt(a, b), spu_fcmgt_ref(a, b));
+    }
+    if (!bad) g_pass++; else { g_fail++; fprintf(stderr, "FAIL: %s (%d)\n", g_current, bad); }
+}
+
+/* ===========================================================================
  * main: run all and report
  * ===========================================================================*/
+static void test_ls_quadwords(void) {
+    static spu_context ctx;
+    ctx.ls = ctx.ls_store;
+    for (unsigned i = 0; i < 16; ++i) ctx.ls[i] = (uint8_t)i;
+    TEST("lqd: big-endian words, aligned and wrapped address");
+    EXPECT_EQ(spu_ls_read128(&ctx, SPU_LS_SIZE + 7),
+              make128_words(0x00010203, 0x04050607, 0x08090A0B, 0x0C0D0E0F));
+    TEST("stqd: big-endian bytes, aligned and wrapped address");
+    spu_ls_write128(&ctx, SPU_LS_SIZE + 23,
+                   make128_words(0x01234567, 0x89ABCDEF, 0x76543210, 0xFEDCBA98));
+    static const uint8_t want[16] = {
+        0x01,0x23,0x45,0x67,0x89,0xAB,0xCD,0xEF,
+        0x76,0x54,0x32,0x10,0xFE,0xDC,0xBA,0x98};
+    if (!memcmp(ctx.ls + 16, want, sizeof want)) g_pass++;
+    else { g_fail++; fprintf(stderr, "FAIL: %s\n", g_current); }
+}
+
 int main(void) {
+    test_ls_quadwords();
     test_immediate_loaders();
     test_simd_arith();
     test_multiply();
@@ -433,6 +519,7 @@ int main(void) {
     test_fsmbi();
     test_sign_extend();
     test_float_fused();
+    test_float_compares();
 
     printf("\nSPU helper tests: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;

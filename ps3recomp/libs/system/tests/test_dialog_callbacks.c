@@ -14,6 +14,7 @@ void spu_coh_notify_write(uint32_t a) { (void)a; }
 void spu_lockline_lock(void) {}
 void spu_lockline_unlock(void) {}
 void np_psnr_pump(void) {}
+void ps3_np_eula_tick(void) {}
 
 static unsigned calls;
 static int waiting;
@@ -51,6 +52,8 @@ int main(void)
     cellSysutilCheckCallback(); assert(calls == 2);
     g_ps3_guest_caller = callback;
     cellSysutilCheckCallback(); assert(calls == 3 && last_result == CELL_MSGDIALOG_BUTTON_NONE);
+    /* The values themselves, which a title compares against: a dialog the title closed reports -1. */
+    assert(last_result == -1 && CELL_MSGDIALOG_BUTTON_INVALID == 0);
     cellSysutilCheckCallback(); assert(calls == 3);
 
     /* The yes/no auto-answer. DEFAULT is a blanket YES, including for a prompt

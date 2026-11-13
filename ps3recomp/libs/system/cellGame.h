@@ -132,6 +132,7 @@ void cellGame_init_from_paramsfo(const char* sfo_path);
 
 /* Central title-id accessor (so other modules don't hardcode placeholders). */
 const char* cellGame_get_title_id(void);
+const char* cellGame_get_hdd_title_id(void);
 const char* cellGame_get_title(void);
 
 /* Set the game's title string */
@@ -144,6 +145,7 @@ void cellGame_set_content_path(const char* path);
  * Functions
  * -----------------------------------------------------------------------*/
 
+s32 cellGamePatchCheck(CellGameContentSize* size, u32 reserved);
 s32 cellGameBootCheck(u32* type, u32* attributes, CellGameContentSize* size,
                        char* dirName);
 

@@ -49,6 +49,8 @@
 #include <windows.h>
 #include <bcrypt.h>
 #pragma comment(lib, "bcrypt.lib")
+#elif defined(__APPLE__)
+#include <CommonCrypto/CommonCryptor.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -77,6 +79,14 @@ static bool dlcAesDecryptBlock(const unsigned char key[16], const unsigned char 
         BCryptCloseAlgorithmProvider(algorithm, 0);
     }
     return decrypted;
+}
+#elif defined(__APPLE__)
+static bool dlcAesDecryptBlock(const unsigned char key[16], const unsigned char input[16], unsigned char output[16])
+{
+    size_t written = 0;
+    return CCCrypt(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode, key, 16, nullptr, input, 16, output, 16,
+                   &written) == kCCSuccess &&
+           written == 16;
 }
 #else
 extern "C" bool dlcAesDecryptBlock(const unsigned char key[16], const unsigned char input[16],

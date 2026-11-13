@@ -30,18 +30,18 @@ extern "C" {
 #define CELL_SPURS_CORE_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x11)
 #define CELL_SPURS_CORE_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x09)
 
-#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS | 0x21)
-#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS | 0x22)
-#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS | 0x23)
-#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS | 0x24)
-#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS | 0x25)
-#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS | 0x26)
-#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS | 0x2A)
-#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS | 0x2F)
-#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS | 0x30)
-#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS | 0x31)
-#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS | 0x32)
-#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS | 0x29)
+#define CELL_SPURS_TASK_ERROR_AGAIN             (CELL_ERROR_BASE_SPURS_TASK | 0x01)
+#define CELL_SPURS_TASK_ERROR_INVAL             (CELL_ERROR_BASE_SPURS_TASK | 0x02)
+#define CELL_SPURS_TASK_ERROR_NOSYS             (CELL_ERROR_BASE_SPURS_TASK | 0x03)
+#define CELL_SPURS_TASK_ERROR_NOMEM             (CELL_ERROR_BASE_SPURS_TASK | 0x04)
+#define CELL_SPURS_TASK_ERROR_SRCH              (CELL_ERROR_BASE_SPURS_TASK | 0x05)
+#define CELL_SPURS_TASK_ERROR_NOENT             (CELL_ERROR_BASE_SPURS_TASK | 0x06)
+#define CELL_SPURS_TASK_ERROR_BUSY              (CELL_ERROR_BASE_SPURS_TASK | 0x0A)
+#define CELL_SPURS_TASK_ERROR_STAT              (CELL_ERROR_BASE_SPURS_TASK | 0x0F)
+#define CELL_SPURS_TASK_ERROR_ALIGN             (CELL_ERROR_BASE_SPURS_TASK | 0x10)
+#define CELL_SPURS_TASK_ERROR_NULL_POINTER      (CELL_ERROR_BASE_SPURS_TASK | 0x11)
+#define CELL_SPURS_TASK_ERROR_FAULT             (CELL_ERROR_BASE_SPURS_TASK | 0x0D)
+#define CELL_SPURS_TASK_ERROR_PERM              (CELL_ERROR_BASE_SPURS_TASK | 0x09)
 
 /* ---------------------------------------------------------------------------
  * Constants
@@ -201,6 +201,8 @@ s32 cellSpursInitialize(CellSpurs* spurs, s32 nSpus, s32 spuPriority,
                         s32 ppuPriority, u8 exitIfNoWork);
 s32 cellSpursInitializeWithAttribute(CellSpurs* spurs,
                                      const CellSpursAttribute* attr);
+s32 cellSpursInitializeWithAttribute2(CellSpurs* spurs,
+                                      const CellSpursAttribute* attr);
 s32 cellSpursFinalize(CellSpurs* spurs);
 
 s32 cellSpursAttributeInitialize(CellSpursAttribute* attr, s32 nSpus,
@@ -211,6 +213,8 @@ s32 cellSpursAttributeSetNamePrefix(CellSpursAttribute* attr,
 s32 cellSpursAttributeSetSpuThreadGroupType(CellSpursAttribute* attr,
                                             s32 type);
 s32 cellSpursAttributeEnableSpuPrintfIfAvailable(CellSpursAttribute* attr);
+s32 cellSpursAttributeEnableSystemWorkload(u64 attr_ea, u64 priority_ea, u32 maxSpu,
+                                           u64 preemptible_ea);
 
 s32 cellSpursGetNumSpuThread(const CellSpurs* spurs, u32* nThreads);
 s32 cellSpursSetMaxContention(CellSpurs* spurs, CellSpursWorkloadId wid,
@@ -231,6 +235,14 @@ s32 cellSpursCreateTaskset(CellSpurs* spurs, CellSpursTaskset* taskset,
 s32 cellSpursCreateTasksetWithAttribute(CellSpurs* spurs,
                                         CellSpursTaskset* taskset,
                                         const CellSpursTasksetAttribute* attr);
+s32 cellSpursCreateTaskset2(CellSpurs* spurs, CellSpursTaskset* taskset, u64 attr_ea);
+s32 cellSpursCreateTask2(CellSpursTaskset* taskset, u64 id_ea, u64 elf_ea,
+                         u64 argument_ea, u64 attr_ea);
+s32 _cellSpursTaskAttribute2Initialize(u64 attr_ea, u32 revision);
+s32 _cellSpursSendSignal(void* taskset, u32 taskId);
+s32 cellSpursGetWorkloadFlag(u64 spurs_ea, u64 flag_pp);
+s32 _cellSpursWorkloadFlagReceiver(u64 spurs_ea, u32 wid, u32 is_set);
+s32 _cellSpursTasksetAttribute2Initialize(u64 attr_ea, u32 revision);
 s32 cellSpursDestroyTaskset(CellSpursTaskset* taskset);
 s32 cellSpursShutdownTaskset(CellSpursTaskset* taskset);
 s32 cellSpursJoinTaskset(CellSpursTaskset* taskset);
@@ -303,8 +315,10 @@ s32 cellSpursBarrierInitialize(u64 taskset_ea, u64 barrier_ea, u32 total);
 s32 cellSpursGetTasksetInfo(u64 taskset_ea, u64 info_ea);
 s32 cellSpursTasksetAttributeSetTasksetSize(CellSpursTasksetAttribute* attr, u32 size);
 s32 cellSpursQueueAttachLv2EventQueue(u64 queue_ea);
+s32 cellSpursQueueSize(u64 queue_ea, u64 size_ea);
 s32 _cellSpursLFQueueInitialize(u64 owner_ea, u64 queue_ea, u64 buffer_ea,
                                 u32 size, u32 depth, u32 direction);
+s32 _cellSpursLFQueuePushBody(u64 queue_ea, u64 data_ea, u32 isBlocking);
 s32 cellSpursLFQueueAttachLv2EventQueue(u64 queue_ea);
 
 s32 cellSpursEventFlagSet(CellSpursEventFlag* eventFlag, u16 bits);

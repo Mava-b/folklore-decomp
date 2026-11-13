@@ -34,7 +34,16 @@
 #include "engine_region.h"
 #include "engine_settings.h"
 
+#ifdef _WIN32
 #include <windows.h>
+#else
+#include <chrono>
+static unsigned long long GetTickCount64()
+{
+    return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
 
 #include <cstdint>
 #include <cstdio>
@@ -153,3 +162,29 @@ void engineCaptureAssistUpdate()
         }
     }
 }
+
+#ifndef _WIN32
+/* Off Windows there is no engine menu, whose per-frame update drives this on
+ * the present thread there; a thread of its own does the same about once a
+ * frame, so boss captures still complete by themselves on macOS. */
+#include <thread>
+namespace
+{
+    struct CaptureAssistDriver
+    {
+        CaptureAssistDriver()
+        {
+            std::thread([] {
+                for (;;)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(16));
+                    if (vm_base)
+                    {
+                        engineCaptureAssistUpdate();
+                    }
+                }
+            }).detach();
+        }
+    } captureAssistDriver;
+}
+#endif

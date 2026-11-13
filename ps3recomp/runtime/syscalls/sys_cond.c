@@ -6,6 +6,8 @@
  * guest mutex, and a later waiter cannot steal an earlier waiter's wakeup.
  */
 #include "sys_cond.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
+#include "sys_timer.h"        /* lv2_usec_deadline: QPC deadline for timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>
@@ -28,6 +30,19 @@ static void cond_unlock(sys_cond_info* c) { LeaveCriticalSection(&c->signal_lock
 static void cond_wake(sys_cond_info* c) { WakeAllConditionVariable(&c->cv); }
 static void guest_lock(sys_mutex_info* m) { EnterCriticalSection(&m->cs); }
 static void guest_unlock(sys_mutex_info* m) { LeaveCriticalSection(&m->cs); }
+
+/* Milliseconds left to a lv2_usec_deadline() deadline, rounded UP (a timed wait
+ * must not return before the guest's timeout); 0 once it has passed. */
+static DWORD cond_ms_until(int64_t deadline)
+{
+    LARGE_INTEGER f, now;
+    QueryPerformanceFrequency(&f);
+    QueryPerformanceCounter(&now);
+    if (now.QuadPart >= deadline) return 0;
+    const uint64_t left = (uint64_t)(deadline - now.QuadPart), q = (uint64_t)f.QuadPart;
+    const uint64_t ms = (left / q) * 1000ull + ((left % q) * 1000ull + q - 1) / q;
+    return ms >= (uint64_t)INFINITE ? (DWORD)(INFINITE - 1) : (DWORD)ms;
+}
 #else
 static pthread_mutex_t s_table_lock = PTHREAD_MUTEX_INITIALIZER;
 static void table_lock(void) { pthread_mutex_lock(&s_table_lock); }
@@ -81,7 +96,9 @@ int64_t sys_cond_create(ppu_context* ctx)
         c->mutex_id = mid;
         c->waiters = NULL;
         memset(c->name, 0, sizeof(c->name));
-        if (attr) memcpy(c->name, (uint8_t*)vm_to_host(attr) + 8, 8);
+        /* sys_cond_attribute_t: pshared, flags, ipc_key u64 @0x08, name[8]
+         * @0x10. Offset 8 copied the ipc_key into the log name. */
+        if (attr) memcpy(c->name, (uint8_t*)vm_to_host(attr) + 0x10, 8);
         c->active = 1;
         g_cond_id_addr[i + 1] = out;
         if (out) {
@@ -120,6 +137,7 @@ int64_t sys_cond_destroy(ppu_context* ctx)
 
 int64_t sys_cond_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     uint64_t timeout = LV2_ARG_U64(ctx, 1);
     /* Preserve upstream's opt-in wait diagnostics across the waiter rewrite. */
     const char* peek = getenv("PS3_COND_PEEK");
@@ -148,6 +166,12 @@ int64_t sys_cond_wait(ppu_context* ctx)
                     (unsigned long long)ctx->gpr[31]);
     }
     if (timeout > ((1ull << 48) - 1)) timeout = (1ull << 48) - 1;
+#ifdef _WIN32
+    /* The QPC deadline below multiplies by the counter frequency in 64 bits;
+     * past 2^40 us (12.7 days) that wraps, and nobody waits that long and
+     * returns: treat it as infinite. */
+    if (timeout > (1ull << 40)) timeout = 0;
+#endif
     sys_cond_info* c = acquire_cond(LV2_ARG_U32(ctx, 0));
     if (!c) return (int32_t)CELL_ESRCH;
     sys_mutex_info* m = &g_sys_mutexes[c->mutex_id - 1];
@@ -166,15 +190,16 @@ int64_t sys_cond_wait(ppu_context* ctx)
 
     int32_t result = CELL_OK;
 #ifdef _WIN32
-    ULONGLONG start = GetTickCount64();
-    uint64_t duration = (timeout + 999) / 1000;
+    /* The timeout runs on the QPC. GetTickCount64 advances in system-timer
+     * ticks (up to 15.6 ms), so measuring a 1 ms timeout with it came back up
+     * to a tick late. The slice handed to the condition variable is rounded up
+     * to whole milliseconds, so a wait never ends before the guest's timeout. */
+    const int64_t deadline = timeout ? lv2_usec_deadline(timeout) : 0;
     while (!waiter.signalled) {
         DWORD ms = INFINITE;
         if (timeout) {
-            uint64_t elapsed = GetTickCount64() - start;
-            if (elapsed >= duration) { result = (int32_t)CELL_ETIMEDOUT; break; }
-            uint64_t remaining = duration - elapsed;
-            ms = remaining >= INFINITE ? INFINITE - 1 : (DWORD)remaining;
+            ms = cond_ms_until(deadline);
+            if (ms == 0) { result = (int32_t)CELL_ETIMEDOUT; break; }
         }
         BOOL ok = SleepConditionVariableCS(&c->cv, &c->signal_lock, ms);
         if (!ok && GetLastError() != ERROR_TIMEOUT && !waiter.signalled) {
@@ -204,7 +229,10 @@ int64_t sys_cond_wait(ppu_context* ctx)
     while (*link != &waiter) link = &(*link)->next;
     *link = waiter.next;
     cond_unlock(c);
+    /* Re-acquiring counts as waiting on the mutex (sys_mutex_destroy). */
+    __atomic_add_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
     for (int i = 0; i < depth; ++i) guest_lock(m);
+    __atomic_sub_fetch(&m->waiters, 1, __ATOMIC_SEQ_CST);
     m->owner_tid = ctx->thread_id;
     m->lock_count = depth;
     return result;

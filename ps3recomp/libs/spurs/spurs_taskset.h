@@ -143,6 +143,8 @@ enum {
 /* ---- create-path layout builders (spurs_taskset.c, phase B2) ------------- */
 void spurs_taskset_init(uint32_t taskset_ea, uint32_t spurs_ea, uint64_t args,
                         uint32_t wid, uint32_t size, uint32_t evf1, uint32_t evf2);
+void spurs_taskset_bitset_update(uint32_t bitset_ea, uint32_t taskId, int set);
+uint32_t spurs_taskset_take_slot(uint32_t taskset_ea, uint32_t max_tasks);
 void spurs_taskset_add_task(uint32_t taskset_ea, uint32_t taskId, uint64_t elf_ea,
                             uint64_t context, const uint32_t arg[4],
                             const uint32_t ls_pattern[4]);

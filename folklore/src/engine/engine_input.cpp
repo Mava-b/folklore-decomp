@@ -10,10 +10,19 @@
 
 #include "imgui.h"
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#else
+#include <chrono>
+static unsigned long long GetTickCount64()
+{
+    return (unsigned long long)std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#endif
 
 namespace
 {
@@ -153,7 +162,15 @@ namespace
 
     bool keyDown(int code)
     {
+#ifdef _WIN32
         return (GetAsyncKeyState(code) & 0x8000) != 0;
+#else
+        /* Off Windows the bindings are kept in the settings file, but the
+         * runtime's keyboard-and-mouse play (cellPad.c) is Windows-only, so
+         * nothing is captured by pressing it here. */
+        (void)code;
+        return false;
+#endif
     }
 
     /* The first bindable key or mouse button held now, or 0. */
@@ -171,6 +188,9 @@ namespace
 
     bool foregroundIsThisProcess()
     {
+#ifndef _WIN32
+        return false;
+#else
         HWND foreground = GetForegroundWindow();
         if (!foreground)
         {
@@ -179,6 +199,7 @@ namespace
         DWORD processId = 0;
         GetWindowThreadProcessId(foreground, &processId);
         return processId == GetCurrentProcessId();
+#endif
     }
 }
 

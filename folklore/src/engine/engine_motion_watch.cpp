@@ -34,6 +34,20 @@
 #include "engine_motion_watch.h"
 #include "engine_region.h"
 
+#ifndef _WIN32
+/* The watch uses Windows guard pages and a vectored exception handler; on
+ * other platforms F3 does nothing (it is a diagnostic, not a game feature). */
+void engineMotionWatchToggle() {}
+void engineMotionWatchUpdate() {}
+bool engineMotionWatchActive(unsigned* secondsLeft)
+{
+    if (secondsLeft)
+    {
+        *secondsLeft = 0;
+    }
+    return false;
+}
+#else
 #include <windows.h>
 
 #include <algorithm>
@@ -433,3 +447,4 @@ bool engineMotionWatchActive(unsigned* secondsLeft)
     }
     return true;
 }
+#endif /* _WIN32 */

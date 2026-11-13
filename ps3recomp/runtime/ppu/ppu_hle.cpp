@@ -18,9 +18,11 @@
  */
 #define PPU_NO_INLINE_LOADS   /* declares its own out-of-line vm_read* below */
 #define PPU_NO_INLINE_STORES  /* and the out-of-line vm_write* */
+#include <chrono>
 #include "ppu_recomp.h"   /* ppu_context */
 #include "ps3emu/nid.h"   /* ps3_nid_table, ps3_nid_entry */
 #include "ps3emu/milestone.h" /* ps3_msf -- boot milestone log */
+#include "ps3emu/ps3_ftrace.h"   /* PS3_FTRACE: spans of HLE import calls */
 #include "../spu/spurs_trace.h" /* SPURS_GOLDEN_TRACE */
 #include <string.h>       /* memcpy */
 #include <stdlib.h>       /* getenv */
@@ -51,6 +53,33 @@ typedef void (*hle_ctx_fn)(ppu_context*);
 static struct { uint32_t nid; hle_ctx_fn fn; const char* name; } g_ctx[HLE_CTX_CAP];
 static uint32_t g_ctx_count = 0;
 
+/* NID -> handler, per calling thread. Both tables above are searched
+ * linearly, g_ctx with about a hundred entries and g_hle_nids with over a
+ * thousand, and a title calls a few imports tens of thousands of times a
+ * second: God of War HD makes ~95k HLE calls a second in gameplay, most of
+ * them cellGcmAddressToOffset and _sys_memcpy, and the two scans were most of
+ * ps3_hle_call's cost. A slot keeps the indexes and the table sizes it was
+ * filled against, so a registration made after the first call is still
+ * found. Per thread, so no slot is read half-written. */
+struct HleSlot { uint32_t nid, ctx_n, tab_n; int32_t ctx_i, tab_i; };
+static thread_local HleSlot t_hle_slot[1024];
+static const HleSlot* hle_slot(uint32_t nid)
+{
+    HleSlot* s = &t_hle_slot[(nid * 2654435761u) >> 22];
+    const uint32_t ctx_n = g_ctx_count, tab_n = g_hle_inited ? g_hle_nids.count : 0;
+    if (s->nid != nid || s->ctx_n != ctx_n || s->tab_n != tab_n || (!s->ctx_n && !s->tab_n)) {
+        s->ctx_i = s->tab_i = -1;
+        for (uint32_t i = 0; i < ctx_n; i++)
+            if (g_ctx[i].nid == nid) { s->ctx_i = (int32_t)i; break; }
+        if (s->ctx_i < 0 && tab_n) {
+            const ps3_nid_entry* e = ps3_nid_table_find(&g_hle_nids, nid);
+            if (e) s->tab_i = (int32_t)(e - g_hle_nids.entries);
+        }
+        s->nid = nid; s->ctx_n = ctx_n; s->tab_n = tab_n;
+    }
+    return s;
+}
+
 extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn fn)
 {
     if (g_ctx_count < HLE_CTX_CAP) {
@@ -58,6 +87,36 @@ extern "C" void ps3_hle_register_ctx(uint32_t nid, const char* name, hle_ctx_fn 
         g_ctx[g_ctx_count].name = name ? name : "?";   /* named in the milestone log */
         g_ctx_count++;
     }
+}
+
+/* Leaf imports that can finish without the dispatcher: no guest code, no
+ * change to r2, no blocking. The module that implements one registers a fast
+ * form beside the full handler. ps3_hle_call tries it first, and the fast form
+ * returns 0 to take the full call instead (a contended lock that has to wait,
+ * say). God of War HD takes an lwmutex about 640,000 times in one frame (its
+ * allocator, when a wave spawns), and the dispatcher's guard and bookkeeping
+ * were a large part of each. Registered at init, before guest threads run.
+ * Fast calls do not show in PS3_FTRACE. */
+typedef int (*hle_fast_fn)(ppu_context*);
+#define HLE_FAST_N 64u
+static struct { uint32_t nid; hle_fast_fn fn; } g_hle_fast[HLE_FAST_N];
+extern "C" void ps3_hle_register_fast(uint32_t nid, hle_fast_fn fn)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn || e.nid == nid) { e.nid = nid; e.fn = fn; return; }
+    }
+}
+static inline hle_fast_fn hle_fast(uint32_t nid)
+{
+    const uint32_t h = (nid * 2654435761u) >> 26;
+    for (uint32_t i = 0; i < HLE_FAST_N; i++) {
+        const auto& e = g_hle_fast[(h + i) & (HLE_FAST_N - 1)];
+        if (!e.fn) return nullptr;
+        if (e.nid == nid) return e.fn;
+    }
+    return nullptr;
 }
 
 /* Is this NID implemented here? Lets a host boot harness that owns its own
@@ -124,6 +183,7 @@ extern "C" __attribute__((weak)) void ppu_gcm_pump(void);
 extern "C" void flow_spurs_kernel_spawn_postinit(void) __attribute__((weak));
 extern "C" void flow_spurs_kernel_spawn_postinit(void) {}
 #include "../platform/win32_backtrace.h"   /* RtlCaptureStackBackTrace / GetModuleHandleA on POSIX */
+#include "ps3emu/log_first.h"
 
 /* An unresolved NID is a firmware import we never registered. Returning
  * CELL_OK "so the game keeps going" is the single biggest source of
@@ -182,11 +242,58 @@ static void ps3_hle_unresolved(uint32_t nid, ppu_context* ctx)
 }
 
 extern "C" void ppu_prof_stamp(void* ctx, unsigned lr);
+
+/* PS3_HLE_TOP=<seconds>: the most-called HLE imports over each window, with
+ * the guest thread and caller of the last call. PS3_HLE_TRACE logs the first N
+ * calls from boot, which says nothing about a stall ten minutes in; this says
+ * what every thread is doing now (polling a pad, spinning on a lwcond, feeding
+ * a decoder that never takes the data). Counts are unlocked: a lost increment
+ * can't change which import is on top. */
+static void hle_top_note(uint32_t nid, const char* name, const ppu_context* ctx, long window_s)
+{
+    enum { HT_MAX = 256 };
+    static uint32_t ht_nid[HT_MAX]; static const char* ht_name[HT_MAX];
+    static unsigned ht_n[HT_MAX], ht_tid[HT_MAX], ht_lr[HT_MAX];
+    static int ht_used = 0;
+    static unsigned long long ht_t0 = 0;
+    int i = 0;
+    for (; i < ht_used; i++) if (ht_nid[i] == nid) break;
+    if (i == ht_used && ht_used < HT_MAX) { ht_nid[i] = nid; ht_name[i] = name; ht_used++; }
+    if (i < HT_MAX) {
+        ht_n[i]++;
+        ht_tid[i] = (unsigned)ctx->thread_id;
+        ht_lr[i] = (unsigned)ctx->lr;
+    }
+    unsigned long long now = (unsigned long long)std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();   /* not ps3_qpc_us: fixtures link this file without cellGcmSys */
+    if (!ht_t0) { ht_t0 = now; return; }
+    if (now - ht_t0 < (unsigned long long)window_s * 1000000ull) return;
+    ht_t0 = now;
+    fprintf(stderr, "--- HLE calls (last %lds) ---\n", window_s);
+    for (int k = 0; k < 10; k++) {
+        int best = -1;
+        for (int j = 0; j < ht_used; j++)
+            if (ht_n[j] && (best < 0 || ht_n[j] > ht_n[best])) best = j;
+        if (best < 0) break;
+        fprintf(stderr, "  %8u  %-36s tid=%-3u lr=0x%08X\n",
+                ht_n[best], ht_name[best], ht_tid[best], ht_lr[best]);
+        ht_n[best] = 0;
+    }
+    for (int j = 0; j < ht_used; j++) ht_n[j] = 0;
+}
 extern "C" uint32_t ppu_prof_resolve_host(void* ra);
 extern "C" uint64_t gcm_perf_now_ns(void);            /* cellGcmSys.c */
 extern "C" volatile uint64_t g_gcm_perf_main_hle_ns;
+#include "ppu_tls.h"   /* PPU_THREAD_LOCAL, for headers generated before it */
+/* Nesting of ps3_hle_call on this host thread. runtime/ppu/ppu_sjlj.c refuses a
+ * guest longjmp that would jump over an HLE handler's frame (one that runs
+ * guest code on the caller's context): the guards below would never run. */
+static PPU_THREAD_LOCAL int g_hle_depth = 0;
+extern "C" int* ps3_hle_depth_slot(void) { return &g_hle_depth; }
+
 extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
 {
+    struct _HleDepth { _HleDepth() { ++g_hle_depth; } ~_HleDepth() { --g_hle_depth; } } _hle_depth;
     /* [fps] breakdown: the main thread's time inside HLE library calls. */
     struct MainHleTimer {
         uint64_t begin;
@@ -198,6 +305,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             }
         }
     } mainHleTimer{ (ctx && ctx->thread_id == 1) ? gcm_perf_now_ns() : 0 };
+    if (const hle_fast_fn f = hle_fast(nid))
+        if (f(ctx)) return;
+
     /* HLE_BT_EVERY=<n>: dump the calling thread's guest stack every nth HLE
      * call it makes. WAITBT_EVERY only samples threads that are blocking on an
      * event queue, which misses a thread that stops looping while it is BUSY --
@@ -234,11 +344,16 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * base (e.g. func_002B03AC's `*(r2-0x4B34)` FMOD list head -> null -> infinite walk
      * -> no draws). Snapshot the caller r2+sp now and restore BOTH the live r2 and the
      * ABI slot on every exit path (offset 40 = 0x28 is the reserved TOC doubleword). */
-    struct _TocGuard { ppu_context* c; uint64_t toc, sp;
+    /* It also closes the PS3_FTRACE span of the call: a thread blocked in an
+     * import (a file read, a SPURS wait) shows up nowhere else. */
+    struct _TocGuard { ppu_context* c; uint64_t toc, sp, ft0; uint32_t nid, lr;
         ~_TocGuard(){ c->gpr[2] = toc; vm_write64(sp + 0x28, toc);
                       unsigned t = (unsigned)c->thread_id;
-                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr; }
-    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1] };
+                      if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = nullptr;
+                      if (ft0) { const uint64_t t1 = ps3_ft_now();
+                                 if (t1 - ft0 >= ps3_ft_min_ns())
+                                     ps3_ft_span(PS3_FT_HLE, t, nid, lr, ft0, t1); } }
+    } _tg{ ctx, ctx->gpr[2], ctx->gpr[1], PS3_FT_ON() ? ps3_ft_now() : 0, nid, (uint32_t)ctx->lr };
     /* Deliver any pending vblank/flip tick on THIS (guest) thread, serialized with
      * guest execution -- the vblank ticker only marks ticks pending; the handlers
      * run here so guest code never executes concurrently on the ticker thread. */
@@ -252,7 +367,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
      * with CELL_SPURS_CORE_ERROR_STAT -> the SPURS task workload never attaches. */
     if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
         ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-        static int _tn = 0; if (_tn++ < 3)
+        static int _tn = 0; if (PS3_LOG_FIRST(_tn, 3))
             fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
         return;
     }
@@ -293,7 +408,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                       s_ha = e ? (long)strtoul(e, 0, 16) : 0; }
       if (s_ha && nid == (uint32_t)s_ha) {
         static int _n = 0;
-        if (_n++ < 6)
+        if (PS3_LOG_FIRST(_n, 6))
           fprintf(stderr, "[hle-args] nid=0x%08X r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X "
                           "r7=0x%08X r8=0x%08X r9=0x%08X r10=0x%08X lr=0x%08X\n",
                   nid, (uint32_t)ctx->gpr[3], (uint32_t)ctx->gpr[4], (uint32_t)ctx->gpr[5],
@@ -372,20 +487,20 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         if (nid == 0x5EF96465u) {
                             const char* ce = getenv("YDKJ_CRI_EVFLAG");
                             uint32_t crif = ce ? (uint32_t)strtoul(ce, 0, 16) : 0x006B4600u;
-                            static int _cd=0; if(getenv("SPURS_TRACE") && _cd++<4) fprintf(stderr,
+                            static int _cd=0; if(getenv("SPURS_TRACE") && PS3_LOG_FIRST(_cd, 4)) fprintf(stderr,
                                 "[EVFLAG] 0x5EF96465 r3=0x%08X r4=0x%08X r5=0x%08X r6=0x%08X\n",
                                 (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],(uint32_t)ctx->gpr[6]);
                             /* the eventFlag EA can be r3/r4/r5 depending on the (public vs _internal)
                              * variant behind this NID; the cri flag is a unique address so match any. */
                             if ((uint32_t)ctx->gpr[3] == crif || (uint32_t)ctx->gpr[4] == crif ||
                                 (uint32_t)ctx->gpr[5] == crif) {
-                                static int _c=0; if(_c++<2) fprintf(stderr,
+                                static int _c=0; if(PS3_LOG_FIRST(_c, 2)) fprintf(stderr,
                                     "[FORCE-HLE] cri eventflag 0x%08X -> REAL libsre (stamps +0xC=0xFF)\n", crif);
                                 break;   /* keep opd (libsre); do NOT force HLE */
                             }
                         }
                         static int _n = 0;
-                        if (_n++ < 8)
+                        if (PS3_LOG_FIRST(_n, 8))
                             fprintf(stderr, "[FORCE-HLE] nid=0x%08X: bypassing libsre, using HLE\n", nid);
                         opd = 0;   /* fall through to the HLE handler below */
                         break;
@@ -450,7 +565,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if (nid==0x87630976u && getenv("YDKJ_FORCEATTR")) {
                 extern uint8_t* vm_base; uint32_t s3=(uint32_t)ctx->gpr[3];
                 if (vm_base[s3+0xC]!=0xFF) { vm_base[s3+0xC]=0xFF;
-                    static int _f=0; if(_f++<4) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
+                    static int _f=0; if(PS3_LOG_FIRST(_f, 4)) fprintf(stderr,"[FORCEATTR] forced struct 0x%08X +0xC=0xFF before create-task\n",s3); }
             }
             /* YDKJ_GUESTINIT: the create-task (0x87630976) runs BEFORE the game's own
              * init of its task descriptor (r3), so descriptor+0xC != 0xFF -> STAT. Eagerly
@@ -467,7 +582,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                 if (getenv("YDKJ_GUESTINIT_CRI") && _ts!=0x40131000u) { /* skip audio */ }
                 else if (vm_base[desc+0xC]!=0xFF) {
                     uint32_t iopd = prx_resolve_export(0x22AAB31Du);
-                    static int _g=0; if(_g++<6) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
+                    static int _g=0; if(PS3_LOG_FIRST(_g, 6)) fprintf(stderr,"[GUESTINIT] pre-init descriptor 0x%08X via 0x22AAB31D (opd=0x%08X) before create-task\n", desc, iopd);
                     if (iopd) { ppu_guest_call(iopd, desc, 1, 8, 0x398, 0, 0, 0, 0);
                         if(_g<=6) fprintf(stderr,"[GUESTINIT] after pre-init: descriptor 0x%08X +0xC=0x%02X\n", desc, vm_base[desc+0xC]); }
                 }
@@ -478,7 +593,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             if (nid==0x1D46FEDFu && getenv("SPURS_TRACE")) {
                 extern uint8_t* vm_base; uint32_t a5=(uint32_t)ctx->gpr[5], a4=(uint32_t)ctx->gpr[4];
                 #define _RD(b,o) ((vm_base[(b)+(o)]<<24)|(vm_base[(b)+(o)+1]<<16)|(vm_base[(b)+(o)+2]<<8)|vm_base[(b)+(o)+3])
-                static int _a=0; if(_a++<2) fprintf(stderr,
+                static int _a=0; if(PS3_LOG_FIRST(_a, 2)) fprintf(stderr,
                     "[CRI_ATTR] task-add r3(taskset)=0x%08X r4=0x%08X r5(attr)=0x%08X r6(elf)=0x%08X\n"
                     "           attr[0..0x1C]= %08X %08X %08X %08X %08X %08X %08X %08X  (attr[0] must be 1)\n",
                     (uint32_t)ctx->gpr[3],a4,a5,(uint32_t)ctx->gpr[6],
@@ -544,25 +659,26 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
                         uint32_t want = (_ed && _ed[0] == (char)49) ? 1u : 3u;
                         static int _ei = 0;
                         if (iopd) {
-                            if (_ei++ < 6) {
+                            const int first = PS3_LOG_FIRST(_ei, 6);
+                            if (first) {
                                 fprintf(stderr, "[EVFLAG] eager _cellSpursEventFlagInitialize"
                                                 " flag=0x%08X spurs=0x%08X taskset=0x%08X dir=%u\n",
                                         ef, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea, want);
                                 fflush(stderr); }
                             ppu_guest_call(iopd, g_ydkj_real_spurs_ea, g_ydkj_real_taskset_ea,
                                            ef, 0, want, 0, 0, 0);
-                            if (_ei <= 6) {
+                            if (first) {
                                 fprintf(stderr, "[EVFLAG] after init: +0C=%02X +0D=%02X +0E=%02X\n",
                                         vm_base[ef+0xC], vm_base[ef+0xD], vm_base[ef+0xE]);
                                 fflush(stderr); }
-                        } else if (_ei++ < 2) {
+                        } else if (PS3_LOG_FIRST(_ei, 2)) {
                             fprintf(stderr, "[EVFLAG] 0x5EF96465 not resolvable via the PRX registry\n");
                         }
                     }
                     if (_ed && dir != 1 && dir != 3) {
                         vm_base[ef + 0xE] = (uint8_t)((_ed[0] == (char)49) ? 1 : 3);
                         static int _es = 0;
-                        if (_es++ < 4) {
+                        if (PS3_LOG_FIRST(_es, 4)) {
                             fprintf(stderr, "[EVFLAG] stamped +0E=%u on 0x%08X\n",
                                     vm_base[ef+0xE], ef);
                             fflush(stderr); }
@@ -618,7 +734,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
               if (nid==0x87630976u && _cap_ts==0x40131000u && (uint32_t)ctx->gpr[3]==0x8041090Fu
                   && getenv("YDKJ_CRI_CREATE_OK")) {
                   ctx->gpr[3]=0; static int _co=0;
-                  if(_co++<2) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
+                  if(PS3_LOG_FIRST(_co, 2)) fprintf(stderr,"[CRI_CREATE_OK] forced cri create return 0 (descriptor pristine) so ELF-init can run\n");
               }
               extern uint64_t vm_read64(uint64_t a);
               if (st && nid==0x87630976u && _cap_ts) {
@@ -646,8 +762,9 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         }
     }
 
-    for (uint32_t i = 0; i < g_ctx_count; i++)
-        if (g_ctx[i].nid == nid) {
+    const HleSlot* hs = hle_slot(nid);
+    if (hs->ctx_i >= 0) {
+            const uint32_t i = (uint32_t)hs->ctx_i;
             ps3_msf("hle:%s", g_ctx[i].name);
             /* Record the name here too. This loop dispatches every
              * ps3_hle_register_ctx handler -- which is the whole sysPrxForUser
@@ -668,7 +785,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             return;
         }
 
-    ps3_nid_entry* e = g_hle_inited ? ps3_nid_table_find(&g_hle_nids, nid) : nullptr;
+    ps3_nid_entry* e = hs->tab_i >= 0 ? &g_hle_nids.entries[hs->tab_i] : nullptr;
     if (!e || !e->handler) {
         /* Recorded before the diagnostic paths below, several of which return
          * early. An import moving between resolved and unresolved is exactly the
@@ -682,7 +799,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * -> the SPURS task workload never attaches -> no movie decode. Return not-loaded. */
         if (nid == 0xE0998DBFu && getenv("YDKJ_TUNERFIX")) {
             ctx->gpr[3] = (uint64_t)(int64_t)(int32_t)0x8001112E;
-            static int _tn = 0; if (_tn++ < 3)
+            static int _tn = 0; if (PS3_LOG_FIRST(_tn, 3))
                 fprintf(stderr, "[TUNERFIX] sysPrxForUser 0xE0998DBF -> 0x8001112E (profiler not loaded)\n");
             return;
         }
@@ -697,7 +814,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
          * game's statCallback (r8 OPD) with a CellSaveDataStatGet{isNewData=1}, honor
          * its result, return CELL_SAVEDATA_RET_OK(0). Legit HLE (real first-run behavior). */
         if (nid==0xCDC6AEFDu) { static int _sdi=-1; if(_sdi<0)_sdi=getenv("YDKJ_SAVEDATA")?1:0;
-          if(_sdi){ static int _once=0; if(_once++<2){
+          if(_sdi){ static int _once=0; if(PS3_LOG_FIRST(_once, 2)){
             uint32_t statCb=(uint32_t)ctx->gpr[8];               /* statCallback OPD */
             uint32_t SC=0x02000000u, SG=0x02000100u, SS=0x02000900u; /* scratch structs */
             for(uint32_t a=0x02000000u;a<0x02001000u;a+=4) vm_write32(a,0);
@@ -713,7 +830,7 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
             ctx->gpr[3]=0; /* CELL_SAVEDATA_RET_OK */
             return;
           } } }
-        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(_sd++<3){
+        if (nid==0xCDC6AEFDu || nid==0x27CB8BC2u) { static int _sd=0; if(PS3_LOG_FIRST(_sd, 3)){
             extern uint32_t vm_read32(uint64_t);
             uint32_t r7=(uint32_t)ctx->gpr[7], r8=(uint32_t)ctx->gpr[8];
             uint32_t r7c=r7?vm_read32(r7):0, r8c=r8?vm_read32(r8):0;
@@ -738,11 +855,15 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
         return;
     }
     g_last_hle_name = e->name;
+    { static long s_ht = -1;
+      if (s_ht < 0) { const char* ev = getenv("PS3_HLE_TOP"); s_ht = ev ? atol(ev) : 0;
+                      if (s_ht < 0) s_ht = 0; }
+      if (s_ht > 0) hle_top_note(nid, e->name, ctx, s_ht); }
     ps3_msf("hle:%s", e->name);
     { unsigned t = (unsigned)ctx->thread_id;
       if (t < PS3_HLE_INFLIGHT_MAX) g_hle_inflight[t] = e->name; }
     if (nid == 0xD0B1D189u /*cellGcmSetTile*/ || nid == 0xDC09357Eu /*SetDisplayBuffer*/) {
-        static int _g=0; if (_g++ < 8)
+        static int _g=0; if (PS3_LOG_FIRST(_g, 8))
             fprintf(stderr, "[hle-trace] %s lr=0x%08X cia=0x%08X r3..r8=%08X %08X %08X %08X %08X %08X\n",
                     e->name, (uint32_t)ctx->lr, (uint32_t)ctx->cia,
                     (uint32_t)ctx->gpr[3],(uint32_t)ctx->gpr[4],(uint32_t)ctx->gpr[5],
@@ -760,14 +881,27 @@ extern "C" void ps3_hle_call(uint32_t nid, ppu_context* ctx)
     { static int _pl=-1; if(_pl<0)_pl=getenv("PS3_HLE_PTRCHECK")?1:0;
       if(_pl){ uint32_t rv=(uint32_t)r;
         if(rv>=0x10000000u && (rv & 0xFFFF0000u)!=0x80010000u && (rv & 0xFFFF0000u)!=0x80020000u){
-          static int _n=0; if(_n++<40) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
+          static int _n=0; if(PS3_LOG_FIRST(_n, 40)) fprintf(stderr,"[PTRLEAK] NID 0x%08X %s returned 0x%08X (out-of-guest-RAM host ptr?)\n",
             nid, e->name?e->name:"?", rv); } } }
 }
 
 /* Populated by the generated registration unit (gen_hle_nids.py). Weak so a
  * build without it still links (no HLE registered -> imports log + return 0). */
+#if defined(_MSC_VER)
+/* MSVC has no weak functions: /alternatename redirects references to the
+ * default only while the strong definition from the generated unit is absent
+ * -- weak semantics, and ignored when ppu_hle_nids.cpp is linked. */
+extern "C" void ppu_hle_register_all_default(void) {}
+extern "C" void ppu_hle_register_all(void);   /* generated unit; /alternatename falls back */
+#  if defined(_M_IX86)
+#    pragma comment(linker, "/alternatename:_ppu_hle_register_all=_ppu_hle_register_all_default")
+#  else
+#    pragma comment(linker, "/alternatename:ppu_hle_register_all=ppu_hle_register_all_default")
+#  endif
+#else
 extern "C" void ppu_hle_register_all(void) __attribute__((weak));
 extern "C" void ppu_hle_register_all(void) {}
+#endif
 
 extern "C" void ppu_hle_init(void)
 {

@@ -166,6 +166,9 @@ static int vdec_ff_receive(VdecFf* d, vdec_ff_emit_fn emit, void* cb_ctx)
             pic.token = (u32)(f->pts != AV_NOPTS_VALUE ? f->pts : f->best_effort_timestamp);
             pic.pict_type = (int)f->pict_type;
             pic.key = (f->flags & AV_FRAME_FLAG_KEY) != 0;
+            if (d->ctx->framerate.num > 0 && d->ctx->framerate.den > 0)
+                pic.frame_ticks = (u32)((90000LL * d->ctx->framerate.den +
+                                         d->ctx->framerate.num / 2) / d->ctx->framerate.num);
             emit(cb_ctx, &pic);                        /* takes pic.yuv */
         }
         d->ff->av_frame_unref(f);

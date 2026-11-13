@@ -49,6 +49,9 @@ static int netctl_online(void)
     return v;
 }
 
+/* For the libraries that answer the same question (cellSysutilNpEula.c). */
+int ps3_netctl_online(void) { return netctl_online(); }
+
 typedef struct {
     int              in_use;
     cellNetCtlHandler handler;
@@ -330,10 +333,11 @@ s32 cellNetCtlDelHandler(s32 hid)
  * Real hardware shows a system dialog and signals progress asynchronously
  * through the cellSysutil callback queue (LOADED -> FINISHED), after which the
  * game calls UnloadAsync to retrieve the result. In an offline native recomp
- * there is nothing to show and we are already "connected", so we immediately
- * post LOADED + FINISHED to every registered sysutil callback slot and report a
- * successful result on unload. This unblocks the common boot-time "connecting
- * to network" gate without requiring a real PSN session.
+ * there is nothing to show, so we immediately post LOADED + FINISHED to every
+ * registered sysutil callback slot. On unload the result is "connected" with
+ * PS3_NET_ONLINE=1 and "cancelled" otherwise, matching what GetState reports.
+ * This unblocks the common boot-time "connecting to network" gate without
+ * requiring a real PSN session.
  * -----------------------------------------------------------------------*/
 
 static void netstart_broadcast(u32 status)
@@ -344,10 +348,18 @@ static void netstart_broadcast(u32 status)
         cellSysutilQueueEvent(slot, status, 0);
 }
 
+/* The "connect to the network" screen a title opens before going online. It
+ * finishes at once; its verdict (UnloadAsync's result) follows the same state
+ * GetState reports: connected only with PS3_NET_ONLINE. Offline it is the
+ * user backing out of the screen, CELL_NET_CTL_ERROR_DIALOG_CANCELED, as on
+ * RPCS3 with no network. Answering "connected" while every other query says
+ * offline sent Resistance's Multiplayer > Online Game on to request a PSN
+ * ticket and then wait for one for ever on a black screen. */
 s32 cellNetCtlNetStartDialogLoadAsync(const CellNetCtlNetStartDialogParam* param)
 {
     (void)param;
-    printf("[cellNetCtl] NetStartDialogLoadAsync() -> auto-connect\n");
+    printf("[cellNetCtl] NetStartDialogLoadAsync() -> %s\n",
+           netctl_online() ? "auto-connect" : "offline: cancelled");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_LOADED);
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_FINISHED);
     return CELL_OK;
@@ -361,11 +373,18 @@ s32 cellNetCtlNetStartDialogAbortAsync(void)
 
 s32 cellNetCtlNetStartDialogUnloadAsync(CellNetCtlNetStartDialogResult* result)
 {
+    /* Offline (the default), the dialog ends as if the player cancelled it,
+     * as RPCS3 reports it without a network: "connected" while GetState says
+     * there is no network sent inFAMOUS 2 on to a PSN terms-of-service check
+     * that never answers, behind an endless "Please wait...". A cancelled
+     * connection is a path every title handles. PS3_NET_ONLINE=1: connected. */
+    const u32 res = netctl_online() ? 0u : (u32)CELL_NET_CTL_ERROR_DIALOG_CANCELED;
     if (result) {
         result = GUEST_PTR(result, CellNetCtlNetStartDialogResult*);
-        result->result = 0;   /* 0 = connected; endian-safe */
+        result->result = (s32)ps3_bswap32(res);   /* guest big-endian */
     }
-    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0 (connected)\n");
+    printf("[cellNetCtl] NetStartDialogUnloadAsync() -> result=0x%08X (%s)\n", res,
+           res ? "cancelled: offline" : "connected");
     netstart_broadcast(CELL_SYSUTIL_NET_CTL_NETSTART_UNLOADED);
     return CELL_OK;
 }

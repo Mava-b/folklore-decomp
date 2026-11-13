@@ -105,6 +105,7 @@ extern uint32_t ppu_vm_size;
 #define HEAP_BASE   0x00400000u
 
 #define CLEAR_ARGB  0xFF101830u          /* what we expect to come out again  */
+#define SPLIT_B_ARGB 0xFF20C040u         /* --split-present: the frame after  */
 #define VTX_OFFSET  0x00010000u          /* RSX offset of our vertex buffer   */
 #define TEX_OFFSET  0x00020000u          /* RSX offset of our test texture    */
 #define FP_OFFSET   0x00030000u          /* RSX offset of our fragment programs */
@@ -178,6 +179,17 @@ static const u32 CUBE_FACE_ARGB[6] = {
     0xFFC03020u, 0xFF20C030u, 0xFF3020C0u, 0xFFC0C020u, 0xFF20C0C0u, 0xFF8040E0u,
 };
 #define CUBE_ARGB        0xFF8040E0u      /* face 5, -Z: what --cube must read */
+
+/* --float-rt / --float-rt-r: an offscreen RGBA32F (SET_SURFACE_FORMAT colour
+ * 0xC) or R32F (0xD) surface, the size the guest clips it to, and the bytes
+ * per pixel of each. The backing is one float per channel in R, G, B, A
+ * order, (0, 1, 1, 1) for RGBA32F and 0 for R32F: no reading of those bytes
+ * in any channel order presents the red the surface is drawn, so a surface
+ * that was never created and was sampled from guest memory instead shows. */
+#define FRT_OFFSET       0x001D0000u
+#define FRT_DIM          64u
+#define FRT_RGBA_BPP     16u
+#define FRT_R_BPP        4u
 
 /* Functions the RSX side exports but does not declare in a public header. */
 extern void cellGcm_rsx_process_fifo(void);
@@ -295,6 +307,16 @@ static void upload_rtt_backing(void)
         guest_w32(IO_ADDR + RTT_OFFSET + i * 4u, RTT_BACKING);
 }
 
+/* Guest memory behind the --float-rt surfaces (see FRT_OFFSET). */
+static void upload_float_rt_backing(int one_channel)
+{
+    static const float rgba[4] = { 0.0f, 1.0f, 1.0f, 1.0f };
+    const uint32_t bpp = one_channel ? FRT_R_BPP : FRT_RGBA_BPP;
+    for (uint32_t i = 0; i < FRT_DIM * FRT_DIM; i++)
+        for (uint32_t c = 0; c < bpp / 4u; c++)
+            guest_f32(IO_ADDR + FRT_OFFSET + i * bpp + c * 4u, rgba[c]);
+}
+
 /* ...and the same for --depthtex's zeta: the bytes a CPU-cleared depth buffer
  * would hold at the offset the second pass binds a texture unit to. */
 static void upload_depthtex_backing(void)
@@ -330,6 +352,23 @@ static void upload_textured_quad(void)
     for (int i = 0; i < 6; i++)
         for (int k = 0; k < 12; k++)
             guest_f32(IO_ADDR + TVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
+}
+
+/* --border: the same quad with every texcoord shifted by 2, so the whole
+ * quad samples outside [0,1] and every pixel is the border wrap's answer.
+ * Layout as the textured quad. */
+#define RVTX_OFFSET (VTX_OFFSET + 0x8000u)
+#define BORDER_ARGB 0xFFFFFFFFu          /* SET_TEXTURE_BORDER_COLOR: white */
+static void upload_border_quad(void)
+{
+    static const float pos[6][2] = { {-1,-1}, {1,-1}, {1,1}, {-1,-1}, {1,1}, {-1,1} };
+    static const float uv[6][2]  = { {0,0}, {1,0}, {1,1}, {0,0}, {1,1}, {0,1} };
+    for (int i = 0; i < 6; i++) {
+        const float v[12] = { pos[i][0], pos[i][1], 0, 1,   0, 1, 0, 1,
+                              uv[i][0] + 2.0f, uv[i][1] + 2.0f, 0, 0 };
+        for (int k = 0; k < 12; k++)
+            guest_f32(IO_ADDR + RVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[k]);
+    }
 }
 
 /* The --cube texture: each face a flat colour of its own. */
@@ -375,6 +414,12 @@ static void upload_mip_texture(void)
  * pixels is what drives the LOD past level 0; the sampler's max LOD then pins
  * it at level 1. Layout as the textured quad: float4 pos, colour, uv. */
 #define MVTX_OFFSET (VTX_OFFSET + 0x3000u)
+/* --mip-aniso: the same quad stretched to 0.8 of the target's height, so the
+ * texture is minified ~2.5x across and magnified ~4.5x down. Isotropic
+ * filtering takes the LOD from the longer axis and still lands on level 1;
+ * anisotropic filtering (PS3_ANISO) takes several samples along it and its
+ * LOD from the shorter one, which is level 0. */
+static int s_mip_aniso;
 static void upload_mip_quad(void)
 {
     static const float v[6][12] = {
@@ -386,8 +431,11 @@ static void upload_mip_quad(void)
         { -0.02f, 0.02f,0,1,  0,1,0,1,  0,1,0,0 },
     };
     for (int i = 0; i < 6; i++)
-        for (int k = 0; k < 12; k++)
-            guest_f32(IO_ADDR + MVTX_OFFSET + (uint32_t)(i * 48 + k * 4), v[i][k]);
+        for (int k = 0; k < 12; k++) {
+            float f = v[i][k];
+            if (k == 1 && s_mip_aniso) f *= 20.0f;            /* y: +-0.02 -> +-0.4 */
+            guest_f32(IO_ADDR + MVTX_OFFSET + (uint32_t)(i * 48 + k * 4), f);
+        }
 }
 
 /* The guest-shader draw's vertex block: the same full-viewport triangle, but
@@ -641,6 +689,25 @@ static void emit_textured_draw_fmt(u32 tex_offset, u32 w, u32 h, u32 fmt_byte)
     emit_textured_draw_full(tex_offset, w, h, fmt_byte, 0, TVTX_OFFSET);
 }
 
+/* --border: --tex's green texture with SET_TEXTURE_ADDRESS BORDER (4) on s,
+ * t and r and an opaque white SET_TEXTURE_BORDER_COLOR, drawn with the quad
+ * whose texcoords are all outside [0,1]. The centre pixel has to be the
+ * border colour: the texture's green means the wrap clamped to the edge.
+ * The draw blends SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the clear, so a
+ * border read as transparent black (the register ignored) leaves the clear
+ * colour there -- unblended it would present 0, which reads as "no headless
+ * readback" and would pass. */
+static void emit_border_draw(void)
+{
+    emit(NV4097_SET_TEXTURE_ADDRESS      + 0, 4u | (4u << 8) | (4u << 16));
+    emit(NV4097_SET_TEXTURE_BORDER_COLOR + 0, BORDER_ARGB);
+    emit(NV4097_SET_BLEND_ENABLE,        1u);
+    emit(NV4097_SET_BLEND_FUNC_SFACTOR,  0x0302u | (0x0302u << 16));   /* SRC_ALPHA           */
+    emit(NV4097_SET_BLEND_FUNC_DFACTOR,  0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
+    emit(NV4097_SET_BLEND_EQUATION,      0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit_textured_draw_full(TEX_OFFSET, TEX_W, TEX_H, 0x85u | 0x20u, 0, RVTX_OFFSET);
+}
+
 /* The same quad on a cube map: SET_TEXTURE_FORMAT's bit 2 says cube, and the
  * vertices are the ones whose texcoord is a direction. */
 static void emit_cube_draw(void)
@@ -699,6 +766,84 @@ static void emit_rtt_draws(void)
     emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
 }
 
+/* --feedback: a draw that samples the colour target it is writing, which is
+ * what in-place deferred lighting does (read the albedo, write the lit colour
+ * over it).
+ *
+ * The red triangle goes into the --rtt surface as there, with its pitch and
+ * format declared so the surface and a texture over the same bytes describe
+ * one layout. Then,
+ * still targeting that surface, the full-screen quad samples it through TEX
+ * r0, TC0 and writes the result back over it: a copy of itself. Last, the
+ * display samples the surface as in --rtt.
+ *
+ * Red survives only if the second draw read the surface as it was when the
+ * draw started. A backend that falls back to the guest bytes at that offset
+ * (green, as in --rtt) overwrites the surface with green; one that rejects
+ * the draw leaves red behind too, so the mode also asks the engine's log. */
+static void emit_feedback_draws(void)
+{
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   RTT_OFFSET);
+    emit(NV4097_SET_SURFACE_PITCH_A,         RTT_DIM * 4u);
+    /* A8R8G8B8, Z24S8, linear: the engine only hands out a copy of a target
+     * whose declared layout is the texture's. */
+    emit(NV4097_SET_SURFACE_FORMAT,          0x148u);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, RTT_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   RTT_DIM << 16);
+    emit(NV4097_SET_SHADER_PROGRAM,          0u);
+    emit_triangle_draw();
+    emit(NV4097_SET_TEXTURE_CONTROL3 + 0,    RTT_DIM * 4u);
+    emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);     /* reads its own target */
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_PITCH_A,         1280u * 4u);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
+    emit_textured_draw_at(RTT_OFFSET, RTT_DIM, RTT_DIM);
+}
+
+/* --float-rt / --float-rt-r: the red triangle into a 32-bit float colour
+ * surface with blending on, then the display samples it, as --feedback does
+ * for an A8R8G8B8 one: the surface's pitch and format are declared so a
+ * W32_Z32_Y32_X32_FLOAT (0x9B) or X32_FLOAT (0x9C) texture over the same bytes
+ * describes one layout. A title renders small reductions (a scene's average
+ * luminance) into targets like these and blends into them.
+ *
+ * SRC_ALPHA / ONE_MINUS_SRC_ALPHA over the surface's seeded contents with the
+ * triangle's alpha of 1 leaves red, so the check is the same as --rtt's; what
+ * the mode adds is a blended pipeline and a render pass in a float format,
+ * which the Vulkan workflow runs under the validation layer. */
+static void emit_float_rt_draws(int one_channel)
+{
+    const u32 bpp = one_channel ? FRT_R_BPP : FRT_RGBA_BPP;
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   FRT_OFFSET);
+    emit(NV4097_SET_SURFACE_PITCH_A,         FRT_DIM * bpp);
+    /* colour 0xC (A32B32G32R32F) or 0xD (B32F), Z24S8, linear. */
+    emit(NV4097_SET_SURFACE_FORMAT,          one_channel ? 0x14Du : 0x14Cu);
+    emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_0);
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, FRT_DIM << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   FRT_DIM << 16);
+    emit(NV4097_SET_SHADER_PROGRAM,          0u);
+    emit(NV4097_SET_BLEND_ENABLE,            1u);
+    emit(NV4097_SET_BLEND_FUNC_SFACTOR,      0x0302u | (0x0302u << 16));   /* SRC_ALPHA           */
+    emit(NV4097_SET_BLEND_FUNC_DFACTOR,      0x0303u | (0x0303u << 16));   /* ONE_MINUS_SRC_ALPHA */
+    emit(NV4097_SET_BLEND_EQUATION,          0x8006u | (0x8006u << 16));   /* FUNC_ADD            */
+    emit_triangle_draw();
+    emit(NV4097_SET_BLEND_ENABLE,            0u);
+
+    emit(NV4097_SET_CONTEXT_DMA_COLOR_A,     CELL_GCM_CONTEXT_DMA_MEMORY_FRAME_BUFFER);
+    emit(NV4097_SET_SURFACE_COLOR_AOFFSET,   0u);
+    emit(NV4097_SET_SURFACE_PITCH_A,         1280u * 4u);
+    emit(NV4097_SET_SURFACE_FORMAT,          0x148u);                      /* A8R8G8B8 again */
+    emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, 1280u << 16);
+    emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   720u << 16);
+    emit(NV4097_SET_TEXTURE_CONTROL3 + 0,    FRT_DIM * bpp);
+    emit_textured_draw_fmt(FRT_OFFSET, FRT_DIM, FRT_DIM, (one_channel ? 0x9Cu : 0x9Bu) | 0x20u);
+}
+
 /* Declare an MRT1 set, write both of its members from ONE draw, then sample
  * one of them -- which is what a deferred renderer's G-buffer pass is.
  *
@@ -730,6 +875,10 @@ static void emit_mrt_draws(int sample_b)
     emit(NV4097_SET_SURFACE_COLOR_TARGET,    CELL_GCM_SURFACE_TARGET_MRT1);
     emit(NV4097_SET_SURFACE_CLIP_HORIZONTAL, MRT_DIM << 16);
     emit(NV4097_SET_SURFACE_CLIP_VERTICAL,   MRT_DIM << 16);
+    /* Targets B..D take their colour mask from COLOR_MASK_MRT (0x0370), one
+     * A,R,G,B nibble each, not from COLOR_MASK, and it resets to 0: a title
+     * enables them with cellGcmSetColorMaskMrt, as this does for B. */
+    emit(0x0370u /* NV4097_SET_COLOR_MASK_MRT */, 0xF0u);
 
     /* Clear the set, which is one clear per target on both paths, before
      * anything draws into it. That is what a G-buffer pass does, and it is
@@ -874,6 +1023,34 @@ static void emit_shader_draw(void)
     emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
 }
 
+/* --clip / --clip-keep: the --shader triangle with a vertex program that
+ * also writes o5 = v3, the colour (0, 0, 1, 1), so user clip plane 1's
+ * distance (o5.z) is 1 everywhere. SET_USER_CLIP_PLANE_CONTROL (0x1478, one
+ * 4-bit op per plane) enables plane 1 as ENABLE_LT (keeps d <= 0: the whole
+ * triangle is clipped, the clear colour stays) or as ENABLE_GE (keeps d >= 0:
+ * the red comes through). A renderer that ignores the register draws red in
+ * both. The register goes back to 0 afterwards, as a title's reset would. */
+#define NV4097_SET_USER_CLIP_PLANE_CONTROL 0x00001478u
+static void emit_clip_draw(int keep)
+{
+    u8 vp[48];
+    rsx_test_vp_mov_out(vp +  0, 0, RSX_TEST_VP_SWZ_IDENT, 0, 0);   /* MOV o0, v0      */
+    rsx_test_vp_mov_out(vp + 16, 3, RSX_TEST_VP_SWZ_IDENT, 1, 0);   /* MOV o1, v3      */
+    rsx_test_vp_mov_out(vp + 32, 3, RSX_TEST_VP_SWZ_IDENT, 5, 1);   /* MOV o5, v3, END */
+    emit_programs(vp, sizeof vp, FP_OFFSET);
+    emit(NV4097_SET_USER_CLIP_PLANE_CONTROL, (keep ? 2u : 1u) << 4);  /* plane 1 */
+
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 0 * 4, VTX_MAIN(SVTX_OFFSET +  0));  /* position */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 0 * 4, VFMT(4, 32));
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_OFFSET + 3 * 4, VTX_MAIN(SVTX_OFFSET + 16));  /* colour   */
+    emit(NV4097_SET_VERTEX_DATA_ARRAY_FORMAT + 3 * 4, VFMT(4, 32));
+
+    emit(NV4097_SET_BEGIN_END, 5u);                       /* TRIANGLES        */
+    emit(NV4097_DRAW_ARRAYS,   0u | ((3u - 1u) << 24));   /* first=0 count=3  */
+    emit(NV4097_SET_BEGIN_END, 0u);                       /* end              */
+    emit(NV4097_SET_USER_CLIP_PLANE_CONTROL, 0u);
+}
+
 /* Depth test on, LESS, writes on -- the state a title sets for opaque
  * geometry -- and the two triangles as separate BEGIN/END pairs, which is how
  * a title issues two draws rather than one split primitive stream. */
@@ -968,18 +1145,22 @@ static void submit_frame(int with_draw)
             emit(NV4097_CLEAR_SURFACE,            0xF0u);
         }
     }
-    if (with_draw == 12)     emit_depth_bounds_draw();
+    if (with_draw == 15)     emit_border_draw();
+    else if (with_draw == 12) emit_depth_bounds_draw();
     else if (with_draw == 11) emit_cube_draw();
     else if (with_draw == 10) emit_mrt_draws(0);
     else if (with_draw == 9) emit_mrt_draws(1);
     else if (with_draw == 8) emit_depthtex_draws();
     else if (with_draw == 7) emit_quad_draws();
+    else if (with_draw == 14) emit_feedback_draws();
+    else if (with_draw == 18 || with_draw == 19) emit_float_rt_draws(with_draw == 19);
     else if (with_draw == 6) emit_rtt_draws();
     else if (with_draw == 5) emit_mip_draw();
     else if (with_draw == 4) emit_depth_draw();
     else if (with_draw == 3) emit_shader_draw();
+    else if (with_draw == 16 || with_draw == 17) emit_clip_draw(with_draw == 17);
     else if (with_draw == 2) emit_textured_draw();
-    else if (with_draw == 1) emit_triangle_draw();
+    else if (with_draw == 1 || with_draw == 13) emit_triangle_draw();
 
     guest_w32(CTRL_ADDR + 0, g_fifo_len);   /* put */
     cellGcm_rsx_process_fifo();
@@ -1045,7 +1226,7 @@ static int run_thread_check(void)
     ctx.gpr[5] = 0;            /* arg */
     ctx.gpr[6] = 1000;         /* priority */
     ctx.gpr[7] = 0x10000;      /* guest stack size */
-    ctx.gpr[8] = 0;            /* flags */
+    ctx.gpr[8] = 1;            /* flags: SYS_PPU_THREAD_CREATE_JOINABLE (joined below) */
     ctx.gpr[9] = 0;            /* name */
     int64_t crc = sys_ppu_thread_create(&ctx);
     if (crc != 0) {
@@ -1088,8 +1269,9 @@ static int run_thread_check(void)
  * Neither had ever been initialised off Windows -- the Windows build takes
  * WASAPI and XInput -- so nothing said whether they even run. This is not a
  * sound or input test: it is the assertion that init, a few polls and
- * shutdown complete, twice, and that a shutdown with no device open is
- * survivable. With SDL_AUDIODRIVER=dummy and no controller plugged in it
+ * shutdown complete, twice, that a shutdown with no device open is
+ * survivable, and that port 0 with no controller reports a pad at rest
+ * (sticks centred). With SDL_AUDIODRIVER=dummy and no controller plugged in it
  * needs no hardware, which is what lets CI run it.
  * -----------------------------------------------------------------------*/
 static int run_audio_pad_check(void)
@@ -1149,6 +1331,30 @@ static int run_audio_pad_check(void)
             nanosleep(&ts, NULL);
         }
 
+        /* Port 0 is served with no device behind it, and what it reports
+         * then must be a pad at rest: both sticks centred (128), not zero,
+         * which is full deflection up and left -- a title would steer and
+         * turn its camera on its own. */
+        r = cellPadGetData(0, (CellPadData*)(uintptr_t)HEAP_BASE);
+        if (r != CELL_OK) {
+            fprintf(stderr, "[host] cellPadGetData(0) -> 0x%08X\n", (unsigned)r);
+            rc = 6;
+        } else {
+            static const struct { int off; const char* name; } sticks[] = {
+                { CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_X, "right x" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_RIGHT_Y, "right y" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_LEFT_X,  "left x" },
+                { CELL_PAD_BTN_OFFSET_ANALOG_LEFT_Y,  "left y" },
+            };
+            for (unsigned k = 0; k < sizeof sticks / sizeof sticks[0]; k++) {
+                const uint8_t* p = vm_base + HEAP_BASE + 4u + 2u * (unsigned)sticks[k].off;
+                unsigned v = ((unsigned)p[0] << 8) | p[1];
+                printf("[host] port 0 %s stick = %u %s\n", sticks[k].name, v,
+                       v == 128 ? "OK" : "NOT CENTRED");
+                if (v != 128) rc = 6;
+            }
+        }
+
         r = cellPadEnd();
         if (r != CELL_OK) { fprintf(stderr, "[host] cellPadEnd -> 0x%08X\n", (unsigned)r); rc = 6; }
         r = cellAudioQuit();
@@ -1179,8 +1385,9 @@ static int run_audio_pad_check(void)
  * software path, which is why Linux runs that mode and not these. */
 static int mode_needs_translator(int mode)
 {
-    return mode == 3 || mode == 5 || mode == 6 || mode == 8 ||
-           mode == 9 || mode == 10 || mode == 11;
+    return mode == 3 || mode == 5 || mode == 6 || mode == 8 || mode == 14 ||
+           mode == 9 || mode == 10 || mode == 11 || mode == 15 ||
+           mode == 16 || mode == 17 || mode == 18 || mode == 19;
 }
 
 /* ...and which ones must, on a backend that has a translator, have run the
@@ -1196,10 +1403,16 @@ static const char* mode_flag_name(int mode)
     case 3:  return "--shader";
     case 5:  return "--mip";
     case 6:  return "--rtt";
+    case 14: return "--feedback";
     case 8:  return "--depthtex";
     case 9:  return "--mrt";
     case 10: return "--mrt-a";
     case 11: return "--cube";
+    case 15: return "--border";
+    case 16: return "--clip";
+    case 17: return "--clip-keep";
+    case 18: return "--float-rt";
+    case 19: return "--float-rt-r";
     default: return "(mode)";
     }
 }
@@ -1254,6 +1467,10 @@ int main(int argc, char** argv)
          * that the sampler reaches level 1. The levels are different colours,
          * so a backend that uploads only level 0 presents the wrong one. */
         else if (strcmp(argv[i], "--mip") == 0)    do_draw = 5;
+        /* --mip-aniso: --mip with the quad stretched along y, which only
+         * anisotropic filtering samples from level 0. Passes with PS3_ANISO
+         * set and must fail without it. */
+        else if (strcmp(argv[i], "--mip-aniso") == 0) { do_draw = 5; s_mip_aniso = 1; }
         /* --rtt: render into a colour surface of the guest's own and then
          * sample it, which is what a title does for every reflection, shadow
          * map and post-processing pass. Needs the guest-program path. */
@@ -1291,7 +1508,33 @@ int main(int argc, char** argv)
          * the depthBounds feature; anywhere else the mode says so and stops
          * without a verdict. */
         else if (strcmp(argv[i], "--depthbounds") == 0) do_draw = 12;
+        /* --split-present (Vulkan): present the red triangle frame in two
+         * halves with the next frame drained in between, as a host that
+         * presents on its own thread does. The second frame clears to
+         * SPLIT_B_ARGB. What was shown must still be the triangle's red: the
+         * second frame's clear may not reach a present that had already
+         * begun. On the draw engine path the surface itself must hold the
+         * second frame by then. */
+        else if (strcmp(argv[i], "--split-present") == 0) do_draw = 13;
+        /* --feedback: see emit_feedback_draws. */
+        else if (strcmp(argv[i], "--feedback") == 0) do_draw = 14;
+        /* --border: see emit_border_draw. Metal only for now: the Vulkan
+         * backend still samples every border as transparent black. */
+        else if (strcmp(argv[i], "--border") == 0) do_draw = 15;
+        /* --clip / --clip-keep: see emit_clip_draw. */
+        else if (strcmp(argv[i], "--clip") == 0) do_draw = 16;
+        else if (strcmp(argv[i], "--clip-keep") == 0) do_draw = 17;
+        /* --float-rt / --float-rt-r: see emit_float_rt_draws. */
+        else if (strcmp(argv[i], "--float-rt") == 0) do_draw = 18;
+        else if (strcmp(argv[i], "--float-rt-r") == 0) do_draw = 19;
     }
+#if !defined(__APPLE__)
+    if (do_draw == 15) {
+        printf("[host] --border: the %s backend does not honour SET_TEXTURE_BORDER_COLOR yet; skipped\n",
+               HOST_BACKEND_NAME);
+        return 0;
+    }
+#endif
     /* The guest-program modes, which a backend without a translator cannot
      * run. --depth and --quads are not among them: both are fixed-function. */
     if (mode_needs_translator(do_draw) && !HOST_BACKEND_GUEST_SHADERS) {
@@ -1334,14 +1577,20 @@ int main(int argc, char** argv)
         printf("[host] --tex-io: local ea 0x%08X has offset 0x%08X, the texture's page\n",
                0xC0000000u + TEX_OFFSET, guest_r32(out));
     }
-    if (do_draw == 1) upload_triangle();
+    if (do_draw == 1 || do_draw == 13) upload_triangle();
     if (do_draw == 2) { upload_texture(); upload_textured_quad(); }
-    if (do_draw == 3) upload_shader_triangle();
+    if (do_draw == 15) { upload_texture(); upload_border_quad(); }
+    if (do_draw == 3 || do_draw == 16 || do_draw == 17) upload_shader_triangle();
     if (do_draw == 4) upload_depth_triangles();
     if (do_draw == 12) upload_depth_bounds_triangles();
     if (do_draw == 5) { upload_mip_texture(); upload_mip_quad(); }
     /* --rtt draws both: the triangle into the surface, the quad out of it. */
-    if (do_draw == 6) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
+    if (do_draw == 6 || do_draw == 14) { upload_triangle(); upload_textured_quad(); upload_rtt_backing(); }
+    if (do_draw == 18 || do_draw == 19) {
+        upload_triangle();
+        upload_textured_quad();
+        upload_float_rt_backing(do_draw == 19);
+    }
     if (do_draw == 7) upload_quad_geometry();
     /* --depthtex draws both too: the flat triangle into the zeta, the quad
      * out of it. */
@@ -1364,6 +1613,40 @@ int main(int argc, char** argv)
     u32 got = host_backend_color();
     printf("[host] clear colour through the FIFO: 0x%08X (expected 0x%08X) %s\n",
            got, CLEAR_ARGB, got == CLEAR_ARGB ? "OK" : "MISMATCH");
+
+    if (do_draw == 13) {
+#if defined(PS3RECOMP_RSX_VULKAN) && !defined(__APPLE__)
+        cellGcmSetFlipCommand(0);
+        cellGcmTickVBlank();
+        cellGcmTickFlip();
+        rsx_vulkan_backend_present_begin();
+        emit(NV4097_SET_COLOR_CLEAR_VALUE, SPLIT_B_ARGB);   /* the next frame */
+        emit(NV4097_CLEAR_SURFACE, 0xF0u);
+        guest_w32(CTRL_ADDR + 0, g_fifo_len);
+        cellGcm_rsx_process_fifo();
+        rsx_vulkan_backend_present_finish();
+        const u32 shown = rsx_vulkan_backend_presented_center();
+        const u32 now = host_backend_center();
+        int rc = (got == CLEAR_ARGB) ? 0 : 2;
+        printf("[host] --split-present: shown 0x%08X (expected 0xFFFF0000) %s\n", shown,
+               (shown & 0x00FFFFFFu) == 0x00FF0000u ? "OK" : "MISMATCH");
+        if ((shown & 0x00FFFFFFu) != 0x00FF0000u) rc = 3;
+        if (HOST_BACKEND_GUEST_SHADERS) {
+            printf("[host] --split-present: surface now 0x%08X (expected 0x%08X) %s\n", now,
+                   SPLIT_B_ARGB, (now & 0x00FFFFFFu) == (SPLIT_B_ARGB & 0x00FFFFFFu) ? "OK" : "MISMATCH");
+            if ((now & 0x00FFFFFFu) != (SPLIT_B_ARGB & 0x00FFFFFFu)) rc = 3;
+        }
+        host_backend_shutdown();
+        free(vm_base);
+        return rc;
+#else
+        printf("[host] --split-present: skipped, the %s backend presents in one call\n",
+               HOST_BACKEND_NAME);
+        host_backend_shutdown();
+        free(vm_base);
+        return 0;
+#endif
+    }
 
     /* Flip loop, as cellGcmSetFlipCommand + the vblank ticker drive it. */
     cellGcmSetFlipCommand(0);
@@ -1410,24 +1693,33 @@ int main(int argc, char** argv)
          * here, and MRT_BACKING means the guest bytes behind the surface were
          * sampled instead of the surface itself. With --cube it is the -Z
          * face's colour: any other face's colour means a face went missing on
-         * the way up or the image was sampled as 2D.
+         * the way up or the image was sampled as 2D. With --float-rt it is
+         * red once more, out of an RGBA32F surface; --float-rt-r's R32F
+         * surface has only a red channel, so only red is compared there.
          */
-        u32 want = (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
+        u32 want = (do_draw == 15) ? BORDER_ARGB   /* the border, not the texture */
+                 : (do_draw == 12) ? 0xFF0000FFu   /* blue, inside its bounds */
                  : (do_draw == 11) ? CUBE_ARGB
                  : (do_draw == 10) ? MRT_A_ARGB
                  : (do_draw == 9) ? MRT_B_ARGB
                  : (do_draw == 8) ? DTEX_ARGB     /* the sampled depth as a byte */
                  : (do_draw == 7) ? 0xFFFF0000u   /* the quad strip over the polygon */
+                 : (do_draw == 17) ? 0xFFFF0000u  /* plane 1 keeps d >= 0        */
+                 : (do_draw == 16) ? CLEAR_ARGB   /* plane 1 clipped it all      */
+                 : (do_draw == 18 || do_draw == 19) ? 0xFFFF0000u   /* only the surface holds red */
+                 : (do_draw == 14) ? 0xFFFF0000u  /* the copy kept the triangle  */
                  : (do_draw == 6) ? 0xFFFF0000u   /* only the surface holds red  */
-                 : (do_draw == 5) ? MIP_L1_ARGB
+                 : (do_draw == 5) ? (s_mip_aniso ? MIP_L0_ARGB : MIP_L1_ARGB)
                  : (do_draw == 4) ? 0xFFFF0000u   /* near red beats far green    */
                  : (do_draw == 3) ? 0xFFFF0000u   /* blue vertices, FP swaps r/b */
                  : (do_draw == 2) ? TEX_ARGB
                  : (do_draw == 1) ? 0xFFFF0000u
                                   : CLEAR_ARGB;
-        printf("[host] presented pixel: 0x%08X (expected 0x%08X) %s\n",
-               back, want, (back & 0x00FFFFFFu) == (want & 0x00FFFFFFu) ? "OK" : "MISMATCH");
-        if ((back & 0x00FFFFFFu) != (want & 0x00FFFFFFu)) rc = 3;
+        const u32 cmp = (do_draw == 19) ? 0x00FF0000u : 0x00FFFFFFu;
+        printf("[host] presented pixel: 0x%08X (expected 0x%08X%s) %s\n",
+               back, want, (do_draw == 19) ? ", red only" : "",
+               (back & cmp) == (want & cmp) ? "OK" : "MISMATCH");
+        if ((back & cmp) != (want & cmp)) rc = 3;
     }
     if (mode_runs_guest_programs(do_draw) && HOST_BACKEND_GUEST_SHADERS) {
         /* The pixel alone cannot prove the programs ran: a backend that
@@ -1438,6 +1730,12 @@ int main(int argc, char** argv)
         u32 gd = host_backend_guest_draws();
         printf("[host] draws through guest programs: %u %s\n", gd, gd ? "OK" : "NONE");
         if (!gd) rc = 4;
+        /* --feedback: both textured draws ran, the one reading its own
+         * target included; a rejected draw would also leave the red. */
+        if (do_draw == 14 && gd < 2) {
+            printf("[host] --feedback: the self-sampling draw did not run\n");
+            rc = 4;
+        }
     }
 
     host_backend_shutdown();

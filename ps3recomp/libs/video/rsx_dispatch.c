@@ -45,6 +45,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include "ps3emu/log_first.h"
 
 #define M_DMA_COLOR1            0x018C
 #define M_DMA_COLOR0            0x0194
@@ -169,7 +170,13 @@ void rsx_dispatch_init(rsx_dispatch* rsx, const rsx_dispatch_sink* sink)
      * 0xFFFFFF00 = depth 1.0, stencil 0 (RPCS3 rsx_methods.cpp reset image
      * as numbering oracle). Seeded so a raw register read is trustworthy for
      * clear consumers, mirroring COLOR_MASK/FRONT_FACE above. */
-    rsx->regs[0x1D8C >> 2] = 0xFFFFFF00u;
+    rsx->regs[0x1D8C >> 2] = RSX_DSP_ZSTENCIL_CLEAR_RESET;
+
+    /* NV40 reset ZMIN_MAX_CONTROL (0x1D78) is 1: clip at the near and far
+     * planes, no depth clamp (RPCS3 rsx_methods.cpp; the GCM default of
+     * cellGcmSetZMinMaxControl(TRUE, FALSE, FALSE)). Seeded so a raw 0 means
+     * a title that turned clipping off. */
+    rsx->regs[0x1D78 >> 2] = 0x00000001u;
 
     /* NV40 reset stencil state (RPCS3 rsx_methods.cpp reset image): write
      * and compare masks 0xFF, func ALWAYS, ops KEEP, front and back. A title
@@ -347,7 +354,7 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
      * constants. Drop it, and say what it was. */
     if (idx >= RSX_DSP_NUM_REGS) {
         static int n = 0;
-        if (n++ < 8)
+        if (PS3_LOG_FIRST(n, 8))
             fprintf(stderr, "[rsx-dispatch] method 0x%05X (arg 0x%08X) out of range -- dropped\n",
                     method, arg);
         return;
@@ -365,11 +372,23 @@ void rsx_dispatch_method(rsx_dispatch* rsx, u32 method, u32 arg)
         (method >= 0x0A80 && method < 0x0B00))
         vtx_const_fold(rsx, method, arg);
 
-    /* Completing a floating-point position emits a register-based vertex.
-     * Other attributes update the current values copied with that position.
-     * Keep these writes as ordinary constant state outside BEGIN/END. */
-    if (rsx->in_begin_end && (method == 0x1508 || method == 0x1C0C) &&
-        rsx->sink.immediate_vertex)
+    /* Completing a position emits a register-based vertex: the last word of
+     * ATTR0 in any of its immediate encodings. Other attributes update the
+     * current values copied with that position. Keep these writes as ordinary
+     * constant state outside BEGIN/END.
+     *
+     * Only the float encodings used to count (DATA3F's Z, DATA4F's W).
+     * Resistance's movie player sends its quad as DATA2S positions, so every
+     * movie frame drew nothing and the cutscenes played on a black screen. */
+    if (rsx->in_begin_end && rsx->sink.immediate_vertex &&
+        (method == 0x1508 ||    /* DATA3F  Z            */
+         method == 0x1C0C ||    /* DATA4F  W            */
+         method == 0x1884 ||    /* DATA2F  Y            */
+         method == 0x1E40 ||    /* DATA1F  X            */
+         method == 0x1900 ||    /* DATA2S  (one word)   */
+         method == 0x1940 ||    /* DATA4UB (one word)   */
+         method == 0x1984 ||    /* DATA4S  second word  */
+         method == 0x0A84))     /* SCALED4S second word */
         rsx->sink.immediate_vertex(rsx->sink.user, rsx);
 
     /* Transform program upload window: word goes to instruction slot
@@ -641,7 +660,10 @@ void rsx_dsp_get_texture(const rsx_dispatch* rsx, u32 unit, rsx_dsp_texture* out
         return;
     const u32 base = M_TEX_OFFSET + unit * 0x20;
     const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
-    out->offset    = rsx_dsp_reg(rsx, base);
+    /* The offset is 31 bits; bit 31 is not part of it (RPCS3 masks it with 0x7FFFFFFF for fragment and vertex
+     * textures). Taken whole, a main-memory texture bound at 0x82A22900 missed the IO lookup. The location comes from
+     * the format word alone. */
+    out->offset    = rsx_dsp_reg(rsx, base) & 0x7FFFFFFFu;
     out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
     out->cubemap   = (fmt >> 2) & 1;
     out->dimension = (fmt >> 4) & 0xF;
@@ -669,7 +691,7 @@ void rsx_dsp_get_vertex_texture(const rsx_dispatch* rsx, u32 unit,
         return;
     const u32 base = M_VERTEX_TEXTURE + unit * 0x20;
     const u32 fmt  = rsx_dsp_reg(rsx, base + 0x04);
-    out->offset    = rsx_dsp_reg(rsx, base + 0x00);
+    out->offset    = rsx_dsp_reg(rsx, base + 0x00) & 0x7FFFFFFFu;   /* 31-bit offset, as above */
     out->location  = (fmt & 3) == 2 ? RSX_LOCATION_MAIN : RSX_LOCATION_LOCAL;
     out->cubemap   = (fmt >> 2) & 1;
     out->dimension = (fmt >> 4) & 0xF;

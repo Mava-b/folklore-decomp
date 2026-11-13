@@ -11,8 +11,21 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#elif defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <CoreGraphics/CoreGraphics.h>
+#include <climits>
+#include <strings.h>
+#define _stricmp strcasecmp
+#else
+#include <strings.h>
+#define _stricmp strcasecmp
+#include <unistd.h>
+#include <climits>
+#endif
 #include <cstdlib>
 #include <cstring>
 #include <atomic>
@@ -109,6 +122,7 @@ EngineSettings& engineSettings()
 
 std::string engineExecutableDirectory()
 {
+#ifdef _WIN32
     char modulePath[MAX_PATH * 2] = {};
     const DWORD length = GetModuleFileNameA(nullptr, modulePath, (DWORD)sizeof(modulePath));
     if (length == 0 || length >= sizeof(modulePath))
@@ -116,6 +130,23 @@ std::string engineExecutableDirectory()
         return ".";
     }
     std::string directory(modulePath, length);
+#elif defined(__APPLE__)
+    char modulePath[PATH_MAX * 2] = {};
+    uint32_t capacity = (uint32_t)sizeof(modulePath);
+    if (_NSGetExecutablePath(modulePath, &capacity) != 0)
+    {
+        return ".";
+    }
+    std::string directory(modulePath);
+#else
+    char modulePath[PATH_MAX * 2] = {};
+    const ssize_t length = readlink("/proc/self/exe", modulePath, sizeof(modulePath) - 1);
+    if (length <= 0)
+    {
+        return ".";
+    }
+    std::string directory(modulePath, (size_t)length);
+#endif
     const size_t separator = directory.find_last_of("\\/");
     return separator == std::string::npos ? std::string(".") : directory.substr(0, separator);
 }
@@ -129,7 +160,12 @@ const char* engineSettingsPath()
     }
     /* Next to the exe, not the working directory: a shared build is started
      * by double-clicking, from wherever. */
-    static const std::string besideExecutable = engineExecutableDirectory() + "\\folklore_settings.ini";
+    static const std::string besideExecutable = engineExecutableDirectory() +
+#ifdef _WIN32
+        "\\folklore_settings.ini";
+#else
+        "/folklore_settings.ini";
+#endif
     return besideExecutable.c_str();
 }
 
@@ -650,8 +686,16 @@ float engineSettingsAspectValue(AspectRatio aspectRatio)
     {
     case AspectRatio::MatchDisplay:
     {
+#ifdef _WIN32
         const int screenWidth = GetSystemMetrics(SM_CXSCREEN);
         const int screenHeight = GetSystemMetrics(SM_CYSCREEN);
+#elif defined(__APPLE__)
+        const int screenWidth = (int)CGDisplayPixelsWide(CGMainDisplayID());
+        const int screenHeight = (int)CGDisplayPixelsHigh(CGMainDisplayID());
+#else
+        const int screenWidth = 0;
+        const int screenHeight = 0;
+#endif
         if (screenWidth > 0 && screenHeight > 0)
         {
             const float displayAspect = (float)screenWidth / (float)screenHeight;

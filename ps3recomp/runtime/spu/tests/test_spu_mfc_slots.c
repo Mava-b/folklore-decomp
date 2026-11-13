@@ -206,6 +206,9 @@ int main(void)
      * engines must remain untouched, regardless of allocator address reuse. */
     helde[3]->queue_count = 7;
     helde[3]->tag_completed = 0;
+    /* Looked up last on this thread, so a per-thread memo of the lookup would
+     * answer the next call: the release has to make it forget. */
+    CHECK(mfc_for(held[3]) == helde[3]);
     spu_mfc_release(held[3]);
     mfc_engine* reusere = mfc_for(held[3]);
     CHECK(reusere->queue_count == 0);

@@ -10,7 +10,7 @@
  * be the real port; supplying the names lets the file compile first, so the
  * port can be about behaviour instead of spelling.
  *
- * On MSVC this header is a passthrough. It is independent of win32_compat.h
+ * On MSVC and on Windows hosts built with MinGW (which spell all of these natively) this header is a passthrough. It is independent of win32_compat.h
  * (either can be included alone), and the two do not overlap.
  *
  * Widths follow the MSVC declarations, not the LP64 `long`: the bit-scan
@@ -20,7 +20,7 @@
 #ifndef PS3RECOMP_MSVC_COMPAT_H
 #define PS3RECOMP_MSVC_COMPAT_H
 
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || defined(_WIN32)
 #  include <intrin.h>
 #  include <stdlib.h>
 #  include <string.h>

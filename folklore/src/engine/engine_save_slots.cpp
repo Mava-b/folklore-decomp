@@ -7,6 +7,10 @@
 #include "engine_region.h"
 #include "engine_settings.h"
 
+/* Windows only: the slots are picked in the engine menu, the launcher and the
+ * start-up (engine_portable.cpp), all Windows code, with Win32 file calls.
+ * On macOS the runtime's PS3_SAVEDATA_SELECT still picks a slot. */
+#ifdef _WIN32
 #include <windows.h>
 
 #include <algorithm>
@@ -661,3 +665,5 @@ void engineSaveSlotApplyEnvironment()
     std::fprintf(stderr, "[saves] save slot %d: %s (%s)\n", slot.number, directory.c_str(),
                  slot.exists ? slot.subtitle.c_str() : "empty: a new game");
 }
+
+#endif /* _WIN32 */

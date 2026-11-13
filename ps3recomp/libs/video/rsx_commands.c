@@ -20,6 +20,7 @@
 #include <stdlib.h>   /* getenv -- an implicit decl returns int, truncating the pointer */
 #include <string.h>
 #include "../../runtime/memory/vm.h"    /* VM_HLE_INJECT_BASE */
+#include "ps3emu/log_first.h"
 
 /* ---------------------------------------------------------------------------
  * Global backend
@@ -73,6 +74,10 @@ void rsx_state_init(rsx_state* state)
     state->cull_face = 1; /* BACK */
     state->front_face = 0; /* CW */
 
+    /* Colour target A, as libgcm sets up. With 0 (NONE) a title that never
+     * writes the register would look like it draws depth only. */
+    state->color_target = 1;
+
     /* Default color mask: all channels writable (A|R|G|B) */
     state->color_mask = 0x01010101;
 
@@ -83,6 +88,13 @@ void rsx_state_init(rsx_state* state)
     state->stencil_op_fail = 0x1E00;  /* KEEP */
     state->stencil_op_zfail = 0x1E00; /* KEEP */
     state->stencil_op_zpass = 0x1E00; /* KEEP */
+    state->stencil_write_mask = 0xFF;
+    state->back_stencil_func = 0x0207;
+    state->back_stencil_mask = 0xFF;
+    state->back_stencil_write_mask = 0xFF;
+    state->back_stencil_op_fail = 0x1E00;
+    state->back_stencil_op_zfail = 0x1E00;
+    state->back_stencil_op_zpass = 0x1E00;
 
     /* Default alpha test */
     state->alpha_func = 0x0207; /* ALWAYS */
@@ -152,7 +164,7 @@ static int process_surface_method(rsx_state* state, u32 method, u32 data)
         state->surface_dirty = 1;
         return 0;
     case NV4097_SET_SURFACE_COLOR_TARGET:
-        { static int _ct=0; if (_ct++ < 24 && getenv("RTT_DUMP"))
+        { static int _ct=0; if (PS3_LOG_FIRST(_ct, 24) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXCT] color_target=0x%X offA=0x%X offB=0x%X offC=0x%X offD=0x%X%s",
                     data, state->surface_color_offset[0], state->surface_color_offset[1],
                     state->surface_color_offset[2], state->surface_color_offset[3], "\n"); }
@@ -203,7 +215,7 @@ static int process_texture_method(rsx_state* state, u32 method, u32 data)
 
     switch (reg) {
     case 0x00: /* TEXTURE_OFFSET */
-        tex->offset = data;
+        tex->offset = data & 0x7FFFFFFFu;   /* 31-bit offset; bit 31 is not an address bit */
         break;
     case 0x04: /* TEXTURE_FORMAT */
         tex->format = data;
@@ -250,7 +262,7 @@ static int process_vertex_texture_method(rsx_state* state, u32 method, u32 data)
     rsx_texture_state* tex = &state->vertex_textures[unit];
 
     switch (reg) {
-    case 0x00: tex->offset       = data; break;
+    case 0x00: tex->offset       = data & 0x7FFFFFFFu; break;   /* 31-bit offset */
     case 0x04: tex->format       = data; break;
     case 0x08: tex->address      = data; break;
     case 0x0C: tex->control0     = data; break;
@@ -332,6 +344,93 @@ static int process_vertex_attrib_method(rsx_state* state, u32 method, u32 data)
  * Main method dispatch
  * -----------------------------------------------------------------------*/
 
+/* NV4097_SET_TRANSFORM_PROGRAM[i]: one microcode word at the write cursor. */
+static inline void rsx_vp_ucode_word(rsx_state* state, u32 data)
+{
+    u32 w = state->vp_ucode_write;
+    if (w + 4 <= sizeof(state->vp_ucode)) {
+        /* data is host-endian already; store as little-endian bytes. */
+        /* Titles upload a draw's program before every draw, mostly the
+         * one already there. Only a changed word changes the program
+         * (vp_dirty lets the backend skip looking it up again). */
+        const u8 b[4] = { (u8)data, (u8)(data >> 8), (u8)(data >> 16), (u8)(data >> 24) };
+        if (memcmp(&state->vp_ucode[w], b, 4) != 0) {
+            memcpy(&state->vp_ucode[w], b, 4);
+            state->vp_dirty = 1;
+        }
+        state->vp_ucode_write = w + 4;
+        if (w + 4 > state->vp_ucode_bytes) { state->vp_ucode_bytes = w + 4; state->vp_dirty = 1; }
+    }
+}
+
+/* NV4097_SET_TRANSFORM_CONSTANT[reg_offset]: one lane of a vertex constant. */
+static inline void rsx_vp_const_word(rsx_state* state, u32 reg_offset, u32 data)
+{
+    u32 slot = state->transform_constant_load + (reg_offset >> 2);
+    u32 lane = reg_offset & 3;
+    if (slot < RSX_MAX_VERTEX_CONSTANTS) {
+        float f;
+        memcpy(&f, &data, 4);
+        { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
+          static int _n=0;
+          static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
+          int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
+          if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
+        state->vertex_constants[slot][lane] = f;
+        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && PS3_LOG_FIRST(_sq, 500))
+            fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
+        if (!state->vertex_constants_dirty) {
+            state->vertex_constants_lo = slot;
+            state->vertex_constants_hi = slot;
+            state->vertex_constants_dirty = 1;
+        } else {
+            if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
+            if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
+        }
+    }
+}
+
+/* An incrementing run of `count` data words from guest memory (big-endian,
+ * `src` at the first) for methods `method`, `method` + 4, ... Vertex-program
+ * microcode and constants are most of a frame's words, and every one of them
+ * was a call through the FIFO walker and another into rsx_process_method:
+ * God of War HD re-uploads each draw's program and constants, about five
+ * million microcode words a second. Runs that stay inside the microcode or
+ * the constant window (a constant run may open with the load slot) are
+ * handled here in one call. Returns 0, having done nothing, for any other run
+ * and while RSX_TRACE is on. */
+int rsx_process_vp_run(rsx_state* state, u32 method, const u8* src, u32 count)
+{
+    static int tr = -1;
+    if (tr < 0) tr = getenv("RSX_TRACE") ? 1 : 0;
+    if (tr || !count) return 0;
+    const u32 end = method + count * 4;
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM && end <= NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        for (u32 i = 0; i < count; i++) {
+            u32 v; memcpy(&v, src + i * 4, 4);
+            rsx_vp_ucode_word(state, __builtin_bswap32(v));
+        }
+        return 1;
+    }
+    if (method >= NV4097_SET_TRANSFORM_CONSTANT_LOAD &&
+        end <= NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
+        u32 i = 0;
+        if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+            u32 v; memcpy(&v, src, 4);
+            rsx_process_method(state, method, __builtin_bswap32(v));   /* the load slot */
+            i = 1;
+        } else if (method < NV4097_SET_TRANSFORM_CONSTANT) {
+            return 0;
+        }
+        for (; i < count; i++) {
+            u32 v; memcpy(&v, src + i * 4, 4);
+            rsx_vp_const_word(state, (method + i * 4 - NV4097_SET_TRANSFORM_CONSTANT) / 4, __builtin_bswap32(v));
+        }
+        return 1;
+    }
+    return 0;
+}
+
 int rsx_process_method(rsx_state* state, u32 method, u32 data)
 {
     /* RSX_TRACE=<N>: trace the first N methods (bare "1" keeps the old 250).
@@ -339,7 +438,45 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * the first real draw -- exactly the ones worth seeing -- were never traced. */
     { static int _rt=-1; if(_rt<0){ const char* e=getenv("RSX_TRACE");
         _rt = e ? (atoi(e) > 1 ? atoi(e) : 250) : 0; }
-      if(_rt){ static int _m=0; if(_m++<_rt) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+      if(_rt){ static int _m=0; if(PS3_LOG_FIRST(_m, _rt)) fprintf(stderr,"[rsxm] method=0x%04X data=0x%08X\n", method, data); } }
+    /* Vertex-program constants and microcode are most of a frame's method
+     * stream (God of War HD: about 140k constant vec4s and 70k microcode
+     * headers a second), and their handlers sat behind every check below.
+     * None of those checks matches these methods, so they go first. */
+    if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
+        /* Vertex program load slot — instruction index (each = 16 bytes).
+         * Following NV4097_SET_TRANSFORM_PROGRAM words fill from here. */
+        state->transform_program_load = data;
+        state->vp_ucode_write = data * 16;
+        state->shader_dirty = 1;
+        return 0;
+    }
+    /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
+     * microcode words appended at the current write cursor. Capture them so the
+     * backend can decompile the real VP (4 words = one NV40 instruction). */
+    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
+        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
+        rsx_vp_ucode_word(state, data);
+        return 0;
+    }
+    if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
+        { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_n, 200))
+            fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
+        state->transform_constant_load = data;
+        return 0;
+    }
+    /* NV4097_SET_TRANSFORM_CONSTANT[0..31] — up to 32 dwords (8 vec4s) per
+     * command, 0x1F00..0x1F7C. Each register slot writes to a lane of one
+     * vertex constant vec4: vec_index = LOAD + (reg_offset/4), lane = reg_offset%4.
+     * The data arrives as a host-endian u32; reinterpret the bits as float
+     * because the game's intent is "these 32 bits are a float". The hardware
+     * does NOT auto-advance LOAD between commands — games re-issue
+     * SET_TRANSFORM_CONSTANT_LOAD before each block. */
+    if (method >= NV4097_SET_TRANSFORM_CONSTANT &&
+        method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
+        rsx_vp_const_word(state, (method - NV4097_SET_TRANSFORM_CONSTANT) / 4, data);
+        return 0;
+    }
     /* Back-end write label / semaphore (cellGcmSetWriteBackEndLabel): the RSX
      * writes a value to a report/label the CPU polls for CPU<->RSX sync (double
      * buffering). Real hardware DOES this; without it the game's frame-fence
@@ -352,8 +489,49 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
      * for the frequency divisor (instancing). Captured for read_vp_vertex. */
     if (method == 0x00001FC0) { state->frequency_divider_op = data; return 0; }
 
-    { static u32 s_sem_off = 0;
+    /* NV4097_SET_CONTEXT_DMA_SEMAPHORE (0x01A4) picks where the semaphore
+     * offset points. CELL_GCM_CONTEXT_DMA_MEMORY_HOST_BUFFER (0xFEED0001) is
+     * main memory by IO offset: Edge-style SPU geometry jobs release ring
+     * segments that way, and their producer polls that very word -- written
+     * into the label window instead, the read index never moved and every
+     * job spun until the DMA repeat limiter killed it. */
+    /* NV4097_SET_CONTEXT_DMA_NOTIFIES (0x0180) / NV4097_NOTIFY (0x0104): write
+     * {timestamp, 0} to notify slot (ctx & 7) ^ 7 in IO page 0xF1, for the
+     * CELL_GCM_CONTEXT_DMA_NOTIFY_MAIN_n objects (cellGcmGetNotifyDataAddress). */
+    { static u32 s_notify_ctx = 0;
+      if (method == 0x0180) s_notify_ctx = data;
+      if (method == 0x0104) {
+          if ((s_notify_ctx & ~7u) == (0x6660420Fu & ~7u)) {
+              extern void vm_write32(uint32_t a, uint32_t v);
+              extern u32 gcm_io_offset_to_ea(u32 io);
+              extern unsigned long long ps3_ms_now(void);
+              u32 ea = gcm_io_offset_to_ea(0x0F100000u + ((s_notify_ctx & 7u) ^ 7u) * 0x40u);
+              { static int n = 0; if (n++ < 4)   /* TEMP */
+                  fprintf(stderr, "[RSX] NOTIFY slot %u -> ea 0x%08X\n", (s_notify_ctx & 7u) ^ 7u, ea); }
+              if (ea) {
+                  unsigned long long ts = ps3_ms_now() * 1000000ull;
+                  vm_write32(ea, (u32)(ts >> 32)); vm_write32(ea + 4, (u32)ts);
+                  vm_write32(ea + 8, 0); vm_write32(ea + 12, 0);
+              }
+          }
+          return 0;
+      } }
+    { static u32 s_sem_off = 0, s_sem_ctx = 0;
+      if (method == 0x01A4) {
+          if (data != s_sem_ctx) { static int _l = 0; if (_l++ < 8)
+              fprintf(stderr, "[RSX] semaphore context dma = 0x%08X\n", data); }
+          s_sem_ctx = data;
+      }
       if (method == 0x1D6C) { s_sem_off = data; return 0; }
+      if ((method == 0x1D70 || method == 0x1D74) && s_sem_ctx == 0xFEED0001u) {
+        extern void vm_write32(uint32_t a, uint32_t v);
+        extern u32 gcm_io_offset_to_ea(u32 io);
+        u32 ea = gcm_io_offset_to_ea(s_sem_off);
+        u32 val = method == 0x1D74 ? data
+                : (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
+        if (ea) vm_write32(ea, val);
+        return 0;
+      }
       if (method == 0x1D70) {
         extern void vm_write32(uint32_t a, uint32_t v);
         /* The RSX back-end semaphore write swaps bytes 0<->2 of the value (hw
@@ -365,7 +543,11 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
          * Apply the same swap the hardware does so the pre-swap cancels out. */
         u32 val = (data & 0xff00ff00u) | ((data >> 16) & 0xffu) | ((data & 0xffu) << 16);
         vm_write32(VM_HLE_INJECT_BASE + (s_sem_off & 0x00FFFFFFu), val);
-        { static int _l=0; if(_l++<8) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
+        { static u32 seen[64]; static int ns = 0; int k = 0;   /* TEMP: distinct release offsets */
+          for (; k < ns; k++) if (seen[k] == s_sem_off) break;
+          if (k == ns && ns < 64) { seen[ns++] = s_sem_off;
+              fprintf(stderr, "[RSX] first back-end release @off 0x%X val 0x%08X\n", s_sem_off, val); } }
+        { static int _l=0; if(PS3_LOG_FIRST(_l, 8)) fprintf(stderr,"[RSX] label write @0x%08X = 0x%08X (sync fence, raw 0x%08X)\n", VM_HLE_INJECT_BASE+(s_sem_off&0xFFFFFF), val, data); }
         return 0;
       }
       if (method == 0x1D74) {
@@ -462,7 +644,14 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
     if (method == NV4097_CLEAR_SURFACE) {
-        { static int _c=0; if (_c++ < 12) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value); }
+        { static int _c=0; int _first = PS3_LOG_FIRST(_c, 12); if (_first) fprintf(stderr, "[RSX] CLEAR_SURFACE mask=0x%X color=0x%08X\n", data, state->color_clear_value);
+          /* Each distinct mask once more, however late: a depth-only clear
+           * first shows up long after the boot screens used up the 12. */
+          static u32 seen[16]; static int ns = 0; int k = 0;
+          while (k < ns && seen[k] != data) k++;
+          if (k == ns && ns < 16) { seen[ns++] = data;
+              if (!_first) fprintf(stderr, "[RSX] CLEAR_SURFACE new mask=0x%X color=0x%08X\n",
+                                   data, state->color_clear_value); } }
         if (s_backend && s_backend->clear) {
             float depth = (float)(state->zstencil_clear_value >> 8) / (float)0xFFFFFF;
             u8 stencil = state->zstencil_clear_value & 0xFF;
@@ -547,6 +736,27 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->stencil_dirty = 1;
         return 0;
     }
+    if (method == NV4097_SET_STENCIL_MASK) {
+        state->stencil_write_mask = data;
+        state->stencil_dirty = 1;
+        return 0;
+    }
+    if (method == NV4097_SET_TWO_SIDED_STENCIL_TEST_ENABLE) {
+        state->two_sided_stencil = data ? 1 : 0;
+        state->stencil_dirty = 1;
+        return 0;
+    }
+    if (method >= NV4097_SET_BACK_STENCIL_MASK && method <= NV4097_SET_BACK_STENCIL_OP_ZPASS) {
+        u32* const back[] = {
+            &state->back_stencil_write_mask, &state->back_stencil_func,
+            &state->back_stencil_ref, &state->back_stencil_mask,
+            &state->back_stencil_op_fail, &state->back_stencil_op_zfail,
+            &state->back_stencil_op_zpass,
+        };
+        *back[(method - NV4097_SET_BACK_STENCIL_MASK) / 4] = data;
+        state->stencil_dirty = 1;
+        return 0;
+    }
 
     /* Culling */
     if (method == NV4097_SET_CULL_FACE_ENABLE) {
@@ -574,14 +784,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         state->shader_dirty = 1;
         return 0;
     }
-    if (method == NV4097_SET_TRANSFORM_PROGRAM_LOAD) {
-        /* Vertex program load slot — instruction index (each = 16 bytes).
-         * Following NV4097_SET_TRANSFORM_PROGRAM words fill from here. */
-        state->transform_program_load = data;
-        state->vp_ucode_write = data * 16;
-        state->shader_dirty = 1;
-        return 0;
-    }
 
     if (method == NV4097_SET_TRANSFORM_PROGRAM_START) {
         if (state->transform_program_start != data) state->vp_dirty = 1;
@@ -590,24 +792,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    /* NV4097_SET_TRANSFORM_PROGRAM[0..31] — a run of 32-bit vertex-program
-     * microcode words appended at the current write cursor. Capture them so the
-     * backend can decompile the real VP (4 words = one NV40 instruction). */
-    if (method >= NV4097_SET_TRANSFORM_PROGRAM &&
-        method <  NV4097_SET_TRANSFORM_PROGRAM + 32 * 4) {
-        u32 w = state->vp_ucode_write;
-        if (w + 4 <= sizeof(state->vp_ucode)) {
-            /* data is host-endian already; store as little-endian bytes. */
-            state->vp_ucode[w+0] = (u8)(data);
-            state->vp_ucode[w+1] = (u8)(data >> 8);
-            state->vp_ucode[w+2] = (u8)(data >> 16);
-            state->vp_ucode[w+3] = (u8)(data >> 24);
-            state->vp_ucode_write = w + 4;
-            if (w + 4 > state->vp_ucode_bytes) state->vp_ucode_bytes = w + 4;
-            state->vp_dirty = 1;
-        }
-        return 0;
-    }
     if (method == NV4097_SET_VERTEX_ATTRIB_OUTPUT_MASK) {
         state->vertex_attrib_output_mask = data;
         return 0;
@@ -634,12 +818,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    if (method == NV4097_SET_TRANSFORM_CONSTANT_LOAD) {
-        { static int _n=0, _e=-1; if (_e < 0) _e = getenv("LOAD_DBG") ? 1 : 0; if (_e && _n++ < 200)
-            fprintf(stderr, "[LOAD] transform_constant_load = %u\n", data); }
-        state->transform_constant_load = data;
-        return 0;
-    }
 
     /* Registers that sit right after the 32-dword constant window. Taken as
      * constants c(load+8..15) they overwrite whatever was uploaded there. */
@@ -657,40 +835,6 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         return 0;
     }
 
-    /* NV4097_SET_TRANSFORM_CONSTANT[0..31] — up to 32 dwords (8 vec4s) per
-     * command, 0x1F00..0x1F7C. Each register slot writes to a lane of one
-     * vertex constant vec4: vec_index = LOAD + (reg_offset/4), lane = reg_offset%4.
-     * The data arrives as a host-endian u32; reinterpret the bits as float
-     * because the game's intent is "these 32 bits are a float". The hardware
-     * does NOT auto-advance LOAD between commands — games re-issue
-     * SET_TRANSFORM_CONSTANT_LOAD before each block. */
-    if (method >= NV4097_SET_TRANSFORM_CONSTANT &&
-        method <  NV4097_SET_TRANSFORM_CONSTANT + NV4097_SET_TRANSFORM_CONSTANT_DWORDS * 4) {
-        u32 reg_offset = (method - NV4097_SET_TRANSFORM_CONSTANT) / 4;
-        u32 slot = state->transform_constant_load + (reg_offset >> 2);
-        u32 lane = reg_offset & 3;
-        if (slot < RSX_MAX_VERTEX_CONSTANTS) {
-            float f;
-            memcpy(&f, &data, 4);
-            { static int _en=-1; if(_en<0){const char*e=getenv("TCONST_DBG");_en=e?1:0;}
-              static int _n=0;
-              static int _max=-1; if(_max<0){const char*m=getenv("TCONST_MAX");_max=m?atoi(m):64;}
-              int _hit = _en && (getenv("TCONST_ALL") ? (_n<_max) : (slot>=12 && slot<=30 && _n<400));
-              if(_hit){ _n++; fprintf(stderr,"[TCONST] load=%u slot=%u lane=%u = %.4f\n", state->transform_constant_load, slot, lane, f); } }
-            state->vertex_constants[slot][lane] = f;
-            { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && slot==256 && lane==0 && _sq++ < 500)
-                fprintf(stderr, "[SEQ] upload c256.x=%.4f (load=%u)\n", f, state->transform_constant_load); }
-            if (!state->vertex_constants_dirty) {
-                state->vertex_constants_lo = slot;
-                state->vertex_constants_hi = slot;
-                state->vertex_constants_dirty = 1;
-            } else {
-                if (slot < state->vertex_constants_lo) state->vertex_constants_lo = slot;
-                if (slot > state->vertex_constants_hi) state->vertex_constants_hi = slot;
-            }
-        }
-        return 0;
-    }
 
     /* Draw */
     if (method == NV4097_SET_BEGIN_END) {
@@ -748,8 +892,8 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     if (method == NV4097_DRAW_ARRAYS) {
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
-        { static int _d=0; if (_d++ < 32) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
-        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && _sq++ < 500)
+        { static int _d=0; if (PS3_LOG_FIRST(_d, 32)) fprintf(stderr, "[RSX] DRAW_ARRAYS prim=%u first=%u count=%u\n", state->primitive_type, first, count); }
+        { static int _sq=0, _e=-1; if (_e < 0) _e = getenv("SEQ_DBG") ? 1 : 0; if (_e && PS3_LOG_FIRST(_sq, 500))
             fprintf(stderr, "[SEQ] DRAW surf0=0x%X c256.x=%.4f c257.y=%.4f\n",
                     state->surface_color_offset[0], state->vertex_constants[256][0],
                     state->vertex_constants[257][1]); }
@@ -775,7 +919,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
     }
 
     if (method == NV4097_SET_SHADER_CONTROL) {
-        { static int _sc=0; if (_sc++ < 12 && getenv("RTT_DUMP"))
+        { static int _sc=0; if (PS3_LOG_FIRST(_sc, 12) && getenv("RTT_DUMP"))
             fprintf(stderr, "[RSXSC] shader_control=0x%X\n", data); }
         state->shader_control = data;
         state->shader_dirty = 1;
@@ -793,7 +937,7 @@ int rsx_process_method(rsx_state* state, u32 method, u32 data)
         /* [23:0] first index, [31:24] count-1 (same packing as DRAW_ARRAYS). */
         u32 first = data & 0xFFFFFF;
         u32 count = ((data >> 24) & 0xFF) + 1;
-        { static int _d=0; if (_d++ < 8) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
+        { static int _d=0; if (PS3_LOG_FIRST(_d, 8)) fprintf(stderr, "[RSX] DRAW_INDEX_ARRAY prim=%u first=%u count=%u idxoff=0x%X dma=0x%X\n", state->primitive_type, first, count, state->index_array_offset, state->index_array_dma); }
         ps3_ms("rsx:draw_indexed");
         if (s_backend && s_backend->draw_indexed)
             s_backend->draw_indexed(s_backend->userdata, state->primitive_type,
@@ -848,7 +992,7 @@ int rsx_process_command_buffer(rsx_state* state, const u32* buf, u32 size)
     u32 pos = 0;
     u32 count = size / 4; /* size in dwords */
 
-    { static int _c=0; if (count && _c++ < 16) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
+    { static int _c=0; if (count && PS3_LOG_FIRST(_c, 16)) fprintf(stderr, "[RSX] process_cmd_buffer words=%u first_hdr=0x%08X\n", count, buf[0]); }
     while (pos < count) {
         u32 header = buf[pos++];
         u32 type = (header >> 29) & 0x7;

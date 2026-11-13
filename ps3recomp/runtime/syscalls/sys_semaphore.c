@@ -3,11 +3,14 @@
  */
 
 #include "sys_semaphore.h"
+#include "sys_ppu_thread.h"   /* ppu_thread_note_block */
 #include "../ps3_log.h"
 #include "sys_timer.h"   /* lv2_usec_deadline: sub-ms timed waits */
 #include "../memory/vm.h"
 #include <string.h>
 #include <stdlib.h>      /* getenv (else the pointer return is truncated to int) */
+#include "ps3emu/log_first.h"
+#include "ps3emu/ps3_env_once.h"   /* getenv("...") once per call site: SEMTID and SEMCHAIN are tested on every wait and post */
 
 /* ---------------------------------------------------------------------------
  * Globals
@@ -249,8 +252,10 @@ int64_t sys_semaphore_create(ppu_context* ctx)
                    ((proto_be << 8) & 0xFF0000) | ((proto_be << 24) & 0xFF000000u);
 #endif
         s->protocol = proto_be;
-        /* name at offset 8 */
-        memcpy(s->name, attr_raw + 8, 8);
+        /* name at offset 0x18: sys_semaphore_attribute_t is protocol, pshared,
+         * ipc_key u64 @0x08, flags @0x10, pad @0x14, name[8] @0x18. Offset 8
+         * logged the ipc_key as the name. */
+        memcpy(s->name, attr_raw + 0x18, 8);
     }
 
 #ifdef _WIN32
@@ -276,7 +281,7 @@ int64_t sys_semaphore_create(ppu_context* ctx)
      * LBP movie stall was a 2369-waits/0-posts semaphore whose OWNER took
      * grep archaeology to guess -- the name would have said it instantly. */
     { static int _n = 0;
-      if (_n++ < 48)
+      if (PS3_LOG_FIRST(_n, 48))
           fprintf(stderr, "[sem] create id=%u name='%.8s' init=%d max=%d id_out=0x%08X lr=0x%08X\n",
                   sem_id, s->name, initial, max_val, id_out_addr, (uint32_t)ctx->lr); }
 
@@ -304,10 +309,29 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
         return (int64_t)(int32_t)CELL_ESRCH;
     }
 
+    /* lv2 refuses to destroy a semaphore threads are blocked on (CELL_EBUSY).
+     * Closing the handle under them turned each waiter's wait into an instant
+     * failure and its loop into a spin on a deleted lock. A waiter a pending
+     * post already covers (waiters <= value) is on its way out; only the ones
+     * left over are blocked, which is lv2's condition. */
 #ifdef _WIN32
+    EnterCriticalSection(&s->value_lock);
+    const int blocked = s->waiters > s->value;
+    LeaveCriticalSection(&s->value_lock);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     CloseHandle(s->sem_handle);
     DeleteCriticalSection(&s->value_lock);
 #else
+    pthread_mutex_lock(&s->mtx);
+    const int blocked = s->waiters > s->value;
+    pthread_mutex_unlock(&s->mtx);
+    if (blocked) {
+        sem_table_unlock();
+        return (int64_t)(int32_t)CELL_EBUSY;
+    }
     pthread_cond_destroy(&s->cv);
     pthread_mutex_destroy(&s->mtx);
 #endif
@@ -326,11 +350,20 @@ int64_t sys_semaphore_destroy(ppu_context* ctx)
 /* SEM_ERRDBG=1: report non-OK returns. PSGL's PlatformDevice asserts on one of
  * these once per frame, and naming the failing call beats inferring it. */
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx);
+#ifdef _WIN32
+/* libs/video/cellGcmSys.c: an event to wait on besides the semaphore, and the
+ * pump to run when it fires, so a flip handler that posts this semaphore runs
+ * as soon as the flip completes. Weak: the runtime also links without GCM. */
+void* ppu_gcm_wait_pump(void (**pump)(void));
+void* ppu_gcm_wait_pump_absent(void (**pump)(void)) { *pump = NULL; return NULL; }
+#pragma comment(linker, "/alternatename:ppu_gcm_wait_pump=ppu_gcm_wait_pump_absent")
+#endif
 int64_t sys_semaphore_wait(ppu_context* ctx)
 {
+    ppu_thread_note_block(ctx->thread_id);   /* PS3_PRIO_START */
     int64_t r = sys_semaphore_wait_impl(ctx);
     static int d = -1; if (d < 0) d = getenv("SEM_ERRDBG") ? 1 : 0;
-    if (d && r) { static int n = 0; if (n++ < 12)
+    if (d && r) { static int n = 0; if (PS3_LOG_FIRST(n, 12))
         fprintf(stderr, "[sem] wait(sem=%u) -> %lld%c",
                 (unsigned)ctx->gpr[3], (long long)r, 10); }
     return r;
@@ -338,21 +371,26 @@ int64_t sys_semaphore_wait(ppu_context* ctx)
 static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 {
     { static int _d = -1; if (_d < 0) _d = getenv("SEM_WAITDBG") ? 1 : 0;
-      if (_d) { static int _n = 0; if (_n++ < 20)
+      if (_d) { static int _n = 0; if (PS3_LOG_FIRST(_n, 20))
           fprintf(stderr, "[sem] wait(id=%u) tid=%llu%c", (unsigned)ctx->gpr[3],
                   (unsigned long long)ctx->thread_id, 10); } }
     uint32_t sem_id     = LV2_ARG_U32(ctx, 0);
     uint64_t timeout_us = LV2_ARG_U64(ctx, 1);
+    /* lv2_usec_deadline multiplies by the QPC frequency in 64 bits and wraps
+     * for a timeout past about 21 days; 2^63, say, comes out as "already
+     * passed". Beyond 2^40 us (12.7 days) is indistinguishable from forever. */
+    if (timeout_us > (1ull << 40)) timeout_us = 0;
     /* Per-port hook: an engine job manager may spin on sys_semaphore_wait /
      * trywait waiting for SPU-job completions a lifted policy module never
      * writes, so a port can satisfy them here. Defined weakly below, so this is
      * a no-op for a port that does not need it. */
     { extern void ps3_spu_job_complete_pending(void); ps3_spu_job_complete_pending(); }
-    { static int _n = 0; if (getenv("SEMTID") && _n++ < 60000)
+    { static int _n = 0, st = -1; if (st < 0) st = getenv("SEMTID") ? 1 : 0;
+      if (st && PS3_LOG_FIRST(_n, 60000))
         fprintf(stderr, "[WAIT tid=%llu] semaphore_wait(sem=%u timeout=%llu cia=0x%08X lr=0x%08X)\n",
                 (unsigned long long)ctx->thread_id, sem_id, (unsigned long long)timeout_us,
                 (unsigned)ctx->cia, (unsigned)ctx->lr);
-      else if (!getenv("SEMTID") && ps3_log_verbose())
+      else if (!st && ps3_log_verbose())
         fprintf(stderr, "[WAIT] semaphore_wait(sem=%u timeout=%llu)\n", sem_id, (unsigned long long)timeout_us); }
     /* PS3_BREADCRUMB: every 500th wait, dump the per-tid indirect-call breadcrumb
      * table. Fires reliably DURING the loader hang (respump spins sem16 waits),
@@ -362,9 +400,10 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
       if(bc){ static long w=0; if((++w % 500)==0){ extern void lbp_breadcrumb_dump(const char*); lbp_breadcrumb_dump("semwait"); } } }
     /* SEMCHAIN: dump the guest call-chain at the main thread's sem=7 poll (the
      * "loading done" wait) to locate its loop -- is it meant to re-post sem=3? */
-    if (getenv("SEMCHAIN") && sem_id == 7 && ctx->thread_id == 0) {
+    static int semchain = -1; if (semchain < 0) semchain = getenv("SEMCHAIN") ? 1 : 0;
+    if (semchain && sem_id == 7 && ctx->thread_id == 0) {
         static int _c = 0;
-        if (_c++ < 2) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
+        if (PS3_LOG_FIRST(_c, 2)) { extern void ppu_log_host_chain(const char*); ppu_log_host_chain("sem7-wait-tid0"); }
     }
     if (sem_id == 0 || sem_id > SYS_SEMAPHORE_MAX) {
         /* SEM_BADID=1: a wait/post on a handle that was never created means
@@ -400,7 +439,15 @@ static int64_t sys_semaphore_wait_impl(ppu_context* ctx)
 
         /* Bounded slices keep timed waits on the QPC deadline. */
         DWORD ms = (timeout_us == 0) ? INFINITE : 1;
-        WaitForSingleObject(s->sem_handle, ms);
+        void (*pump)(void) = NULL;
+        HANDLE pump_ev = (HANDLE)ppu_gcm_wait_pump(&pump);
+        if (pump_ev && pump) {
+            HANDLE hs[2] = { s->sem_handle, pump_ev };
+            if (WaitForMultipleObjects(2, hs, FALSE, ms) == WAIT_OBJECT_0 + 1)
+                pump();
+        } else {
+            WaitForSingleObject(s->sem_handle, ms);
+        }
 
         EnterCriticalSection(&s->value_lock);
         if (s->waiters > 0) s->waiters--;
@@ -464,7 +511,7 @@ int64_t sys_semaphore_trywait(ppu_context* ctx)
 
     sys_semaphore_info* s = &g_sys_semaphores[sem_id - 1];
     if (!s->active) {
-        static int _n = 0; if (_n++ < 6)
+        static int _n = 0; if (PS3_LOG_FIRST(_n, 6))
             fprintf(stderr, "[sem] post(id=%u) -> ESRCH: slot inactive"
                             " (value=%d max=%d)%c",
                     sem_id, s->value, s->max_value, 10);
@@ -503,17 +550,19 @@ int64_t sys_semaphore_post(ppu_context* ctx)
     uint32_t sem_id = LV2_ARG_U32(ctx, 0);
     int32_t  count  = LV2_ARG_S32(ctx, 1);
 
-    { static int _n=0; if (getenv("SEMTID") && _n < 60000)
+    { static int _n=0, st = -1; if (st < 0) st = getenv("SEMTID") ? 1 : 0;
+      if (st && _n < 60000)
         fprintf(stderr, "[WAKE tid=%llu] semaphore_post(sem=%u count=%d)\n",
                 (unsigned long long)ctx->thread_id, sem_id, count);
-      else if (!getenv("SEMTID") && _n < 40)
+      else if (!st && _n < 40)
         fprintf(stderr, "[WAKE] semaphore_post(sem=%u count=%d)\n", sem_id, count);
       _n++; }
     /* SEMCHAIN: dump the guest call-chain at every sem=3 post (the sema the main
      * loading thread starves on) -- reveals which thread/loop produces it. */
-    if (getenv("SEMCHAIN") && sem_id == 3) {
+    static int semchain = -1; if (semchain < 0) semchain = getenv("SEMCHAIN") ? 1 : 0;
+    if (semchain && sem_id == 3) {
         static int _c = 0;
-        if (_c++ < 3) { extern void ppu_log_host_chain(const char*);
+        if (PS3_LOG_FIRST(_c, 3)) { extern void ppu_log_host_chain(const char*);
             fprintf(stderr, "[SEMCHAIN] sem=3 post by tid=%llu\n", (unsigned long long)ctx->thread_id);
             ppu_log_host_chain("sem3-post"); }
     }
@@ -537,7 +586,7 @@ int64_t sys_semaphore_post(ppu_context* ctx)
 #ifdef _WIN32
     EnterCriticalSection(&s->value_lock);
     if (s->value + count > s->max_value) {
-        if (getenv("PS3_SEMTRACE")) { static int _n=0; if(_n++<6)
+        if (getenv("PS3_SEMTRACE")) { static int _n=0; if(PS3_LOG_FIRST(_n, 6))
             fprintf(stderr, "[SEMTRACE] post OVERFLOW id=%u value=%d+%d > max=%d\n",
                     sem_id, s->value, count, s->max_value); }
         LeaveCriticalSection(&s->value_lock);

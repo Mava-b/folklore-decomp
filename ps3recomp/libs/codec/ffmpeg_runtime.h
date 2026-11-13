@@ -1,7 +1,7 @@
 /*
  * ps3recomp - FFmpeg, loaded at run time
  *
- * The codec modules (cellVdec today; cellAdec, cellDmux later) decode through
+ * The codec modules (cellVdec, and cellAdec for AC3; cellDmux later) decode through
  * libavcodec when the host has it. It is never linked: the library is opened
  * with dlopen / LoadLibrary the first time a decoder is created, and only the
  * handful of functions the modules call are resolved into a table. So

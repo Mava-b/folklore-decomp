@@ -52,6 +52,55 @@ uint32_t ps3_hle_count(void);   /* handlers actually registered, for the milesto
 void     ppu_sysprx_register(void);
 void     ppu_fs_register(void);
 int      ppu_run(uint32_t entry_opd, uint32_t stack_top);
+#if defined(__APPLE__)
+/* AppKit only runs on the process's main thread, and the Metal backend reaches it with
+ * dispatch_sync onto the main queue from the frame clock (rsx_metal_backend_init, and
+ * rsx_metal_backend_pump_messages on every tick, also under the host window launcher). With the
+ * guest on the main thread nothing serviced that queue: the frame clock blocked there, the FIFO
+ * never drained, and the guest waited on the ring forever (black window, 0 fps). So, as in
+ * templates/project/main.cpp, the guest runs on a thread of its own with the 256 MB host stack
+ * every guest thread gets (sys_ppu_thread.c) and the main thread turns the run loop.
+ * (Ported from the Demon's Souls port's ps3recomp-local.patch, commit 098465f.) */
+#include <CoreFoundation/CoreFoundation.h>
+#include <pthread.h>
+extern "C" void* objc_autoreleasePoolPush(void);
+extern "C" void  objc_autoreleasePoolPop(void* pool);
+struct boot_guest_run { uint32_t entry, stack_top; int rc; volatile int done; };
+static void* boot_guest_thread(void* arg)
+{
+    boot_guest_run* g = (boot_guest_run*)arg;
+    g->rc = ppu_run(g->entry, g->stack_top);
+    __atomic_store_n(&g->done, 1, __ATOMIC_RELEASE);
+    CFRunLoopStop(CFRunLoopGetMain());
+    return nullptr;
+}
+extern "C" void rsx_metal_backend_prepare_app(void);
+static int boot_run_guest(uint32_t entry, uint32_t stack_top)
+{
+    /* NSApp belongs to this (the main) thread before the guest can touch
+     * AppKit through SDL or the backend: see rsx_metal_backend.m. */
+    rsx_metal_backend_prepare_app();
+    static boot_guest_run g;
+    g.entry = entry; g.stack_top = stack_top; g.rc = 0; g.done = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256u * 1024u * 1024u);
+    pthread_t th;
+    int err = pthread_create(&th, &attr, boot_guest_thread, &g);
+    pthread_attr_destroy(&attr);
+    if (err != 0) {
+        fprintf(stderr, "[boot] could not start the guest thread (%d)\n", err);
+        return -1;
+    }
+    /* Short slices: CFRunLoopStop only ends a run that is already going. */
+    while (!__atomic_load_n(&g.done, __ATOMIC_ACQUIRE))
+        CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, false);
+    pthread_join(th, nullptr);
+    return g.rc;
+}
+#else
+static int boot_run_guest(uint32_t entry, uint32_t stack_top) { return ppu_run(entry, stack_top); }
+#endif
 extern const char* ppu_vfs_root;   /* host dir that PS3 mount points map into */
 /* The status a guest handed to sys_process_exit, published by
  * libs/system/sysPrxForUser.c before it calls the host exit(). A title that
@@ -410,6 +459,7 @@ static void rsx_present_frame(void)
 }
 static int rsx_pump_messages(void)
 { return s_rsx_live ? rsx_null_backend_pump_messages() : rsx_backend_pump(); }
+extern "C" void ps3_host_quit(const char* why);   /* libs/system/cellSysutil.c: REQUEST_EXITGAME, then exit 0 */
 
 /* Frames handed to the backend at a guest FLIP boundary -- one per frame the
  * guest actually finished, which is the number a port means by "is anything
@@ -536,7 +586,19 @@ static DWORD WINAPI vblank_ticker(LPVOID)
         }
     }
     TickClock::time_point nextTick = TickClock::now();
+#if defined(__APPLE__)
+    /* This thread draws (the Metal draw engine runs from the flips it
+     * delivers) and is a plain pthread with no autorelease pool, so every
+     * autoreleased Metal descriptor it made lived until exit: about 2 GB in
+     * three hours in Resistance 2. One pool per pass, popped at the top of
+     * the next (so no path through the body can skip it). */
+    void* frame_pool = nullptr;
+#endif
     for (;;) {
+#if defined(__APPLE__)
+        if (frame_pool) objc_autoreleasePoolPop(frame_pool);
+        frame_pool = objc_autoreleasePoolPush();
+#endif
         /* Was Sleep(4). The FIFO kick event existed, was signalled on a dry
          * fence queue, and had no waiter -- so a guest starved for `get` or a
          * fence still paid the whole tick. Waiting on it keeps the same 4 ms
@@ -594,19 +656,17 @@ static DWORD WINAPI vblank_ticker(LPVOID)
               static int _n=0; if(_n++<12) fprintf(stderr,"[INJQ3] injected q%u event rc=%d\n",qid,r); } }
         if (rsx_ok) {
             if (rsx_pump_messages() != 0) {
+                rsx_ok = 0;
                 /* The window was closed (its close button, Alt+F4, or Escape with
-                 * PS3_ESCAPE_QUITS): end the process. It used to stop presenting and
-                 * keep running, so a game started without a console window (a
-                 * launcher, a double-clicked exe) kept playing its audio unseen. */
+                 * PS3_ESCAPE_QUITS): quit as the console's Quit Game does -- every
+                 * registered sysutil callback gets CELL_SYSUTIL_REQUEST_EXITGAME, so the
+                 * title can finish a save and exit, and ps3_host_quit ends the process
+                 * itself after PS3_QUIT_GRACE_MS -- instead of leaving the guest running
+                 * (and its audio playing) with no window. Once only. Folklore (patch
+                 * 0051/0054): the controller stops rumbling at once. */
                 fprintf(stderr, "[boot] window closed -- exiting\n");
-                fflush(stdout);
-                fflush(stderr);
                 cellPad_stop_rumble();   /* libs/input/cellPad.c */
-#ifdef _WIN32
-                ExitProcess(0);
-#else
-                _exit(0);
-#endif
+                ps3_host_quit("window closed");
             }
             if (getenv("YDKJ_PACETRACE")) {
                 static ULONGLONG s_win=0; static int s_pf=0, s_pres=0; static ULONGLONG s_presms=0;
@@ -1404,7 +1464,7 @@ int main(int argc, char** argv)
 #ifdef _WIN32
     fprintf(stderr, "[boot] MAIN guest thread tid=%lu\n", (unsigned long)GetCurrentThreadId());
 #endif
-    int rc = ppu_run(entry, stack_top);
+    int rc = boot_run_guest(entry, stack_top);   /* macOS: on its own thread, see above */
     printf("\n[boot] ppu_run returned %d (entry function unwound)\n", rc);
     /* A guest that called sys_process_exit never reaches this line: that path
      * ends in the host exit(). Getting here means the entry function returned

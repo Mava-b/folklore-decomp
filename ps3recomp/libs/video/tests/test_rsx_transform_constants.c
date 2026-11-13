@@ -16,11 +16,14 @@
 #include <stdio.h>
 #include <string.h>
 
-/* rsx_commands.c reaches the guest VM (semaphore labels) and the boot
- * milestone log; nothing here uses either, so stubs are enough to link. */
+/* rsx_commands.c reaches the guest VM (semaphore labels, notify area), the
+ * GCM IO map, its clock and the boot milestone log; nothing here uses any of
+ * them, so stubs are enough to link. */
 uint32_t ppu_hle_inject_base;
 void vm_write32(uint32_t addr, uint32_t value) { (void)addr; (void)value; }
 void ps3_ms(const char* key) { (void)key; }
+uint32_t gcm_io_offset_to_ea(uint32_t io) { (void)io; return 0; }
+unsigned long long ps3_ms_now(void) { return 0; }
 
 static int g_fail;
 

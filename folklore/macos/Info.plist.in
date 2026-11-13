@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  The game's Info.plist (CMakeLists.txt builds build-mac/folklore.app on
+  macOS). It is what makes macOS treat the game as a game: gamepolicyd turns
+  Game Mode on for a fullscreen, frontmost app whose bundle carries
+  LSSupportsGameMode or the games category, and it only reads a real bundle.
+  Running folklore.app/Contents/MacOS/folklore directly (run_mac.sh runs the
+  build-mac/folklore link to it) keeps the bundle identity. From the
+  inFAMOUS 2 port.
+-->
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>${MACOSX_BUNDLE_EXECUTABLE_NAME}</string>
+    <key>CFBundleIdentifier</key>
+    <string>${MACOSX_BUNDLE_GUI_IDENTIFIER}</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>${MACOSX_BUNDLE_BUNDLE_NAME}</string>
+    <key>CFBundleDisplayName</key>
+    <string>Folklore</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>${MACOSX_BUNDLE_SHORT_VERSION_STRING}</string>
+    <key>CFBundleVersion</key>
+    <string>${MACOSX_BUNDLE_BUNDLE_VERSION}</string>
+    <key>CFBundleIconFile</key>
+    <string>${MACOSX_BUNDLE_ICON_FILE}</string>
+    <key>LSApplicationCategoryType</key>
+    <string>public.app-category.games</string>
+    <!-- macOS 26+ -->
+    <key>LSSupportsGameMode</key>
+    <true/>
+    <!-- macOS 14-15 -->
+    <key>GCSupportsGameMode</key>
+    <true/>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>
