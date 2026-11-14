@@ -660,6 +660,11 @@ When something draws wrong, press **F2** (or the PS button on a DualShock 3)
 while it is on screen, or double-click `capture.bat`. The next four seconds of
 draws go to `logs\capture-<date-time>\`.
 
+Each draw's textures are listed in `draws.csv` with the same 16-digit key the
+texture dump and texture packs use (`#<key>`, and `+pack` when a pack's
+replacement was drawn), so a texture seen on screen can be traced to its file
+in `textures\dump` or `textures\replace`.
+
 ### Motion watch (for the capture mechanics)
 
 **F3** in game starts a 20-second watch of where the game reads the

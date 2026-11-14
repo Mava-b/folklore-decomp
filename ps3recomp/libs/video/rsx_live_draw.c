@@ -4896,6 +4896,34 @@ static void ld_texture_index_insert(u32 entryIndex)
     g_ld_texture_bucket[bucket] = (u16)(entryIndex + 1u);
 }
 
+/* For render captures: the dump/texture-pack key of the texture bound as
+ * `t` (from its cached copy), and whether a pack's replacement is bound.
+ * 0 when it has no cached copy yet. */
+static int ld_capture_texture_key(const rsx_dsp_texture* t, u64* keyOut, int* replacedOut)
+{
+    const u32 remap = t->remap & 0xFFFF;
+    const u32 lookupBucket = ld_texture_key_bucket(t->location, t->offset, t->format, t->width,
+                                                   t->height, t->pitch, remap, t->cubemap);
+    for (u32 link = g_ld_texture_bucket[lookupBucket]; link; link = g_ld_texture_next[link - 1u])
+    {
+        const texcache_t* entry = &g.textures[link - 1u];
+        if (entry->location != t->location || entry->offset != t->offset || entry->format != t->format ||
+            entry->width != t->width || entry->height != t->height || entry->pitch != t->pitch ||
+            entry->remap != remap || entry->cubemap != t->cubemap)
+        {
+            continue;
+        }
+        if (!entry->content_hash)
+        {
+            return 0;
+        }
+        *keyOut = ld_texture_replace_key(t, remap, entry->content_hash);
+        *replacedOut = entry->replaced_format != DXGI_FORMAT_UNKNOWN;
+        return 1;
+    }
+    return 0;
+}
+
 static u32 texture_srv_slot(const rsx_dsp_texture* t)
 {
     const u32 remap = t->remap & 0xFFFF;
@@ -11036,12 +11064,23 @@ static void live_draw_csv_emit(u32 prim, u32 n_tri, const char* outcome)
     fprintf(file, ",0x%04X,0x%04X,",
             active_attr_mask, dc.layout.mask & 0xFFFFu);
     /* Enabled fragment texture units, so a pass that samples a surface (or an
-     * empty copy of one) is visible in the row: unit:loc:offset:fmt:WxH. */
+     * empty copy of one) is visible in the row: unit:loc:offset:fmt:WxH,
+     * then #<key> -- the 16-digit name the texture dump and texture packs
+     * use -- with "+pack" when a pack's replacement is the one bound. */
     for (u32 u = 0; u < 16; u++) {
         rsx_dsp_texture t; rsx_dsp_get_texture(&g.rsx, u, &t);
         if (t.enabled)
-            fprintf(file, "%u:%u:%X:%02X:%ux%u ", u, t.location, t.offset,
+        {
+            fprintf(file, "%u:%u:%X:%02X:%ux%u", u, t.location, t.offset,
                     t.format & 0xFF, t.width, t.height);
+            u64 textureKey = 0;
+            int replaced = 0;
+            if (ld_capture_texture_key(&t, &textureKey, &replaced))
+            {
+                fprintf(file, "#%016llX%s", (unsigned long long)textureKey, replaced ? "+pack" : "");
+            }
+            fprintf(file, " ");
+        }
     }
     /* Vertex attribute layout: index:type x size /stride @location:offset
      * (type 1 s16n 2 f32 3 f16 4 u8n 5 s16 6 cmp 7 u8). A mesh that draws

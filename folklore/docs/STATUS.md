@@ -1903,6 +1903,13 @@ What 0006 fixes in ps3recomp to make that run:
     (they said stereo). Routing checked by mixing a tone on each of the
     eight PS3 channels through audio_mix_one_block for each layout (built
     with MinGW, run under Wine); not yet heard on speakers.
+135. Captures name textures by their dump/pack key (patches/0111): each
+    enabled unit in draws.csv's texture column is followed by #<key>
+    (ld_texture_replace_key of its cached copy's content hash, the name the
+    dump writes and a pack file starts with) and "+pack" when the bound
+    copy is a replacement (ld_capture_texture_key). For finding which file
+    a texture on screen is -- first use: Doolin's scrolling cloud shadows,
+    whose upscaled replacement looks wrong.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
