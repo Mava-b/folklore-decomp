@@ -654,6 +654,21 @@ The quickest check that it works: open a dumped texture that is easy to
 spot, paint something obvious on it, save it into `textures\replace` and
 start the game with the option on.
 
+**Ignoring textures.** A texture listed in `textures\ignore.txt` is neither
+dumped nor replaced: the game's own texture is always used, whatever is in
+`textures\replace` (an `ignore.txt` inside `replace` or `dump` works too).
+One texture a line, by its 16-digit key; a whole file name works, and
+anything after the key, or a line starting with `#`, is a note:
+
+```
+# Doolin's cloud shadows: the upscale looks worse than the original
+5D64FB8D09B517E3
+```
+
+It is read when the game starts. To find a texture's key, take a render
+capture (F2) with it on screen: `draws.csv` lists each draw's textures by
+key.
+
 ### Render capture (for bug reports)
 
 When something draws wrong, press **F2** (or the PS button on a DualShock 3)

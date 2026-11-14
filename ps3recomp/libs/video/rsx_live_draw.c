@@ -3865,6 +3865,177 @@ void rsx_live_draw_set_texture_pack(const char* folder)
     ReleaseSRWLockExclusive(&g_ld_texture_pack_lock);
 }
 
+/* The ignore list: textures neither dumped nor replaced. ignore.txt in the
+ * textures folder (the folder holding replace\ and dump\), or in the
+ * replace or dump folder itself; every one found is read. One texture a
+ * line, by the 16-digit key the dump names it with -- a whole file name
+ * works, as only the key at the start counts; anything else on a line, and
+ * lines starting with # or ;, are notes. Read once, when the game starts. A
+ * texture whose upscale looks worse than the original (Doolin's sliding
+ * cloud shadows, 5D64FB8D09B517E3) can be listed instead of deleted. */
+static u64* g_ld_texture_ignore_keys = NULL;
+static u32 g_ld_texture_ignore_count = 0;
+static int g_ld_texture_ignore_loaded = 0;
+
+static int ld_texture_ignore_compare(const void* left, const void* right)
+{
+    const u64 leftKey = *(const u64*)left;
+    const u64 rightKey = *(const u64*)right;
+    return leftKey < rightKey ? -1 : (leftKey > rightKey ? 1 : 0);
+}
+
+/* A line's key: 16 hex digits at its start (after spaces), ended by the
+ * end of the line, a space, or _ . - as in a file name. */
+static int ld_texture_ignore_parse_line(const char* line, u64* keyOut)
+{
+    while (*line == ' ' || *line == '\t')
+    {
+        line++;
+    }
+    u64 value = 0;
+    for (int digitIndex = 0; digitIndex < 16; digitIndex++)
+    {
+        const char digit = line[digitIndex];
+        u32 nibble = 0;
+        if (digit >= '0' && digit <= '9')
+        {
+            nibble = (u32)(digit - '0');
+        }
+        else if (digit >= 'A' && digit <= 'F')
+        {
+            nibble = (u32)(digit - 'A' + 10);
+        }
+        else if (digit >= 'a' && digit <= 'f')
+        {
+            nibble = (u32)(digit - 'a' + 10);
+        }
+        else
+        {
+            return 0;
+        }
+        value = (value << 4) | nibble;
+    }
+    const char next = line[16];
+    if (next != '\0' && next != '\r' && next != '\n' && next != ' ' && next != '\t' && next != '_' &&
+        next != '.' && next != '-' && next != ',')
+    {
+        return 0;
+    }
+    *keyOut = value;
+    return 1;
+}
+
+static void ld_texture_ignore_read(const char* path)
+{
+    FILE* file = fopen(path, "r");
+    if (!file)
+    {
+        return;
+    }
+    char line[512];
+    u32 added = 0;
+    while (fgets(line, sizeof(line), file))
+    {
+        u64 key = 0;
+        if (!ld_texture_ignore_parse_line(line, &key))
+        {
+            continue;
+        }
+        u64* grown = (u64*)realloc(g_ld_texture_ignore_keys, (g_ld_texture_ignore_count + 1u) * sizeof(u64));
+        if (!grown)
+        {
+            break;
+        }
+        g_ld_texture_ignore_keys = grown;
+        g_ld_texture_ignore_keys[g_ld_texture_ignore_count++] = key;
+        added++;
+    }
+    fclose(file);
+    fprintf(stderr, "[tex-ignore] %u texture(s) listed in %s: not dumped, not replaced\n", added, path);
+    fflush(stderr);
+}
+
+/* `folder`\ignore.txt and, when `parentToo`, the same in its parent. */
+static void ld_texture_ignore_read_around(const char* folder, int parentToo, char seen[4][MAX_PATH], int* seenCount)
+{
+    if (!folder || !folder[0])
+    {
+        return;
+    }
+    char base[MAX_PATH];
+    snprintf(base, sizeof(base), "%s", folder);
+    size_t length = strlen(base);
+    while (length > 0 && (base[length - 1] == '\\' || base[length - 1] == '/'))
+    {
+        base[--length] = 0;
+    }
+    for (int level = 0; level < (parentToo ? 2 : 1); level++)
+    {
+        if (level == 1)
+        {
+            char* separator = strrchr(base, '\\');
+            char* slash = strrchr(base, '/');
+            if (slash && (!separator || slash > separator))
+            {
+                separator = slash;
+            }
+            if (!separator)
+            {
+                return;
+            }
+            *separator = 0;
+        }
+        char path[MAX_PATH + 16];
+        snprintf(path, sizeof(path), "%s\\ignore.txt", base);
+        int already = 0;
+        for (int seenIndex = 0; seenIndex < *seenCount; seenIndex++)
+        {
+            if (_stricmp(seen[seenIndex], path) == 0)
+            {
+                already = 1;
+            }
+        }
+        if (already || *seenCount >= 4 || GetFileAttributesA(path) == INVALID_FILE_ATTRIBUTES)
+        {
+            continue;
+        }
+        snprintf(seen[*seenCount], MAX_PATH, "%s", path);
+        (*seenCount)++;
+        ld_texture_ignore_read(path);
+    }
+}
+
+static void ld_texture_ignore_load(void)
+{
+    if (g_ld_texture_ignore_loaded)
+    {
+        return;
+    }
+    g_ld_texture_ignore_loaded = 1;
+    char seen[4][MAX_PATH];
+    int seenCount = 0;
+    ld_texture_ignore_read_around(g_ld_texture_pack_folder, 1, seen, &seenCount);
+    if (ld_texture_dump_enabled())
+    {
+        ld_texture_ignore_read_around(g_ld_texture_dump_folder, 1, seen, &seenCount);
+    }
+    if (g_ld_texture_ignore_count > 1u)
+    {
+        qsort(g_ld_texture_ignore_keys, g_ld_texture_ignore_count, sizeof(u64), ld_texture_ignore_compare);
+    }
+}
+
+static int ld_texture_ignored(u64 key)
+{
+    ld_texture_ignore_load();
+    if (!g_ld_texture_ignore_count)
+    {
+        return 0;
+    }
+    return bsearch(&key, g_ld_texture_ignore_keys, g_ld_texture_ignore_count, sizeof(u64),
+                   ld_texture_ignore_compare) != NULL;
+}
+
 int rsx_live_draw_get_texture_pack_stats(u32* filesFound, u32* filesInUse, u32* filesBroken)
 {
     if (filesFound)
@@ -4019,7 +4190,14 @@ static void ld_texture_pack_scan(const char* folder, int depth)
         if (nameLength > 4 && _stricmp(found.cFileName + nameLength - 4, ".dds") == 0 &&
             ld_texture_pack_parse_key(found.cFileName, &key))
         {
-            ld_texture_pack_add(key, path);
+            if (ld_texture_ignored(key))
+            {
+                fprintf(stderr, "[tex-ignore] not using %s (in ignore.txt)\n", path);
+            }
+            else
+            {
+                ld_texture_pack_add(key, path);
+            }
         }
     } while (FindNextFileA(search, &found));
     FindClose(search);
@@ -4757,7 +4935,7 @@ static ID3D12Resource* decode_guest_texture_dumping(
     if (dumpAllowed && !hasReplacement && contentHash && ld_texture_dump_enabled())
     {
         const u64 key = ld_texture_replace_key(texture, remap, contentHash);
-        if (!ld_texture_dump_seen_before(key))
+        if (!ld_texture_dump_seen_before(key) && !ld_texture_ignored(key))
         {
             ld_texture_dump_context* context = &g_ld_texture_dump_context;
             context->active = 1;

@@ -1910,6 +1910,15 @@ What 0006 fixes in ps3recomp to make that run:
     copy is a replacement (ld_capture_texture_key). For finding which file
     a texture on screen is -- first use: Doolin's scrolling cloud shadows,
     whose upscaled replacement looks wrong.
+136. Texture ignore list (patches/0112). ignore.txt in the textures folder
+    (the parent of the pack or dump folder) or in the pack or dump folder
+    itself, all read once at start: one key per line (16 hex digits at the
+    start, then the end, whitespace or _ . - , -- so file names work; #
+    and ; lines are notes). A listed key is skipped when the pack folder
+    is scanned (logged "[tex-ignore] not using ...") and never dumped.
+    First entry: 5D64FB8D09B517E3, Doolin's cloud-shadow map (1024x1024
+    DXT1, bound on almost every ground draw, capture-20261114-213244): its
+    2048x2048 upscale turned the soft gradients into hard-edged patches.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
