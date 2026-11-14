@@ -60,6 +60,9 @@ extern "C"
     void rsx_live_draw_get_shader_stats(uint32_t* pending, uint32_t* built, uint32_t* skippedDraws);
     int rsx_live_draw_get_hdr_status(uint32_t* displayPeakNits);
     long cellPad_mouse_wheel_total(void);
+    /* The audio output (cellAudio.c): channels to the device, and the device's own. */
+    int cellAudio_output_channels(void);
+    int cellAudio_device_channels(void);
     void rsx_live_draw_get_hdr_levels(uint32_t* peakInUse, uint32_t* paperWhiteInUse, uint32_t* windowsSdrWhite);
     extern volatile int g_cellpad_block_guest_input;
     /* A controller read over HID (cellPad.c): a DualShock 3 or 4, DualSense
@@ -103,6 +106,7 @@ namespace
         EngineSettings::Bloom startBloom = EngineSettings::Bloom::Smooth;
         EngineSettings::IdSouls startIdSouls = EngineSettings::IdSouls::Smooth;
         EngineSettings::AmbientOcclusion startAmbientOcclusion = EngineSettings::AmbientOcclusion::Subtle;
+        EngineSettings::AudioOutput startAudioOutput = EngineSettings::AudioOutput::Automatic;
         bool menuOpen = false;
         bool focusRequested = false;
         ID3D12DescriptorHeap* srvHeap = nullptr;
@@ -1589,6 +1593,33 @@ namespace
                 }
             }
 
+            ImGui::SeparatorText("Sound");
+            {
+                int audioIndex = (int)settings.audioOutput;
+                bool audioChanged = ImGui::RadioButton("Automatic##audio", &audioIndex, 0);
+                ImGui::SameLine();
+                audioChanged |= ImGui::RadioButton("Stereo##audio", &audioIndex, 1);
+                ImGui::SameLine();
+                audioChanged |= ImGui::RadioButton("5.1##audio", &audioIndex, 2);
+                ImGui::SameLine();
+                audioChanged |= ImGui::RadioButton("7.1##audio", &audioIndex, 3);
+                if (audioChanged)
+                {
+                    settings.audioOutput = (EngineSettings::AudioOutput)audioIndex;
+                    changed = true;
+                }
+                const int outputChannels = cellAudio_output_channels();
+                const int deviceChannels = cellAudio_device_channels();
+                const char* playingAs = outputChannels == 8 ? "7.1" : (outputChannels == 6 ? "5.1" : "stereo");
+                if (outputChannels)
+                {
+                    ImGui::TextDisabled("Playing in %s on a %d-channel device%s.", playingAs, deviceChannels,
+                                        settings.audioOutput != menu.startAudioOutput
+                                            ? "; the change applies when you next start the game"
+                                            : "");
+                }
+            }
+
             ImGui::SeparatorText("Physics");
             changed |= ImGui::Checkbox("Step physics by the frame time (fixes cloth and hair above 30 fps)",
                                        &settings.physicsFrameStep);
@@ -1782,6 +1813,7 @@ namespace
             menu.startBloom = engineSettings().bloom;
             menu.startIdSouls = engineSettings().idSouls;
             menu.startAmbientOcclusion = engineSettings().ambientOcclusion;
+            menu.startAudioOutput = engineSettings().audioOutput;
             if (!initialize((ID3D12Device*)device, (ID3D12CommandQueue*)queue, (DXGI_FORMAT)format, height))
             {
                 menu.failed = true;

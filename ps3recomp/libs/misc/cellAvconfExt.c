@@ -20,6 +20,11 @@ extern u8* vm_base;
 #include <stdio.h>
 #include <string.h>
 
+/* libs/audio/cellAudio.c: the output the game configured, for the surround
+ * mix and the engine menu. */
+void cellAudio_note_game_channels(int channels);
+int cellAudio_game_channels(void);
+
 /* ---------------------------------------------------------------------------
  * Internal state
  * -----------------------------------------------------------------------*/
@@ -119,7 +124,7 @@ s32 cellAudioOutGetConfiguration(u32 audioOut,
     config = GUEST_PTR(config, CellAudioOutConfiguration*);
 
     memset(config, 0, sizeof(CellAudioOutConfiguration));
-    config->channel = CELL_AUDIO_OUT_CHNUM_2;
+    config->channel = cellAudio_game_channels() ? (u8)cellAudio_game_channels() : CELL_AUDIO_OUT_CHNUM_2;
     config->encoder = CELL_AUDIO_OUT_CODING_TYPE_LPCM;
 
     return CELL_OK;
@@ -148,7 +153,7 @@ s32 cellAudioOutGetState(u32 audioOut, u32 deviceIndex, void* state)
     vm_write8(ea + 3, 0);
     vm_write32(ea + 4, 0);                                  /* no down-mixer  */
     vm_write8(ea + 8, CELL_AUDIO_OUT_CODING_TYPE_LPCM);     /* soundMode      */
-    vm_write8(ea + 9, CELL_AUDIO_OUT_CHNUM_2);
+    vm_write8(ea + 9, cellAudio_game_channels() ? (u8)cellAudio_game_channels() : CELL_AUDIO_OUT_CHNUM_2);
     vm_write8(ea + 10, CELL_AUDIO_OUT_FS_48KHZ);
     vm_write8(ea + 11, 0);
     vm_write32(ea + 12, 0);
@@ -190,7 +195,28 @@ s32 cellVideoOutSetGamma(u32 videoOut, float gamma)
  * the title queries availability separately. NID 0x4692AB35. */
 s32 cellAudioOutConfigure(u32 audioOut, void* config, void* option, u32 waitForEvent)
 {
-    (void)config; (void)option; (void)waitForEvent;
-    printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    (void)option; (void)waitForEvent;
+    /* CellAudioOutConfiguration { u8 channel; u8 encoder; u8 reserved[10];
+     * u32 downMixer; }: the output the game asked for. Remembered, so that
+     * GetConfiguration and GetState report it back. */
+    const uint32_t ea = (uint32_t)(uintptr_t)config;
+    if (ea)
+    {
+        const u8* bytes = GUEST_PTR(config, const u8*);
+        const int channels = bytes[0];
+        const uint32_t downMixer = ((uint32_t)bytes[12] << 24) | ((uint32_t)bytes[13] << 16) |
+                                   ((uint32_t)bytes[14] << 8) | (uint32_t)bytes[15];
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u): %d channels, encoder %u, down-mixer %u -> ok\n",
+               audioOut, channels, (unsigned)bytes[1], (unsigned)downMixer);
+        if (channels == CELL_AUDIO_OUT_CHNUM_2 || channels == CELL_AUDIO_OUT_CHNUM_6 ||
+            channels == CELL_AUDIO_OUT_CHNUM_8)
+        {
+            cellAudio_note_game_channels(channels);
+        }
+    }
+    else
+    {
+        printf("[cellAvconfExt] AudioOutConfigure(audioOut=%u) -> ok\n", audioOut);
+    }
     return 0;
 }

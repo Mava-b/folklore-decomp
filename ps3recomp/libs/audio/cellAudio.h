@@ -115,6 +115,18 @@ s32 cellAudioSetPersonalDevice(s32 iPersonalStream, s32 iDevice);
 /* NID: 0x28BC1409 */
 s32 cellAudioUnsetPersonalDevice(s32 iPersonalStream);
 
+/* Host output (not PS3 API). The speakers the mix goes to: 0 the Windows
+ * device's own setup (7.1, 5.1 or stereo), or 2, 6 or 8 channels. Read when
+ * cellAudioInit opens the device, so set it before the game starts. */
+void cellAudio_set_output_mode(int channels);
+/* Channels going to the device (2, 6 or 8; 0 before it opens), the device's
+ * own channel count (0 unknown), and what the game configured through
+ * cellAudioOutConfigure (0 not yet). */
+int cellAudio_output_channels(void);
+int cellAudio_device_channels(void);
+void cellAudio_note_game_channels(int channels);
+int cellAudio_game_channels(void);
+
 #ifdef __cplusplus
 }
 #endif

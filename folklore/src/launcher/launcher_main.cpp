@@ -1466,6 +1466,13 @@ namespace
             }
         }
 
+        sectionHeading("Sound");
+        changed |= enumChoice("Audio output", &settings.audioOutput,
+                              {"Automatic (as Windows)", "Stereo", "5.1 surround", "7.1 surround"});
+        note("The game mixes its sound for 7.1, as on the PS3. Automatic plays it on as many speakers as the "
+             "Windows default output device is set up for (Sound settings, Speaker setup); Stereo folds it down "
+             "to two.");
+
         sectionHeading("Physics");
         changed |= ImGui::Checkbox("Step physics by the frame time (fixes cloth and hair above 30 fps)",
                                    &settings.physicsFrameStep);

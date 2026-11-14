@@ -56,6 +56,7 @@ namespace
             engineSettingsLoad();
             engineSettingsApplyGraphics();
             engineSettingsApplyInput();
+            engineSettingsApplyAudio();
         }
     };
 
@@ -306,6 +307,25 @@ void engineSettingsLoad()
         {
             settingsInstance.fullResEffects = parseBool(value);
         }
+        else if (std::strcmp(key, "audio_output") == 0)
+        {
+            if (std::strcmp(value, "stereo") == 0)
+            {
+                settingsInstance.audioOutput = EngineSettings::AudioOutput::Stereo;
+            }
+            else if (std::strcmp(value, "5.1") == 0)
+            {
+                settingsInstance.audioOutput = EngineSettings::AudioOutput::Surround51;
+            }
+            else if (std::strcmp(value, "7.1") == 0)
+            {
+                settingsInstance.audioOutput = EngineSettings::AudioOutput::Surround71;
+            }
+            else
+            {
+                settingsInstance.audioOutput = EngineSettings::AudioOutput::Automatic;
+            }
+        }
         else if (std::strcmp(key, "ambient_occlusion") == 0)
         {
             if (std::strcmp(value, "off") == 0)
@@ -540,6 +560,12 @@ void engineSettingsSave()
                  : current.ambientOcclusion == EngineSettings::AmbientOcclusion::Strong ? "strong"
                                                                                         : "subtle");
     std::fprintf(file, "physics_frame_step = %d\n", current.physicsFrameStep ? 1 : 0);
+    std::fprintf(file, "# auto (the Windows speaker setup), stereo, 5.1 or 7.1 (next start)\n");
+    const char* audioOutputText = current.audioOutput == EngineSettings::AudioOutput::Stereo       ? "stereo"
+                                  : current.audioOutput == EngineSettings::AudioOutput::Surround51 ? "5.1"
+                                  : current.audioOutput == EngineSettings::AudioOutput::Surround71 ? "7.1"
+                                                                                                    : "auto";
+    std::fprintf(file, "audio_output = %s\n", audioOutputText);
     std::fprintf(file, "# opening logos: off (they all play), start (Start skips them) or always (never shown)\n");
     const char* logoSkipText = current.logoSkip == EngineSettings::LogoSkip::Always  ? "always"
                                : current.logoSkip == EngineSettings::LogoSkip::Start ? "start"
@@ -683,6 +709,27 @@ float engineSettingsAspectValue(AspectRatio aspectRatio)
     default:
         return 16.0f / 9.0f;
     }
+}
+
+extern "C" void cellAudio_set_output_mode(int channels);
+
+void engineSettingsApplyAudio()
+{
+    const EngineSettings& current = engineSettings();
+    int channels = 0;
+    if (current.audioOutput == EngineSettings::AudioOutput::Stereo)
+    {
+        channels = 2;
+    }
+    else if (current.audioOutput == EngineSettings::AudioOutput::Surround51)
+    {
+        channels = 6;
+    }
+    else if (current.audioOutput == EngineSettings::AudioOutput::Surround71)
+    {
+        channels = 8;
+    }
+    cellAudio_set_output_mode(channels);
 }
 
 void engineSettingsApplyInput()

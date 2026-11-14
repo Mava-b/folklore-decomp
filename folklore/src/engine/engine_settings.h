@@ -184,6 +184,21 @@ struct EngineSettings
      * 1/30 s (see folklore_physics_plan_steps). Keeps the cloth and hair
      * stable above 30 fps; at 30 fps it steps the same as the original. */
     bool physicsFrameStep = true;
+    /* Audio output: the game mixes for 7.1 (an 8-channel cellAudio port).
+     *   Automatic  the Windows default device's speaker setup: 7.1, 5.1 or
+     *              stereo;
+     *   Stereo     folded down to two channels, as before;
+     *   Surround51 5.1, the PS3's rear pair folded into the surround pair;
+     *   Surround71 7.1 as the game mixed it.
+     * cellAudio_set_output_mode; applies at the next start. */
+    enum class AudioOutput
+    {
+        Automatic,
+        Stereo,
+        Surround51,
+        Surround71,
+    };
+    AudioOutput audioOutput = AudioOutput::Automatic;
     /* The opening logos: the logo movie (995) and the six still logos after
      * it (tools/game_patches.py, logoSkip / logoStills / logoAlways).
      *   Off     as on the PS3: they all play.
@@ -263,6 +278,8 @@ std::string engineTexturePackFolder();
 bool engineTexturePackOnThisLaunch();
 /* Hand the input settings to the pad runtime (startup and every change). */
 void engineSettingsApplyInput();
+/* The audio output (read once, when the game opens its audio). */
+void engineSettingsApplyAudio();
 /* The aspect ratio a setting asks for (16:9 for Original). */
 float engineSettingsAspectValue(AspectRatio aspectRatio);
 /* Whether this build's release has more than one language (the EU one). */

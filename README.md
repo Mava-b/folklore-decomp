@@ -114,6 +114,10 @@ be turned back to the original.
 - **Keyboard and mouse**: play with them, a controller, or both at once;
   the mouse turns the camera, and every button can be rebound in the
   launcher or the engine menu.
+- **5.1 and 7.1 surround**: the game's own 7.1 mix goes to your speakers as
+  it is, as on a PS3 connected to a surround receiver (it was folded down
+  to stereo). Automatic follows the Windows speaker setup; Stereo, 5.1 and
+  7.1 can be chosen on the launcher's Gameplay page or in the engine menu.
 
 Builds can be made from the v1.00 disc or from the game's **1.10 update**
 (rumble, and the newer Folk data), and the **downloadable content** you bought
@@ -287,6 +291,9 @@ ones `run.ps1` uses).
   (.rap)...**, and any pack still missing its licence.
 - **Graphics**, **Display**, **Gameplay**: every setting of the in-game
   engine menu, including the ones that only apply when the game starts.
+- **Gameplay** also holds **Audio output**: *Automatic* (the speaker setup
+  of the Windows default output device), *Stereo*, *5.1 surround* or *7.1
+  surround*. Applies at the next start.
 - **Controls**: motion controls, keyboard and mouse, and the key bindings
   (click one, then press the key, mouse button or wheel direction for it).
 - **Dump textures this run** (Graphics page): the next Play starts the game

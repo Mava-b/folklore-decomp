@@ -1885,6 +1885,24 @@ What 0006 fixes in ps3recomp to make that run:
     as before. Left alone: frames 58020 and 65035 (100-125 ms with the
     renderer at 9-13 ms and the game thread in nothing measured) and 5978
     (45 ms waiting for the GPU), one each.
+134. Surround sound (patches/0110, engine setting audio_output). Folklore
+    opens one 8-channel cellAudio port (PortOpen nChannel=8, nBlock=16),
+    which the mixer always folded down to stereo for WASAPI; Windows then
+    upmixed that to the device (the tester's: 8 channels). The 8 channels
+    are in the PS3's order: front L/R, centre, LFE, surround L/R, rear L/R
+    (RPCS3 issue 11066, from the SDK documentation). Now the mix has 2, 6
+    or 8 output channels (s_out_channels): 7.1 is opened as float
+    WAVEFORMATEXTENSIBLE with Windows' 7.1 mask 0x63F (FL FR FC LFE BL BR
+    SL SR), so the PS3's surround pair goes to SL/SR and its rear pair to
+    BL/BR; 5.1 (mask 0x3F) folds the rear pair into the surround pair at
+    0.707; stereo is the old fold-down, unchanged. Automatic takes the
+    channel count of the default device's mix format; a layout the device
+    refuses falls back 7.1 -> 5.1 -> stereo. The limiter takes one gain for
+    all channels. cellAudioOutConfigure now logs and remembers the channel
+    count the game asks for, and GetConfiguration/GetState report it back
+    (they said stereo). Routing checked by mixing a tone on each of the
+    eight PS3 channels through audio_mix_one_block for each layout (built
+    with MinGW, run under Wine); not yet heard on speakers.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to
