@@ -186,6 +186,11 @@ void rsx_live_draw_set_soft_cutouts(int enabled);
 /* Full-resolution effects: 3D passes the game draws into surfaces smaller
  * than the screen (the water reflections) drawn at the render scale. Live. */
 void rsx_live_draw_set_full_res_effects(int enabled);
+/* Screen-width scene buffer: from a render scale of 2, the 2x-wide
+ * anti-aliasing surfaces (Folklore's 2560x720 scene) and their depth at half
+ * the horizontal render scale, so the scene costs what the screen does.
+ * Read when the first surface is made: set it before the game starts. */
+void rsx_live_draw_set_scene_screen_width(int enabled);
 /* Repeat draws: a draw whose state is the previous draw's apart from its
  * transform constants reuses that draw's upload, pipeline and tables (1, the
  * default) or goes through the whole draw path again (0). Live. */

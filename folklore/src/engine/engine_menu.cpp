@@ -1247,6 +1247,12 @@ namespace
         {
             ImGui::TextDisabled("Above 1x on a smaller window the image is also supersampled (smoother edges).");
         }
+        changed |= ImGui::Checkbox("Scene at screen width (faster at 2x and 3x; next start)", &settings.sceneScreenWidth);
+        if (ImGui::IsItemHovered())
+        {
+            ImGui::SetTooltip("The game draws its 3D scene twice as wide as the screen, the PS3's anti-aliasing.\n"
+                              "From 2x that costs a lot and adds little; this draws it at the screen's width.");
+        }
         ImGui::TextUnformatted("Aspect ratio (field of view)");
         changed |= radioAspect("16:9 (original)", AspectRatio::Original);
         ImGui::SameLine();

@@ -44,7 +44,13 @@ namespace
     /* Both sides of the focus: pso 98dbb71efb61695f. */
     constexpr uint64_t kTwoSidedHash = 0x1F15BEB3C708B830ull;
 
+    /* LD_SCENE_SQUEEZE: the picture's width over the scene's. The scene is
+     * the PS3's 2x-wide buffer (0.5) unless the renderer draws it at screen
+     * width (setting scene_screen_width), when it defines it as 1.0. */
     const char* const kCommon = R"HLSL(
+#ifndef LD_SCENE_SQUEEZE
+#define LD_SCENE_SQUEEZE 0.5
+#endif
 float4 _rsx_zeta_argb(Texture2D depthTexture, SamplerState depthSampler, float2 coordinate) {
     float depth = saturate(depthTexture.SampleLevel(depthSampler, coordinate, 0).x);
     uint depthBits = (uint)round(depth * 16777215.0);
@@ -132,8 +138,9 @@ float folkloreAmbient(float2 coordinate, float2 screenPosition) {
     uint depthWidth, depthHeight;
     rsx_tex[1].GetDimensions(depthWidth, depthHeight);
     const int2 depthSize = int2(max(depthWidth, 1u), max(depthHeight, 1u));
-    // The scene is supersampled twice across, so its picture is half as wide.
-    const float aspect = 0.5 * (float)depthSize.x / (float)depthSize.y;
+    // The scene is supersampled twice across (unless drawn at screen width),
+    // so its picture is half as wide.
+    const float aspect = LD_SCENE_SQUEEZE * (float)depthSize.x / (float)depthSize.y;
     const int2 centreTexel = int2(coordinate * (float2)depthSize);
     const float centreDepth = saturate(rsx_tex[1].Load(int3(clamp(centreTexel, int2(0, 0), depthSize - 1), 0)).x);
     if (centreDepth >= folkloreAmbientSkyDepth) {
@@ -198,11 +205,12 @@ float4 main(PSInput input) : SV_TARGET {
                              rsx_tex[0].Sample(rsx_samp[0], coordinate + pairOffset).xyz);
     const float alpha = rsx_tex[0].Sample(rsx_samp[0], coordinate).w;
     const float blurAmount = factor - sharpFactor;
-    // A round disc on screen (the scene is twice as wide as the screen),
-    // reaching as far as each of the game's two copies was pushed.
+    // A round disc on screen (the scene is twice as wide as the screen,
+    // unless drawn at screen width), reaching as far as each of the game's
+    // two copies was pushed.
     uint sceneWidth, sceneHeight;
     rsx_tex[0].GetDimensions(sceneWidth, sceneHeight);
-    const float2 screenPixels = float2(0.5 * (float)max(sceneWidth, 1u), (float)max(sceneHeight, 1u));
+    const float2 screenPixels = float2(LD_SCENE_SQUEEZE * (float)max(sceneWidth, 1u), (float)max(sceneHeight, 1u));
     const float radiusPixels = length(pairOffset * screenPixels);
     float ambient = 1.0;
     if (folkloreAmbientStrength > 0.0) {

@@ -1281,6 +1281,9 @@ namespace
             settings.renderScale = scaleIndex + 1;
             changed = true;
         }
+        changed |= ImGui::Checkbox("Scene at screen width (faster at 2x and 3x)", &settings.sceneScreenWidth);
+        note("The game draws its 3D scene twice as wide as the screen, the PS3's anti-aliasing. At 2x and 3x "
+             "that doubles the graphics card's work for little gain; this draws it at the screen's width.");
         changed |= enumChoice("Aspect ratio", &settings.aspectRatio,
                               {"16:9 (the PS3's)", "Match the display", "21:9 ultrawide", "32:9 super ultrawide"});
         changed |= enumChoice("Anti-aliasing", &settings.antiAliasing, {"Off", "FXAA (softer)", "SMAA (sharp edges)"});

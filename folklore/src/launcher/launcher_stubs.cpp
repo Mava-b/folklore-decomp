@@ -19,6 +19,7 @@ extern "C"
     void rsx_live_draw_set_async_shaders(int enabled) { (void)enabled; }
     void rsx_live_draw_set_repeat_draws(int enabled) { (void)enabled; }
     void rsx_live_draw_set_soft_cutouts(int enabled) { (void)enabled; }
+    void rsx_live_draw_set_scene_screen_width(int enabled) { (void)enabled; }
     void cellAudio_set_output_mode(int channels) { (void)channels; }
     void rsx_live_draw_set_full_res_effects(int enabled) { (void)enabled; }
     void rsx_live_draw_set_anisotropy(uint32_t level) { (void)level; }

@@ -393,6 +393,12 @@ saved to `folklore_settings.ini`.
   - *Fullscreen* (borderless; **Alt+Enter** toggles it any time).
   - *Render resolution*: 1x (1280×720, the PS3's), 2x or 3x. Applies on the
     next start.
+  - *Scene at screen width* (off by default): the game draws its 3D scene
+    twice as wide as the screen, as the PS3's anti-aliasing, so at 3x on a
+    21:9 screen the scene is 10240×2160. With this on, at 2x and 3x it is
+    drawn at the screen's width instead: about half the graphics card's work
+    for the scene and every effect over it, with SMAA left to smooth the
+    edges. Next start.
   - *Aspect ratio*: 16:9, match display, 21:9 or 32:9 — a wider field of view,
     not a stretched picture. Next start.
   - *Menus and HUD* (when wider than 16:9): *Map and gauges at the edges*

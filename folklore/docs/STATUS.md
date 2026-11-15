@@ -1919,6 +1919,27 @@ What 0006 fixes in ps3recomp to make that run:
     First entry: 5D64FB8D09B517E3, Doolin's cloud-shadow map (1024x1024
     DXT1, bound on almost every ground draw, capture-20261114-213244): its
     2048x2048 upscale turned the soft gradients into hard-edged patches.
+137. Scene at screen width (patches/0113, engine setting
+    scene_screen_width, off by default, next start). The 3D scene is the
+    PS3's 2x-wide AA buffer (2560x720: 0x2A40000, 0x1B40000, zeta
+    0x22C0000), resolved to the 1280x720 screen by the depth-of-field
+    pass, so at 3x on 21:9 it, every transparent effect and its depth are
+    10240x2160 -- the GPU load behind run-20261113-175149's 60-75 fps
+    (5-8 ms a frame waiting for the GPU, ~360 blended draws). With the
+    setting on and a render scale of 2 or 3, a canvas surface at least
+    twice the canvas across and less than twice down (ld_surface_halved)
+    gets half the canvas's horizontal scale (surface_t.halved), and so does
+    its zeta (zdepth_t.scale_x, which now sizes the zeta, its depth
+    snapshot and the snapshot dispatch). Viewports, scissors, WPOS and
+    draw_scale_x follow from ld_surface_scale_x_for as before. Widened-ness
+    (ultrawide HUD placement, 0107's widened-picture test) counts a halved
+    surface at twice its scale (ld_surface_widened), and the HUD strip uses
+    its unwidened scale. engine_dof.cpp's ambient-occlusion aspect and
+    depth-of-field disc assumed a 2x-wide scene (0.5); they read
+    LD_SCENE_SQUEEZE, which ld_apply_ps_replacement defines as 1.0 in
+    front of a replacement that uses it when the scene is at screen width
+    (the shader disk cache keys on the text, so the two compile apart).
+    Not yet run.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

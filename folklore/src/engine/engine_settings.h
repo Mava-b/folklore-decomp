@@ -70,6 +70,12 @@ struct EngineSettings
      * 1280x720; read when the renderer starts, so a change applies on the
      * next launch. The other two apply at once. */
     int renderScale = 1;
+    /* Scene buffer at screen width: the game draws its 3D scene twice as
+     * wide as the screen (the PS3's anti-aliasing); from a render scale of
+     * 2 that buffer is drawn at the screen's width instead, about halving
+     * the graphics card's work for the scene (ld_surface_halved). Next
+     * start. */
+    bool sceneScreenWidth = false;
     AntiAliasing antiAliasing = AntiAliasing::Smaa;
     bool backgroundShaders = true;
     /* Repeat draws: an object drawn again with only its position changed

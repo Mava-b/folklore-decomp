@@ -1,0 +1,251 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -65,6 +65,7 @@
+ void rsx_live_draw_set_shadow_softness(int l) { (void)l; }
+ void rsx_live_draw_set_soft_cutouts(int e) { (void)e; }
+ void rsx_live_draw_set_full_res_effects(int e) { (void)e; }
++void rsx_live_draw_set_scene_screen_width(int e) { (void)e; }
+ void rsx_live_draw_set_repeat_draws(int e) { (void)e; }
+ void rsx_live_draw_set_sharpening(u32 p) { (void)p; }
+ void rsx_live_draw_set_ps_replacement(u64 h, const char* s) { (void)h; (void)s; }
+@@ -265,6 +266,7 @@
+     u32 scale;                /* host pixels per guest pixel, vertically (ld_surface_scale_for) */
+     float scale_x;            /* ... and horizontally: scale x the ultrawide widening */
+     u32 raised;               /* a reduced-size surface's render-scale twin (ld_raised_target_wanted) */
++    u32 halved;               /* a 2x-wide scene buffer at screen width (ld_surface_halved) */
+     ID3D12Resource* fb_tex;   /* feedback copy, see surface_feedback_srv */
+ #if !defined(YZ_PERF_CLEAN)
+     u32 resource_serial;
+@@ -291,6 +293,7 @@
+     ID3D12Resource* tex;
+     ID3D12Resource* snapshot;
+     u32 w, h;
++    float scale_x;            /* host pixels across per guest pixel (ld_surface_scale_x_for) */
+     u32 snapshot_w, snapshot_h;
+     D3D12_RESOURCE_STATES snapshot_state;
+     int cleared;
+@@ -576,6 +579,10 @@
+ static volatile LONG g_ld_repeat_draws = 1;      /* the repeat-draw fast path (ld_repeat_draw) */
+ static volatile LONG g_ld_soft_cutouts = 1;      /* cut-outs with soft edges (render_state_t.alpha_coverage) */
+ static volatile LONG g_ld_full_res_effects = 1;  /* reduced-size 3D passes at the render scale (surface_t.raised) */
++/* Screen-width scene buffer (rsx_live_draw_set_scene_screen_width): read
++ * once, by the first surface made; see ld_surface_halved. */
++static volatile LONG g_ld_scene_screen_width = 0;
++static int g_ld_scene_screen_width_fixed = -1;
+ /* Bumped whenever the per-draw rings or the command list start over: a draw
+  * recorded under another epoch may not reuse the previous draw's ring
+  * offsets and descriptor tables. */
+@@ -649,9 +656,53 @@
+     return ld_surface_is_canvas(guestWidth, guestHeight) ? (g.scale ? g.scale : 1u) : 1u;
+ }
+ 
++/* Screen-width scene buffer. Folklore draws its 3D scene into 2560x720 --
++ * the PS3's 2x-wide anti-aliasing buffer, resolved to the 1280x720 screen by
++ * the depth-of-field pass -- so at a render scale of 3 on a 21:9 screen the
++ * scene, every transparent effect over it and its depth buffer are 10240x2160:
++ * twice the screen's pixels, the graphics card's main load in busy places
++ * (run-20261113-175149: 60-75 fps, 5-8 ms a frame waiting for the GPU). From
++ * a render scale of 2 that width buys little the render scale has not
++ * already, so with the setting on such a surface -- at least twice the
++ * canvas across and less than twice down -- takes half the canvas's
++ * horizontal scale: its host width is the screen's. Its zeta follows
++ * (zdepth_t.scale_x). Read once per run: surfaces keep their size. */
++static int ld_scene_screen_width_active(void)
++{
++    if (g_ld_scene_screen_width_fixed < 0)
++    {
++        g_ld_scene_screen_width_fixed = InterlockedCompareExchange(&g_ld_scene_screen_width, 0, 0) &&
++                                        (g.scale ? g.scale : 1u) >= 2u;
++        if (g_ld_scene_screen_width_fixed)
++        {
++            fprintf(stderr, "[live-draw] screen-width scene buffer: 2x-wide surfaces at half the horizontal "
++                            "render scale\n");
++        }
++    }
++    return g_ld_scene_screen_width_fixed;
++}
++
++static int ld_surface_halved(u32 guestWidth, u32 guestHeight)
++{
++    if (!guestWidth)
++    {
++        guestWidth = g.width;
++    }
++    if (!guestHeight)
++    {
++        guestHeight = g.height;
++    }
++    return ld_scene_screen_width_active() && ld_surface_is_canvas(guestWidth, guestHeight) &&
++           guestWidth >= 2u * g.width && guestHeight < 2u * g.height;
++}
++
+ static float ld_surface_scale_x_for(u32 guestWidth, u32 guestHeight)
+ {
+-    return ld_surface_is_canvas(guestWidth, guestHeight) ? ld_canvas_scale_x() : 1.0f;
++    if (!ld_surface_is_canvas(guestWidth, guestHeight))
++    {
++        return 1.0f;
++    }
++    return ld_surface_halved(guestWidth, guestHeight) ? ld_canvas_scale_x() * 0.5f : ld_canvas_scale_x();
+ }
+ 
+ /* A guest-pixel length in a surface's host pixels: ld_surface_x across,
+@@ -673,7 +724,18 @@
+ 
+ static int ld_surface_is_canvas_scale(const surface_t* surface)
+ {
+-    return surface->scale == (g.scale ? g.scale : 1u) && surface->scale_x == ld_canvas_scale_x();
++    const float canvasScaleX = surface->halved ? ld_canvas_scale_x() * 0.5f : ld_canvas_scale_x();
++    return surface->scale == (g.scale ? g.scale : 1u) && surface->scale_x == canvasScaleX;
++}
++
++/* Whether a surface is widened for an ultrawide screen (its horizontal
++ * scale above its vertical one, a screen-width scene counted at its own
++ * width). */
++static int ld_surface_widened(const surface_t* surface)
++{
++    const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
++    const float horizontalScale = surface->scale_x * (surface->halved ? 2.0f : 1.0f);
++    return horizontalScale > verticalScale * 1.01f;
+ }
+ 
+ /* Bounds of the open bank in each transient ring (absolute offsets). */
+@@ -2668,6 +2730,17 @@
+         {
+             memcpy(hlsl, entry->hlsl, strlen(entry->hlsl) + 1);
+             replaced = 1;
++            /* Replacements that size things by the 2x-wide scene learn
++             * whether it is at screen width (LD_SCENE_SQUEEZE: the picture's
++             * width over the scene's, 0.5 by default). */
++            static const char kScreenWidthDefine[] = "#define LD_SCENE_SQUEEZE 1.0\n";
++            const size_t replacementLength = strlen(hlsl);
++            if (ld_scene_screen_width_active() && strstr(hlsl, "LD_SCENE_SQUEEZE") &&
++                replacementLength + sizeof(kScreenWidthDefine) <= capacity)
++            {
++                memmove(hlsl + sizeof(kScreenWidthDefine) - 1u, hlsl, replacementLength + 1u);
++                memcpy(hlsl, kScreenWidthDefine, sizeof(kScreenWidthDefine) - 1u);
++            }
+             break;
+         }
+     }
+@@ -2705,6 +2778,11 @@
+     InterlockedExchange(&g_ld_soft_cutouts, enabled ? 1 : 0);
+ }
+ 
++void rsx_live_draw_set_scene_screen_width(int enabled)
++{
++    InterlockedExchange(&g_ld_scene_screen_width, enabled ? 1 : 0);
++}
++
+ void rsx_live_draw_set_full_res_effects(int enabled)
+ {
+     InterlockedExchange(&g_ld_full_res_effects, enabled ? 1 : 0);
+@@ -5700,6 +5778,7 @@
+     s->scale = surfaceScale;
+     s->scale_x = surfaceScaleX;
+     s->raised = raised ? 1u : 0u;
++    s->halved = (!raised && ld_surface_halved(want_w, want_h)) ? 1u : 0u;
+ #if !defined(YZ_PERF_CLEAN)
+     s->resource_serial = ++g_ld_surface_resource_serial;
+ #endif
+@@ -6048,7 +6127,7 @@
+     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    rd.Width = ld_scaled_x(nw);
++    rd.Width = ld_scale_pixels(nw, z->scale_x);
+     rd.Height = ld_scaled(nh);
+     rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1;
+@@ -6134,7 +6213,8 @@
+     hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+     D3D12_RESOURCE_DESC rd = {0};
+     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    rd.Width = ld_scaled_x(want_w);
++    const float zetaScaleX = ld_surface_scale_x_for(want_w, want_h);
++    rd.Width = ld_scale_pixels(want_w, zetaScaleX);
+     rd.Height = ld_scaled(want_h);
+     rd.DepthOrArraySize = 1;
+     rd.MipLevels = 1;
+@@ -6162,6 +6242,7 @@
+     z->offset = offset;
+     z->w = want_w;
+     z->h = want_h;
++    z->scale_x = zetaScaleX;
+     z->had_write = 0;
+     z->snapshot_valid = 0;
+     z->snapshot_w = rt_w ? rt_w : want_w;
+@@ -6180,7 +6261,7 @@
+      * not a depth-resource copy operation. */
+     D3D12_RESOURCE_DESC snapshot_rd = {0};
+     snapshot_rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+-    snapshot_rd.Width = ld_scaled_x(z->snapshot_w);
++    snapshot_rd.Width = ld_scale_pixels(z->snapshot_w, z->scale_x);
+     snapshot_rd.Height = ld_scaled(z->snapshot_h);
+     snapshot_rd.DepthOrArraySize = 1;
+     snapshot_rd.MipLevels = 1;
+@@ -6273,7 +6354,7 @@
+     g.list->lpVtbl->SetComputeRootDescriptorTable(
+         g.list, 1, destination_table);
+     g.list->lpVtbl->Dispatch(
+-        g.list, (ld_scaled_x(z->snapshot_w) + 7u) / 8u,
++        g.list, (ld_scale_pixels(z->snapshot_w, z->scale_x) + 7u) / 8u,
+         (ld_scaled(z->snapshot_h) + 7u) / 8u, 1);
+ 
+     D3D12_RESOURCE_BARRIER uav_done = {0};
+@@ -9324,8 +9405,7 @@
+ static int ld_hud_placing(const surface_t* surface)
+ {
+     const LONG layout = InterlockedCompareExchange(&g_ld_hud_layout, 0, 0);
+-    const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
+-    return layout != 0 && surface->scale_x > verticalScale * 1.01f;
++    return layout != 0 && ld_surface_widened(surface);
+ }
+ 
+ static void ld_hdr_scene_snapshot(u32 target);
+@@ -9337,8 +9417,7 @@
+  * 2560x720 depth canvas left on unit 3 under its own 128x128 texture. */
+ static int ld_hud_samples_widened_surface(const surface_t* surface)
+ {
+-    const float verticalScale = (float)(surface->scale ? surface->scale : 1u);
+-    if (!(surface->scale_x > verticalScale * 1.01f))
++    if (!ld_surface_widened(surface))
+     {
+         return 0;
+     }
+@@ -9353,8 +9432,7 @@
+         const surface_t* sampled = &g.surfaces[index];
+         if (sampled->tex && sampled->location == texture.location && sampled->offset == texture.offset)
+         {
+-            const float sampledVertical = (float)(sampled->scale ? sampled->scale : 1u);
+-            return sampled->scale_x > sampledVertical * 1.01f;
++            return ld_surface_widened(sampled);
+         }
+     }
+     return 0;
+@@ -12978,7 +13056,8 @@
+          * surface at its own proportions -- the middle one, or moved out
+          * towards the left or right edge by the edge setting; the scissor
+          * follows. */
+-        const float hudWidth = dvp.Width / drawSurface->scale_x * renderScale;
++        const float unwidenedScaleX = renderScale * (drawSurface->halved ? 0.5f : 1.0f);
++        const float hudWidth = dvp.Width / drawSurface->scale_x * unwidenedScaleX;
+         const float centredLeft = (dvp.Width - hudWidth) * 0.5f;
+         const float edgeAmount = (float)InterlockedCompareExchange(&g_ld_hud_edge, 0, 0) / 100.0f;
+         float placedLeft = centredLeft;
+diff --git a/libs/video/rsx_live_draw.h b/libs/video/rsx_live_draw.h
+--- a/libs/video/rsx_live_draw.h
++++ b/libs/video/rsx_live_draw.h
+@@ -186,6 +186,11 @@
+ /* Full-resolution effects: 3D passes the game draws into surfaces smaller
+  * than the screen (the water reflections) drawn at the render scale. Live. */
+ void rsx_live_draw_set_full_res_effects(int enabled);
++/* Screen-width scene buffer: from a render scale of 2, the 2x-wide
++ * anti-aliasing surfaces (Folklore's 2560x720 scene) and their depth at half
++ * the horizontal render scale, so the scene costs what the screen does.
++ * Read when the first surface is made: set it before the game starts. */
++void rsx_live_draw_set_scene_screen_width(int enabled);
+ /* Repeat draws: a draw whose state is the previous draw's apart from its
+  * transform constants reuses that draw's upload, pipeline and tables (1, the
+  * default) or goes through the whole draw path again (0). Live. */

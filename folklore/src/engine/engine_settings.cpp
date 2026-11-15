@@ -188,6 +188,10 @@ void engineSettingsLoad()
             const int scale = std::atoi(value);
             settingsInstance.renderScale = (scale >= 1 && scale <= 3) ? scale : 1;
         }
+        else if (std::strcmp(key, "scene_screen_width") == 0)
+        {
+            settingsInstance.sceneScreenWidth = parseBool(value);
+        }
         else if (std::strcmp(key, "anti_aliasing") == 0)
         {
             if (std::strcmp(value, "fxaa") == 0)
@@ -503,6 +507,8 @@ void engineSettingsSave()
     std::fprintf(file, "show_performance_overlay = %d\n", current.showPerformanceOverlay ? 1 : 0);
     std::fprintf(file, "show_save_notice = %d\n", current.showSaveNotice ? 1 : 0);
     std::fprintf(file, "render_scale = %d\n", current.renderScale);
+    std::fprintf(file, "# 2x and 3x: the 3D scene at the screen's width, not twice it (faster; next start)\n");
+    std::fprintf(file, "scene_screen_width = %d\n", current.sceneScreenWidth ? 1 : 0);
     std::fprintf(file, "# off, fxaa or smaa\n");
     std::fprintf(file, "anti_aliasing = %s\n",
                  current.antiAliasing == AntiAliasing::Fxaa   ? "fxaa"
@@ -616,6 +622,7 @@ extern "C"
     void rsx_live_draw_set_shadow_softness(int level);
     void rsx_live_draw_set_repeat_draws(int enabled);
     void rsx_live_draw_set_soft_cutouts(int enabled);
+    void rsx_live_draw_set_scene_screen_width(int enabled);
     void rsx_live_draw_set_full_res_effects(int enabled);
     void rsx_live_draw_set_sharpening(uint32_t percent);
     void rsx_live_draw_set_hdr(int enabled, uint32_t peakNits, uint32_t paperWhiteNits, uint32_t highlightPercent);
@@ -665,6 +672,7 @@ void engineSettingsApplyGraphics()
         rsx_live_draw_set_texture_pack(folder.c_str());
     }
     rsx_live_draw_set_render_scale((uint32_t)current.renderScale);
+    rsx_live_draw_set_scene_screen_width(current.sceneScreenWidth ? 1 : 0);
     rsx_live_draw_set_post_aa((int)current.antiAliasing);
     rsx_live_draw_set_async_shaders(current.backgroundShaders ? 1 : 0);
     rsx_live_draw_set_repeat_draws(current.repeatDraws ? 1 : 0);
