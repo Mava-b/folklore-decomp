@@ -1940,6 +1940,19 @@ What 0006 fixes in ps3recomp to make that run:
     front of a replacement that uses it when the scene is at screen width
     (the shader disk cache keys on the text, so the two compile apart).
     Not yet run.
+138. Crash in a cutscene (run-20261117-174605, patches/0114). Frame 90264
+    took 9212 ms, 9205 ms of it in vertex fetch (normally under 1 ms a
+    frame); during it CreateGraphicsPipelineState failed with E_FAIL (the
+    device not removed), and the log ends there. No draw reaches that
+    honestly: the likely reading is one draw whose batches added up to
+    tens of millions of vertex references (a BEGIN/END carries any number
+    of 256-vertex packets, merged when contiguous), its fetch buffers
+    growing to gigabytes until allocations, then the pipeline build, then
+    the process failed. A draw of more than 4M references
+    (LD_MAX_DRAW_VERTICES overrides) is now left out before fetching
+    (counted as drop{fetch}) and the first eight are logged with their
+    batches, packets, primitive, index array, pipeline and surface, to see
+    where such a draw comes from if it happens again.
 
 `run.ps1 -Libsre` runs on Sony's libsre instead, for comparison (entry 62). Locally (stand-in
 data), HLE crashes in `sgx-audio-thr` within 25 s; the real libsre runs on to

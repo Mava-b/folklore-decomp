@@ -1,0 +1,68 @@
+diff --git a/libs/video/rsx_live_draw.c b/libs/video/rsx_live_draw.c
+--- a/libs/video/rsx_live_draw.c
++++ b/libs/video/rsx_live_draw.c
+@@ -12212,6 +12212,64 @@
+         g_ld_profile.total_used_attribute_max = used_layout.count;
+     const LONGLONG fetch_pack_begin = ld_profile_qpc();
+ #endif
++    /* A draw no PS3 game makes: more vertex references than the limit
++     * (4M by default; LD_MAX_DRAW_VERTICES overrides). Fetching one froze a
++     * cutscene for 9.2 s in vertex fetch while its buffers grew to
++     * gigabytes, a pipeline then failed to build (E_FAIL) and the game
++     * crashed (run-20261117-174605, frame 90264). It is left out instead,
++     * and the first few are logged with what they asked for. */
++    {
++        static u64 drawVertexLimit = 0;
++        static u32 hugeDrawLogs = 0;
++        if (!drawVertexLimit)
++        {
++            const char* text = getenv("LD_MAX_DRAW_VERTICES");
++            const unsigned long long requested = text ? strtoull(text, NULL, 10) : 0ull;
++            drawVertexLimit = requested ? (u64)requested : 4194304ull;
++        }
++        u64 references = 0;
++        u32 largestBatch = 0;
++        for (u32 batch = 0; batch < dc.n_arr; batch++)
++        {
++            references += dc.arr[batch].count;
++            if (dc.arr[batch].count > largestBatch)
++            {
++                largestBatch = dc.arr[batch].count;
++            }
++        }
++        for (u32 batch = 0; batch < dc.n_idx; batch++)
++        {
++            references += dc.idx[batch].count;
++            if (dc.idx[batch].count > largestBatch)
++            {
++                largestBatch = dc.idx[batch].count;
++            }
++        }
++        if (references > drawVertexLimit)
++        {
++            g_ld_stats.group_drop_fetch++;
++            if (hugeDrawLogs < 8u)
++            {
++                hugeDrawLogs++;
++                rsx_dsp_index_array hugeIndexArray;
++                rsx_dsp_get_index_array(&g.rsx, &hugeIndexArray);
++                rsx_dsp_surface hugeSurface;
++                rsx_dsp_get_surface(&g.rsx, &hugeSurface);
++                fprintf(stderr,
++                        "[live-draw] frame %u: draw of %llu vertices left out (limit %llu): %u array and %u index "
++                        "batches, largest %u, first %u+%u; %u packets; prim %u; index array %u:0x%X%s; "
++                        "pso %016llx; surface 0x%X %ux%u\n",
++                        g_ld_frames, (unsigned long long)references, (unsigned long long)drawVertexLimit, dc.n_arr,
++                        dc.n_idx, largestBatch, dc.n_arr ? dc.arr[0].first : (dc.n_idx ? dc.idx[0].first : 0u),
++                        dc.n_arr ? dc.arr[0].count : (dc.n_idx ? dc.idx[0].count : 0u), dc.n_packets, prim,
++                        hugeIndexArray.location, hugeIndexArray.offset, hugeIndexArray.is_u32 ? " u32" : " u16",
++                        (unsigned long long)live_legacy_pso_key(), hugeSurface.color_offset[0], hugeSurface.clip_w,
++                        hugeSurface.clip_h);
++                fflush(stderr);
++            }
++            return;
++        }
++    }
+     const u64 fetchBegin = ld_perf_ticks();
+     if (ld_vertex_compact_payload()) {
+         fetch_batches_hoisted(&used_layout, 1);
